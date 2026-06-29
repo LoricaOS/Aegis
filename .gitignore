@@ -1,0 +1,4 @@
+/build/
+kernel/cap/target/
+*.o
+*.d
