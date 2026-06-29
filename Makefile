@@ -227,6 +227,17 @@ LIMINE_DIR = tools/limine
 LIMINE_BIN = $(BUILD)/limine
 ISO_DIR    = $(BUILD)/isodir
 
+# Limine binaries are fetched (pinned in $(LIMINE_DIR)/VERSION), not vendored.
+# The stamp runs the fetch once; every limine file depends on it so the ISO
+# rules pull it in transitively via $(LIMINE_BIN).
+LIMINE_STAMP = $(LIMINE_DIR)/.fetched
+$(LIMINE_STAMP): tools/fetch-limine.sh $(LIMINE_DIR)/VERSION
+	sh tools/fetch-limine.sh
+	@touch $@
+$(LIMINE_DIR)/limine.c $(LIMINE_DIR)/limine-bios-hdd.h $(LIMINE_DIR)/limine-bios.sys \
+$(LIMINE_DIR)/limine-bios-cd.bin $(LIMINE_DIR)/limine-uefi-cd.bin \
+$(LIMINE_DIR)/BOOTX64.EFI $(LIMINE_DIR)/BOOTIA32.EFI: $(LIMINE_STAMP)
+
 $(LIMINE_BIN): $(LIMINE_DIR)/limine.c $(LIMINE_DIR)/limine-bios-hdd.h
 	@mkdir -p $(BUILD)
 	$(HOSTCC) -std=c99 -O2 -I$(LIMINE_DIR) -o $@ $(LIMINE_DIR)/limine.c

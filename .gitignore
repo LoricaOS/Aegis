@@ -2,3 +2,9 @@
 kernel/cap/target/
 *.o
 *.d
+
+# Limine is fetched (pinned in tools/limine/VERSION), not vendored — keep only
+# the pin + the fetch script; everything else lands here at build time.
+/vendor/
+/tools/limine/*
+!/tools/limine/VERSION
