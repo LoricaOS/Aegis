@@ -302,12 +302,11 @@ ap_entry(void)
     /* Signal BSP that we are online */
     g_ap_online[my_idx] = 1;
 
-    /* AP scheduling is OPT-IN (kernel cmdline `smp_sched`).  Default OFF: APs
-     * park in sti/hlt — the proven-safe behavior shipped through 1.3.0.  When
-     * APs run user tasks they hit an AMD-bare-metal #GP on the iretq return to
-     * ring 3 (SS RPL=0 left unnormalized on some AP path) that QEMU does not
-     * reproduce; until that is fixed on hardware, multi-core scheduling stays
-     * behind the flag so the default boot is safe on real machines. */
+    /* AP scheduling is ON by default; `nosmp_sched` parks APs in sti/hlt as a
+     * safety escape hatch.  The AMD-bare-metal #GP on the iretq return to ring 3
+     * (SS RPL=0 left unnormalized on some AP path) is fixed — SS RPL is now
+     * normalized on every AP return path, so multi-core scheduling is safe on
+     * real hardware. */
     if (!g_ap_sched_enabled) {
         for (;;)
             __asm__ volatile("sti; hlt; cli" ::: "memory");

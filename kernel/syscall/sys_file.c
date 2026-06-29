@@ -18,7 +18,7 @@
  *
  * arg1 = user pointer to null-terminated path string
  * arg2 = flags (O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, O_TRUNC, O_APPEND, etc.)
- * arg3 = mode (ignored — permissions not yet enforced)
+ * arg3 = mode (applied only when O_CREAT actually creates the file)
  *
  * Returns fd on success, negative errno on failure.
  */
