@@ -167,9 +167,8 @@ ALL_OBJS = $(BOOT_OBJ) $(ARCH_OBJS) $(ARCH_ASM_OBJS) $(CORE_OBJS) $(SIGNAL_OBJS)
            $(MM_OBJS) $(SCHED_OBJS) $(TTY_OBJS) $(FS_OBJS) $(DRIVER_OBJS) \
            $(NET_OBJS) $(USERSPACE_OBJS)
 
-.PHONY: all iso disk rootfs run run-fb shell login test test-q35 install-test clean gdb sym trace curl_bin build-musl
 
-.PHONY: all iso test clean version
+.PHONY: all iso test clean version sym dist
 all: $(BUILD)/aegis.elf
 
 # asm/blob objects that have none. This is what makes header edits rebuild.
@@ -249,11 +248,55 @@ $(BUILD)/aegis.iso: $(KERNEL_STRIPPED) $(LIMINE_BIN)
 	    $(ISO_DIR) -o $@
 	$(LIMINE_BIN) bios-install $@
 
-# Smoke test: boot the kernel alone (no rootfs). With no init on any root fs the
-# kernel must run all the way to init-spawn and panic "[INIT] no init found",
-# which proves the kernel boots end-to-end with zero userland.
-test: iso
+# ── Capability test: a freestanding test-init booted from a minimal rootfs ──
+# test/init.c is built with the kernel's own toolchain (no libc, raw syscalls),
+# packed as /bin/vigil into a tiny ext2 image, and booted as a Limine module.
+# It checks pid/write and — the point — that a POWER-gated syscall is DENIED to
+# baseline-cap init (no ambient authority). See tools/captest.sh.
+$(BUILD)/test-init: test/init.c
+	@mkdir -p $(BUILD)
+	$(CC) -ffreestanding -nostdlib -static -fno-pie -no-pie -fno-stack-protector \
+	    -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -O2 -e _start -o $@ $<
+
+$(BUILD)/test-rootfs.img: $(BUILD)/test-init
+	dd if=/dev/zero of=$@ bs=512 count=8192 2>/dev/null      # 4 MiB
+	/sbin/mke2fs -t ext2 -F -b 4096 -L aegis-test $@ >/dev/null 2>&1
+	printf 'mkdir /bin\nwrite $(BUILD)/test-init /bin/vigil\n' | /sbin/debugfs -w $@ >/dev/null 2>&1
+
+$(BUILD)/aegis-test.iso: $(KERNEL_STRIPPED) $(BUILD)/test-rootfs.img $(LIMINE_BIN)
+	@rm -rf $(BUILD)/test-isodir
+	@mkdir -p $(BUILD)/test-isodir/boot/limine $(BUILD)/test-isodir/EFI/BOOT
+	cp $(KERNEL_STRIPPED) $(BUILD)/test-isodir/boot/aegis.elf
+	cp $(BUILD)/test-rootfs.img $(BUILD)/test-isodir/boot/rootfs.img
+	printf 'timeout: 0\n\n/Aegis kernel test\n    protocol: multiboot2\n    path: boot():/boot/aegis.elf\n    module_path: boot():/boot/rootfs.img\n    cmdline: boot=text\n' > $(BUILD)/test-isodir/boot/limine/limine.conf
+	cp $(LIMINE_DIR)/limine-bios.sys $(LIMINE_DIR)/limine-bios-cd.bin $(LIMINE_DIR)/limine-uefi-cd.bin $(BUILD)/test-isodir/boot/limine/
+	cp $(LIMINE_DIR)/BOOTX64.EFI $(LIMINE_DIR)/BOOTIA32.EFI $(BUILD)/test-isodir/EFI/BOOT/
+	xorriso -as mkisofs -R -r -J \
+	    -b boot/limine/limine-bios-cd.bin \
+	    -no-emul-boot -boot-load-size 4 -boot-info-table \
+	    --efi-boot boot/limine/limine-uefi-cd.bin \
+	    -efi-boot-part --efi-boot-image \
+	    --protective-msdos-label \
+	    $(BUILD)/test-isodir -o $@
+	$(LIMINE_BIN) bios-install $@
+
+# Full test: (1) capability/syscall test via a booted test-init, then (2) the
+# kernel-only smoke test (no rootfs → "no init found" panic).
+test: $(BUILD)/aegis-test.iso iso
+	bash tools/captest.sh $(BUILD)/aegis-test.iso
 	bash tools/ktest.sh $(BUILD)/aegis.iso
+
+# Resolve a kernel address (e.g. from a [PANIC] backtrace) to source:line.
+sym:
+	@test -n "$(ADDR)" || { echo "usage: make sym ADDR=0x..."; exit 1; }
+	x86_64-elf-addr2line -e $(BUILD)/aegis.elf -f $(ADDR)
+
+# Produce the release artifact: a stripped, version-named kernel image to attach
+# to the GitHub release an OS downloads (see AspisOS tools/fetch-kernel.sh).
+dist: $(KERNEL_STRIPPED)
+	@mkdir -p $(BUILD)/dist
+	cp $(KERNEL_STRIPPED) $(BUILD)/dist/aegis-$(AEGIS_VERSION).elf
+	@echo "release artifact: $(BUILD)/dist/aegis-$(AEGIS_VERSION).elf"
 
 version:
 	@echo $(AEGIS_VERSION)
