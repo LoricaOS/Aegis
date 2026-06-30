@@ -11,7 +11,7 @@ Aegis is **just the kernel**. It embeds no userland: at boot it mounts the root
 filesystem the bootloader/OS provides and execs `/bin/vigil` as init (panicking
 "no init found" if there is none, exactly like Linux). An operating system built
 on Aegis supplies its own userland, root filesystem, and boot image — see
-[AspisOS](https://github.com/AspisOS/AspisOS) for the reference OS.
+[LoricaOS](https://github.com/LoricaOS/LoricaOS) for the reference OS.
 
 ## Build
 

@@ -8,7 +8,7 @@ Aegis is a **standalone, clean-slate x86-64 kernel** — just the kernel. It
 embeds no userland: at boot it mounts the root filesystem the bootloader/OS
 provides and execs `/bin/vigil` as init (panicking "no init found" if there is
 none, like Linux). It publishes a versioned `aegis.elf` artifact that an OS
-consumes; the reference OS is [AspisOS](https://github.com/AspisOS/AspisOS),
+consumes; the reference OS is [LoricaOS](https://github.com/LoricaOS/LoricaOS),
 which fetches `aegis.elf` rather than building it here.
 
 ## The security model is the product — never weaken it
@@ -49,7 +49,7 @@ make dist      # the stripped, release aegis.elf
 ```
 
 `make iso`/`make test` are a **smoke test only** — there is no userland here, so
-a clean boot ends at the "no init found" panic. Real boots happen in AspisOS.
+a clean boot ends at the "no init found" panic. Real boots happen in LoricaOS.
 
 ## Conventions
 
@@ -57,5 +57,5 @@ a clean boot ends at the "no init found" panic. Real boots happen in AspisOS.
   core. No new abstractions without a second caller; fail closed at the boundary.
 - Kernel references that are legitimately "Aegis" (the name `aegis.elf`, the
   `/etc/aegis/*` capability paths, "the Aegis kernel") stay — the OS on top is
-  "AspisOS"; do not rebrand kernel identifiers.
+  "LoricaOS"; do not rebrand kernel identifiers.
 - Commit trailer: `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`.
