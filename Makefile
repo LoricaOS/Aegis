@@ -303,7 +303,7 @@ sym:
 	x86_64-elf-addr2line -e $(BUILD)/aegis.elf -f $(ADDR)
 
 # Produce the release artifact: a stripped, version-named kernel image to attach
-# to the GitHub release an OS downloads (see AspisOS tools/fetch-kernel.sh).
+# to the GitHub release an OS downloads (see LoricaOS tools/fetch-kernel.sh).
 dist: $(KERNEL_STRIPPED)
 	@mkdir -p $(BUILD)/dist
 	cp $(KERNEL_STRIPPED) $(BUILD)/dist/aegis-$(AEGIS_VERSION).elf
