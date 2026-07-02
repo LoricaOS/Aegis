@@ -407,6 +407,10 @@ static int nvme_blkdev_read(struct blkdev *dev, uint64_t lba, uint32_t count,
                             void *buf);
 static int nvme_blkdev_write(struct blkdev *dev, uint64_t lba, uint32_t count,
                              const void *buf);
+static int nvme_read_one(struct blkdev *dev, uint64_t lba, uint32_t count,
+                         void *buf);
+static int nvme_write_one(struct blkdev *dev, uint64_t lba, uint32_t count,
+                          const void *buf);
 
 /* -------------------------------------------------------------------------
  * nvme_init
@@ -673,11 +677,11 @@ nvme_io_validate(const struct blkdev *dev, uint64_t lba, uint32_t count,
     return 0;
 }
 
-/* nvme_blkdev_read — read `count` native LBAs from LBA into buf.
- * Uses the shared multi-page bounce buffer allocated in nvme_init().
- * Supports transfers up to s_max_xfer bytes (bounce size clamped to MDTS). */
+/* nvme_read_one — read up to s_max_xfer bytes (one PRP-list command) from LBA
+ * into buf.  Uses the shared multi-page bounce buffer allocated in nvme_init().
+ * Callers exceeding s_max_xfer go through nvme_blkdev_read, which splits. */
 static int
-nvme_blkdev_read(struct blkdev *dev, uint64_t lba, uint32_t count, void *buf)
+nvme_read_one(struct blkdev *dev, uint64_t lba, uint32_t count, void *buf)
 {
     uint32_t   bytes;
     void      *tmp;
@@ -725,6 +729,29 @@ nvme_blkdev_read(struct blkdev *dev, uint64_t lba, uint32_t count, void *buf)
     return rc;
 }
 
+/* nvme_blkdev_read — read `count` native LBAs from LBA into buf, splitting into
+ * per-command chunks of at most s_max_xfer bytes.  Callers (sys_disk's
+ * whole-disk copy, ext2's contiguous run reads) issue up to 64 KiB at once;
+ * on a controller whose MDTS clamps s_max_xfer below that, a single command
+ * would be rejected — so the driver, which alone knows the limit, chunks here
+ * rather than making every caller track MDTS. */
+static int
+nvme_blkdev_read(struct blkdev *dev, uint64_t lba, uint32_t count, void *buf)
+{
+    uint32_t bs = dev->block_size ? dev->block_size : 512u;
+    uint32_t max_lbas = s_max_xfer / bs;
+    if (max_lbas == 0u) max_lbas = 1u;
+    for (uint32_t done = 0; done < count; ) {
+        uint32_t n = count - done;
+        if (n > max_lbas) n = max_lbas;
+        int rc = nvme_read_one(dev, lba + done,
+                               n, (uint8_t *)buf + (uint64_t)done * bs);
+        if (rc != 0) return rc;
+        done += n;
+    }
+    return 0;
+}
+
 /* nvme_flush — issue an NVMe FLUSH (opcode 0x00) so the drive commits its
  * volatile write cache to non-volatile media.  The raw installer copy and
  * ext2 write-back both end at "the controller ACKed the write" — on real
@@ -761,12 +788,12 @@ nvme_flush(void)
     spin_unlock_irqrestore(&nvme_lock, fl);
 }
 
-/* nvme_blkdev_write — write `count` native LBAs from buf to LBA.
- * Uses the shared multi-page bounce buffer allocated in nvme_init().
- * Supports transfers up to s_max_xfer bytes (bounce size clamped to MDTS). */
+/* nvme_write_one — write up to s_max_xfer bytes (one PRP-list command) from buf
+ * to LBA.  Uses the shared multi-page bounce buffer allocated in nvme_init().
+ * Callers exceeding s_max_xfer go through nvme_blkdev_write, which splits. */
 static int
-nvme_blkdev_write(struct blkdev *dev, uint64_t lba, uint32_t count,
-                  const void *buf)
+nvme_write_one(struct blkdev *dev, uint64_t lba, uint32_t count,
+               const void *buf)
 {
     uint32_t   bytes;
     void      *tmp;
@@ -810,4 +837,24 @@ nvme_blkdev_write(struct blkdev *dev, uint64_t lba, uint32_t count,
     spin_unlock_irqrestore(&nvme_lock, fl);
     return rc;
     }
+}
+
+/* nvme_blkdev_write — write `count` native LBAs from buf to LBA, splitting into
+ * per-command chunks of at most s_max_xfer bytes (see nvme_blkdev_read). */
+static int
+nvme_blkdev_write(struct blkdev *dev, uint64_t lba, uint32_t count,
+                  const void *buf)
+{
+    uint32_t bs = dev->block_size ? dev->block_size : 512u;
+    uint32_t max_lbas = s_max_xfer / bs;
+    if (max_lbas == 0u) max_lbas = 1u;
+    for (uint32_t done = 0; done < count; ) {
+        uint32_t n = count - done;
+        if (n > max_lbas) n = max_lbas;
+        int rc = nvme_write_one(dev, lba + done,
+                                n, (const uint8_t *)buf + (uint64_t)done * bs);
+        if (rc != 0) return rc;
+        done += n;
+    }
+    return 0;
 }
