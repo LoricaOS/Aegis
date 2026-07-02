@@ -12,7 +12,9 @@
 #include "fb.h"
 #include "arch.h"
 #include "serial.h"
-#include "pcie.h"
+#ifdef __x86_64__
+#include "pcie.h"   /* fb_check_amd — x86 PCIe probe only */
+#endif
 #include "vmm.h"
 #include "kva.h"
 #include "pmm.h"
@@ -673,6 +675,7 @@ fb_heartbeat(void)
             s_fb_va[y * s_pitch_px + x] = color;
 }
 
+#ifdef __x86_64__
 void
 fb_check_amd(void)
 {
@@ -693,6 +696,7 @@ fb_check_amd(void)
            (uint32_t)amd->device_id);
     printk("[FB] WARN: ensure GRUB boots in UEFI mode (AMD APUs lack VBE)\n");
 }
+#endif /* __x86_64__ */
 
 /* Panic bluescreen, panic_halt, and boot splash rendering are in a
  * separate file for readability.  Included here (same translation unit)

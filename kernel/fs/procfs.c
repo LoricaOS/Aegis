@@ -530,6 +530,8 @@ gen_hda(char *buf, uint32_t bufsz)
     int n = hda_dump(buf, (int)bufsz);
     if (n > 0)
         return (uint32_t)n;
+#else
+    (void)bufsz;   /* no HDA driver on this arch */
 #endif
     char *p = pfs_strcpy(buf, "no HDA codec\n");
     *p = '\0';

@@ -327,10 +327,15 @@ void pmm_init(void)
         pmm_reserve_region(reserved[i].base, reserved[i].len);
 
     /* Step 4: reserve the kernel image + bitmap (bitmap is in .bss,
-     * inside this range).  The kernel image spans from PHYS_BASE to
-     * PHYS_BASE + kernel_size, where kernel_size = _kernel_end_VA - VIRT_BASE. */
-    pmm_reserve_region(ARCH_KERNEL_PHYS_BASE,
-                       (uint64_t)(uintptr_t)_kernel_end - ARCH_KERNEL_VIRT_BASE);
+     * inside this range).  The kernel image spans from PHYS_BASE+slide to
+     * PHYS_BASE+slide + kernel_size, where kernel_size = _kernel_end_VA -
+     * VIRT_BASE - PHYS_BASE.  slide is 0 on the multiboot2 path; under the
+     * Limine protocol the image lands wherever the bootloader put it (and
+     * that range is not usable RAM there, so this reserve is belt-and-
+     * braces — but reserving the UNslid range would eat foreign RAM). */
+    pmm_reserve_region(ARCH_KERNEL_PHYS_BASE + arch_kern_phys_slide(),
+                       (uint64_t)(uintptr_t)_kernel_end - ARCH_KERNEL_VIRT_BASE
+                       - ARCH_KERNEL_PHYS_BASE);
 
     /* Step 5: report. Bootstrap phase — the full bitmap (and final managed
      * total) is reported by pmm_init_late(). */

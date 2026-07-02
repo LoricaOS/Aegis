@@ -68,6 +68,7 @@ ARCH_SRCS = \
 
 CORE_SRCS = \
     kernel/core/main.c \
+    kernel/core/limine.c \
     kernel/core/printk.c \
     kernel/core/random.c \
     kernel/core/poll.c \
@@ -168,8 +169,16 @@ ALL_OBJS = $(BOOT_OBJ) $(ARCH_OBJS) $(ARCH_ASM_OBJS) $(CORE_OBJS) $(SIGNAL_OBJS)
            $(NET_OBJS) $(USERSPACE_OBJS)
 
 
-.PHONY: all iso test clean version sym dist
+.PHONY: all iso test clean version sym dist arm64 arm64-iso test-arm64
 all: $(BUILD)/aegis.elf
+
+# ── ARM64 build (aarch64-linux-gnu toolchain; see Makefile.arm64) ───────────
+arm64:
+	$(MAKE) -f Makefile.arm64
+arm64-iso:
+	$(MAKE) -f Makefile.arm64 iso
+test-arm64:
+	$(MAKE) -f Makefile.arm64 test
 
 # asm/blob objects that have none. This is what makes header edits rebuild.
 # MUST come AFTER `all:` — the .d files declare object targets, and if included
@@ -247,7 +256,7 @@ $(BUILD)/aegis.iso: $(KERNEL_STRIPPED) $(LIMINE_BIN)
 	@rm -rf $(ISO_DIR)
 	@mkdir -p $(ISO_DIR)/boot/limine $(ISO_DIR)/EFI/BOOT
 	cp $(KERNEL_STRIPPED) $(ISO_DIR)/boot/aegis.elf
-	printf 'timeout: 0\n\n/Aegis kernel\n    protocol: multiboot2\n    path: boot():/boot/aegis.elf\n    cmdline: boot=text\n' > $(ISO_DIR)/boot/limine/limine.conf
+	printf 'timeout: 0\n\n/Aegis kernel\n    protocol: limine\n    path: boot():/boot/aegis.elf\n    cmdline: boot=text\n' > $(ISO_DIR)/boot/limine/limine.conf
 	cp $(LIMINE_DIR)/limine-bios.sys $(LIMINE_DIR)/limine-bios-cd.bin $(LIMINE_DIR)/limine-uefi-cd.bin $(ISO_DIR)/boot/limine/
 	cp $(LIMINE_DIR)/BOOTX64.EFI $(LIMINE_DIR)/BOOTIA32.EFI $(ISO_DIR)/EFI/BOOT/
 	xorriso -as mkisofs -R -r -J \
@@ -269,17 +278,22 @@ $(BUILD)/test-init: test/init.c
 	$(CC) -ffreestanding -nostdlib -static -fno-pie -no-pie -fno-stack-protector \
 	    -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -O2 -e _start -o $@ $<
 
-$(BUILD)/test-rootfs.img: $(BUILD)/test-init
+$(BUILD)/test-exectgt: test/exectgt.c
+	@mkdir -p $(BUILD)
+	$(CC) -ffreestanding -nostdlib -static -fno-pie -no-pie -fno-stack-protector \
+	    -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -O2 -e _start -o $@ $<
+
+$(BUILD)/test-rootfs.img: $(BUILD)/test-init $(BUILD)/test-exectgt
 	dd if=/dev/zero of=$@ bs=512 count=8192 2>/dev/null      # 4 MiB
 	/sbin/mke2fs -t ext2 -F -b 4096 -L aegis-test $@ >/dev/null 2>&1
-	printf 'mkdir /bin\nwrite $(BUILD)/test-init /bin/vigil\n' | /sbin/debugfs -w $@ >/dev/null 2>&1
+	printf 'mkdir /bin\nwrite $(BUILD)/test-init /bin/vigil\nwrite $(BUILD)/test-exectgt /bin/exectest\n' | /sbin/debugfs -w $@ >/dev/null 2>&1
 
 $(BUILD)/aegis-test.iso: $(KERNEL_STRIPPED) $(BUILD)/test-rootfs.img $(LIMINE_BIN)
 	@rm -rf $(BUILD)/test-isodir
 	@mkdir -p $(BUILD)/test-isodir/boot/limine $(BUILD)/test-isodir/EFI/BOOT
 	cp $(KERNEL_STRIPPED) $(BUILD)/test-isodir/boot/aegis.elf
 	cp $(BUILD)/test-rootfs.img $(BUILD)/test-isodir/boot/rootfs.img
-	printf 'timeout: 0\n\n/Aegis kernel test\n    protocol: multiboot2\n    path: boot():/boot/aegis.elf\n    module_path: boot():/boot/rootfs.img\n    cmdline: boot=text\n' > $(BUILD)/test-isodir/boot/limine/limine.conf
+	printf 'timeout: 0\n\n/Aegis kernel test\n    protocol: limine\n    path: boot():/boot/aegis.elf\n    module_path: boot():/boot/rootfs.img\n    cmdline: boot=text\n' > $(BUILD)/test-isodir/boot/limine/limine.conf
 	cp $(LIMINE_DIR)/limine-bios.sys $(LIMINE_DIR)/limine-bios-cd.bin $(LIMINE_DIR)/limine-uefi-cd.bin $(BUILD)/test-isodir/boot/limine/
 	cp $(LIMINE_DIR)/BOOTX64.EFI $(LIMINE_DIR)/BOOTIA32.EFI $(BUILD)/test-isodir/EFI/BOOT/
 	xorriso -as mkisofs -R -r -J \
@@ -291,11 +305,32 @@ $(BUILD)/aegis-test.iso: $(KERNEL_STRIPPED) $(BUILD)/test-rootfs.img $(LIMINE_BI
 	    $(BUILD)/test-isodir -o $@
 	$(LIMINE_BIN) bios-install $@
 
-# Full test: (1) capability/syscall test via a booted test-init, then (2) the
-# kernel-only smoke test (no rootfs → "no init found" panic).
-test: $(BUILD)/aegis-test.iso iso
+# Multiboot2-protocol smoke ISO: same kernel, booted via the mb2 header +
+# 32→64 entry in boot.asm. Keeps the microvm boot path (the code the Limine
+# protocol obsoletes) verified on every `make test`.
+$(BUILD)/aegis-mb2.iso: $(KERNEL_STRIPPED) $(LIMINE_BIN)
+	@rm -rf $(BUILD)/mb2-isodir
+	@mkdir -p $(BUILD)/mb2-isodir/boot/limine $(BUILD)/mb2-isodir/EFI/BOOT
+	cp $(KERNEL_STRIPPED) $(BUILD)/mb2-isodir/boot/aegis.elf
+	printf 'timeout: 0\n\n/Aegis kernel (multiboot2)\n    protocol: multiboot2\n    path: boot():/boot/aegis.elf\n    cmdline: boot=text\n' > $(BUILD)/mb2-isodir/boot/limine/limine.conf
+	cp $(LIMINE_DIR)/limine-bios.sys $(LIMINE_DIR)/limine-bios-cd.bin $(LIMINE_DIR)/limine-uefi-cd.bin $(BUILD)/mb2-isodir/boot/limine/
+	cp $(LIMINE_DIR)/BOOTX64.EFI $(LIMINE_DIR)/BOOTIA32.EFI $(BUILD)/mb2-isodir/EFI/BOOT/
+	xorriso -as mkisofs -R -r -J \
+	    -b boot/limine/limine-bios-cd.bin \
+	    -no-emul-boot -boot-load-size 4 -boot-info-table \
+	    --efi-boot boot/limine/limine-uefi-cd.bin \
+	    -efi-boot-part --efi-boot-image \
+	    --protective-msdos-label \
+	    $(BUILD)/mb2-isodir -o $@
+	$(LIMINE_BIN) bios-install $@
+
+# Full test: (1) capability/syscall test via a booted test-init (Limine
+# protocol), then (2) the kernel-only smoke test on BOTH boot protocols
+# (no rootfs → "no init found" panic proves full bring-up).
+test: $(BUILD)/aegis-test.iso iso $(BUILD)/aegis-mb2.iso
 	bash tools/captest.sh $(BUILD)/aegis-test.iso
 	bash tools/ktest.sh $(BUILD)/aegis.iso
+	bash tools/ktest.sh $(BUILD)/aegis-mb2.iso
 
 # Resolve a kernel address (e.g. from a [PANIC] backtrace) to source:line.
 sym:

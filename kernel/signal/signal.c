@@ -89,6 +89,12 @@ signal_deliver(cpu_state_t *s)
     s->elr    = (uint64_t)sa->sa_handler;
     s->sp_el0 = new_sp;
     s->x[0]   = (uint64_t)signum;  /* first argument = signal number */
+    /* x30 (LR) = restorer: an AArch64 handler returns via `ret`, so LR must
+     * point at the sa_restorer trampoline (which calls rt_sigreturn). The
+     * x86 path relies on the handler's `ret` popping sf.pretcode off the
+     * stack; on arm64 the return address is a register, so the kernel must
+     * seed it here or the handler returns to a stale LR and crashes. */
+    s->x[30]  = (uint64_t)sa->sa_restorer;
 
     /* Block the signal during handler execution */
     proc->signal_mask |= sa->sa_mask | (1ULL << signum);

@@ -58,6 +58,7 @@
 #include "ip.h"
 #include "blkdev.h"
 #include "random.h"
+#include "bootinfo.h"
 #include <stdint.h>
 
 void poll_test(void);
@@ -93,6 +94,20 @@ task_idle(void)
      * so idle is always wakeable, matching the AP idle loop in smp.c. */
     for (;;)
         arch_wait_for_irq();
+}
+
+void kernel_main(uint32_t mb_magic, void *mb_info);
+
+/* kernel_main_limine — Limine boot protocol continuation (see
+ * kernel/core/limine.c). Runs on the kernel's own boot stack with the
+ * bootloader's page tables still live. Adopt the ingested bootinfo into
+ * arch_mm's statics, then run the ordinary kernel_main with no mb2 info —
+ * arch_mm_init(NULL) knows the ingest already happened. */
+void
+kernel_main_limine(const aegis_bootinfo_t *bi)
+{
+    arch_mm_ingest(bi);
+    kernel_main(0, NULL);
 }
 
 void

@@ -13,7 +13,7 @@ DEST=tools/limine
 VER="$(awk 'NR==1{print $1; exit}' "$DEST/VERSION")"
 URL=https://github.com/limine-bootloader/limine.git
 CACHE="vendor/limine-$VER"
-FILES="BOOTX64.EFI BOOTIA32.EFI limine-bios.sys limine-bios-cd.bin limine-uefi-cd.bin limine-bios-hdd.h limine.c LICENSE"
+FILES="BOOTX64.EFI BOOTIA32.EFI BOOTAA64.EFI limine-bios.sys limine-bios-cd.bin limine-uefi-cd.bin limine-bios-hdd.h limine.c LICENSE"
 
 if [ ! -d "$CACHE" ]; then
     echo "[fetch-limine] cloning Limine $VER"

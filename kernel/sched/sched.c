@@ -38,6 +38,15 @@ _Static_assert(sizeof(((aegis_task_t *)0)->fpu_state) == 1024,
     "fpu_state must be the 1024-byte XSAVE area size");
 #endif
 
+#ifdef __aarch64__
+/* ctx_switch.S hardcodes FPU_OFF = 16 for its ldp/stp q. The V-register
+ * store area is 512 bytes (32 × 128-bit) with FPSR/FPCR at +512. */
+_Static_assert(offsetof(aegis_task_t, fpu_state) == 16,
+    "fpu_state must be at offset 16 — FPU_OFF in ctx_switch.S");
+_Static_assert(sizeof(((aegis_task_t *)0)->fpu_state) == 528,
+    "fpu_state must be 528 bytes (V0-31 + FPSR/FPCR)");
+#endif
+
 /* 16KB per task; values single-sourced in limits.h (shared with proc.c). */
 #define STACK_PAGES  AEGIS_STACK_PAGES
 #define STACK_SIZE   AEGIS_STACK_SIZE
@@ -1023,8 +1032,20 @@ sched_tick(void)
      * proc_enter_user handles only the first entry; preempted tasks resume
      * via isr_common_stub which does not reload FS.base. IF=0 here (PIT ISR). */
     aegis_task_t *resumed = sched_current();
-    if (resumed->is_user)
+    if (resumed->is_user) {
+#ifdef __aarch64__
+        /* arm64 has no per-task TTBR0 save/restore in the exception vectors
+         * (x86 does it in isr_common_stub via the saved CR3). So the timer-
+         * preemption resume path MUST reload the resumed task's address
+         * space here — otherwise the RESTORE_ALL+eret returns to EL0 with
+         * whatever TTBR0 was active (the preempted-out task's or master),
+         * and the resumed task's code faults with a level-0 instruction
+         * abort. The cooperative yields (sched_block/stop/resume) already
+         * do this; sched_tick is the preemption twin. */
+        vmm_switch_to(((aegis_process_t *)resumed)->pml4_phys);
+#endif
         arch_set_fs_base(resumed->fs_base);
+    }
 }
 
 /* dump_all_tasks — stackshot.  Walk the circular all-task list and print each

@@ -449,11 +449,10 @@ proc_spawn_init(void)
     if (vr != 0 || vf.size == 0) {
         if (vr == 0 && vf.ops->close) vf.ops->close(vf.priv);
         printk("[INIT] no init at %s on root filesystem\n", INIT_PATH);
-#ifdef __x86_64__
+        /* Fatal on every arch (Linux "No init found" semantics) — the
+         * arm64 port boots a rootfs module via Limine now, so the old
+         * "no userland yet, idle instead" fallback is gone. */
         panic_halt("[INIT] no init found on root filesystem");
-#else
-        return;   /* ARM64: no userland yet — fall through to idle scheduler */
-#endif
     }
 
     uint64_t pages = (vf.size + 4095ULL) / 4096ULL;

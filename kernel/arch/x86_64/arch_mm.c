@@ -1,6 +1,7 @@
 #include "arch.h"
 #include "fb.h"      /* FB_MAX_WIDTH / FB_MAX_HEIGHT / FB_MAX_PITCH */
 #include "printk.h"
+#include "bootinfo.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -64,6 +65,18 @@ typedef struct {
 
 static aegis_mem_region_t regions[MAX_REGIONS];
 static uint32_t           region_count = 0;
+
+/* Physical slide of the kernel image: PA(sym) = sym - KERN_VMA + slide.
+ * 0 on the multiboot2 path (GRUB honours the ELF LMA, PHYS_BASE). Set from
+ * the Limine executable-address response (no placement guarantee there).
+ * Consumed by vmm_init (kernel map + window PT phys) and pmm_init (kernel
+ * image reservation). */
+static uint64_t s_kern_phys_slide = 0;
+/* Early phys→virt offset: VA = PA + off for pre-vmm_init physical access.
+ * 0 on the multiboot2 path (boot.asm identity map); the HHDM offset on the
+ * Limine path (no identity map in the bootloader's tables). Dead once
+ * vmm_init loads the kernel's own tables (which include an identity map). */
+static uint64_t s_early_pv_off = 0;
 static uint64_t s_rsdp_v1_phys = 0;   /* ACPI 1.0 RSDP (type-14 tag) */
 static uint64_t s_rsdp_v2_phys = 0;   /* ACPI 2.0+ RSDP (type-15 tag) */
 static arch_fb_info_t s_fb_info;       /* zeroed at startup; addr==0 means absent */
@@ -85,8 +98,112 @@ static aegis_mem_region_t x86_reserved[4] = {
     { 0x0UL, 0x0UL },       /* multiboot2 module 2 (ESP) — filled by arch_mm_init */
 };
 
+/* fb_ingest — validate + store a boot framebuffer (shared by the mb2 tag
+ * parser and the Limine ingest). The framebuffer info is untrusted
+ * bootloader input. Sanitise the geometry at the source (defense in depth —
+ * fb_init() re-checks the same limits) so a corrupt or malicious value can
+ * never propagate absurd dimensions into the page-mapping / clear math
+ * downstream. All products are computed in uint64 so they cannot wrap.
+ *
+ * Reject on: zero/oversized width or height; zero/oversized pitch; pitch
+ * too small to hold one 32-bpp scanline; or a physical extent
+ * (addr + pitch*height) that overflows the 64-bit address space. On any
+ * rejection s_fb_info stays zeroed (addr == 0), which is exactly the "no
+ * framebuffer present" state — arch_get_fb_info() returns 0, fb_init()
+ * bails silently, and the kernel still boots to serial (Output Law 2).
+ * Only 32-bpp linear RGB framebuffers are accepted. */
+static void
+fb_ingest(uint64_t addr, uint64_t pitch, uint64_t w, uint64_t h,
+          uint32_t bpp, uint32_t type)
+{
+    if (type != 1 || bpp != 32)
+        return;
+    if (w == 0 || w > FB_MAX_WIDTH ||
+        h == 0 || h > FB_MAX_HEIGHT ||
+        pitch == 0 || pitch > FB_MAX_PITCH ||
+        pitch < w * 4u ||
+        addr == 0 ||
+        pitch * h > UINT64_MAX - addr) {
+        printk("[FB] WARN: rejecting boot framebuffer: "
+               "addr=0x%lx %ux%u pitch=%u bpp=%u\n",
+               addr, (uint32_t)w, (uint32_t)h, (uint32_t)pitch, bpp);
+        return;
+    }
+    s_fb_info.addr   = addr;
+    s_fb_info.pitch  = (uint32_t)pitch;
+    s_fb_info.width  = (uint32_t)w;
+    s_fb_info.height = (uint32_t)h;
+    s_fb_info.bpp    = (uint8_t)bpp;
+    s_fb_info.type   = (uint8_t)type;
+}
+
+/* arch_mm_ingest — adopt boot information from the Limine boot protocol
+ * path (kernel/core/limine.c). Fills the same statics the multiboot2 tag
+ * parser fills, so everything downstream (pmm, fb, acpi, ramdisk, cmdline)
+ * is boot-path oblivious. */
+void arch_mm_ingest(const aegis_bootinfo_t *bi)
+{
+    s_kern_phys_slide = bi->kern_phys_slide;
+    s_early_pv_off    = bi->hhdm_offset;
+
+    for (uint32_t i = 0; i < bi->usable_count && region_count < MAX_REGIONS; i++) {
+        regions[region_count].base = bi->usable[i].base;
+        regions[region_count].len  = bi->usable[i].len;
+        region_count++;
+    }
+
+    uint32_t ci;
+    for (ci = 0; ci < sizeof(s_cmdline) - 1 && bi->cmdline[ci]; ci++)
+        s_cmdline[ci] = bi->cmdline[ci];
+    s_cmdline[ci] = '\0';
+
+    /* Limine (base revision 3) reports the RSDP as a physical address. */
+    s_rsdp_v2_phys = bi->rsdp_phys;
+
+    /* Modules by config order: 0 = rootfs, 1 = ESP image. Under Limine
+     * these live in EXECUTABLE_AND_MODULES memmap regions, NOT usable RAM —
+     * but main.c reclaims their pages after the ramdisk copy via
+     * pmm_unreserve_region, which refuses to free pages outside usable
+     * regions. So each module range is ALSO appended to the usable list:
+     * pmm_init frees it (step 2), immediately re-reserves it through the
+     * x86_reserved entry below (step 3), and the post-copy unreserve then
+     * genuinely returns it to the allocator — same lifecycle as mb2. */
+    s_module_phys = bi->module[0].phys;
+    s_module_size = bi->module[0].size;
+    if (s_module_size) {
+        x86_reserved[2].base = s_module_phys & ~0xFFFUL;
+        x86_reserved[2].len  = ((s_module_phys + s_module_size + 0xFFF) & ~0xFFFUL)
+                               - x86_reserved[2].base;
+        if (region_count < MAX_REGIONS) {
+            regions[region_count].base = x86_reserved[2].base;
+            regions[region_count].len  = x86_reserved[2].len;
+            region_count++;
+        }
+    }
+    s_module2_phys = bi->module[1].phys;
+    s_module2_size = bi->module[1].size;
+    if (s_module2_size) {
+        x86_reserved[3].base = s_module2_phys & ~0xFFFUL;
+        x86_reserved[3].len  = ((s_module2_phys + s_module2_size + 0xFFF) & ~0xFFFUL)
+                               - x86_reserved[3].base;
+        if (region_count < MAX_REGIONS) {
+            regions[region_count].base = x86_reserved[3].base;
+            regions[region_count].len  = x86_reserved[3].len;
+            region_count++;
+        }
+    }
+
+    fb_ingest(bi->fb.addr_phys, bi->fb.pitch, bi->fb.width, bi->fb.height,
+              bi->fb.bpp, 1 /* Limine ingest is RGB-only already */);
+}
+
 void arch_mm_init(void *mb_info)
 {
+    /* Limine path: arch_mm_ingest() already ran (from kernel_main_limine,
+     * before kernel_main); there is no multiboot2 info to parse. */
+    if (mb_info == NULL)
+        return;
+
     /* SAFETY: mb_info is a physical address equal to the virtual address
      * under Phase 2 identity mapping. Casting to a pointer is safe here.
      * The VMM phase must remap this before switching to higher-half. */
@@ -172,52 +289,14 @@ void arch_mm_init(void *mb_info)
 
         if (tag->type == MB2_TAG_FB) {
             const mb2_fb_tag_t *fb = (const mb2_fb_tag_t *)p;
-            /* Only accept 32-bpp linear (type==1) framebuffers.
-             * Some firmwares (notably QEMU + std-vga + OVMF) advertise
-             * a 24-bpp GOP which we don't render to; those callers will
-             * see sys_fb_map() return ENODEV. Real UEFI hardware
-             * generally exposes 32-bpp modes. */
-            if (fb->framebuffer_type == 1 && fb->framebuffer_bpp == 32) {
-                /* The framebuffer tag is untrusted bootloader input.
-                 * Sanitise the geometry at the source (defense in depth —
-                 * fb_init() re-checks the same limits) so a corrupt or
-                 * malicious tag can never propagate absurd dimensions into
-                 * the page-mapping / clear math downstream. All products
-                 * are computed in uint64 so they cannot wrap.
-                 *
-                 * Reject on: zero/oversized width or height; zero/oversized
-                 * pitch; pitch too small to hold one 32-bpp scanline; or a
-                 * physical extent (addr + pitch*height) that overflows the
-                 * 64-bit address space. On any rejection we leave s_fb_info
-                 * zeroed (addr == 0), which is exactly the "no framebuffer
-                 * tag present" state — arch_get_fb_info() returns 0,
-                 * fb_init() bails silently, and the kernel still boots to
-                 * serial (Output Law 2). */
-                uint64_t w     = fb->framebuffer_width;
-                uint64_t h     = fb->framebuffer_height;
-                uint64_t pitch = fb->framebuffer_pitch;
-                uint64_t addr  = fb->framebuffer_addr;
-
-                if (w == 0 || w > FB_MAX_WIDTH ||
-                    h == 0 || h > FB_MAX_HEIGHT ||
-                    pitch == 0 || pitch > FB_MAX_PITCH ||
-                    pitch < w * 4u ||
-                    addr == 0 ||
-                    pitch * h > UINT64_MAX - addr) {
-                    printk("[FB] WARN: rejecting boot framebuffer tag: "
-                           "addr=0x%lx %ux%u pitch=%u bpp=%u\n",
-                           addr, fb->framebuffer_width,
-                           fb->framebuffer_height, fb->framebuffer_pitch,
-                           (uint32_t)fb->framebuffer_bpp);
-                } else {
-                    s_fb_info.addr   = fb->framebuffer_addr;
-                    s_fb_info.pitch  = fb->framebuffer_pitch;
-                    s_fb_info.width  = fb->framebuffer_width;
-                    s_fb_info.height = fb->framebuffer_height;
-                    s_fb_info.bpp    = fb->framebuffer_bpp;
-                    s_fb_info.type   = fb->framebuffer_type;
-                }
-            }
+            /* Only 32-bpp linear (type==1) framebuffers are accepted (see
+             * fb_ingest). Some firmwares (notably QEMU + std-vga + OVMF)
+             * advertise a 24-bpp GOP which we don't render to; those
+             * callers will see sys_fb_map() return ENODEV. Real UEFI
+             * hardware generally exposes 32-bpp modes. */
+            fb_ingest(fb->framebuffer_addr, fb->framebuffer_pitch,
+                      fb->framebuffer_width, fb->framebuffer_height,
+                      fb->framebuffer_bpp, fb->framebuffer_type);
         }
 
         /* Tags are 8-byte aligned */
@@ -292,4 +371,16 @@ const char *
 arch_get_cmdline(void)
 {
     return s_cmdline;
+}
+
+uint64_t
+arch_kern_phys_slide(void)
+{
+    return s_kern_phys_slide;
+}
+
+uint64_t
+arch_early_pv_off(void)
+{
+    return s_early_pv_off;
 }

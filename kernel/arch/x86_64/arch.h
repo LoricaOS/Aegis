@@ -142,6 +142,22 @@ int arch_get_module2(uint64_t *phys_out, uint64_t *size_out);
  * Returns pointer to static buffer (empty string if no cmdline tag). */
 const char *arch_get_cmdline(void);
 
+/* Limine boot protocol path (kernel/core/limine.c → kernel_main_limine):
+ * adopt the ingested bootinfo into the same statics the mb2 parser fills. */
+struct aegis_bootinfo;
+void arch_mm_ingest(const struct aegis_bootinfo *bi);
+
+/* Physical slide of the kernel image: PA(sym) = sym - KERN_VMA + slide.
+ * 0 on the multiboot2 path; from the Limine executable-address response
+ * otherwise. */
+uint64_t arch_kern_phys_slide(void);
+
+/* Early phys→virt offset for pre-vmm_init physical access:
+ * VA = PA + arch_early_pv_off(). 0 on the multiboot2 path (identity map);
+ * the HHDM offset on the Limine path. Invalid after vmm_init loads the
+ * kernel's own tables (use the identity map / window from then on). */
+uint64_t arch_early_pv_off(void);
+
 /* -------------------------------------------------------------------------
  * x86-64 GDT segment selectors
  * ------------------------------------------------------------------------- */

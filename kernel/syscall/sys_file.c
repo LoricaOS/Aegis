@@ -809,6 +809,8 @@ uint64_t
 sys_sync(void)
 {
     ext2_sync();
-    nvme_flush();
+#ifdef __x86_64__
+    nvme_flush();   /* no NVMe driver on arm64 yet */
+#endif
     return 0;
 }

@@ -1,0 +1,119 @@
+/*
+ * gic.c — GICv3 (QEMU virt: distributor @ 0x08000000, redistributor
+ * frames @ 0x080A0000), system-register CPU interface, BSP only.
+ */
+
+#include "arch.h"
+#include "printk.h"
+#include <stdint.h>
+
+#define GICD_PHYS   0x08000000UL
+#define GICR_PHYS   0x080A0000UL
+
+#define GICD_CTLR        0x0000
+#define GICD_IGROUPR     0x0080
+#define GICD_ISENABLER   0x0100
+#define GICD_IPRIORITYR  0x0400
+#define GICD_IROUTER     0x6000
+
+#define GICR_CTLR        0x0000
+#define GICR_WAKER       0x0014
+/* SGI/PPI frame = redistributor base + 64K */
+#define GICR_SGI_OFF     0x10000
+#define GICR_IGROUPR0    0x0080
+#define GICR_ISENABLER0  0x0100
+#define GICR_IPRIORITYR  0x0400
+
+static volatile uint8_t *s_gicd;
+static volatile uint8_t *s_gicr;
+
+static inline uint32_t d32(uint32_t off)             { return *(volatile uint32_t *)(s_gicd + off); }
+static inline void     dw32(uint32_t off, uint32_t v){ *(volatile uint32_t *)(s_gicd + off) = v; }
+static inline void     dw64(uint32_t off, uint64_t v){ *(volatile uint64_t *)(s_gicd + off) = v; }
+static inline uint32_t r32(uint32_t off)             { return *(volatile uint32_t *)(s_gicr + off); }
+static inline void     rw32(uint32_t off, uint32_t v){ *(volatile uint32_t *)(s_gicr + off) = v; }
+
+/* Redistributor frame for a given CPU. QEMU virt lays the GICv3
+ * redistributors out as consecutive 128 KiB (0x20000) frames in CPU-index
+ * order starting at GICR_PHYS, so core N's frame is GICR_PHYS + N*0x20000. */
+#define GICR_STRIDE 0x20000UL
+static volatile uint8_t *
+gicr_for(uint32_t cpu)
+{
+    return (volatile uint8_t *)arch_dmap(GICR_PHYS + (uint64_t)cpu * GICR_STRIDE);
+}
+
+/* gic_cpu_init — per-CPU GICv3 bring-up: wake THIS core's redistributor,
+ * make its SGIs/PPIs group-1 at a permissive priority, enable the virtual
+ * timer PPI (27), and enable the system-register CPU interface. Called on
+ * the BSP by gic_init and on each AP by its ap_c_entry (with its own index). */
+void
+gic_cpu_init(uint32_t cpu)
+{
+    volatile uint8_t *rd = gicr_for(cpu);
+
+    *(volatile uint32_t *)(rd + GICR_WAKER) &= ~(1u << 1);   /* ProcessorSleep=0 */
+    while (*(volatile uint32_t *)(rd + GICR_WAKER) & (1u << 2))
+        ;                                                    /* ChildrenAsleep=0 */
+
+    *(volatile uint32_t *)(rd + GICR_SGI_OFF + GICR_IGROUPR0) = 0xFFFFFFFFu;
+    for (int i = 0; i < 8; i++)
+        *(volatile uint32_t *)(rd + GICR_SGI_OFF + GICR_IPRIORITYR + 4 * i) = 0xA0A0A0A0u;
+    /* Enable the generic virtual-timer PPI (INTID 27) on this core. */
+    *(volatile uint32_t *)(rd + GICR_SGI_OFF + GICR_ISENABLER0) = 1u << 27;
+
+    uint64_t sre;
+    __asm__ volatile("mrs %0, S3_0_C12_C12_5" : "=r"(sre));       /* ICC_SRE_EL1 */
+    __asm__ volatile("msr S3_0_C12_C12_5, %0" : : "r"(sre | 1));
+    __asm__ volatile("isb");
+    __asm__ volatile("msr S3_0_C4_C6_0, %0" : : "r"(0xF8UL));     /* ICC_PMR_EL1 */
+    __asm__ volatile("msr S3_0_C12_C12_7, %0" : : "r"(1UL));      /* ICC_IGRPEN1_EL1 */
+    __asm__ volatile("isb");
+}
+
+void
+gic_init(void)
+{
+    s_gicd = (volatile uint8_t *)arch_dmap(GICD_PHYS);
+    s_gicr = (volatile uint8_t *)arch_dmap(GICR_PHYS);
+
+    /* Distributor: affinity routing + group-1 forwarding (once, BSP). */
+    dw32(GICD_CTLR, (1u << 4) | (1u << 1) | (1u << 0));
+
+    gic_cpu_init(0);   /* BSP's own redistributor + CPU interface */
+
+    printk("[GIC] OK: GICv3 distributor + redistributor online\n");
+}
+
+/* gic_enable_ppi — enable a private interrupt (INTID < 32) on this CPU. */
+void
+gic_enable_ppi(uint32_t intid)
+{
+    *(volatile uint32_t *)(s_gicr + GICR_SGI_OFF + GICR_ISENABLER0) = 1u << intid;
+}
+
+/* gic_enable_spi — enable a shared interrupt, routed to CPU 0. */
+void
+gic_enable_spi(uint32_t intid)
+{
+    dw32(GICD_IGROUPR + 4 * (intid / 32),
+         d32(GICD_IGROUPR + 4 * (intid / 32)) | (1u << (intid % 32)));
+    *(volatile uint8_t *)(s_gicd + GICD_IPRIORITYR + intid) = 0xA0;
+    dw64(GICD_IROUTER + 8 * intid, 0);            /* affinity 0.0.0.0 */
+    dw32(GICD_ISENABLER + 4 * (intid / 32), 1u << (intid % 32));
+}
+
+uint32_t
+gic_ack(void)
+{
+    uint64_t iar;
+    __asm__ volatile("mrs %0, S3_0_C12_C12_0" : "=r"(iar));       /* ICC_IAR1_EL1 */
+    return (uint32_t)iar & 0xFFFFFFu;
+}
+
+void
+gic_eoi(uint32_t intid)
+{
+    __asm__ volatile("msr S3_0_C12_C12_1, %0" : : "r"((uint64_t)intid)); /* ICC_EOIR1_EL1 */
+    __asm__ volatile("isb");
+}

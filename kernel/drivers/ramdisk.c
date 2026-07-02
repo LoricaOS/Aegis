@@ -31,6 +31,32 @@ ramdisk_write(blkdev_t *dev, uint64_t lba, uint32_t count, const void *buf)
     return 0;
 }
 
+/* map_module — map a module's physical range into kernel VA for reading.
+ * The bootloader may place modules ANYWHERE in RAM (Limine puts them near
+ * the top of memory), so the boot identity map [0..1GB) cannot be relied
+ * on — map through KVA instead. phys need not be page-aligned (Limine
+ * guarantees 4KiB, but don't depend on it). Pair with unmap_module. */
+static uint8_t *
+map_module(uint64_t phys, uint64_t size, uint32_t *pages_out)
+{
+    uint64_t start = phys & ~0xFFFULL;
+    uint32_t pages = (uint32_t)(((phys + size + 0xFFF) & ~0xFFFULL) - start) / 4096;
+    uint8_t *va = (uint8_t *)kva_map_phys_pages(start, pages);
+    if (!va)
+        return 0;
+    *pages_out = pages;
+    return va + (phys & 0xFFF);
+}
+
+/* unmap_module — release the VA range WITHOUT freeing the frames: main.c
+ * reclaims the module's physical pages via pmm_unreserve_region after the
+ * copy; freeing them here too would double-free. */
+static void
+unmap_module(uint8_t *va, uint32_t pages)
+{
+    kva_unmap_keep_frames((void *)((uintptr_t)va & ~0xFFFULL), pages);
+}
+
 void
 ramdisk_init(uint64_t phys_base, uint64_t size)
 {
@@ -41,10 +67,15 @@ ramdisk_init(uint64_t phys_base, uint64_t size)
      * We cannot map the module's physical pages in-place because GRUB places
      * the module right after the kernel image, potentially overlapping with
      * physical addresses used by VMM page tables.  Copying avoids the conflict.
-     *
-     * SAFETY: the identity map [0..1GB) is still active at this point in boot
-     * (vmm_teardown_identity runs later), so we can read the module's physical
-     * address directly via pointer cast. */
+     * The source is read through a temporary KVA mapping (map_module) — NOT
+     * the boot identity map, which only covers the first 1GB while Limine
+     * places modules wherever it likes (top of RAM in practice). */
+    uint32_t src_pages = 0;
+    const uint8_t *src = map_module(phys_base, size, &src_pages);
+    if (!src) {
+        printk("[RAMDISK] FAIL: cannot map rootfs module\n");
+        return;
+    }
     /* Zero-extend to the ext2's true size. The ISO ships a TRUNCATED rootfs
      * image — trailing free/zero ext2 blocks are dropped at build time to shrink
      * the ISO (the fs is one block group with 4 KiB blocks, so it has no backup
@@ -57,7 +88,7 @@ ramdisk_init(uint64_t phys_base, uint64_t size)
      * absent superblock (e.g. not ext2) falls back to the shipped size. */
     uint64_t true_size = size;
     {
-        const uint8_t *sb = (const uint8_t *)(uintptr_t)(phys_base + 1024);
+        const uint8_t *sb = src + 1024;
         uint16_t magic = (uint16_t)(sb[56] | (sb[57] << 8));
         if (magic == 0xEF53) {
             uint32_t blocks = (uint32_t)sb[4] | ((uint32_t)sb[5] << 8) |
@@ -76,13 +107,13 @@ ramdisk_init(uint64_t phys_base, uint64_t size)
     s_base = (uint8_t *)kva_alloc_pages(num_pages);
     s_size = true_size;
     {
-        const uint8_t *src = (const uint8_t *)(uintptr_t)phys_base;
         uint64_t i;
         for (i = 0; i < size; i++)            /* shipped (truncated) image */
             s_base[i] = src[i];
         for (; i < true_size; i++)            /* zero-extend (kva_alloc_pages does NOT zero) */
             s_base[i] = 0;
     }
+    unmap_module((uint8_t *)src, src_pages);
     if (true_size > size)
         printk("[RAMDISK] OK: zero-extended %u MB image to %u MB ext2\n",
                (unsigned)(size / (1024 * 1024)),
@@ -139,15 +170,21 @@ ramdisk_init2(uint64_t phys_base, uint64_t size)
 {
     if (phys_base == 0 || size == 0)
         return;
+    uint32_t src_pages = 0;
+    const uint8_t *src = map_module(phys_base, size, &src_pages);
+    if (!src) {
+        printk("[RAMDISK] FAIL: cannot map ESP module\n");
+        return;
+    }
     uint32_t num_pages = (uint32_t)((size + 4095) / 4096);
     s_base2 = (uint8_t *)kva_alloc_pages(num_pages);
     s_size2 = size;
     {
-        const uint8_t *src = (const uint8_t *)(uintptr_t)phys_base;
         uint64_t i;
         for (i = 0; i < size; i++)
             s_base2[i] = src[i];
     }
+    unmap_module((uint8_t *)src, src_pages);
     s_ramdisk2.name[0] = 'r'; s_ramdisk2.name[1] = 'a';
     s_ramdisk2.name[2] = 'm'; s_ramdisk2.name[3] = 'd';
     s_ramdisk2.name[4] = 'i'; s_ramdisk2.name[5] = 's';

@@ -1,15 +1,32 @@
-; boot.asm — Aegis multiboot2 entry point and higher-half trampoline
+; boot.asm — Aegis x86-64 boot entries.
 ;
-; Boot sequence:
-;   1. GRUB loads us in 32-bit protected mode at physical ~0x100000.
+; TWO entry points share this file:
+;
+;   limine_start (ELF entry) — the Limine boot protocol path. The bootloader
+;   hands off in 64-bit long mode with the kernel mapped higher-half and an
+;   HHDM active, so no mode switching or bootstrap page tables are needed:
+;   load our own GDT, switch to the .bss boot stack, call limine_boot_entry.
+;
+;   _start (multiboot2 header entry-address tag) — the legacy/microvm path
+;   (GRUB, QEMU direct mb2 loaders). Everything the Limine protocol
+;   obsoletes lives here and is PRESERVED for that path: the 32-bit entry,
+;   the 5 bootstrap page tables in .bss, the PAE/EFER long-mode enable, and
+;   the 32→64 far-jump trampoline.
+;
+; multiboot2 sequence:
+;   1. GRUB loads us at physical 0x100000 (ELF LMA) in 32-bit protected mode.
 ;   2. We build 5 page tables in .bss (physical addresses via (label-KERN_VMA)).
 ;   3. Enable PAE + long mode (EFER), load CR3, enable paging.
-;   4. Far-jump to long_mode_phys (still physical VMA, in .text.boot).
+;   4. Far-jump to long_mode_phys (executing at its physical address).
 ;   5. long_mode_phys sets segments, then jmp rax → long_mode_high.
 ;   6. long_mode_high (higher-half VMA, in .text) sets stack, calls kernel_main.
 ;
-; Register clobbers: all (this is the entry point, not a callable function).
-; Calling convention: none — we eventually call kernel_main via C ABI.
+; All sections now carry higher-half VMAs (LMA = VMA - KERN_VMA via the
+; linker AT() directive) so the Limine protocol accepts the ELF; the 32-bit
+; code references every absolute symbol as (label - KERN_VMA) = physical.
+;
+; Register clobbers: all (these are entry points, not callable functions).
+; Calling convention: none — we eventually call C via the SysV AMD64 ABI.
 
 MULTIBOOT2_MAGIC  equ 0xE85250D6   ; identifies this as a multiboot2 header
 MULTIBOOT2_ARCH   equ 0             ; 0 = i386 (32-bit protected mode entry)
@@ -41,6 +58,16 @@ multiboot_header_start:
     dd 0        ; preferred height (0 = any)
     dd 32       ; preferred depth  (32bpp required)
 
+    ; Entry-address tag (type=3): GRUB must enter at _start's PHYSICAL
+    ; address. Required now that every section (including .text.boot) has a
+    ; higher-half VMA — the ELF e_entry points at limine_start (the Limine
+    ; protocol entry) and is useless to a 32-bit multiboot2 loader.
+    align 8
+    dw 3        ; type = MULTIBOOT_HEADER_TAG_ENTRY_ADDRESS
+    dw 0        ; flags = 0 (required)
+    dd 12       ; tag size
+    dd (_start - KERN_VMA)
+
     align 8
     ; End tag (type=0, flags=0, size=8)
     dw 0
@@ -50,12 +77,13 @@ multiboot_header_end:
 
 
 ; ────────────────────────────────────────────────
-; .text.boot — runs at physical VMA (VMA = LMA)
-; Contains: GDT, _start (32-bit), long_mode_phys (64-bit trampoline)
+; .text.boot — the multiboot2 (microvm) path: 32-bit entry + trampoline.
+; Contains: GDT, _start (32-bit), long_mode_phys (64-bit trampoline).
 ;
-; IMPORTANT: The GDT lives here so that lgdt uses a physical address.
-; After the linker split, anything in .data/.rodata has a higher-half VMA —
-; wrong for lgdt in 32-bit mode. In .text.boot, VMA = LMA = physical.
+; VMA is higher-half (like every section now); LMA = VMA - KERN_VMA =
+; physical. The 32-bit code below therefore references every absolute
+; symbol as (label - KERN_VMA), which IS its physical address. Relative
+; jumps within the section need no adjustment.
 ; ────────────────────────────────────────────────
 section .text.boot
 bits 32
@@ -76,11 +104,12 @@ gdt64:
     dq 0x00AF92000000FFFF
 gdt64_end:
 
-; LGDT descriptor: 2-byte limit + 4-byte base.
-; gdt64 is in .text.boot so its address here IS the physical address.
+; LGDT descriptor for the 32-bit mb2 path: 2-byte limit + 4-byte base.
+; The base must be PHYSICAL (paging is off) — gdt64 now has a higher-half
+; VMA, so subtract KERN_VMA to get its load (physical) address.
 gdt64_ptr:
     dw (gdt64_end - gdt64 - 1)
-    dd gdt64                         ; 32-bit physical address (VMA=LMA in .text.boot)
+    dd (gdt64 - KERN_VMA)            ; 32-bit physical address
 
 
 ; _start — first instruction executed after the bootloader hands off control.
@@ -195,8 +224,8 @@ _start:
     wrmsr
 
     ; ── Load GDT ────────────────────────────────────────────────────────
-    ; gdt64_ptr is in .text.boot (VMA=LMA=physical) — address is correct.
-    lgdt [gdt64_ptr]
+    ; gdt64_ptr has a higher-half VMA; its physical address is -KERN_VMA.
+    lgdt [dword (gdt64_ptr - KERN_VMA)]
 
     ; ── Enable paging (also activates long mode) ────────────────────────
     ; Also set CR0.WP (write protect) so ring-0 respects read-only pages.
@@ -207,9 +236,11 @@ _start:
 
     ; ── Far jump: reload CS with 64-bit code descriptor ─────────────────
     ; Selector 0x08 = GDT entry 1 (64-bit code), RPL=0.
-    ; long_mode_phys is in .text.boot so its address IS physical — no subtraction needed.
+    ; Jump target must be the PHYSICAL address of long_mode_phys (we are
+    ; still executing at physical addresses; the higher-half mapping is
+    ; active but this jump's immediate is what the CPU fetches next).
     ; CPU enters 64-bit long mode after this jump.
-    jmp 0x08:long_mode_phys
+    jmp 0x08:(long_mode_phys - KERN_VMA)
 
 
 ; long_mode_phys — executes in 64-bit mode at a physical address (still .text.boot).
@@ -243,12 +274,65 @@ long_mode_phys:
 
 ; ────────────────────────────────────────────────
 ; .text — runs at higher-half VMA (0xFFFFFFFF80xxxxxx)
-; Contains: long_mode_high (permanent kernel entry)
+; Contains: limine_start (Limine protocol entry), long_mode_high
+; (multiboot2 path's permanent entry)
 ; ────────────────────────────────────────────────
 section .text
 bits 64
 
 extern kernel_main
+extern limine_boot_entry
+
+; LGDT descriptor for the Limine path: 2-byte limit + 8-byte base (64-bit
+; lgdt form). Base is gdt64's higher-half VMA — mapped by the bootloader
+; (it's in a loaded section) AND by the kernel's own tables after vmm_init,
+; so the GDT stays reachable across the page-table switch. This is why we
+; don't keep running on Limine's GDT: it lives in bootloader-reclaimable
+; memory that the kernel's tables never map, and the CPU re-reads GDT
+; entries on every exception's CS load.
+gdt64_ptr_high:
+    dw (gdt64_end - gdt64 - 1)
+    dq gdt64
+
+; limine_start — ELF entry point: the Limine boot protocol handoff.
+;
+; Entry state per the Limine spec (base revision 3): 64-bit long mode,
+; kernel mapped higher-half per the ELF plus an HHDM, bootloader GDT
+; (CS=0x28, DS/ES/SS=0x30), IF=0, bootloader-provided stack, all GPRs 0.
+;
+; Everything the multiboot2 path builds by hand (page tables, the 32→64
+; switch) is already done for us — we only: load our own GDT, move onto
+; the kernel's .bss boot stack (the bootloader stack is in reclaimable
+; memory that dies with Limine's page tables at vmm_init), and enter C.
+;
+; Clobbers: all. Calling convention: none (entry point).
+global limine_start
+limine_start:
+    cli
+    lgdt [rel gdt64_ptr_high]
+
+    ; Reload CS with our 64-bit code selector via a far return.
+    push 0x08
+    lea  rax, [rel .reload_cs]
+    push rax
+    retfq
+.reload_cs:
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+
+    ; Kernel boot stack (16-byte aligned, .bss — mapped by the bootloader
+    ; now and by the kernel's own tables later).
+    mov rsp, boot_stack_top
+    xor rbp, rbp
+
+    call limine_boot_entry
+.halt:
+    hlt
+    jmp .halt
 
 ; long_mode_high — first code executing at the higher-half virtual address.
 ;

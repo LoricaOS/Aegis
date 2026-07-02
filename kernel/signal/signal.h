@@ -67,6 +67,7 @@ typedef struct {
 #define REG_RSP     REG_SP
 #define REG_EFL     REG_PSTATE
 #define REG_R8      REG_X8
+#define REG_RAX     REG_X0   /* syscall return-value register */
 
 /* ARM64 signal frame — matches musl's AArch64 sigcontext layout.
  * Simplified: only save/restore GPRs + SP + PC + PSTATE.

@@ -158,9 +158,15 @@ elf_load(struct aegis_process *proc, uint64_t pml4_phys, const uint8_t *data,
 
         /* BUG #4 part 2: the segment's file-backed bytes must lie within
          * the file.  Overflow-safe: p_offset > len, then
-         * p_filesz > len - p_offset. */
-        if (ph->p_offset > (uint64_t)len ||
-            ph->p_filesz > (uint64_t)len - ph->p_offset) {
+         * p_filesz > len - p_offset.  A pure-BSS segment (p_filesz == 0)
+         * reads NOTHING from the file, so its p_offset is irrelevant and
+         * may legitimately point past EOF — linkers place a final BSS-only
+         * PT_LOAD at the next max-page-size boundary (64 KiB on aarch64),
+         * well past the on-disk bytes.  Only validate the file range when
+         * there are file-backed bytes to read. */
+        if (ph->p_filesz > 0 &&
+            (ph->p_offset > (uint64_t)len ||
+             ph->p_filesz > (uint64_t)len - ph->p_offset)) {
             printk("[ELF] FAIL: PT_LOAD past end of file\n");
             return -1;
         }

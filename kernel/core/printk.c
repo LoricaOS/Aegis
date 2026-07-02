@@ -326,6 +326,8 @@ panic_assert_fail(const char *cond, const char *file, unsigned line)
     cpu = (unsigned)lapic_id();
 #endif
     printk("[ASSERT] FAIL: %s at %s:%u cpu%u\n", cond, file, line, cpu);
-    for (;;)
-        __asm__ volatile("cli; hlt");
+    for (;;) {
+        arch_disable_irq();
+        arch_halt();
+    }
 }

@@ -175,8 +175,21 @@ alloc_table(void)
 }
 
 /*
- * alloc_table_early — allocate and zero a page-table page using the identity
- * map.  Valid only during vmm_init(), before arch_vmm_load_pml4() switches
+ * early_pv — early boot phys→virt: valid only during vmm_init(), before
+ * arch_vmm_load_pml4() switches to the new PML4.  On the multiboot2 path
+ * this is the identity map (offset 0, boot.asm pd_lo fills 512 entries);
+ * on the Limine path it is the bootloader's HHDM (usable RAM is mapped
+ * there at base revision 3, and the PMM only hands out usable-RAM frames).
+ */
+static inline uint64_t *
+early_pv(uint64_t phys)
+{
+    return (uint64_t *)(uintptr_t)(phys + arch_early_pv_off());
+}
+
+/*
+ * alloc_table_early — allocate and zero a page-table page via early_pv.
+ * Valid only during vmm_init(), before arch_vmm_load_pml4() switches
  * to the new PML4 and before the window allocator is wired up.
  * After vmm_init() returns, call alloc_table() instead.
  */
@@ -188,9 +201,7 @@ alloc_table_early(void)
         printk("[VMM] FAIL: out of memory allocating page table\n");
         panic_halt("[VMM] FAIL: out of memory allocating page table");
     }
-    /* SAFETY: identity map [0..1GB) is active (boot.asm pd_lo fills 512 entries);
-     * phys must be within that range. PMM starts above _kernel_end. */
-    uint64_t *p = (uint64_t *)(uintptr_t)phys;
+    uint64_t *p = early_pv(phys);
     int i;
     for (i = 0; i < 512; i++)
         p[i] = 0;
@@ -242,12 +253,13 @@ vmm_init(void)
     uint64_t pdpt_hi_phys = alloc_table_early();
     uint64_t pd_hi_phys   = alloc_table_early();
 
-    /* SAFETY: identity map [0..4MB) is active for all five tables. */
-    uint64_t *pml4    = (uint64_t *)(uintptr_t)pml4_phys;
-    uint64_t *pdpt_lo = (uint64_t *)(uintptr_t)pdpt_lo_phys;
-    uint64_t *pd_lo   = (uint64_t *)(uintptr_t)pd_lo_phys;
-    uint64_t *pdpt_hi = (uint64_t *)(uintptr_t)pdpt_hi_phys;
-    uint64_t *pd_hi   = (uint64_t *)(uintptr_t)pd_hi_phys;
+    /* SAFETY: early_pv (identity map on mb2, HHDM on Limine) covers all
+     * five freshly-allocated usable-RAM tables. */
+    uint64_t *pml4    = early_pv(pml4_phys);
+    uint64_t *pdpt_lo = early_pv(pdpt_lo_phys);
+    uint64_t *pd_lo   = early_pv(pd_lo_phys);
+    uint64_t *pdpt_hi = early_pv(pdpt_hi_phys);
+    uint64_t *pd_hi   = early_pv(pd_hi_phys);
 
     /* Identity map: VA [0..1GB) → PA [0..1GB) via PML4[0].
      * PML4[0] → pdpt_lo[0] → pd_lo with 512 × 2MB huge pages.
@@ -261,15 +273,40 @@ vmm_init(void)
             pd_lo[i] = ((uint64_t)i << 21) | arch_pte_from_flags(VMM_FLAG_PRESENT | VMM_FLAG_WRITABLE) | (1UL << 7);
     }
 
-    /* Higher-half map: VA [KERN_VMA..KERN_VMA+4MB) → PA [0..4MB).
+    /* Higher-half kernel map: VA [KERN_VMA..KERN_VMA+8MB) → PA [slide..slide+8MB).
      * KERN_VMA = 0xFFFFFFFF80000000 → PML4[511], PDPT[510].
-     * PML4[511] → pdpt_hi[510] → pd_hi with two 2MB huge pages. */
+     *
+     * slide = arch_kern_phys_slide(): 0 on the multiboot2 path (kernel
+     * physically at its linked LMA, so this maps PA [0..8MB) exactly as it
+     * always has, VGA hole included), or wherever Limine physically placed
+     * the image. Limine guarantees the image is physically contiguous with
+     * one uniform virt→phys offset but NOT 2MB alignment — so when the
+     * slide is off 2MB congruence the map is built from 4K PTs instead of
+     * 2MB huge pages. (When relocated, the sub-PHYS_BASE first megabyte of
+     * this window maps foreign RAM; nothing reads it — VGA is mb2-only.) */
     pml4[511]    = pdpt_hi_phys | arch_pte_from_flags(VMM_FLAG_PRESENT | VMM_FLAG_WRITABLE);
     pdpt_hi[510] = pd_hi_phys   | arch_pte_from_flags(VMM_FLAG_PRESENT | VMM_FLAG_WRITABLE);
-    pd_hi[0]     = 0x000000UL   | arch_pte_from_flags(VMM_FLAG_PRESENT | VMM_FLAG_WRITABLE) | (1UL << 7);
-    pd_hi[1]     = 0x200000UL   | arch_pte_from_flags(VMM_FLAG_PRESENT | VMM_FLAG_WRITABLE) | (1UL << 7);
-    pd_hi[2]     = 0x400000UL   | arch_pte_from_flags(VMM_FLAG_PRESENT | VMM_FLAG_WRITABLE) | (1UL << 7);
-    pd_hi[3]     = 0x600000UL   | arch_pte_from_flags(VMM_FLAG_PRESENT | VMM_FLAG_WRITABLE) | (1UL << 7);
+    {
+        uint64_t slide = arch_kern_phys_slide();
+        if ((slide & 0x1FFFFFUL) == 0) {
+            /* 2MB-congruent (always true on mb2): four 2MB huge pages. */
+            for (uint32_t t = 0; t < 4; t++)
+                pd_hi[t] = (slide + (uint64_t)t * 0x200000UL)
+                           | arch_pte_from_flags(VMM_FLAG_PRESENT | VMM_FLAG_WRITABLE)
+                           | (1UL << 7);
+        } else {
+            /* Unaligned Limine placement: 4 PTs of 512 4K pages each. */
+            for (uint32_t t = 0; t < 4; t++) {
+                uint64_t pt_phys = alloc_table_early();
+                uint64_t *pt = early_pv(pt_phys);
+                for (uint32_t e = 0; e < 512; e++)
+                    pt[e] = (slide + (uint64_t)t * 0x200000UL + (uint64_t)e * 4096UL)
+                            | arch_pte_from_flags(VMM_FLAG_PRESENT | VMM_FLAG_WRITABLE);
+                pd_hi[t] = pt_phys
+                           | arch_pte_from_flags(VMM_FLAG_PRESENT | VMM_FLAG_WRITABLE);
+            }
+        }
+    }
 
     /* Install the mapped-window PT into pd_hi[4].
      * pd_hi is a local pointer (identity-cast of pd_hi_phys) in scope here.
@@ -278,13 +315,16 @@ vmm_init(void)
      * pd_hi[4] covers 0xFFFFFFFF80800000 (VMM_WINDOW_VA); kva now starts at pd_hi[5]
      * (0xFFFFFFFF80A00000) — currently NULL. */
     {
-        /* Physical address of s_window_pt: PA = VA - KERN_VMA.
+        /* Physical address of s_window_pt: PA = VA - KERN_VMA + slide.
          * All higher-half symbols have PA = VA - ARCH_KERNEL_VIRT_BASE
-         * (the linker AT() directive sets LMA = VMA - KERN_VMA).
-         * Adding ARCH_KERNEL_PHYS_BASE would be wrong: PHYS_BASE is just
-         * where the first section starts, not an additive offset. */
+         * plus the image's physical slide (0 on mb2, where the linker
+         * AT() directive's LMA = VMA - KERN_VMA is where GRUB loads it;
+         * the Limine executable-address delta otherwise). Adding
+         * ARCH_KERNEL_PHYS_BASE would be wrong: PHYS_BASE is just where
+         * the first section starts, not an additive offset. */
         uint64_t win_phys = (uint64_t)(uintptr_t)s_window_pt
-                            - ARCH_KERNEL_VIRT_BASE;
+                            - ARCH_KERNEL_VIRT_BASE
+                            + arch_kern_phys_slide();
         pd_hi[4]      = win_phys | arch_pte_from_flags(VMM_FLAG_PRESENT | VMM_FLAG_WRITABLE);
         s_window_pte  = &s_window_pt[0];
         s_window_pte2 = &s_window_pt[1];

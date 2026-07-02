@@ -1,6 +1,7 @@
 #include "arch.h"
 #include "serial.h"
 #include "vga.h"
+#include "bootinfo.h"
 
 /*
  * arch_init — initialize all x86_64 early subsystems.
@@ -12,7 +13,14 @@
 void arch_init(void)
 {
     serial_init();
-    vga_init();
+    /* VGA text is multiboot2-path only. It writes through
+     * KERN_VMA + 0xB8000, which reaches the real VGA hole only when the
+     * kernel's phys slide is 0 (mb2 loads at the linked LMA). Under the
+     * Limine protocol that VA is unmapped at entry (and maps foreign RAM
+     * after vmm_init when the kernel was relocated) — and every Limine
+     * boot provides a linear framebuffer for console output instead. */
+    if (!g_boot_limine)
+        vga_init();
 }
 
 /* arch_pat_init — enable Write-Combining in PAT entry 1.

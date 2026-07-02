@@ -28,7 +28,17 @@ typedef struct aegis_task_t {
     int32_t              on_cpu;           /* offset 8 */
     uint8_t              is_idle;          /* offset 12 — 1 = per-CPU idle task (never queued) */
     uint8_t              _pad_on_cpu[3];   /* offset 13-15 — keep fpu_state 16-aligned */
-#ifdef __x86_64__
+#if defined(__aarch64__)
+    /* fpu_state — AArch64 FP/SIMD save area for this task's user NEON state:
+     * 32 × 128-bit V registers (512 bytes) + FPSR + FPCR (2 × 32-bit) at
+     * byte offset 512.  The kernel is built -mgeneral-regs-only and never
+     * touches V registers, so the live FP state at any ctx_switch point
+     * belongs to the outgoing task's user code — ctx_switch.S swaps this
+     * area exactly like the x86 FXSAVE path.  aligned(16) both satisfies
+     * the ldp/stp q operands and pins the field at byte offset 16
+     * (FPU_OFF in ctx_switch.S — _Static_assert in sched.c). */
+    __attribute__((aligned(16))) uint8_t fpu_state[528];
+#elif defined(__x86_64__)
     /* fpu_state — 512-byte FXSAVE/FXRSTOR area for this task's user FPU/SSE
      * state (x87 ST0-7, FCW/FSW/FTW/FOP, XMM0-15, MXCSR).
      *
@@ -179,27 +189,44 @@ fpu_state_restore_live(const aegis_task_t *task)
     else
         __asm__ volatile("fxrstor (%0)" : : "r"(task->fpu_state) : "memory");
 }
-#else
-/* Non-x86 stubs — ARM64 FP/SIMD context save is a separate work item
- * (the ARM64 port has no userland yet; see ARM64.md phase A4). */
+#elif defined(__aarch64__)
+/* arm64 FP/SIMD helpers.  arm64_fpu_save/restore live in ctx_switch.S
+ * (raw ldp/stp q — the C here is built -mgeneral-regs-only and cannot
+ * name V registers). */
+void arm64_fpu_save(void *area);
+void arm64_fpu_restore(const void *area);
+
+/* Default FP state = all zero: FPCR=0 (round-to-nearest, no exception
+ * traps, flush-to-zero off) and FPSR=0, V registers cleared.  Call from
+ * every task-creation path before the task can be switched in. */
 static inline void
 fpu_state_init(aegis_task_t *task)
 {
-    (void)task;
+    __builtin_memset(task->fpu_state, 0, sizeof(task->fpu_state));
 }
 
+/* Snapshot the CPU's live V registers into the task area (fork: the child
+ * inherits the parent's live user FP state — the -mgeneral-regs-only
+ * kernel hasn't touched it since SVC entry, and IF-off prevents preemption). */
 static inline void
 fpu_state_save_live(aegis_task_t *task)
 {
-    (void)task;
+    arm64_fpu_save(task->fpu_state);
 }
 
+/* Load the task area into the live V registers (execve: reset to the
+ * fpu_state_init defaults before returning to the new image). */
 static inline void
 fpu_state_restore_live(const aegis_task_t *task)
 {
-    (void)task;
+    arm64_fpu_restore(task->fpu_state);
 }
-#endif /* __x86_64__ */
+#else
+/* Other arches — no FP context yet. */
+static inline void fpu_state_init(aegis_task_t *task) { (void)task; }
+static inline void fpu_state_save_live(aegis_task_t *task) { (void)task; }
+static inline void fpu_state_restore_live(const aegis_task_t *task) { (void)task; }
+#endif /* arch FP helpers */
 
 /* Initialize the run queue. No tasks yet. */
 void sched_init(void);

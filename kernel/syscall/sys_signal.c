@@ -112,12 +112,21 @@ sys_rt_sigreturn(syscall_frame_t *frame)
 {
     aegis_process_t *proc = current_proc();
 
+#ifdef __aarch64__
+    /* AArch64: the handler returns via `ret` (x30 = restorer) — nothing was
+     * popped off the user stack — and signal_deliver set SP_EL0 to the
+     * rt_sigframe base. So the frame is exactly at SP_EL0, with NO x86-style
+     * pretcode adjustment (subtracting 8 here reads the gregs one slot low,
+     * restoring a garbage ELR from the stack → a wild jump). */
+    uint64_t sigframe_addr = FRAME_SP(frame);
+#else
     /* musl's __restore_rt calls sys_rt_sigreturn via SYSCALL with RSP still
      * pointing past the pretcode slot — the signal handler's `ret` already
      * popped pretcode (8 bytes) before jumping to __restore_rt.  Linux
      * compensates with `frame = regs->sp - sizeof(long)`.  Do the same: the
      * actual rt_sigframe_t starts at frame->user_rsp - 8. */
     uint64_t sigframe_addr = FRAME_SP(frame) - sizeof(uint64_t);
+#endif
     if (!user_ptr_valid(sigframe_addr, sizeof(rt_sigframe_t))) {
         sched_exit(); /* signal frame corrupted — terminate */
         __builtin_unreachable();
@@ -128,9 +137,26 @@ sys_rt_sigreturn(syscall_frame_t *frame)
 
     /* Restore interrupted execution context */
 #ifdef __aarch64__
+    /* Full GPR restore: signal_deliver saved x0-x30 into gregs[0..30];
+     * the ERET path replays the whole frame, so every register must come
+     * back from the (user-controlled) sigframe — then be sanitized. */
+    for (int ri = 0; ri < 31; ri++)
+        frame->regs[ri] = (uint64_t)sf.gregs[ri];
     FRAME_IP(frame) = (uint64_t)sf.gregs[REG_RIP];
     FRAME_SP(frame) = (uint64_t)sf.gregs[REG_RSP];
-    FRAME_FLAGS(frame) = (uint64_t)sf.gregs[REG_EFL];
+
+    /* SECURITY (X1 equivalent): the restored PC must be a user address —
+     * a crafted frame must not make the kernel ERET into the higher half. */
+    if (FRAME_IP(frame) > USER_ADDR_MAX) {
+        sched_exit(); /* kernel PC in sigframe — kill the process */
+        __builtin_unreachable();
+    }
+
+    /* SECURITY (X2 equivalent): sanitize the restored PSTATE. The sigframe
+     * is user-controlled — a crafted SPSR could request EL1 (M[3:0]),
+     * masked interrupts (DAIF), or debug single-step (SS). Preserve only
+     * the arithmetic flags NZCV; force EL0t with interrupts enabled. */
+    frame->spsr = (uint64_t)sf.gregs[REG_EFL] & 0xF0000000UL;
 #else
     frame->rip      = (uint64_t)sf.gregs[REG_RIP];
     frame->rflags   = (uint64_t)sf.gregs[REG_EFL];
