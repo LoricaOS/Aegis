@@ -200,6 +200,12 @@ signal_deliver_sysret(syscall_frame_t *frame, uint64_t *saved_rdi_ptr)
 static void
 signal_terminate(aegis_process_t *proc, int signum)
 {
+    /* Log the death — a fatal default-action signal used to kill a process
+     * with zero trace, which made "the desktop silently vanished" class bugs
+     * (e.g. a compositor SIGPIPE) undiagnosable in the field. One line, only
+     * on abnormal termination, mirroring Linux's segfault report. */
+    printk("[SIGNAL] pid=%u %s killed by signal %d\n",
+           proc->pid, proc->exe_path, signum);
     proc->term_signal = (uint32_t)signum;
     proc->exit_status = 128 + (uint64_t)signum;
     sched_exit();

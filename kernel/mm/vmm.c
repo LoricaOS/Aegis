@@ -1087,7 +1087,7 @@ vmm_set_user_prot(uint64_t pml4_phys, uint64_t virt, uint64_t flags)
              * vmm_cow_fault_handle (a writable+COW PTE would never fault → the
              * copy would never happen → cross-process aliasing). SHARED frames
              * are genuinely shared and stay writable (they are never COW). */
-            uint64_t old_sw = old & (VMM_FLAG_COW | VMM_FLAG_SHARED);
+            uint64_t old_sw = old & (VMM_FLAG_COW | VMM_FLAG_SHARED | VMM_FLAG_SHARED_OWNED);
             uint64_t newpte = saved_phys | arch_pte_from_flags(flags) | old_sw;
             if ((old_sw & VMM_FLAG_COW) && (flags & VMM_FLAG_WRITABLE))
                 newpte &= ~(uint64_t)VMM_FLAG_WRITABLE;
@@ -1111,7 +1111,7 @@ vmm_set_user_prot(uint64_t pml4_phys, uint64_t virt, uint64_t flags)
      * → two address spaces alias one live frame. Dropping SHARED makes the
      * teardown guards free driver RAM (fb double-free). Keep both. */
     uint64_t phys   = ARCH_PTE_ADDR(old);
-    uint64_t old_sw = old & (VMM_FLAG_COW | VMM_FLAG_SHARED);
+    uint64_t old_sw = old & (VMM_FLAG_COW | VMM_FLAG_SHARED | VMM_FLAG_SHARED_OWNED);
     if (flags == 0) {
         /* PROT_NONE: store phys with no PRESENT bit (CPU ignores the PTE) but
          * keep the address for munmap and the software bits so a later
@@ -1188,6 +1188,27 @@ vmm_copy_user_pages(uint64_t src_pml4, uint64_t dst_pml4)
                     uint64_t src_phys = pte & ~0x8000000000000FFFULL;
                     /* Preserve all PTE flags including bit 63 (NX/XD bit). */
                     uint64_t flags    = pte &  0x8000000000000FFFULL;
+                    uint64_t va = (pml4i << 39) | (pdpti << 30) |
+                                  (pdi   << 21) | (pti   << 12);
+
+                    /* Shared frames must be INHERITED, never copied — copying
+                     * forks the child off the live shared buffer (fb scanout /
+                     * memfd window). Same-frame, same-flags into the child;
+                     * ref the refcounted (memfd) kind, leave driver-owned fb. */
+                    if (flags & (VMM_FLAG_SHARED | VMM_FLAG_SHARED_OWNED)) {
+                        if (vmm_map_user_page_nolock(dst_pml4, va, src_phys, flags) < 0) {
+                            spin_unlock_irqrestore(&vmm_window_lock, fl);
+                            return -1;
+                        }
+                        if (flags & VMM_FLAG_SHARED_OWNED)
+                            pmm_ref_page(src_phys);
+                        if (++batch >= FORK_BATCH_SIZE) {
+                            batch = 0;
+                            spin_unlock_irqrestore(&vmm_window_lock, fl);
+                            fl = spin_lock_irqsave(&vmm_window_lock);
+                        }
+                        continue;
+                    }
 
                     /* Allocate destination frame */
                     uint64_t dst_phys = pmm_alloc_page();
@@ -1202,10 +1223,6 @@ vmm_copy_user_pages(uint64_t src_pml4, uint64_t dst_pml4)
                     __builtin_memcpy(dst_va, src_va, 4096);
                     vmm_window_unmap2();
                     vmm_window_unmap();
-
-                    /* Reconstruct virtual address */
-                    uint64_t va = (pml4i << 39) | (pdpti << 30) |
-                                  (pdi   << 21) | (pti   << 12);
 
                     if (vmm_map_user_page_nolock(dst_pml4, va, dst_phys, flags) < 0) {
                         pmm_free_page(dst_phys);
@@ -1300,20 +1317,23 @@ vmm_cow_user_pages(uint64_t src_pml4, uint64_t dst_pml4)
                     uint64_t va = (pml4i << 39) | (pdpti << 30) |
                                   (pdi   << 21) | (pti   << 12);
 
-                    if (flags & VMM_FLAG_SHARED) {
-                        /* Driver-owned shared RAM (sys_fb_map framebuffer
-                         * backing — WB system RAM, so not caught by the WC/UC
-                         * MMIO skip above). Inherit it as-is into the child:
-                         * same frame, same flags (still writable, NO write-
-                         * protect, NO COW), and NO pmm_ref_page — the PMM does
-                         * not track this frame per-mapping (the GPU driver owns
-                         * it; teardown leaves it alone). COW-breaking it would
-                         * fork the compositor off the live scanout; ref'ing it
-                         * would unbalance a frame teardown never frees. */
+                    if (flags & (VMM_FLAG_SHARED | VMM_FLAG_SHARED_OWNED)) {
+                        /* Shared RAM inherited into the child as-is: same frame,
+                         * same flags (still writable, NO write-protect, NO COW).
+                         * COW-breaking it would fork a sharer off the live shared
+                         * buffer (the compositor's scanout, or a GUI client's
+                         * window memfd).  Two kinds, distinguished by the flag:
+                         *   - VMM_FLAG_SHARED (driver-owned, e.g. sys_fb_map fb):
+                         *     NO pmm_ref_page — the PMM doesn't track it.
+                         *   - VMM_FLAG_SHARED_OWNED (memfd MAP_SHARED): DO
+                         *     pmm_ref_page — the child now maps the refcounted
+                         *     frame, and teardown will pmm_free_page it. */
                         if (vmm_map_user_page_nolock(dst_pml4, va, phys, flags) < 0) {
                             spin_unlock_irqrestore(&vmm_window_lock, fl);
                             return -1;
                         }
+                        if (flags & VMM_FLAG_SHARED_OWNED)
+                            pmm_ref_page(phys);
                     } else if (flags & VMM_FLAG_WRITABLE) {
                         /* Writable → RO + COW for both parent and child.
                          * Write-protect the parent first so any concurrent

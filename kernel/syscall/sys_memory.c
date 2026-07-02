@@ -494,7 +494,11 @@ sys_mmap(uint64_t arg1, uint64_t arg2, uint64_t arg3,
                 if (reserved) vma_remove(proc, base, len);
                 return SYS_ERR(EINVAL);
             }
-            vmm_map_user_page(proc->pml4_phys, va, mf->phys_pages[pi], map_flags);
+            /* Tag memfd MAP_SHARED pages VMM_FLAG_SHARED_OWNED so fork inherits
+             * them shared+writable (no COW-break onto a private copy) while
+             * still refcounting the frame — see the flag's comment in vmm.h. */
+            vmm_map_user_page(proc->pml4_phys, va, mf->phys_pages[pi],
+                              map_flags | VMM_FLAG_SHARED_OWNED);
             /* This mapping now holds its own reference on the memfd frame.
              * Invariant: total refs = 1 (memfd) + live MAP_SHARED mappings.
              * Without this, munmap/exit would free a frame still owned by
