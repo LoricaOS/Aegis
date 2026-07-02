@@ -34,8 +34,9 @@ _Static_assert(((TCP_RBUF_SIZE - 1) >> TCP_RCV_WSCALE) <= 0xFFFF,
 /* TCP_ADVMSS — Maximum Segment Size we advertise in our SYN/SYN-ACK so the peer
  * sends full 1460-byte segments.  1460 = 1500 (Ethernet MTU) - 20 (IP) - 20
  * (TCP); a 1460-byte payload fits the 1536-byte virtio RX buffer (14 eth + 20 +
- * 20 + 1460 = 1514).  Our OWN send path stays at the conservative TCP_DEFAULT_MSS
- * (536) — this option only governs what the peer sends to us (downloads). */
+ * 20 + 1460 = 1514).  Our OWN send path uses the peer's MSS from its SYN
+ * (conn->snd_mss, clamped to TCP_ADVMSS), falling back to the RFC-879 536
+ * default only when the peer offered no MSS option. */
 #define TCP_ADVMSS 1460
 
 /* Receive-window update threshold (Silly Window Syndrome avoidance, RFC 1122
@@ -81,6 +82,8 @@ typedef struct {
                                * 0 = peer offered no scaling */
     uint8_t     rcv_wscale;    /* RFC 7323 shift we advertise (outgoing); 0 until
                                * we decide to offer scaling on this conn */
+    uint16_t    snd_mss;       /* peer's MSS from its SYN (clamped to TCP_ADVMSS);
+                               * 0 (zeroed slot) → treat as 536 default */
     uint8_t    *rbuf;          /* kva-allocated at boot, never freed */
     uint32_t    rbuf_head, rbuf_tail;
     uint8_t    *sbuf;          /* kva-allocated at boot, never freed */

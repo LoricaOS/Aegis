@@ -74,7 +74,10 @@ sys_write(uint64_t arg1, uint64_t arg2, uint64_t arg3)
 
     /* Copy user buffer to kernel staging area to prevent TOCTOU — the user
      * could modify or unmap the buffer between the user_ptr_valid check and
-     * the actual write.  Copy in 256-byte chunks (same pattern as sys_writev).
+     * the actual write.  Copy in page-size chunks (same pattern as sys_writev):
+     * a 4 KiB write used to be 16 × 256 B ops->write calls, each re-doing the
+     * fd's cache lookups; one page per chunk keeps the stack cost bounded
+     * (16 KiB kernel stacks) while cutting the per-chunk overhead 16x.
      *
      * For pipes, pipe_write_fn returns a positive partial count or a negative
      * errno (-EPIPE).  The loop handles both correctly:
@@ -88,10 +91,10 @@ sys_write(uint64_t arg1, uint64_t arg2, uint64_t arg3)
      * EAGAIN. Set before dispatch, cleared on every return path below. */
     sched_current()->write_nonblock = (f->flags & VFS_O_NONBLOCK) ? 1 : 0;
     uint64_t total = 0;
+    uint8_t staging[4096];
     while (total < arg3) {
-        uint8_t staging[256];
         uint64_t chunk = arg3 - total;
-        if (chunk > 256) chunk = 256;
+        if (chunk > sizeof(staging)) chunk = sizeof(staging);
         copy_from_user(staging, (const void *)(uintptr_t)(arg2 + total), chunk);
         int r = f->ops->write(f->priv, staging, chunk);
         if (r <= 0) {
@@ -158,12 +161,12 @@ sys_writev(uint64_t arg1, uint64_t arg2, uint64_t arg3)
 
         /* S8: Copy user buffer to kernel staging area to prevent TOCTOU.
          * The user could unmap the page between validation and use.
-         * Copy in 256-byte chunks and write from kernel memory. */
+         * Copy in page-size chunks and write from kernel memory. */
         uint64_t vec_written = 0;
         while (vec_written < iov.iov_len) {
-            uint8_t staging[256];
+            uint8_t staging[4096];
             uint64_t remaining = iov.iov_len - vec_written;
-            uint64_t chunk = remaining > 256 ? 256 : remaining;
+            uint64_t chunk = remaining > sizeof(staging) ? sizeof(staging) : remaining;
             copy_from_user(staging,
                            (const void *)(uintptr_t)(iov.iov_base + vec_written),
                            chunk);

@@ -76,6 +76,12 @@ void vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags);
  * 2MB huge pages; doing so will panic the kernel. */
 void vmm_unmap_page(uint64_t virt);
 
+/* vmm_unmap_page_noshoot — like vmm_unmap_page but skips the cross-CPU TLB
+ * shootdown (local invlpg only).  For batch unmaps: the caller MUST issue one
+ * tlb_shootdown_kernel() over the whole range afterwards, or other CPUs keep
+ * stale translations (the SMP recycled-KVA corruption bug). */
+void vmm_unmap_page_noshoot(uint64_t virt);
+
 /* Allocate a new PML4 and copy kernel high entries [256..511] from the
  * master PML4. Returns physical address of the new PML4.
  * Valid while identity map [0..4MB) is active (Phase 5 constraint). */

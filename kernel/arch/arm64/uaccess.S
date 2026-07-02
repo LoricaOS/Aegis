@@ -3,8 +3,12 @@
  *
  * uint64_t arm64_uaccess_copy(void *dst [x0], const void *src [x1],
  *                             uint64_t len [x2]);
- * Byte copy; returns the number of bytes NOT copied (0 = full success),
- * the Linux convention. Backs copy_from_user / copy_to_user (uaccess.h).
+ * 8-byte-wide copy with a byte tail (unaligned ldr/str on Normal memory is
+ * architecturally fine; this backs every syscall's user<->kernel transfer, so
+ * a byte loop was ~8x the work). Returns the number of bytes NOT copied
+ * (0 = full success), the Linux convention: on a fault mid-word the whole
+ * word counts as uncopied (conservative, aborts are precise so nothing was
+ * partially stored). Backs copy_from_user / copy_to_user (uaccess.h).
  *
  * The user-touching load and store are registered in the kernel exception
  * table (__ex_table) as {fault_pc, fixup_pc} pairs. If the copy faults —
@@ -25,7 +29,20 @@
 .type arm64_uaccess_copy, %function
 arm64_uaccess_copy:
     cbz     x2, 2f              // len == 0 → nothing to copy
-1:
+    cmp     x2, #8
+    b.lo    1f                  // short copy → byte loop only
+3:                              // 8-byte main loop
+.Lu_load8:
+    ldr     x3, [x1]
+.Lu_store8:
+    str     x3, [x0]
+    add     x0, x0, #8
+    add     x1, x1, #8
+    sub     x2, x2, #8
+    cmp     x2, #8
+    b.hs    3b
+    cbz     x2, 2f
+1:                              // byte tail (< 8 bytes)
 .Lu_load:
     ldrb    w3, [x1]
 .Lu_store:
@@ -46,6 +63,8 @@ arm64_uaccess_copy:
      * __ex_table between __start_ex_table / __stop_ex_table (linker-arm64.ld). */
     .pushsection __ex_table, "a"
     .align 3
-    .quad .Lu_load,  .Lu_fixup
-    .quad .Lu_store, .Lu_fixup
+    .quad .Lu_load8,  .Lu_fixup
+    .quad .Lu_store8, .Lu_fixup
+    .quad .Lu_load,   .Lu_fixup
+    .quad .Lu_store,  .Lu_fixup
     .popsection

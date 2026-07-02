@@ -729,15 +729,45 @@ int ext2_read(uint32_t inode_num, void *buf, uint64_t offset, uint32_t len)
             uint32_t i;
             for (i = 0; i < can_copy; i++)
                 out[bytes_read + i] = 0;
+        } else if (in_block == 0 && can_copy == s_block_size &&
+                   blk < s_sb.s_blocks_count && cache_find(blk) < 0) {
+            /* Multi-block fast path: this and the following blocks are
+             * full-block reads.  Gather a run of blocks that are consecutive
+             * ON DISK and not in the cache (a cached block may be dirty — its
+             * cached copy is authoritative), then issue ONE device read for
+             * the whole run straight into the caller's buffer.  With the
+             * NVMe multi-page bounce this turns a 64 KiB sequential read from
+             * 16 serialized device round-trips into 1.  Bypassing the cache
+             * also stops bulk data evicting the hot indirect/bitmap blocks
+             * from its 16 slots.  Runs are capped so one request can never
+             * exceed the block layer's per-command ceiling. */
+            uint32_t max_run = (len - bytes_read) / s_block_size;
+            uint32_t run_cap = EXT2_READ_RUN_BYTES / s_block_size;
+            if (max_run > run_cap) max_run = run_cap;
+            uint32_t run = 1;
+            while (run < max_run) {
+                uint32_t nb = ext2_block_num(&inode, file_block + run);
+                if (nb != blk + run || nb >= s_sb.s_blocks_count ||
+                    cache_find(nb) >= 0)
+                    break;
+                run++;
+            }
+            uint32_t spb = s_block_size / 512;
+            s_cache_dev_reads++;
+            if (s_dev->read(s_dev, (uint64_t)blk * spb, run * spb,
+                            out + bytes_read) < 0) {
+                ext2_lock_release(fl);
+                return (int)bytes_read;
+            }
+            bytes_read += run * s_block_size;
+            continue;
         } else {
             uint8_t *data = cache_get_slot(blk);
             if (!data) {
                 ext2_lock_release(fl);
                 return (int)bytes_read;
             }
-            uint32_t i;
-            for (i = 0; i < can_copy; i++)
-                out[bytes_read + i] = data[in_block + i];
+            __builtin_memcpy(out + bytes_read, data + in_block, can_copy);
         }
         bytes_read += can_copy;
     }
