@@ -60,6 +60,24 @@
  *     the live framebuffer into a kernel stack (wild-write corruption, the
  *     graphical-NVMe #GP). The PTE is still cleared in the execve path. */
 #define VMM_FLAG_SHARED   (1UL << 10)
+/* VMM_FLAG_SHARED_OWNED — this user PTE maps a MAP_SHARED memfd frame: a
+ * PMM-REFCOUNTED frame that MULTIPLE processes map at the same physical page
+ * (the compositor + a GUI client sharing a window buffer). Software PTE bit 11.
+ *
+ * Distinct from VMM_FLAG_SHARED (driver-owned, never ref'd/freed) because a
+ * memfd frame IS tracked by the PMM refcount: it must be ref'd when a new
+ * mapping appears and unref'd when one goes away, or the frame leaks / UAFs.
+ * The two walks treat it as:
+ *   - fork (vmm_cow_user_pages): share as-is (same frame, still writable, NO
+ *     write-protect, NO COW) — like SHARED — BUT ALSO pmm_ref_page it, since the
+ *     child now maps the refcounted frame. Without the COW-exempt inherit, the
+ *     parent's next write to the shared window buffer would COW-break onto a
+ *     PRIVATE copy the other mappers never see (a GUI client that fork()s after
+ *     mapping its window — e.g. the installer's login-elevate — froze on-screen).
+ *   - teardown / munmap: pmm_free_page as normal (drops the per-mapping ref).
+ *     It carries bit 11, NOT bit 10, so the "never free VMM_FLAG_SHARED" guards
+ *     correctly do NOT skip it. */
+#define VMM_FLAG_SHARED_OWNED (1UL << 11)
 #define VMM_FLAG_NX       (1UL << 63)
 
 /* vmm_init — build the initial higher-half page tables and activate them.
