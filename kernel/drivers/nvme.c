@@ -52,12 +52,64 @@ static uint32_t              s_iosq_tail = 0;
 static uint32_t              s_iocq_head = 0;
 static uint8_t               s_iocq_phase = 1;
 
-/* Single-page bounce buffer for read/write I/O.
- * Allocated once in nvme_init; reused for all synchronous I/O.
- * Phase 20: synchronous only — no concurrent I/O. */
-static void    *s_iobuf     = NULL;
-static uint64_t s_iobuf_phys = 0;
+/* Multi-page bounce buffer for read/write I/O (VA-contiguous, physically
+ * scattered <4GB pages, described to the controller via a PRP list).
+ * Allocated once in nvme_init; reused for all synchronous I/O.  One command
+ * now moves up to NVME_BOUNCE_PAGES pages instead of one 4KB round-trip per
+ * page (a 128KB read used to be 32 fully-serialized submit+poll cycles).
+ * Still synchronous QD1 — no concurrent I/O. */
+#define NVME_BOUNCE_PAGES 32u             /* 128 KiB max per command */
+static void    *s_iobuf      = NULL;      /* VA of page 0 (contiguous range) */
+static uint64_t s_iobuf_phys = 0;         /* phys of page 0 → SQE PRP1 */
+static uint64_t s_iobuf_page_phys[NVME_BOUNCE_PAGES];
+static uint64_t *s_prplist   = NULL;      /* PRP list page: phys of pages 1..N-1 */
+static uint64_t  s_prplist_phys = 0;
+static uint32_t  s_max_xfer  = 4096u;     /* min(bounce bytes, MDTS); set in init */
+static uint32_t  s_mdts_max  = 0xFFFFFFFFu; /* controller MDTS in bytes (identify) */
 static spinlock_t nvme_lock = SPINLOCK_INIT;
+
+/* iobuf_alloc — (re)allocate the bounce page set and rewrite the PRP list.
+ * Falls back to a single page (s_max_xfer = 4096) if the low pool cannot
+ * supply the full set.  Returns -1 only if not even one page is available.
+ * The PRP list page itself is allocated once and rewritten in place. */
+static void *alloc_queue_page(uint64_t *phys_out);
+static int
+iobuf_alloc(void)
+{
+    uint32_t pages = NVME_BOUNCE_PAGES;
+    uint8_t *va = (uint8_t *)kva_alloc_pages_low(pages);
+    if (va == NULL) {
+        pages = 1u;
+        va = (uint8_t *)kva_alloc_pages_low(1);
+        if (va == NULL)
+            return -1;
+    }
+    if (pages > 1u && s_prplist == NULL) {
+        s_prplist = (uint64_t *)alloc_queue_page(&s_prplist_phys);
+        if (s_prplist == NULL)
+            pages = 1u;               /* no PRP list page → single-page mode */
+    }
+    for (uint32_t i = 0; i < pages; i++)
+        s_iobuf_page_phys[i] = kva_page_phys(va + (uint64_t)i * 4096u);
+    for (uint32_t i = 1; i < pages; i++)
+        s_prplist[i - 1u] = s_iobuf_page_phys[i];
+    s_iobuf      = va;
+    s_iobuf_phys = s_iobuf_page_phys[0];
+    uint32_t bounce_bytes = pages * 4096u;
+    s_max_xfer = (bounce_bytes < s_mdts_max) ? bounce_bytes : s_mdts_max;
+    return 0;
+}
+
+/* prp2_for — the SQE PRP2 value for a transfer of `bytes` starting at bounce
+ * offset 0 (NVMe 1.4 §4.1.1): 0 for one page, the second page's address for
+ * exactly two pages, else the PRP list. */
+static uint64_t
+prp2_for(uint32_t bytes)
+{
+    if (bytes <= 4096u)  return 0u;
+    if (bytes <= 8192u)  return s_iobuf_page_phys[1];
+    return s_prplist_phys;
+}
 
 /* -------------------------------------------------------------------------
  * Helpers
@@ -129,13 +181,12 @@ alloc_queue_page(uint64_t *phys_out)
 static void
 iobuf_quarantine(void)
 {
-    uint64_t new_phys = 0;
-    void *new_buf = alloc_queue_page(&new_phys);
-    if (new_buf) {
-        s_iobuf      = new_buf;
-        s_iobuf_phys = new_phys;
+    /* Reallocate the whole bounce set (and rewrite the PRP list in place);
+     * the old pages are leaked exactly as before — bounded, rare, and
+     * harmless next to silent corruption.  On low-pool exhaustion keep the
+     * old set (same behavior as the old single-page path). */
+    if (iobuf_alloc() == 0)
         printk("[NVME] WARN: bounce buffer quarantined after failed cmd\n");
-    }
 }
 
 /* Poll for a CQE whose phase tag matches *phase.  On success, advances the
@@ -466,6 +517,17 @@ nvme_init(void)
             return;
         }
         /* Model name at bytes [24,63] — space-padded; not printed for now */
+
+        /* MDTS (byte 77): max data transfer size as 2^MDTS units of the
+         * minimum page size (CAP.MPSMIN, bits [51:48]; we run CC.MPS=4K).
+         * 0 = no limit.  Clamp our per-command ceiling to it so a large
+         * bounce transfer can never exceed what the controller accepts. */
+        {
+            uint8_t  mdts   = id_buf[77];
+            uint32_t mps_min = 4096u << ((s_bar0->cap >> 48) & 0xFu);
+            if (mdts != 0u && mdts < 15u)
+                s_mdts_max = mps_min << mdts;
+        }
     }
 
     /* Step 7: Identify Namespace NSID=1 (CNS=0) */
@@ -524,11 +586,10 @@ nvme_init(void)
             }
         }
 
-        /* Allocate bounce buffer for synchronous read/write I/O.
-         * Its physical address is written into the read/write SQE prp1 and
-         * DMA'd by the controller, so it must come from the <4GB pool. */
-        s_iobuf = alloc_queue_page(&s_iobuf_phys);
-        if (s_iobuf == NULL) {
+        /* Allocate the multi-page bounce buffer + PRP list for synchronous
+         * read/write I/O.  Every page is DMA'd by the controller, so it all
+         * comes from the <4GB pool (kva_alloc_pages_low / alloc_queue_page). */
+        if (iobuf_alloc() != 0) {
             printk("[NVME] FAIL: bounce buffer low-memory allocation failed\n");
             return;
         }
@@ -593,10 +654,12 @@ nvme_io_validate(const struct blkdev *dev, uint64_t lba, uint32_t count,
     if (count == 0u)
         return -1;                       /* hazard 1: NLB underflow */
 
-    /* hazard 2: 64-bit length, bounded to one bounce page */
+    /* hazard 2: 64-bit length, bounded to the bounce buffer / MDTS.
+     * s_max_xfer ≤ 128 KiB, so with 512-byte blocks count ≤ 256 and the
+     * 16-bit NLB field (count-1 ≤ 255) still can never overflow. */
     uint64_t bytes64 = (uint64_t)count * (uint64_t)dev->block_size;
-    if (bytes64 == 0u || bytes64 > 4096u)
-        return -1;                       /* multi-page / overflow rejected */
+    if (bytes64 == 0u || bytes64 > (uint64_t)s_max_xfer)
+        return -1;                       /* too large / overflow rejected */
 
     /* hazard 3: range check in 64-bit (lba + count cannot wrap a uint64
      * for any count that survived the page bound above, but compute defensively
@@ -611,8 +674,8 @@ nvme_io_validate(const struct blkdev *dev, uint64_t lba, uint32_t count,
 }
 
 /* nvme_blkdev_read — read `count` native LBAs from LBA into buf.
- * Uses a shared bounce buffer allocated in nvme_init().
- * Only supports transfers that fit in one 4KB page (count * block_size <= 4096). */
+ * Uses the shared multi-page bounce buffer allocated in nvme_init().
+ * Supports transfers up to s_max_xfer bytes (bounce size clamped to MDTS). */
 static int
 nvme_blkdev_read(struct blkdev *dev, uint64_t lba, uint32_t count, void *buf)
 {
@@ -637,7 +700,7 @@ nvme_blkdev_read(struct blkdev *dev, uint64_t lba, uint32_t count, void *buf)
     sqe->cdw0  = NVME_IO_READ | ((uint32_t)cid << 16);
     sqe->nsid  = 1u;
     sqe->prp1  = buf_phys;
-    sqe->prp2  = 0u;
+    sqe->prp2  = prp2_for(bytes);
     sqe->cdw10 = (uint32_t)(lba & 0xFFFFFFFFu);
     sqe->cdw11 = (uint32_t)(lba >> 32);
     sqe->cdw12 = count - 1u;   /* NLB: 0-based count */
@@ -699,8 +762,8 @@ nvme_flush(void)
 }
 
 /* nvme_blkdev_write — write `count` native LBAs from buf to LBA.
- * Uses a shared bounce buffer allocated in nvme_init().
- * Only supports transfers that fit in one 4KB page (count * block_size <= 4096). */
+ * Uses the shared multi-page bounce buffer allocated in nvme_init().
+ * Supports transfers up to s_max_xfer bytes (bounce size clamped to MDTS). */
 static int
 nvme_blkdev_write(struct blkdev *dev, uint64_t lba, uint32_t count,
                   const void *buf)
@@ -726,7 +789,7 @@ nvme_blkdev_write(struct blkdev *dev, uint64_t lba, uint32_t count,
     sqe->cdw0  = NVME_IO_WRITE | ((uint32_t)cid << 16);
     sqe->nsid  = 1u;
     sqe->prp1  = buf_phys;
-    sqe->prp2  = 0u;
+    sqe->prp2  = prp2_for(bytes);
     sqe->cdw10 = (uint32_t)(lba & 0xFFFFFFFFu);
     sqe->cdw11 = (uint32_t)(lba >> 32);
     sqe->cdw12 = count - 1u;   /* NLB: 0-based count */

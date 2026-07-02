@@ -34,8 +34,15 @@ void       ext2_lock_release(irqflags_t fl);
  * on every block iteration, so they stay resident even in 16 slots (read
  * dev_reads/data-block measured at 1.06x, i.e. no re-walk).  The real ext2
  * write-path cost was the O(n²) bitmap rescan, fixed with a per-group
- * allocation hint in ext2.c — not the cache size.  Left at 16. */
+ * allocation hint in ext2.c — not the cache size.  Left at 16.
+ * (Sequential DATA now bypasses these slots entirely: ext2_read batches
+ * contiguous uncached full blocks into one direct device read.) */
 #define CACHE_SLOTS 16
+
+/* Cap for ext2_read's multi-block direct-read run (bytes).  64 KiB = 16
+ * 4 KiB blocks: well under the NVMe driver's 128 KiB per-command bounce
+ * ceiling, big enough to amortize the per-command submit+poll cost. */
+#define EXT2_READ_RUN_BYTES 65536u
 
 typedef struct {
     uint32_t block_num;

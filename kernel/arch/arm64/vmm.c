@@ -293,6 +293,14 @@ vmm_unmap_page(uint64_t virt)
     spin_unlock_irqrestore(&vmm_lock, fl);
 }
 
+/* On arm64 the TLBI in vmm_unmap_page is already inner-shareable (broadcast
+ * to all cores in hardware) — there is no per-page IPI to batch away. */
+void
+vmm_unmap_page_noshoot(uint64_t virt)
+{
+    vmm_unmap_page(virt);
+}
+
 uint64_t
 vmm_phys_of(uint64_t virt)
 {

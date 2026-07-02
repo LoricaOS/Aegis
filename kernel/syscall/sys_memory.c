@@ -27,13 +27,22 @@ int g_lazyfile = 1;
  * demand-fault path runs with IF=0 (interrupt-gate #PF / IF=0 syscall context),
  * so there is no same-CPU re-entry on the buffer either.
  *
- * Lazily allocated on first use per CPU (one KVA page); never freed — it lives
- * for the system lifetime exactly as the old static buffer did. A pointer array
+ * Lazily allocated on first use per CPU (MM_FAULT_CLUSTER KVA pages — the
+ * fault-time readahead window); never freed — it lives for the system lifetime
+ * exactly as the old static buffer did. A pointer array
  * (AEGIS_MAX_CPUS * 8 B = 8 KB BSS) is used instead of a static
- * [AEGIS_MAX_CPUS][4096] array, which at AEGIS_MAX_CPUS=1024 would burn 4 MB of
+ * per-CPU array, which at AEGIS_MAX_CPUS=1024 would burn megabytes of
  * the 8 MB kernel-BSS budget. cpu_id is a uint8_t (< 256 < AEGIS_MAX_CPUS), so
  * the index is always in bounds. */
 static uint8_t *s_filebuf[AEGIS_MAX_CPUS];
+
+/* MM_FAULT_CLUSTER — pages populated per file-backed fault (fault-time
+ * readahead).  One #PF on a sequential mmap read used to mean one 4 KiB ext2
+ * read (one device round-trip) per page; clustering reads 64 KiB in one ext2
+ * call (which batches contiguous blocks into one NVMe command) and maps all
+ * 16 pages, cutting both traps and device commands ~16x on the mmap-heavy
+ * exec/port-startup paths. */
+#define MM_FAULT_CLUSTER 16u
 
 /*
  * sys_brk — syscall 12
@@ -645,6 +654,7 @@ mm_populate_fault(aegis_process_t *proc, uint64_t va)
     uint64_t foff  = v->file_off;
     uint64_t fsize = v->file_size;
     uint64_t vbase = v->base;
+    uint64_t vlen  = v->len;
 
     /* Fast path: already present (re-entry, or a sibling thread populated it). */
     if (vmm_phys_of_user_raw(proc->pml4_phys, va))
@@ -664,20 +674,35 @@ mm_populate_fault(aegis_process_t *proc, uint64_t va)
         return -1;                       /* OOM → fault */
     vmm_zero_page(phys);
 
-    /* VMA_FILE: read the backing file page into the frame before mapping it.
-     * Bytes past EOF stay zero (file hole / partial last page). */
+    /* VMA_FILE: cluster read — up to MM_FAULT_CLUSTER pages of the backing
+     * file in ONE generation-validated ext2 read (see MM_FAULT_CLUSTER).
+     * Bytes past EOF stay zero (file hole / partial last page).  `got` is the
+     * number of file bytes read into buf; pages of the cluster beyond it are
+     * not prefetched (they fault + zero-fill later if legitimately mapped). */
+    uint32_t cluster = 1;
+    uint32_t got     = 0;
+    uint8_t *buf     = NULL;
     if (vtype == VMA_FILE && fino) {
         uint64_t fpos = foff + (va - vbase);
+        /* Readahead window: clamp to the VMA end (never touch pages of a
+         * neighboring mapping) — EOF is handled by the read length below. */
+        uint64_t vma_pages_left = (vbase + vlen - va) >> 12;
+        cluster = MM_FAULT_CLUSTER;
+        if ((uint64_t)cluster > vma_pages_left)
+            cluster = (uint32_t)vma_pages_left;
+        if (cluster == 0)
+            cluster = 1;
         if (fpos < fsize) {
             uint64_t avail = fsize - fpos;
-            uint32_t n = avail < 4096 ? (uint32_t)avail : 4096;
+            uint64_t want  = (uint64_t)cluster * 4096u;
+            if (want > avail) want = avail;
             /* Per-CPU bounce buffer — no lock (see s_filebuf comment). The
              * fault path is IF=0, so this CPU can't be preempted mid-read and
              * no other CPU touches this slot. */
             uint32_t cpu = percpu_self()->cpu_id;
-            uint8_t *buf = s_filebuf[cpu];
+            buf = s_filebuf[cpu];
             if (!buf) {
-                buf = kva_alloc_pages(1);
+                buf = kva_alloc_pages(MM_FAULT_CLUSTER);
                 if (!buf) {            /* KVA exhausted — clean fault, no leak */
                     pmm_free_page(phys);
                     return -1;
@@ -688,25 +713,52 @@ mm_populate_fault(aegis_process_t *proc, uint64_t va)
              * number was recycled for a different file since mmap, fault
              * instead of leaking the new file's contents through this mapping
              * (the original open()'s DAC check no longer applies to it). */
-            int got = ext2_read_validated(fino, buf, fpos, n, fgen);
-            if (got == EXT2_EGEN) {
+            int g = ext2_read_validated(fino, buf, fpos, (uint32_t)want, fgen);
+            if (g == EXT2_EGEN) {
                 pmm_free_page(phys);
                 return -1;               /* recycled inode → SIGSEGV */
             }
-            if (got > 0)
-                vmm_write_phys_bytes(phys, 0, buf, (uint32_t)got);
+            got = (g > 0) ? (uint32_t)g : 0;
         }
     }
 
     uint64_t mf = VMM_FLAG_PRESENT | VMM_FLAG_USER | VMM_FLAG_NX;
     if (vprot & PROT_WRITE) mf |= VMM_FLAG_WRITABLE;
     if (vprot & PROT_EXEC)  mf &= ~VMM_FLAG_NX;
-    int r = vmm_try_map_user_page(proc->pml4_phys, va, phys, mf);
-    if (r != 0) {
-        /* r==1: lost the race, page already present → free our frame, success.
-         * r==-1: OOM allocating a page table → free our frame, real fault. */
-        pmm_free_page(phys);
-        return (r == 1) ? 0 : -1;
+
+    for (uint32_t i = 0; i < cluster; i++) {
+        uint64_t page_off = (uint64_t)i * 4096u;
+        uint64_t frame;
+        if (i == 0) {
+            frame = phys;              /* pre-allocated + zeroed above */
+        } else {
+            /* Prefetch pages only while backed by read data — a page beyond
+             * `got` is either past EOF or after a short read; let it fault
+             * on its own later. Best-effort: OOM just ends the readahead. */
+            if (page_off >= got)
+                break;
+            frame = pmm_alloc_page();
+            if (!frame)
+                break;
+            vmm_zero_page(frame);
+        }
+        if (buf && page_off < got) {
+            uint32_t n = (got - page_off) < 4096u ? (uint32_t)(got - page_off)
+                                                  : 4096u;
+            vmm_write_phys_bytes(frame, 0, buf + page_off, n);
+        }
+        int r = vmm_try_map_user_page(proc->pml4_phys, va + page_off, frame, mf);
+        if (r != 0) {
+            /* r==1: lost the populate race, page already present → free our
+             * frame and move on (success for the faulting page).
+             * r==-1: OOM allocating a page table → real fault for page 0,
+             * end of readahead otherwise. */
+            pmm_free_page(frame);
+            if (i == 0)
+                return (r == 1) ? 0 : -1;
+            if (r == -1)
+                break;
+        }
     }
     return 0;
 }

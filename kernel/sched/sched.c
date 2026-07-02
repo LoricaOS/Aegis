@@ -36,6 +36,10 @@ _Static_assert(offsetof(aegis_task_t, fpu_state) == 64,
     "fpu_state must be at offset 64 — FPU_STATE_OFF in ctx_switch.asm");
 _Static_assert(sizeof(((aegis_task_t *)0)->fpu_state) == 1024,
     "fpu_state must be the 1024-byte XSAVE area size");
+/* ctx_switch.asm hardcodes IS_USER_OFF to skip the FPU save/restore for
+ * kernel tasks (-mno-sse: they never own live FPU state). */
+_Static_assert(offsetof(aegis_task_t, is_user) == 1108,
+    "is_user must be at offset 1108 — IS_USER_OFF in ctx_switch.asm");
 #endif
 
 #ifdef __aarch64__

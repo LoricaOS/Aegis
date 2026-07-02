@@ -140,6 +140,42 @@ static int tcp_parse_wscale(const uint8_t *opts, uint32_t optlen, uint8_t *shift
     return 0;
 }
 
+/* TCP send-side fallback MSS: the conservative IPv4 default (576-byte MTU →
+ * 536-byte MSS, RFC 879/1122), used only when the peer's SYN carried no MSS
+ * option.  Normally sends chunk to conn->snd_mss (peer MSS, ≤ TCP_ADVMSS;
+ * s_tcp_buf is 1480 so a full 1460 segment fits). */
+#define TCP_DEFAULT_MSS  536
+
+/* tcp_snd_mss — the segment size to use for conn's outbound data. */
+static inline uint16_t tcp_snd_mss(const tcp_conn_t *c)
+{
+    return c->snd_mss ? c->snd_mss : TCP_DEFAULT_MSS;
+}
+
+/* tcp_parse_mss — same option walk, for the MSS option (RFC 793, kind 2,
+ * len 4).  Returns the peer's MSS clamped to TCP_ADVMSS (s_tcp_buf holds one
+ * full-size segment), or TCP_DEFAULT_MSS if absent/malformed. */
+static uint16_t tcp_parse_mss(const uint8_t *opts, uint32_t optlen)
+{
+    uint32_t i = 0;
+    while (i < optlen) {
+        uint8_t kind = opts[i];
+        if (kind == 0) break;
+        if (kind == 1) { i++; continue; }
+        if (i + 1 >= optlen) break;
+        uint8_t olen = opts[i + 1];
+        if (olen < 2 || i + olen > optlen) break;
+        if (kind == 2 && olen == 4) {
+            uint16_t mss = (uint16_t)((opts[i + 2] << 8) | opts[i + 3]);
+            if (mss > TCP_ADVMSS) mss = TCP_ADVMSS;
+            if (mss < 64) break;   /* nonsense value → default */
+            return mss;
+        }
+        i += olen;
+    }
+    return TCP_DEFAULT_MSS;
+}
+
 /* tcp_send_syn — emit a SYN or SYN-ACK carrying TCP options: an MSS option
  * (TCP_ADVMSS) always, plus a Window Scale option (conn->rcv_wscale) when this
  * connection is offering scaling (rcv_wscale != 0).  Option layout mirrors Linux
@@ -262,11 +298,6 @@ static int tcp_send_at_seq(netdev_t *dev, tcp_conn_t *conn, uint8_t flags,
     return ip_send(dev, conn->remote_ip, IP_PROTO_TCP, s_tcp_buf, tcp_len);
 }
 
-/* TCP maximum segment size for retransmit chunking.  No MSS option is
- * negotiated, so use the conservative IPv4 default (576-byte MTU → 536-byte
- * MSS, RFC 879/1122).  s_tcp_buf is 1480 so a single MSS always fits. */
-#define TCP_DEFAULT_MSS  536
-
 /* tcp_unacked — bytes in sbuf awaiting ACK == SND.NXT - SND.UNA. */
 static inline uint32_t tcp_unacked(const tcp_conn_t *c)
 {
@@ -289,8 +320,9 @@ static void tcp_retransmit_unacked(netdev_t *dev, tcp_conn_t *c)
 {
     uint32_t unacked = tcp_unacked(c);
     if (unacked == 0) return;
-    uint32_t n = unacked < TCP_DEFAULT_MSS ? unacked : TCP_DEFAULT_MSS;
-    uint8_t  seg[TCP_DEFAULT_MSS];
+    uint16_t mss = tcp_snd_mss(c);
+    uint32_t n = unacked < mss ? unacked : mss;
+    uint8_t  seg[TCP_ADVMSS];
     /* Two-segment memcpy out of the power-of-two sbuf ring (was a byte loop). */
     uint32_t hoff  = c->sbuf_head & (TCP_SBUF_SIZE - 1);
     uint32_t first = TCP_SBUF_SIZE - hoff;
@@ -450,6 +482,7 @@ void tcp_rx(netdev_t *dev, ip4_addr_t src_ip, ip4_addr_t dst_ip,
                     conn->snd_wscale = psh;
                     conn->rcv_wscale = TCP_RCV_WSCALE;
                 }
+                conn->snd_mss = tcp_parse_mss(opts, optlen);
             }
             tcp_send_syn(dev, conn, TCP_SYN | TCP_ACK);
             conn->snd_nxt++;
@@ -551,6 +584,7 @@ void tcp_rx(netdev_t *dev, ip4_addr_t src_ip, ip4_addr_t dst_ip,
                         conn->rcv_wscale = 0;   /* peer can't scale → neither do we */
                         conn->snd_wscale = 0;
                     }
+                    conn->snd_mss = tcp_parse_mss(opts, optlen);
                 }
                 tcp_send_segment(dev, conn, TCP_ACK, NULL, 0);
                 conn->retransmit_at = 0;
@@ -1285,9 +1319,10 @@ tcp_conn_send(uint32_t conn_id, const void *data, uint16_t len)
     /* Transmit the window-permitted prefix from the lock-free snapshot,
      * segmented to one MSS per packet. */
     uint32_t off = 0;
+    uint16_t mss = tcp_snd_mss(c);
     while (off < sendable) {
         uint32_t chunk = sendable - off;
-        if (chunk > TCP_DEFAULT_MSS) chunk = TCP_DEFAULT_MSS;
+        if (chunk > mss) chunk = mss;
         tcp_send_at_seq(dev, c, TCP_PSH | TCP_ACK, send_seq + off,
                         snap + off, (uint16_t)chunk);
         off += chunk;

@@ -382,8 +382,12 @@ oom:
     panic_halt("[VMM] FAIL: out of memory in vmm_map_page");
 }
 
-void
-vmm_unmap_page(uint64_t virt)
+/* unmap_page_inner — clear the PTE + local invlpg; returns 1 if a present
+ * mapping was removed.  The cross-CPU shootdown is the caller's job (either
+ * per-page via vmm_unmap_page, or ONE ranged shootdown for a batch via
+ * vmm_unmap_page_noshoot — see kva_free_pages). */
+static int
+unmap_page_inner(uint64_t virt)
 {
     if (virt & ~VMM_PAGE_MASK) {
         printk("[VMM] FAIL: vmm_unmap_page virt not aligned\n");
@@ -450,7 +454,12 @@ vmm_unmap_page(uint64_t virt)
     arch_vmm_invlpg(virt);
 
     spin_unlock_irqrestore(&vmm_window_lock, fl);
+    return did_unmap;
+}
 
+void
+vmm_unmap_page(uint64_t virt)
+{
     /* Cross-CPU TLB shootdown for the kernel (KVA) range.  KVA lives in the
      * shared higher-half mapping present in EVERY address space, so other
      * CPUs that touched this VA still hold stale entries after the local
@@ -460,8 +469,14 @@ vmm_unmap_page(uint64_t virt)
      * concurrent-startup image-corruption bug).  Use TLB_TARGET_ALL because
      * the range is global, not bound to one pml4.  Called after releasing
      * vmm_window_lock (shootdown deadlock rule). */
-    if (did_unmap)
+    if (unmap_page_inner(virt))
         tlb_shootdown_kernel(virt, virt + VMM_PAGE_SIZE);
+}
+
+void
+vmm_unmap_page_noshoot(uint64_t virt)
+{
+    unmap_page_inner(virt);
 }
 
 uint64_t

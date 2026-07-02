@@ -4,6 +4,7 @@
 #include "printk.h"
 #include "arch.h"
 #include "spinlock.h"
+#include "tlb.h"
 #include "fb.h"
 #include "../lib/va_freelist.h"
 #include <stdint.h>
@@ -213,12 +214,16 @@ kva_free_pages(void *va, uint64_t n)
 {
     uint64_t addr = (uint64_t)(uintptr_t)va;
     uint64_t i;
+    /* Clear all PTEs first, then ONE ranged cross-CPU shootdown — the old
+     * per-page vmm_unmap_page broadcast an IPI + ack spin per page, so a
+     * 14-page task teardown cost 14 shootdowns. */
     for (i = 0; i < n; i++) {
         uint64_t page_va = addr + i * 4096UL;
         uint64_t phys    = vmm_phys_of(page_va);
-        vmm_unmap_page(page_va);
+        vmm_unmap_page_noshoot(page_va);
         pmm_free_page(phys);
     }
+    tlb_shootdown_kernel(addr, addr + n * 4096UL);
 
     /* Return VA range to freelist for reuse */
     irqflags_t fl = spin_lock_irqsave(&kva_lock);
@@ -232,11 +237,11 @@ kva_unmap_keep_frames(void *va, uint64_t n)
     uint64_t addr = (uint64_t)(uintptr_t)va;
     uint64_t i;
     /* Clear the kva PTEs but DO NOT pmm_free_page — the frames' ownership has
-     * been transferred to another mapping (see the header). vmm_unmap_page only
-     * clears the PTE (and does the cross-CPU kernel-VA shootdown); it never
-     * frees the frame. */
+     * been transferred to another mapping (see the header).  Batch the
+     * cross-CPU shootdown into one ranged call, as in kva_free_pages. */
     for (i = 0; i < n; i++)
-        vmm_unmap_page(addr + i * 4096UL);
+        vmm_unmap_page_noshoot(addr + i * 4096UL);
+    tlb_shootdown_kernel(addr, addr + n * 4096UL);
 
     /* Reclaim the VA range for reuse. */
     irqflags_t fl = spin_lock_irqsave(&kva_lock);

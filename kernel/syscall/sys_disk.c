@@ -105,9 +105,12 @@ sys_blkdev_io(uint64_t arg1, uint64_t arg2, uint64_t arg3,
     if (count > dev->block_count || lba > dev->block_count - count)
         return SYS_ERR(EINVAL);
 
-    /* Transfer one native LBA at a time using a kernel bounce buffer.
-     * Chunk clamped so chunk * block_size <= sizeof(s_bounce). */
-    static uint8_t s_bounce[4096];
+    /* Transfer via a kernel bounce buffer.  Chunk clamped so
+     * chunk * block_size <= sizeof(s_bounce).  64 KiB per chunk: the NVMe
+     * driver now takes multi-page PRP transfers, so the installer's whole-
+     * disk copy issues 16x fewer syscall→NVMe round-trips than the old
+     * one-page bounce. */
+    static uint8_t s_bounce[65536];
     static spinlock_t blkdev_io_lock = SPINLOCK_INIT;
     irqflags_t io_fl = spin_lock_irqsave(&blkdev_io_lock);
     uint32_t bs = dev->block_size ? dev->block_size : 512u;

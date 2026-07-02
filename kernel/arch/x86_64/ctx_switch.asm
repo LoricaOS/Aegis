@@ -46,6 +46,12 @@ extern g_use_xsave
 ; offsetof(aegis_task_t, on_cpu) — enforced by a _Static_assert in sched.c.
 ON_CPU_OFF equ 8
 
+; Byte offset of aegis_task_t.is_user (kernel/sched/sched.h).  MUST equal
+; offsetof(aegis_task_t, is_user) — enforced by a _Static_assert in sched.c.
+; Kernel tasks (is_user == 0) never execute FPU/SSE instructions (the kernel
+; is -mno-sse), so their save/restore of the 512-1024 byte area is skipped.
+IS_USER_OFF equ 1108
+
 global ctx_switch
 ctx_switch:
     ; Save outgoing task's callee-saved registers
@@ -61,15 +67,32 @@ ctx_switch:
     ; enabled, else legacy FXSAVE/FXRSTOR (XMM0-15+MXCSR+x87, no YMM). rax/rdx
     ; are caller-saved so free to clobber here; rdi/rsi are untouched.
     ; CR4.OSFXSR (+OSXSAVE/XCR0 when g_use_xsave) set by arch_sse_init().
+    ;
+    ; Kernel tasks are skipped on both sides: a kernel task never executes
+    ; FPU/SSE code (-mno-sse), so on switch-out the live FPU state is not its
+    ; own (its user predecessor already saved on ITS switch-out), and on
+    ; switch-in it has nothing to restore — the next user task's xrstor
+    ; overwrites the register file anyway.
+    cmp     byte [rdi + IS_USER_OFF], 0
+    je      .fpu_restore_check              ; kernel outgoing: nothing to save
     cmp     byte [rel g_use_xsave], 0
-    je      .fpu_fxsave
+    je      .fpu_save_fx
     mov     eax, 7
     xor     edx, edx
     xsave   [rdi + FPU_STATE_OFF]
+    jmp     .fpu_restore_check
+.fpu_save_fx:
+    fxsave  [rdi + FPU_STATE_OFF]
+.fpu_restore_check:
+    cmp     byte [rsi + IS_USER_OFF], 0
+    je      .fpu_done                       ; kernel incoming: nothing to restore
+    cmp     byte [rel g_use_xsave], 0
+    je      .fpu_restore_fx
+    mov     eax, 7
+    xor     edx, edx
     xrstor  [rsi + FPU_STATE_OFF]
     jmp     .fpu_done
-.fpu_fxsave:
-    fxsave  [rdi + FPU_STATE_OFF]
+.fpu_restore_fx:
     fxrstor [rsi + FPU_STATE_OFF]
 .fpu_done:
 
