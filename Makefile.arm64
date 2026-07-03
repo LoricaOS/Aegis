@@ -106,7 +106,7 @@ C_OBJS   = $(patsubst kernel/%.c,$(BUILD)/%.o,$(ARCH_SRCS) $(SHARED_SRCS))
 ASM_OBJS = $(patsubst kernel/%.S,$(BUILD)/%.o,$(ARCH_ASMS))
 ALL_OBJS = $(ASM_OBJS) $(C_OBJS)
 
-.PHONY: all iso test clean
+.PHONY: all iso test test-disk clean dist version
 all: $(BUILD)/aegis-arm64.elf
 
 -include $(C_OBJS:.o=.d)
@@ -202,3 +202,13 @@ test-disk: iso $(BUILD)/vblk-test.img
 
 clean:
 	rm -rf $(BUILD)
+
+# Release artifact — the stripped arm64 kernel the OS fetches (published as
+# aegis-arm64.elf on the GitHub release; cf. x86 `make dist` → aegis.elf).
+dist: $(KERNEL_STRIPPED)
+	@mkdir -p $(BUILD)/dist
+	cp $(KERNEL_STRIPPED) $(BUILD)/dist/aegis-arm64-$(AEGIS_VERSION).elf
+	@echo "release artifact: $(BUILD)/dist/aegis-arm64-$(AEGIS_VERSION).elf"
+
+version:
+	@echo $(AEGIS_VERSION)
