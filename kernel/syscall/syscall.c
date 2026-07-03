@@ -76,7 +76,10 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 233: num = 95;  break;  /* umask */
     case 260: num = 61;  break;  /* wait4 → waitpid */
     case 261: num = 62;  break;  /* kill */
-    case 281: num = 293; break;  /* pipe2 */
+    case  59: num = 293; break;  /* pipe2 (aarch64 __NR_pipe2 == 59; was wrongly
+                                  * 281 — so real pipe2 calls fell through to
+                                  * internal 59 = execve and returned EFAULT,
+                                  * breaking every shell pipeline) */
     case 291: num = 158; break;  /* arch_prctl */
     /* Directory */
     case  34: num = 83; arg1 = arg2; arg2 = arg3; break; /* mkdirat → mkdir (skip dirfd) */
