@@ -27,6 +27,7 @@
 #include "gpt.h"
 #include "pcie.h"
 #include "virtio.h"   /* virtio_blk_init */
+#include "virtio_gpu.h"
 #include "fb.h"
 #include "ramdisk.h"
 #include "ip.h"
@@ -89,6 +90,7 @@ kernel_main_limine(const aegis_bootinfo_t *bi)
     pcie_init();              /* ECAM enumerate — [PCIE] OK or skip     */
     virtio_blk_init();        /* virtio-blk disk → vblk0 (poll mode)    */
     virtio_input_init();      /* virtio keyboard + mouse (desktop input) */
+    virtio_gpu_init();        /* virtio-gpu scanout → compositor fb      */
 
     /* Boot modules → RAM blkdevs (rootfs, optional ESP image). */
     {
