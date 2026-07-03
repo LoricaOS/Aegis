@@ -128,7 +128,8 @@ kernel_main_limine(const aegis_bootinfo_t *bi)
     cap_anchor_audit();
     poll_test();
 
-    net_init();               /* loopback + TCP (no NIC driver yet)     */
+    virtio_net_init();        /* virtio-net NIC → eth0 (poll mode)      */
+    net_init();               /* loopback + TCP + eth0 stack            */
 
     smp_start_aps();          /* PSCI CPU_ON secondary cores — [SMP] OK  */
     sched_init();
