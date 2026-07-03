@@ -393,11 +393,11 @@ sys_execve(syscall_frame_t *frame,
      * + envc (envp pointers)
      * + 1 (envp NULL)
      * + auxv pairs × 2 qwords each:
-     *     6 base: PHDR, PHNUM, PAGESZ, ENTRY, RANDOM, NULL
-     *   + 2 if interp: AT_BASE, AT_PHENT
+     *     7 base: PHDR, PHNUM, PAGESZ, ENTRY, RANDOM, PHENT, NULL
+     *   + 1 if interp: AT_BASE
      */
     {
-    uint64_t auxv_qwords = has_interp ? 16 : 12;
+    uint64_t auxv_qwords = has_interp ? 16 : 14;
     uint64_t table_qwords = (uint64_t)(argc2) + (uint64_t)envc + 3 + auxv_qwords;
     uint64_t table_bytes  = table_qwords * 8ULL;
 
@@ -484,13 +484,20 @@ sys_execve(syscall_frame_t *frame,
             { sched_exit(); __builtin_unreachable(); }
         wp += 8;
 
+        /* auxv: AT_PHENT (4) — program header entry size. MUST be present for
+         * every binary: musl's __init_tls strides the phdr table with
+         * `p += aux[AT_PHENT]`, so a missing/zero AT_PHENT makes it walk garbage
+         * and mis-size the initial TLS (TP lands in an unmapped gap → the first
+         * TLS deref, e.g. errno in free(), faults). Was previously emitted only
+         * for interp binaries, so every static binary that touched TLS crashed
+         * on arm64. */
+        vmm_write_user_u64(proc->pml4_phys, wp, 4ULL);  wp += 8;
+        vmm_write_user_u64(proc->pml4_phys, wp, 56ULL); wp += 8;
+
         if (has_interp) {
             /* auxv: AT_BASE (7) — interpreter load address */
             vmm_write_user_u64(proc->pml4_phys, wp, 7ULL); wp += 8;
             vmm_write_user_u64(proc->pml4_phys, wp, INTERP_BASE); wp += 8;
-            /* auxv: AT_PHENT (4) — program header entry size */
-            vmm_write_user_u64(proc->pml4_phys, wp, 4ULL); wp += 8;
-            vmm_write_user_u64(proc->pml4_phys, wp, 56ULL); wp += 8;
         }
 
         /* auxv: AT_NULL (end sentinel) */
