@@ -212,26 +212,29 @@ const vfs_ops_t g_unix_sock_ops = {
 
 int unix_sock_alloc(void)
 {
+    /* Any ring freed here is freed AFTER dropping unix_lock: kva_free_pages
+     * issues a cross-CPU TLB shootdown, and a CPU spinning for unix_lock with
+     * IRQs disabled (e.g. unix_sock_read) can't ACK the shootdown IPI — doing
+     * the free under the lock deadlocks the whole machine. */
+    void *orphan = (void *)0;
+    int ret = -1;
     irqflags_t fl = spin_lock_irqsave(&unix_lock);
     for (int i = 0; i < UNIX_SOCK_MAX; i++) {
         if (!s_unix[i].in_use) {
-            /* Free orphaned ring from previous connection */
-            if (s_unix[i].ring) {
-                kva_free_pages(s_unix[i].ring, 1);
-                s_unix[i].ring = (void *)0;
-            }
+            orphan = s_unix[i].ring;   /* orphaned ring from a prior connection */
             kmemset(&s_unix[i], 0, sizeof(unix_sock_t));
             s_unix[i].in_use   = 1;
             s_unix[i].state    = UNIX_CREATED;
             s_unix[i].peer_id  = UNIX_NONE;
             refcount_init(&s_unix[i].refcount, 1);
             waitq_init(&s_unix[i].poll_waiters);
-            spin_unlock_irqrestore(&unix_lock, fl);
-            return i;
+            ret = i;
+            break;
         }
     }
     spin_unlock_irqrestore(&unix_lock, fl);
-    return -1;
+    if (orphan) kva_free_pages(orphan, 1);
+    return ret;
 }
 
 unix_sock_t *unix_sock_get(uint32_t id)
@@ -346,20 +349,21 @@ void unix_sock_free(uint32_t id)
     }
 
     /* Peer gone (never connected) or lingering in UNIX_CLOSED: fully
-     * release this slot, the peer's lingering slot, and both rings. */
-    if (us->ring) {
-        kva_free_pages(us->ring, 1);
-        us->ring = (void *)0;
-    }
+     * release this slot, the peer's lingering slot, and both rings. Detach the
+     * rings under the lock but free them AFTER unlocking — kva_free_pages does
+     * a TLB shootdown, which must never run while holding unix_lock (a CPU
+     * spinning for unix_lock with IRQs off can't ACK the IPI → deadlock). */
+    void *free_a = us->ring, *free_b = (void *)0;
+    us->ring = (void *)0;
     if (p && p->state == UNIX_CLOSED) {
-        if (p->ring) {
-            kva_free_pages(p->ring, 1);
-            p->ring = (void *)0;
-        }
+        free_b = p->ring;
+        p->ring = (void *)0;
         p->in_use = 0;
     }
     us->in_use = 0;
     spin_unlock_irqrestore(&unix_lock, fl);
+    if (free_a) kva_free_pages(free_a, 1);
+    if (free_b) kva_free_pages(free_b, 1);
 }
 
 /* unix_sock_wake: wake everything blocked on this socket — blocking accept/
@@ -451,13 +455,10 @@ int unix_sock_connect(uint32_t id, const char *path)
 
     /* Allocate server-side socket */
     int server_id = -1;
+    void *orphan = (void *)0;   /* prior connection's ring; freed after unlock */
     for (int i = 0; i < UNIX_SOCK_MAX; i++) {
         if (!s_unix[i].in_use) {
-            /* Free orphaned ring from previous connection if present */
-            if (s_unix[i].ring) {
-                kva_free_pages(s_unix[i].ring, 1);
-                s_unix[i].ring = (void *)0;
-            }
+            orphan = s_unix[i].ring;
             kmemset(&s_unix[i], 0, sizeof(unix_sock_t));
             s_unix[i].in_use   = 1;
             s_unix[i].state    = UNIX_CONNECTED;
@@ -478,6 +479,9 @@ int unix_sock_connect(uint32_t id, const char *path)
      * it — the server slot is already reserved (in_use=1) so it can't be
      * stolen. */
     spin_unlock_irqrestore(&unix_lock, fl);
+    /* Free the orphaned ring now that the lock is dropped (TLB shootdown must
+     * not run under unix_lock — see unix_sock_alloc). */
+    if (orphan) kva_free_pages(orphan, 1);
     uint8_t *ring_a = (uint8_t *)kva_alloc_pages(1);  /* client→server */
     uint8_t *ring_b = (uint8_t *)kva_alloc_pages(1);  /* server→client */
     fl = spin_lock_irqsave(&unix_lock);
@@ -503,11 +507,13 @@ int unix_sock_connect(uint32_t id, const char *path)
     else if (!ring_a || !ring_b)
         fail = -12;                                   /* ENOMEM */
     if (fail) {
-        if (ring_a) kva_free_pages(ring_a, 1);
-        if (ring_b) kva_free_pages(ring_b, 1);
         s_unix[server_id].ring   = (void *)0;
         s_unix[server_id].in_use = 0;  /* release the reserved slot */
         spin_unlock_irqrestore(&unix_lock, fl);
+        /* Free the rings after unlocking (TLB shootdown — never under
+         * unix_lock; see unix_sock_alloc). */
+        if (ring_a) kva_free_pages(ring_a, 1);
+        if (ring_b) kva_free_pages(ring_b, 1);
         return fail;
     }
 
