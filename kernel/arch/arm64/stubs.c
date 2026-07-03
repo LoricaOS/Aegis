@@ -36,15 +36,14 @@ print_backtrace_from(uint64_t fp, int max)
 /* ── pvpanic (kernel/drivers/panic_screen.c) — QEMU x86 ISA device ─────── */
 void pvpanic_signal_panic(void) {}
 
-/* ── /dev/mouse (kernel/fs/initrd.c) — no pointer device on arm64 v1 ───── */
-waitq_t g_mouse_waiters = WAITQ_INIT;
-
-int
-mouse_poll(mouse_event_t *out)
-{
-    (void)out;
-    return 0;
-}
+/* /dev/mouse is real on arm64 now: usb_mouse.c provides g_mouse_waiters,
+ * mouse_poll and mouse_inject_scroll, fed by virtio-input (virtio_input.c).
+ * (The old no-pointer stubs lived here.)
+ *
+ * virtio_input.c feeds keyboard chars via kbd_usb_inject (the x86 name); on
+ * arm64 the keyboard ring is fed by kbd_inject — bridge the two. */
+extern void kbd_inject(char c);
+void kbd_usb_inject(uint8_t ascii) { kbd_inject((char)ascii); }
 
 /* ── virtio-gpu (kernel/syscall/sys_disk.c fb syscalls) — not ported ───── */
 int virtio_gpu_active(void) { return 0; }

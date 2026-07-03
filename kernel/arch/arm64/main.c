@@ -88,6 +88,7 @@ kernel_main_limine(const aegis_bootinfo_t *bi)
     random_init();
     pcie_init();              /* ECAM enumerate — [PCIE] OK or skip     */
     virtio_blk_init();        /* virtio-blk disk → vblk0 (poll mode)    */
+    virtio_input_init();      /* virtio keyboard + mouse (desktop input) */
 
     /* Boot modules → RAM blkdevs (rootfs, optional ESP image). */
     {

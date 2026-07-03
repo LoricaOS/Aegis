@@ -128,6 +128,8 @@ typedef struct virtq_buf {
  * *out. Returns 0 on success, -1 if not found / un-mappable. Leaves the device
  * in RESET; caller drives negotiate → setup_queue → driver_ok. */
 int  virtio_pci_find(uint16_t modern_id, uint16_t legacy_id, virtio_dev_t *out);
+int  virtio_pci_find_nth(uint16_t modern_id, uint16_t legacy_id, int skip,
+                         virtio_dev_t *out);
 
 /* RESET → ACKNOWLEDGE → DRIVER. */
 void virtio_reset(virtio_dev_t *d);
