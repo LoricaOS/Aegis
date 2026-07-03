@@ -105,18 +105,25 @@ walk_caps(const pcie_device_t *d,
     }
 }
 
-/* ── virtio_pci_find ─────────────────────────────────────────────────────── */
+/* ── virtio_pci_find[_nth] ───────────────────────────────────────────────── */
+/* Find the (skip+1)-th matching virtio device — skip=0 is the first, as
+ * virtio_pci_find. Lets a driver claim several identical devices (e.g. the
+ * separate virtio-keyboard + virtio-mouse input devices QEMU exposes). */
 int
-virtio_pci_find(uint16_t modern_id, uint16_t legacy_id, virtio_dev_t *out)
+virtio_pci_find_nth(uint16_t modern_id, uint16_t legacy_id, int skip,
+                    virtio_dev_t *out)
 {
     const pcie_device_t *found = NULL;
     int count = pcie_device_count();
+    int seen = 0;
     int i;
     for (i = 0; i < count; i++) {
         const pcie_device_t *d = &pcie_get_devices()[i];
         if (d->vendor_id == VIRTIO_VENDOR_ID &&
             (d->device_id == modern_id ||
              (legacy_id != 0 && d->device_id == legacy_id))) {
+            if (seen++ < skip)
+                continue;
             found = d;
             break;
         }
@@ -157,6 +164,12 @@ virtio_pci_find(uint16_t modern_id, uint16_t legacy_id, virtio_dev_t *out)
     out->devcfg          = (volatile uint8_t *)device_va;
     out->features        = 0;
     return 0;
+}
+
+int
+virtio_pci_find(uint16_t modern_id, uint16_t legacy_id, virtio_dev_t *out)
+{
+    return virtio_pci_find_nth(modern_id, legacy_id, 0, out);
 }
 
 /* ── status handshake ────────────────────────────────────────────────────── */

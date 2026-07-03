@@ -6,9 +6,13 @@
 #include "ip.h"
 #include "tcp.h"
 
+void virtio_input_poll(void);
+
 void
 poll_sources_init(void)
 {
     poll_source_register(ip_loopback_poll, POLL_PRIO_LOOPBACK,  "ip_loopback");
     poll_source_register(tcp_tick,         POLL_PRIO_TCP_TIMER, "tcp_tick");
+    /* virtio-input (keyboard + mouse) — drained each tick, like x86. */
+    poll_source_register(virtio_input_poll, POLL_PRIO_VIRTIO_MISC, "virtio_input");
 }

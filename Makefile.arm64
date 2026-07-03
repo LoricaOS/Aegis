@@ -82,7 +82,8 @@ SHARED_SRCS = \
     kernel/fs/memfd.c kernel/fs/eventfd.c kernel/fs/poll_test.c \
     kernel/drivers/fb.c kernel/drivers/ramdisk.c \
     kernel/drivers/virtio_pci.c kernel/drivers/virtqueue.c \
-    kernel/drivers/virtio_blk.c \
+    kernel/drivers/virtio_blk.c kernel/drivers/virtio_input.c \
+    kernel/drivers/usb_mouse.c \
     kernel/net/netdev.c kernel/net/eth.c kernel/net/ip.c \
     kernel/net/udp.c kernel/net/tcp.c kernel/net/socket.c \
     kernel/net/unix_socket.c kernel/net/epoll.c \
