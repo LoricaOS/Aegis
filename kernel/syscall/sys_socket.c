@@ -1308,6 +1308,33 @@ sys_getsockopt(uint64_t fd, uint64_t level, uint64_t optname,
     return 0;
 }
 
+/* ── sys_ppoll ─────────────────────────────────────────────────────────── */
+/* aarch64 (and other generic-ABI arches) have NO poll(2) syscall — musl's
+ * poll() wrapper issues ppoll(fds, nfds, timespec*, sigmask, sigsetsize).
+ * Without this every poll() returned ENOSYS on arm64, so e.g. Lumen's event
+ * loop never saw its listen socket become readable and never accepted GUI
+ * clients (the dock/apps hung in connect()). Convert the timespec to a
+ * millisecond timeout and delegate to sys_poll; the signal mask is ignored
+ * (poll() callers pass none, and v1 has no poll-with-sigmask semantics). */
+uint64_t
+sys_ppoll(uint64_t fds_ptr, uint64_t nfds, uint64_t ts_ptr,
+          uint64_t sigmask, uint64_t sigsetsize)
+{
+    (void)sigmask; (void)sigsetsize;
+    uint64_t timeout_ms;
+    if (ts_ptr == 0) {
+        timeout_ms = (uint64_t)-1;    /* NULL timespec → block indefinitely */
+    } else {
+        struct { int64_t tv_sec; int64_t tv_nsec; } ts;
+        if (copy_from_user(&ts, (const void *)(uintptr_t)ts_ptr, sizeof(ts)) != 0)
+            return SYS_ERR(EFAULT);
+        int64_t ms = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+        if (ms < 0) ms = 0;
+        timeout_ms = (uint64_t)ms;
+    }
+    return sys_poll(fds_ptr, nfds, timeout_ms);
+}
+
 /* ── sys_poll ──────────────────────────────────────────────────────────── */
 
 /* struct pollfd layout (Linux ABI) */

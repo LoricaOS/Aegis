@@ -26,7 +26,9 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case  25: num = 72;  break;  /* fcntl */
     case  29: num = 16;  break;  /* ioctl */
     case  35: num = 87; arg1 = arg2; break;  /* unlinkat → unlink (skip dirfd) */
-    case  46: num = 5;   break;  /* ftruncate → fstat (stub) */
+    case  46: num = 77;  break;  /* ftruncate — real (was stubbed to fstat, so
+                                  * memfds never got sized: Lumen's client surface
+                                  * mmap then failed → GUI clients got EIO) */
     case  48: num = 21; arg1 = arg2; arg2 = arg3; break; /* faccessat → access (skip dirfd) */
     case  49: num = 80;  break;  /* chdir */
     case  56: num = 257; break;  /* openat */
@@ -36,6 +38,7 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case  63: num = 0;   break;  /* read */
     case  64: num = 1;   break;  /* write */
     case  66: num = 20;  break;  /* writev */
+    case  73: num = 271; break;  /* ppoll (aarch64 has no poll; musl poll()→ppoll) */
     case  36: num = 88; arg1 = arg2; arg2 = arg3; break;  /* symlinkat → symlink (skip dirfd) */
     case  78: num = 89; arg1 = arg2; arg2 = arg3; arg3 = arg4; break;  /* readlinkat → readlink (skip dirfd) */
     case  53: num = 90; arg1 = arg2; arg2 = arg3; break;  /* fchmodat → chmod (skip dirfd+flags) */
@@ -106,7 +109,10 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 208: num = 54;  break;  /* setsockopt */
     case 209: num = 55;  break;  /* getsockopt */
     case 210: num = 48;  break;  /* shutdown */
+    case 211: num = 46;  break;  /* sendmsg — SCM_RIGHTS fd passing (Lumen surfaces) */
+    case 212: num = 47;  break;  /* recvmsg — SCM_RIGHTS fd passing (Lumen surfaces) */
     case 278: num = 318; break;  /* getrandom */
+    case 279: num = 319; break;  /* memfd_create — GUI client surfaces (Lumen) */
     case  98: num = 202; break;  /* futex */
     /* Unrecognized numbers fall through — dispatch returns ENOSYS */
     }
@@ -229,6 +235,7 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case  54: return sys_setsockopt(arg1, arg2, arg3, arg4, arg5);
     case  55: return sys_getsockopt(arg1, arg2, arg3, arg4, arg5);
     case   7: return sys_poll(arg1, arg2, arg3);
+    case 271: return sys_ppoll(arg1, arg2, arg3, arg4, arg5);
     case  23: return sys_select(arg1, arg2, arg3, arg4, arg5);
     case 291: return sys_epoll_create1(arg1);
     case 233: return sys_epoll_ctl(arg1, arg2, arg3, arg4);
