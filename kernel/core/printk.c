@@ -231,6 +231,16 @@ printk(const char *fmt, ...)
             break;
         }
 
+        case 'i':
+        case 'd': {
+            int v = va_arg(ap, int);
+            uint64_t u = (uint64_t)v;
+            if (v < 0) { emit_char('-'); u = -(uint64_t)v; }
+            const char *p = fmt_uint64(u, 10, numbuf, (int)sizeof(numbuf));
+            emit_string(p);
+            break;
+        }
+
         case 'x': {
             uint32_t v = va_arg(ap, uint32_t);
             const char *p = fmt_uint64((uint64_t)v, 16, numbuf, (int)sizeof(numbuf));
@@ -244,6 +254,12 @@ printk(const char *fmt, ...)
             if (*fmt == 'u') {
                 uint64_t v = va_arg(ap, uint64_t);
                 const char *p = fmt_uint64(v, 10, numbuf, (int)sizeof(numbuf));
+                emit_string(p);
+            } else if (*fmt == 'd') {
+                int64_t v = va_arg(ap, int64_t);
+                uint64_t u = (uint64_t)v;
+                if (v < 0) { emit_char('-'); u = -(uint64_t)v; }
+                const char *p = fmt_uint64(u, 10, numbuf, (int)sizeof(numbuf));
                 emit_string(p);
             } else if (*fmt == 'x') {
                 uint64_t v = va_arg(ap, uint64_t);

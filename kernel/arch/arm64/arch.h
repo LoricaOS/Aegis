@@ -175,11 +175,26 @@ void arch_set_master_pml4(uint64_t pml4_phys);
  * to EL0. Referenced by proc.c / sys_process.c frame builders. */
 void proc_enter_user(void);
 
-/* TLS base: TPIDR_EL0 (the aarch64 equivalent of IA32_FS_BASE). */
+/* TLS base (TPIDR_EL0, the aarch64 IA32_FS_BASE analogue): a NO-OP on arm64.
+ *
+ * TPIDR_EL0 is owned solely by ctx_switch.S, which snapshots the LIVE outgoing
+ * register into task.fs_base and restores the incoming task's on every switch.
+ * That save-on-switch-out is mandatory on arm64 because musl writes TPIDR_EL0
+ * directly from EL0 (no syscall), so the kernel only learns a task's TLS base
+ * by reading the register when it switches away.
+ *
+ * The generic scheduler calls arch_set_fs_base(next->fs_base) *before*
+ * ctx_switch to load the incoming task's base — correct on x86 (whose
+ * ctx_switch.asm doesn't touch fs_base, and which tracks it via arch_prctl).
+ * On arm64 that write would clobber the still-running OUTGOING task's live
+ * TPIDR_EL0 an instant before ctx_switch.S snapshots it, corrupting the
+ * outgoing task's saved base with the incoming task's (observed: login's TLS
+ * base reverted to init's, so errno/free faulted). Doing nothing here leaves
+ * ctx_switch.S as the single owner. */
 static inline void
 arch_set_fs_base(uint64_t addr)
 {
-    __asm__ volatile("msr tpidr_el0, %0" : : "r"(addr));
+    (void)addr;
 }
 
 /* SMAP-equivalent stubs. arm64 v1 runs with PAN disabled so plain
