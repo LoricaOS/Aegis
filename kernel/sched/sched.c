@@ -49,6 +49,9 @@ _Static_assert(offsetof(aegis_task_t, fpu_state) == 16,
     "fpu_state must be at offset 16 — FPU_OFF in ctx_switch.S");
 _Static_assert(sizeof(((aegis_task_t *)0)->fpu_state) == 528,
     "fpu_state must be 528 bytes (V0-31 + FPSR/FPCR)");
+/* ctx_switch.S saves/restores TPIDR_EL0 (userland TLS base) at FS_BASE_OFF. */
+_Static_assert(offsetof(aegis_task_t, fs_base) == 592,
+    "fs_base must be at offset 592 — FS_BASE_OFF in ctx_switch.S");
 #endif
 
 /* 16KB per task; values single-sourced in limits.h (shared with proc.c). */
