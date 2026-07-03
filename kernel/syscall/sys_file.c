@@ -318,6 +318,52 @@ sys_chdir(uint64_t path_ptr)
     return 0;
 }
 
+/* On aarch64 musl's `struct kstat` (arch/aarch64/kstat.h) orders the header
+ * fields differently from x86-64: st_mode(16)/st_nlink(20) instead of
+ * st_nlink(16)/st_mode(24), no 32-bit __pad0, and uid/gid/rdev shifted up.
+ * k_stat_t matches the x86-64 layout (what x86 musl reads directly), so the
+ * stat syscalls must repack into the aarch64 layout before copying out —
+ * otherwise ls -l shows shuffled fields and stat/find deref the garbage and
+ * crash. Fields from st_size onward are identical in both layouts. */
+#ifdef __aarch64__
+struct kstat_arm64 {
+    uint64_t st_dev, st_ino;
+    uint32_t st_mode, st_nlink, st_uid, st_gid;
+    uint64_t st_rdev, __pad;
+    int64_t  st_size;
+    int32_t  st_blksize, __pad2;
+    int64_t  st_blocks;
+    int64_t  st_atime, st_atime_nsec, st_mtime, st_mtime_nsec, st_ctime, st_ctime_nsec;
+    uint32_t __unused[2];
+};
+#endif
+
+/* emit_stat — copy k_stat_t out to the user's struct stat, repacked to the
+ * per-arch layout musl expects. Returns 0 or SYS_ERR(EFAULT). */
+static uint64_t
+emit_stat(uint64_t uptr, const k_stat_t *ks)
+{
+#ifdef __aarch64__
+    struct kstat_arm64 a;
+    __builtin_memset(&a, 0, sizeof(a));
+    a.st_dev = ks->st_dev; a.st_ino = ks->st_ino;
+    a.st_mode = ks->st_mode; a.st_nlink = (uint32_t)ks->st_nlink;
+    a.st_uid = ks->st_uid; a.st_gid = ks->st_gid; a.st_rdev = ks->st_rdev;
+    a.st_size = ks->st_size; a.st_blksize = (int32_t)ks->st_blksize;
+    a.st_blocks = ks->st_blocks;
+    a.st_atime = ks->st_atime; a.st_atime_nsec = ks->st_atime_nsec;
+    a.st_mtime = ks->st_mtime; a.st_mtime_nsec = ks->st_mtime_nsec;
+    a.st_ctime = ks->st_ctime; a.st_ctime_nsec = ks->st_ctime_nsec;
+    if (copy_to_user((void *)(uintptr_t)uptr, &a, sizeof(a)) != 0)
+        return SYS_ERR(EFAULT);
+    return 0;
+#else
+    if (copy_to_user((void *)(uintptr_t)uptr, ks, sizeof(*ks)) != 0)
+        return SYS_ERR(EFAULT);
+    return 0;
+#endif
+}
+
 /*
  * sys_stat — syscall 4
  * arg1 = user pointer to path string (null-terminated, max 256 bytes)
@@ -334,8 +380,7 @@ sys_stat(uint64_t arg1, uint64_t arg2)
     int rc = vfs_stat_path(path, &ks);
     if (rc != 0) return SYS_ERR(ENOENT);
 
-    COPY_TO_USER(arg2, &ks);
-    return 0;
+    return emit_stat(arg2, &ks);
 }
 
 /*
@@ -364,8 +409,7 @@ sys_fstat(uint64_t arg1, uint64_t arg2)
         ks.st_nlink = 1;
     }
 
-    COPY_TO_USER(arg2, &ks);
-    return 0;
+    return emit_stat(arg2, &ks);
 }
 
 /*
