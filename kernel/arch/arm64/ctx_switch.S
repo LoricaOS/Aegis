@@ -21,7 +21,12 @@
  * ctx_switch.asm comment for the full SMP hazard analysis).
  */
 
-.set FPU_OFF, 16    /* offsetof(aegis_task_t, fpu_state) — _Static_assert in sched.c */
+.set FPU_OFF, 16       /* offsetof(aegis_task_t, fpu_state) — _Static_assert in sched.c */
+.set FS_BASE_OFF, 592  /* offsetof(aegis_task_t, fs_base) — _Static_assert in sched.c.
+                        * TPIDR_EL0 is the userland TLS base; musl sets it directly
+                        * (userland can write TPIDR_EL0), so the kernel must save/
+                        * restore it per-task across switches or musl's TLS (errno,
+                        * TCB) faults once >1 musl process is scheduled. */
 
 .section .text
 .global ctx_switch
@@ -57,6 +62,10 @@ ctx_switch:
     str w3, [x2, #512]
     str w4, [x2, #516]
 
+    /* Save outgoing TPIDR_EL0 (userland TLS base — userland may have set it). */
+    mrs x3, tpidr_el0
+    str x3, [x0, #FS_BASE_OFF]
+
     mov x2, sp
     str x2, [x0]                // outgoing->sp = sp
     ldr x2, [x1]
@@ -87,6 +96,10 @@ ctx_switch:
     ldr w4, [x2, #516]
     msr fpsr, x3
     msr fpcr, x4
+
+    /* Restore incoming TPIDR_EL0 (userland TLS base). */
+    ldr x3, [x1, #FS_BASE_OFF]
+    msr tpidr_el0, x3
 
     ldp x29, x30, [sp], #16
     ldp x27, x28, [sp], #16
