@@ -40,7 +40,13 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case  78: num = 89; arg1 = arg2; arg2 = arg3; arg3 = arg4; break;  /* readlinkat → readlink (skip dirfd) */
     case  53: num = 90; arg1 = arg2; arg2 = arg3; break;  /* fchmodat → chmod (skip dirfd+flags) */
     case  54: num = 92; arg1 = arg2; arg2 = arg3; arg3 = arg4; break;  /* fchownat → chown (skip dirfd+flags) */
-    case  79: num = 5;   break;  /* fstatat → fstat (approx) */
+    case  79: num = 4; arg1 = arg2; arg2 = arg3; break;
+                                 /* newfstatat(dirfd,path,statbuf,flags) → stat(path,statbuf).
+                                  * musl's stat family (fstatat_kstat) uses this for path-based
+                                  * stat on aarch64 (no legacy stat/lstat there). dirfd assumed
+                                  * AT_FDCWD/absolute; flags (incl SYMLINK_NOFOLLOW) dropped —
+                                  * lstat thus follows, acceptable v1. Was wrongly num=5 (fstat)
+                                  * with unshifted args, so ls -l/stat returned garbage/EBADF. */
     case  80: num = 5;   break;  /* fstat */
     case  82: num = 162; break;  /* fsync → sync */
     /* Process */
@@ -80,7 +86,11 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
                                   * 281 — so real pipe2 calls fell through to
                                   * internal 59 = execve and returned EFAULT,
                                   * breaking every shell pipeline) */
-    case 291: num = 158; break;  /* arch_prctl */
+    case 291: num = 0x7fffffff; break;
+                                 /* statx: aarch64 __NR_statx == 291 (NOT arch_prctl, which
+                                  * doesn't exist on aarch64). Force an unhandled number so
+                                  * dispatch returns ENOSYS and musl falls back to
+                                  * newfstatat/fstat above. Was wrongly → arch_prctl(158). */
     /* Directory */
     case  34: num = 83; arg1 = arg2; arg2 = arg3; break; /* mkdirat → mkdir (skip dirfd) */
     case  38: num = 82; arg1 = arg2; arg2 = arg4; break; /* renameat2 → rename (skip dirfds) */
