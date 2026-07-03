@@ -45,13 +45,7 @@ void pvpanic_signal_panic(void) {}
 extern void kbd_inject(char c);
 void kbd_usb_inject(uint8_t ascii) { kbd_inject((char)ascii); }
 
-/* ── virtio-gpu (kernel/syscall/sys_disk.c fb syscalls) — not ported ───── */
-int virtio_gpu_active(void) { return 0; }
-void virtio_gpu_flush(void) {}
-
-uint8_t *
-virtio_gpu_framebuffer(uint32_t *w, uint32_t *h, uint32_t *pitch)
-{
-    (void)w; (void)h; (void)pitch;
-    return 0;
-}
+/* virtio-gpu is real on arm64 now (kernel/drivers/virtio_gpu.c) — it gives the
+ * compositor a scanout framebuffer directly, so the desktop doesn't depend on a
+ * Limine/UEFI GOP framebuffer (Limine panics on the ramfb memory overlap on
+ * arm64 virt). sys_fb_map/sys_fb_flush use virtio_gpu_active/framebuffer/flush. */
