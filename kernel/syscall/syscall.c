@@ -159,7 +159,14 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 20: return sys_writev(arg1, arg2, arg3);
     case 39: return sys_getpid();
     case 56: return sys_clone(frame, arg1, arg2, arg3, arg4, arg5);
-    case 57: return sys_fork(frame);
+    case 57: return sys_fork(frame, arg1, arg2, arg3);
+    /* vfork (58): implemented as fork. POSIX permits this — a conforming vfork
+     * child only execs or _exits, which a plain fork satisfies. musl's vfork()
+     * issues the raw syscall (it does NOT go through clone), so without this
+     * case fork-heavy tools that vfork+exec (gcc spawning cc1/as, shells) get
+     * ENOSYS. No shared-address-space semantics are provided; none are required
+     * by conforming callers. */
+    case 58: return sys_fork(frame, arg1, arg2, arg3);  /* vfork ≡ fork (see below) */
     case 59: return sys_execve(frame, arg1, arg2, arg3);
     case 60: return sys_exit(arg1);
     case 61: return sys_waitpid(arg1, arg2, arg3);

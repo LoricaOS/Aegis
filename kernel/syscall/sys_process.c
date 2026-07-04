@@ -266,9 +266,10 @@ sys_clone(syscall_frame_t *frame, uint64_t flags, uint64_t child_stack,
     if (cl & ~(uint32_t)CLONE_IMPLEMENTED_MASK)
         return SYS_ERR(EINVAL);
 
-    /* Without CLONE_VM this is a plain fork. */
+    /* Without CLONE_VM this is a plain fork. Pass the caller's rdi/rsi/rdx
+     * (= flags/child_stack/ptid for a clone) so the child inherits them. */
     if (!(cl & CLONE_VM))
-        return sys_fork(frame);
+        return sys_fork(frame, flags, child_stack, ptid);
 
     /* ── Thread creation (CLONE_VM set) ─────────────────────────────────── */
 
@@ -585,11 +586,18 @@ sys_clone(syscall_frame_t *frame, uint64_t flags, uint64_t child_stack,
  *   7. Return child PID to the parent.
  */
 uint64_t
-sys_fork(syscall_frame_t *frame)
+sys_fork(syscall_frame_t *frame, uint64_t u_rdi, uint64_t u_rsi, uint64_t u_rdx)
 {
+    /* u_rdi/u_rsi/u_rdx are the caller's rdi/rsi/rdx at syscall entry (the x86
+     * syscall_frame_t does not save them — they arrive as arg1/arg2/arg3). The
+     * child must inherit them: musl's vfork() asm stashes the return address in
+     * rdx across the syscall, so a zeroed rdx crashes the vfork child. */
     aegis_task_t    *parent_task = sched_current();
     if (!parent_task || !parent_task->is_user) return SYS_ERR(EPERM);
     aegis_process_t *parent      = (aegis_process_t *)parent_task;
+#ifdef __aarch64__
+    (void)u_rdi; (void)u_rsi; (void)u_rdx;  /* arm64 copies frame->regs[] below */
+#endif
 
     /* S10: Prevent fork bombs — cap total process count. */
     if (__atomic_load_n(&s_fork_count, __ATOMIC_RELAXED) >= MAX_PROCESSES)
@@ -840,9 +848,16 @@ sys_fork(syscall_frame_t *frame)
     *--sp = 0;                      /* rax = 0  (fork returns 0 in child)   */
     *--sp = frame->rbx;                 /* rbx (callee-saved: inherit parent) */
     *--sp = frame->rip;             /* rcx = return RIP (SYSCALL semantics) */
-    *--sp = 0;                      /* rdx                                  */
-    *--sp = 0;                      /* rsi                                  */
-    *--sp = 0;                      /* rdi                                  */
+    /* Caller-saved rdx/rsi/rdi: inherit the parent's values rather than zero
+     * them. A C fork() caller treats these as scratch, so zeroing was harmless
+     * there — but musl's hand-written vfork() asm stashes the RETURN ADDRESS in
+     * rdx across the syscall (`pop %rdx; syscall; push %rdx; ret`). Zeroing rdx
+     * made the vfork child `ret` to 0 (RIP=0x0 → SIGSEGV), which broke every
+     * program that vfork+execs (gcc spawning cc1/as). Faithfully copying the
+     * parent's register state — as the arm64 path already does — fixes it. */
+    *--sp = u_rdx;                  /* rdx (musl vfork keeps the ret addr here) */
+    *--sp = u_rsi;                  /* rsi                                  */
+    *--sp = u_rdi;                  /* rdi                                  */
     *--sp = frame->rbp;                 /* rbp (callee-saved: inherit parent) */
     *--sp = frame->r8;              /* r8                                   */
     *--sp = frame->r9;              /* r9                                   */
