@@ -298,6 +298,32 @@ isr_dispatch(cpu_state_t *s)
                 vmm_cow_fault_handle(cp->pml4_phys, cr2) == 0)
                 return;   /* COW broken → retry the faulting kernel write */
         }
+        /* Demand paging for KERNEL-mode accesses (copy_*_user et al.): a
+         * NOT-PRESENT (#PF err.P==0) fault on a lazy anonymous user page.
+         * Without this, a kernel copy into/out of a not-yet-faulted lazy buffer
+         * would fall to the exception-table fixup below and short-copy/EFAULT —
+         * forcing every uaccess pre-check to eagerly walk+populate the whole
+         * range up front (O(pages) windowed page-table walks, which spun the
+         * kernel for minutes under a self-hosting cc1's large buffers). Populate
+         * and retry, mirroring the ring-3 lazy path above. Only lazy user pages
+         * are handled (mm_populate_fault==0); a genuine unmapped address returns
+         * non-zero and falls through to the exception-table fixup unchanged. */
+        if (s->cs == ARCH_KERNEL_CS && s->vector == 14 &&
+            !(s->error_code & 1) &&
+            sched_current() && sched_current()->is_user) {
+            uint64_t cr2;
+            __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+            if (cr2 <= USER_ADDR_MAX &&
+                mm_populate_fault((aegis_process_t *)sched_current(), cr2) == 0) {
+                /* Flush any stale not-present TLB entry for this VA before
+                 * retrying the rep-movsb: mm_populate_fault's already-present
+                 * fast path (a sibling CPU mapped it) returns 0 without an
+                 * invlpg, so without this the faulting instruction could re-read
+                 * a stale TLB and fault on the same page forever. */
+                arch_vmm_invlpg(cr2 & ~0xFFFULL);
+                return;   /* lazy page populated → retry the faulting access */
+            }
+        }
         /* Fault-tolerant uaccess: a kernel-mode #PF (14) or #GP (13) inside a
          * copy_*_user rep-movsb whose RIP is registered in the exception table
          * is recovered by redirecting to its fixup, NOT panicking. This catches

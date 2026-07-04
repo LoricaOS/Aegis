@@ -46,6 +46,11 @@ void vma_init(struct aegis_process *proc);
 /* vma_find — VMA entry containing va, or NULL. Used by demand-paging fault. */
 vma_entry_t *vma_find(struct aegis_process *proc, uint64_t va);
 
+/* vma_range_covered — 1 if [addr, addr+len) is fully spanned by VMAs (no hole).
+ * Cheap (O(VMAs spanned) binary searches) — the uaccess fast path uses it to
+ * validate a user buffer without a per-page windowed PTE walk. */
+int vma_range_covered(struct aegis_process *proc, uint64_t addr, uint64_t len);
+
 /* vma_insert — add a VMA entry sorted by base address.
  * Merges with adjacent entries if same prot+type.
  * Returns 0 on success (inserted or merged), -1 on failure: NULL table,
