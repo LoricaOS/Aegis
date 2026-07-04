@@ -14,7 +14,6 @@ CC      = aarch64-linux-gnu-gcc
 LD      = aarch64-linux-gnu-ld
 NM      = aarch64-linux-gnu-nm
 OBJCOPY = aarch64-linux-gnu-objcopy
-CARGO   = cargo +nightly
 HOSTCC ?= cc
 
 AEGIS_VERSION := $(shell cat VERSION 2>/dev/null || echo 0.0.0)
@@ -54,6 +53,7 @@ ARCH_SRCS = \
     kernel/arch/arm64/uart_pl011.c \
     kernel/arch/arm64/poll_sources.c \
     kernel/arch/arm64/pcie.c \
+    kernel/arch/arm64/fdt.c \
     kernel/arch/arm64/smp.c \
     kernel/arch/arm64/stubs.c
 
@@ -68,7 +68,7 @@ ARCH_ASMS = \
 SHARED_SRCS = \
     kernel/core/limine.c kernel/core/printk.c kernel/core/random.c \
     kernel/core/poll.c kernel/core/ksym.c kernel/core/trace.c \
-    kernel/core/lockrank.c kernel/cap/cap_policy.c \
+    kernel/core/lockrank.c kernel/cap/cap.c kernel/cap/cap_policy.c \
     kernel/mm/pmm.c kernel/mm/kva.c kernel/mm/vma.c \
     kernel/lib/va_freelist.c kernel/lib/string.c \
     kernel/sched/sched.c kernel/sched/waitq.c \
@@ -101,8 +101,6 @@ SHARED_SRCS = \
     kernel/proc/proc.c kernel/proc/elf.c \
     kernel/arch/arm64/main.c
 
-CAP_LIB = kernel/cap/target/aarch64-unknown-none/release/libcap.a
-
 C_OBJS   = $(patsubst kernel/%.c,$(BUILD)/%.o,$(ARCH_SRCS) $(SHARED_SRCS))
 ASM_OBJS = $(patsubst kernel/%.S,$(BUILD)/%.o,$(ARCH_ASMS))
 ALL_OBJS = $(ASM_OBJS) $(C_OBJS)
@@ -120,17 +118,12 @@ $(BUILD)/%.o: kernel/%.S
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(CAP_LIB): kernel/cap/src/lib.rs kernel/cap/Cargo.toml
-	$(CARGO) build --release \
-	    --target aarch64-unknown-none \
-	    --manifest-path kernel/cap/Cargo.toml
-
 # Two-pass link to embed the in-kernel symbol table (same as x86).
-$(BUILD)/aegis-arm64.elf: $(ALL_OBJS) $(CAP_LIB) tools/gen-ksyms.sh kernel/core/ksym.h
-	$(LD) $(LDFLAGS) -o $@.tmp $(ALL_OBJS) $(CAP_LIB)
+$(BUILD)/aegis-arm64.elf: $(ALL_OBJS) tools/gen-ksyms.sh kernel/core/ksym.h
+	$(LD) $(LDFLAGS) -o $@.tmp $(ALL_OBJS)
 	NM=$(NM) sh tools/gen-ksyms.sh $@.tmp > $(BUILD)/ksyms.c
 	$(CC) $(CFLAGS) -c $(BUILD)/ksyms.c -o $(BUILD)/ksyms.o
-	$(LD) $(LDFLAGS) -o $@ $(ALL_OBJS) $(CAP_LIB) $(BUILD)/ksyms.o
+	$(LD) $(LDFLAGS) -o $@ $(ALL_OBJS) $(BUILD)/ksyms.o
 	@rm -f $@.tmp
 
 KERNEL_STRIPPED = $(BUILD)/aegis-arm64-stripped.elf

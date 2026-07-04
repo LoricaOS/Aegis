@@ -6,7 +6,6 @@
 CC      = x86_64-elf-gcc
 AS      = nasm
 LD      = x86_64-elf-ld
-CARGO   = cargo +nightly
 OBJCOPY = x86_64-elf-objcopy
 NM      = x86_64-elf-nm
 HOSTCC ?= cc
@@ -75,6 +74,7 @@ CORE_SRCS = \
     kernel/core/ksym.c \
     kernel/core/trace.c \
     kernel/core/lockrank.c \
+    kernel/cap/cap.c \
     kernel/cap/cap_policy.c
 
 MM_SRCS = \
@@ -137,7 +137,6 @@ USERSPACE_SRCS = \
     kernel/proc/proc.c kernel/proc/elf.c
 
 BOOT_SRC  = kernel/arch/x86_64/boot.asm
-CAP_LIB   = kernel/cap/target/x86_64-unknown-none/release/libcap.a
 
 ARCH_ASMS = \
     kernel/arch/x86_64/isr.asm \
@@ -205,27 +204,21 @@ $(BUILD)/arch/x86_64/%.o: kernel/arch/x86_64/%.asm
 	@mkdir -p $(dir $@)
 	$(AS) $(ASFLAGS) $< -o $@
 
-# ── Capability library (Rust) ──────────���─────────────────────────────────────
-$(CAP_LIB): kernel/cap/src/lib.rs kernel/cap/Cargo.toml
-	$(CARGO) build --release \
-	    --target x86_64-unknown-none \
-	    --manifest-path kernel/cap/Cargo.toml
-
 # ── User program builds ─��──────────────────────────────────���────────────────
 # ── Final link ────────────────────────────────────────────────────────────────
 # Two-pass link to embed the in-kernel symbol table. No userland blobs are
 # linked in — the kernel loads init from the root filesystem at boot.
 NM = x86_64-elf-nm
-$(BUILD)/aegis.elf: $(ALL_OBJS) $(CAP_LIB) tools/gen-ksyms.sh kernel/core/ksym.h
+$(BUILD)/aegis.elf: $(ALL_OBJS) tools/gen-ksyms.sh kernel/core/ksym.h
 	@# Pass 1: link with the weak (empty) ksym fallbacks to fix function addrs.
-	$(LD) $(LDFLAGS) -o $@.tmp $(ALL_OBJS) $(CAP_LIB)
+	$(LD) $(LDFLAGS) -o $@.tmp $(ALL_OBJS)
 	@# Generate + compile the in-kernel symbol table from pass 1.  .text precedes
 	@# .rodata in linker.ld, so embedding this const blob does not move any
 	@# function address — the pass-1 addresses stay valid in the relink.
 	NM=$(NM) sh tools/gen-ksyms.sh $@.tmp > $(BUILD)/ksyms.c
 	$(CC) $(CFLAGS) -c $(BUILD)/ksyms.c -o $(BUILD)/ksyms.o
 	@# Pass 2: relink with the strong symbol table (overrides the weak arrays).
-	$(LD) $(LDFLAGS) -o $@ $(ALL_OBJS) $(CAP_LIB) $(BUILD)/ksyms.o
+	$(LD) $(LDFLAGS) -o $@ $(ALL_OBJS) $(BUILD)/ksyms.o
 	@rm -f $@.tmp
 KERNEL_STRIPPED = $(BUILD)/aegis-stripped.elf
 $(KERNEL_STRIPPED): $(BUILD)/aegis.elf
@@ -349,4 +342,3 @@ version:
 
 clean:
 	rm -rf $(BUILD)
-	@$(CARGO) clean --manifest-path kernel/cap/Cargo.toml 2>/dev/null || true
