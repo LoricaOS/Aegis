@@ -10,7 +10,11 @@
 
 /* ── ext2 fd pool ────────────────────────────────────────────────────── */
 
-#define EXT2_FD_POOL 32
+/* 256, not 32: a self-hosting `ld` holds ALL ~150 kernel object files open at
+ * once during the link — 32 slots exhausted, ext2_pool_alloc returned NULL, and
+ * vfs_open mapped that to ENOMEM, so ld failed with "cannot find X: Out of
+ * memory" mid-link. Just a bigger static array (ext2_fd_priv_t is tiny). */
+#define EXT2_FD_POOL 256
 static ext2_fd_priv_t s_ext2_pool[EXT2_FD_POOL];
 
 ext2_fd_priv_t *
@@ -110,6 +114,17 @@ ext2_vfs_write_fn(void *priv, const void *buf, uint64_t len)
     return (int)done;
 }
 
+/* ext2_vfs_seek_fn — sync the write cursor with lseek. Reads already take
+ * f->offset directly (ext2_vfs_read_fn), but writes track their own position,
+ * so without this a seek-then-write (e.g. `as` seeking back to patch an ELF
+ * header after writing sections) would write at the stale position and produce
+ * a corrupt object file. */
+static void
+ext2_vfs_seek_fn(void *priv, uint64_t offset)
+{
+    ((ext2_fd_priv_t *)priv)->write_offset = (uint32_t)offset;
+}
+
 static void
 ext2_vfs_close_fn(void *priv)
 {
@@ -155,6 +170,7 @@ ext2_vfs_stat_fn(void *priv, k_stat_t *st)
 
 const vfs_ops_t s_ext2_ops = {
     .seekable = 1,
+    .seek    = ext2_vfs_seek_fn,
     .read    = ext2_vfs_read_fn,
     .write   = ext2_vfs_write_fn,
     .close   = ext2_vfs_close_fn,

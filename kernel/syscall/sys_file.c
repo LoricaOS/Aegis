@@ -679,6 +679,11 @@ sys_lseek(uint64_t arg1, uint64_t arg2, uint64_t arg3)
     if (new_off < 0)
         return SYS_ERR(EINVAL);
     f->offset = (uint64_t)new_off;
+    /* Sync the driver's internal write cursor: ops->write takes no offset, so a
+     * seek-then-write (e.g. `as` patching an ELF header) would otherwise write
+     * at the stale position and corrupt the file. */
+    if (f->ops->seek)
+        f->ops->seek(f->priv, (uint64_t)new_off);
     return (uint64_t)new_off;
 }
 
