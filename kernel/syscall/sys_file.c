@@ -728,7 +728,7 @@ sys_pipe2(uint64_t arg1, uint64_t arg2)
     proc->fd_table->fds[wfd].priv   = p;
     proc->fd_table->fds[wfd].offset = 0;
     proc->fd_table->fds[wfd].size   = 0;
-    proc->fd_table->fds[wfd].flags  = 0;
+    proc->fd_table->fds[wfd].flags  = VFS_O_WRONLY;
 
     /* Propagate O_CLOEXEC to both pipe ends */
     if (pipe_flags & VFS_O_CLOEXEC) {

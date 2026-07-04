@@ -69,6 +69,13 @@ sys_write(uint64_t arg1, uint64_t arg2, uint64_t arg3)
         !proc->fd_table->fds[arg1].ops->write)
         return SYS_ERR(EBADF);
 
+    /* Enforce the fd's access mode: an O_RDONLY fd must never write. Found
+     * the hard way — a service with stdout closed had its media file land on
+     * fd 1, and stdio flushes overwrote the file's first block through the
+     * read-only fd. */
+    if ((proc->fd_table->fds[arg1].flags & VFS_O_ACCMODE) == VFS_O_RDONLY)
+        return SYS_ERR(EBADF);
+
     if (!user_ptr_valid(arg2, arg3))
         return SYS_ERR(EFAULT);
 
@@ -135,6 +142,9 @@ sys_writev(uint64_t arg1, uint64_t arg2, uint64_t arg3)
     if (arg1 >= PROC_MAX_FDS || !proc->fd_table->fds[arg1].ops ||
         !proc->fd_table->fds[arg1].ops->write)
         return SYS_ERR(EBADF);
+
+    if ((proc->fd_table->fds[arg1].flags & VFS_O_ACCMODE) == VFS_O_RDONLY)
+        return SYS_ERR(EBADF);       /* fd not opened for writing */
 
     /* Reject unreasonable iovcnt before multiplying to avoid overflow. */
     if (arg3 > 1024)
@@ -257,6 +267,8 @@ sys_read(uint64_t arg1, uint64_t arg2, uint64_t arg3)
         return SYS_ERR(EBADF);
     if (!f->ops->read)
         return SYS_ERR(EISDIR);  /* directory fd, not readable */
+    if ((f->flags & VFS_O_ACCMODE) == VFS_O_WRONLY)
+        return SYS_ERR(EBADF);   /* fd not opened for reading */
     if (!user_ptr_valid(arg2, arg3))
         return SYS_ERR(EFAULT);
 
@@ -316,6 +328,8 @@ sys_pread64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t off)
     vfs_file_t *f = &proc->fd_table->fds[fd];
     if (!f->ops) return SYS_ERR(EBADF);
     if (!f->ops->read) return SYS_ERR(EISDIR);
+    if ((f->flags & VFS_O_ACCMODE) == VFS_O_WRONLY)
+        return SYS_ERR(EBADF);   /* fd not opened for reading */
     if (!user_ptr_valid(buf, count)) return SYS_ERR(EFAULT);
     char kbuf[4096];
     uint64_t page_off = buf & 0xFFFULL;
