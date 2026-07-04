@@ -222,7 +222,7 @@ $(BUILD)/aegis.elf: $(ALL_OBJS) tools/gen-ksyms.sh kernel/core/ksym.h
 	@# Generate + compile the in-kernel symbol table from pass 1.  .text precedes
 	@# .rodata in linker.ld, so embedding this const blob does not move any
 	@# function address — the pass-1 addresses stay valid in the relink.
-	NM=$(NM) sh tools/gen-ksyms.sh $@.tmp > $(BUILD)/ksyms.c
+	NM=$(NM) $(SHELL) tools/gen-ksyms.sh $@.tmp > $(BUILD)/ksyms.c
 	$(CC) $(CFLAGS) -c $(BUILD)/ksyms.c -o $(BUILD)/ksyms.o
 	@# Pass 2: relink with the strong symbol table (overrides the weak arrays).
 	$(LD) $(LDFLAGS) -o $@ $(ALL_OBJS) $(BUILD)/ksyms.o
