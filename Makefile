@@ -218,15 +218,24 @@ $(BUILD)/arch/x86_64/%.o: kernel/arch/x86_64/%.asm
 NM = x86_64-elf-nm
 $(BUILD)/aegis.elf: $(ALL_OBJS) tools/gen-ksyms.sh kernel/core/ksym.h
 	@# Pass 1: link with the weak (empty) ksym fallbacks to fix function addrs.
-	$(LD) $(LDFLAGS) -o $@.tmp $(ALL_OBJS)
+	@# Response file: a ~150-object link line is several KB — past some shells'
+	@# command-length limit (self-hosting on Aegis, where `make SHELL=/bin/stsh`
+	@# truncated it and dropped the trailing driver objects). `ld @file` keeps
+	@# the invocation short; make's $(file) writes the list with no shell line.
+	$(file >$(BUILD)/objs.rsp,$(ALL_OBJS))
+	$(LD) $(LDFLAGS) -o $@.tmp @$(BUILD)/objs.rsp
 	@# Generate + compile the in-kernel symbol table from pass 1.  .text precedes
 	@# .rodata in linker.ld, so embedding this const blob does not move any
 	@# function address — the pass-1 addresses stay valid in the relink.
-	NM=$(NM) $(SHELL) tools/gen-ksyms.sh $@.tmp > $(BUILD)/ksyms.c
+	@# gen-ksyms is best-effort: on failure fall back to an empty table (ksym.c's
+	@# weak ksym_count=0 fallback → hex backtraces) so a self-host build still
+	@# produces a complete kernel. Its stderr is surfaced for a real fix.
+	NM=$(NM) $(SHELL) tools/gen-ksyms.sh $@.tmp > $(BUILD)/ksyms.c || echo "/* gen-ksyms unavailable — empty ksym table (weak fallback) */" > $(BUILD)/ksyms.c
 	$(CC) $(CFLAGS) -c $(BUILD)/ksyms.c -o $(BUILD)/ksyms.o
 	@# Pass 2: relink with the strong symbol table (overrides the weak arrays).
-	$(LD) $(LDFLAGS) -o $@ $(ALL_OBJS) $(BUILD)/ksyms.o
-	@rm -f $@.tmp
+	$(file >$(BUILD)/objs2.rsp,$(ALL_OBJS) $(BUILD)/ksyms.o)
+	$(LD) $(LDFLAGS) -o $@ @$(BUILD)/objs2.rsp
+	@rm -f $@.tmp || true
 KERNEL_STRIPPED = $(BUILD)/aegis-stripped.elf
 $(KERNEL_STRIPPED): $(BUILD)/aegis.elf
 	$(OBJCOPY) --strip-all $< $@
