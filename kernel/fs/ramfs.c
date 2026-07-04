@@ -154,8 +154,13 @@ ramfs_write_fn(void *priv, const void *buf, uint64_t len)
     /* Append at end-of-file (stdio issues several small writes; O_TRUNC reset
      * size to 0 in ramfs_open). buf may be a user or kernel pointer — both are
      * fine for copy_from_user. */
+    if (len == 0) return 0;
     uint64_t base = (uint64_t)n->size;
-    if (base >= RAMFS_MAX_SIZE) return 0;
+    /* File at its size cap → return an ERROR, never 0: sys_write/sys_writev pass
+     * a 0 straight back to userspace, and musl's stdio write loop treats 0 as
+     * "retry" (len -= 0), spinning forever. A self-hosting cc1 writing a >cap
+     * temp to /tmp (ramfs) hung the kernel this way (25M repeated writev). */
+    if (base >= RAMFS_MAX_SIZE) return -ENOSPC;
     if (len > (uint64_t)RAMFS_MAX_SIZE - base)
         len = (uint64_t)RAMFS_MAX_SIZE - base;
     uint64_t done = 0;
@@ -176,6 +181,8 @@ ramfs_write_fn(void *priv, const void *buf, uint64_t len)
     }
     if (base + done > n->size)
         n->size = (uint32_t)(base + done);
+    if (done == 0)
+        return -ENOSPC;   /* OOM before a single byte landed — error, never 0 */
     return (int)done;
 }
 

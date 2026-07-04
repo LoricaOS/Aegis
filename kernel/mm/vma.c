@@ -118,6 +118,25 @@ vma_entry_t *vma_find(struct aegis_process *proc, uint64_t va) {
     return result;
 }
 
+/* vma_range_covered — 1 if [addr, addr+len) is fully spanned by VMAs. Walks VMA
+ * to VMA (jumping to each one's end), not page to page, so it's O(VMAs spanned)
+ * rather than a per-page windowed PTE walk. Matches vma_find's per-call locking
+ * (fine under the IF=0-during-syscall design). Caller range-checks overflow. */
+int vma_range_covered(struct aegis_process *proc, uint64_t addr, uint64_t len) {
+    if (len == 0) return 1;
+    if (!proc || !proc->vma_table) return 0;
+    uint64_t end = addr + len;
+    uint64_t va  = addr & ~0xFFFULL;
+    while (va < end) {
+        vma_entry_t *v = vma_find(proc, va);
+        if (!v) return 0;                 /* hole → not covered */
+        uint64_t vend = v->base + v->len;
+        if (vend <= va) return 0;         /* defensive: no forward progress */
+        va = vend;                        /* skip to the end of this VMA */
+    }
+    return 1;
+}
+
 void vma_init(struct aegis_process *proc) {
     vma_entry_t *table = (vma_entry_t *)kva_alloc_pages(VMA_TABLE_PAGES);
     proc->vma_table    = table;
