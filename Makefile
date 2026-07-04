@@ -36,7 +36,14 @@ CFLAGS = \
     $(EXTRA_CFLAGS)
 
 ASFLAGS = -f elf64
-LDFLAGS = -T tools/linker.ld -nostdlib
+# -z noseparate-code: emit ONE combined RWX PT_LOAD (text+rodata+data) instead
+# of ld's default W^X-split segments. The kernel is designed to boot RWX (its
+# early Limine-handoff path writes into the image before its own page tables are
+# up; a non-writable text segment faults under Limine — 0 serial, triple fault).
+# It also makes the segment layout DETERMINISTIC: without this, a tiny .text size
+# change (e.g. one added symbol shifting the two-pass ksym blob) flips ld's
+# auto-segment grouping and silently produces a non-booting image.
+LDFLAGS = -T tools/linker.ld -nostdlib -z noseparate-code
 
 # ── Kernel source lists ─────────────────────────────────��───────────────────
 ARCH_SRCS = \
