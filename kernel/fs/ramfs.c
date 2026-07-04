@@ -204,6 +204,7 @@ ramfs_stat_fn(void *priv, k_stat_t *st)
 }
 
 static const vfs_ops_t s_ramfs_ops = {
+    .seekable = 1,
     .read    = ramfs_read_fn,
     .write   = ramfs_write_fn,
     .close   = ramfs_close_fn,

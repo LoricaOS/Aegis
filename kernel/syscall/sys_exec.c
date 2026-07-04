@@ -16,17 +16,18 @@
 #include "random.h"
 #include "vma.h"
 
-/* Copy a NULL-terminated user array of C-strings into fixed kernel buffers:
- * up to `max` entries, each truncated to 255 chars, into bufs[max][256], with a
- * NULL-terminated pointer table ptrs[0..n]. Returns the entry count, or -1 if a
- * user pointer is invalid (caller maps that to EFAULT). Shared verbatim by
- * sys_execve and sys_spawn for both argv and envp — was open-coded 4x. Callers
- * guard arr_uptr==0 themselves (argv requires a valid array; envp treats 0 as
- * empty). */
+/* Copy a NULL-terminated user array of C-strings into a FLAT kernel buffer:
+ * up to `max` entries, appended NUL-separated into strbuf[strbuf_sz], with a
+ * NULL-terminated pointer table ptrs[0..n] pointing into strbuf. Returns the
+ * entry count, or -1 if a user pointer is invalid OR the strings don't fit
+ * (caller maps -1 to EFAULT — a too-large argv/env fails the exec rather than
+ * silently truncating an arg, which used to chop long `sh -c "<recipe>"` args).
+ * Shared by sys_execve and sys_spawn for both argv and envp. Callers guard
+ * arr_uptr==0 themselves (argv requires a valid array; envp treats 0 as empty). */
 static int
-copy_user_argv(uint64_t arr_uptr, char bufs[][256], char *ptrs[], int max)
+copy_user_argv(uint64_t arr_uptr, char *strbuf, int strbuf_sz, char *ptrs[], int max)
 {
-    int n = 0;
+    int n = 0, off = 0;
     uint64_t ptr_addr = arr_uptr;
     while (n < max) {
         if (!user_ptr_valid(ptr_addr, 8))
@@ -35,18 +36,19 @@ copy_user_argv(uint64_t arr_uptr, char bufs[][256], char *ptrs[], int max)
         copy_from_user(&str_ptr, (const void *)(uintptr_t)ptr_addr, 8);
         if (!str_ptr)
             break;  /* NULL terminator */
-        uint64_t i;
-        for (i = 0; i < 255; i++) {
-            if (!user_ptr_valid(str_ptr + i, 1))
+        ptrs[n] = &strbuf[off];
+        for (;;) {
+            if (off >= strbuf_sz - 1)
+                return -1;  /* arg strings exceed the buffer — fail, don't truncate */
+            if (!user_ptr_valid(str_ptr, 1))
                 return -1;
             char c;
-            copy_from_user(&c, (const void *)(uintptr_t)(str_ptr + i), 1);
-            bufs[n][i] = c;
+            copy_from_user(&c, (const void *)(uintptr_t)str_ptr, 1);
+            strbuf[off++] = c;
+            str_ptr++;
             if (c == '\0')
                 break;
         }
-        bufs[n][255] = '\0';
-        ptrs[n] = bufs[n];
         n++;
         ptr_addr += 8;
     }
@@ -86,8 +88,9 @@ copy_user_argv(uint64_t arr_uptr, char bufs[][256], char *ptrs[], int max)
  *
  * Alignment: RSP % 16 == 8 on entry to _start, per SysV ABI.
  *
- * argv_bufs lives in a kva-allocated buffer (not on the kernel stack)
- * because argv_bufs[64][256] = 16 KB exceeds the per-process kernel stack.
+ * The argv/env working area (execve_argbuf_t) lives in a kva-allocated buffer
+ * (not on the kernel stack) because its flat string buffers are far larger than
+ * a per-process kernel stack.
  */
 uint64_t
 sys_execve(syscall_frame_t *frame,
@@ -122,7 +125,7 @@ sys_execve(syscall_frame_t *frame,
 
     /* 2. Copy argv (<=64) + envp (<=32) from user — shared helper. */
     {
-        int argc = copy_user_argv(argv_uptr, abuf->argv_bufs, abuf->argv_ptrs, 64);
+        int argc = copy_user_argv(argv_uptr, abuf->argv_strs, EXECVE_ARGV_STRBYTES, abuf->argv_ptrs, EXECVE_MAX_ARGV);
         if (argc < 0) { ret = SYS_ERR(EFAULT); goto done; }
         /* argc is a block-local — capture it for the rest of the function */
         {
@@ -130,7 +133,7 @@ sys_execve(syscall_frame_t *frame,
 
     int envc = 0;
     if (envp_uptr != 0) {
-        envc = copy_user_argv(envp_uptr, abuf->env_bufs, abuf->env_ptrs, 32);
+        envc = copy_user_argv(envp_uptr, abuf->env_strs, EXECVE_ENV_STRBYTES, abuf->env_ptrs, EXECVE_MAX_ENV);
         if (envc < 0) { ret = SYS_ERR(EFAULT); goto done; }
     } else {
         abuf->env_ptrs[0] = (char *)0;
@@ -603,12 +606,12 @@ sys_spawn(uint64_t path_uptr, uint64_t argv_uptr,
     }
 
     /* 2. Copy argv (<=64) + envp (<=32) from user — shared helper. */
-    int argc = copy_user_argv(argv_uptr, abuf->argv_bufs, abuf->argv_ptrs, 64);
+    int argc = copy_user_argv(argv_uptr, abuf->argv_strs, EXECVE_ARGV_STRBYTES, abuf->argv_ptrs, EXECVE_MAX_ARGV);
     if (argc < 0) { result = SYS_ERR(EFAULT); goto fail_early; }
 
     int envc = 0;
     if (envp_uptr != 0) {
-        envc = copy_user_argv(envp_uptr, abuf->env_bufs, abuf->env_ptrs, 32);
+        envc = copy_user_argv(envp_uptr, abuf->env_strs, EXECVE_ENV_STRBYTES, abuf->env_ptrs, EXECVE_MAX_ENV);
         if (envc < 0) { result = SYS_ERR(EFAULT); goto fail_early; }
     } else {
         abuf->env_ptrs[0] = (char *)0;

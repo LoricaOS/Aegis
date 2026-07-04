@@ -67,20 +67,30 @@ typedef struct {
 
 /* execve_argbuf_t — argv+envp working storage allocated from kva.
  *
- * argv_bufs[64][256] alone is 16 KB — larger than a child process's
- * 4-page kernel stack.  Allocating from kva avoids the overflow.
- * Size: 64*256 + 65*8 + 64*8 + 32*256 + 33*8 + 32*8 = 25912 bytes → 7 kva pages.
- */
+ * FLAT string buffers (not [N][256]): a single argv string can be large — a
+ * shell run as a `make` recipe interpreter gets the WHOLE recipe as one arg
+ * (`stsh -c "<400-char gcc line>"`), and a link step passes ~150 object args.
+ * A [N][256] layout truncated the recipe at 255 bytes (dropping the trailing
+ * source file → "gcc: input from standard input") and capped argv at 64. The
+ * flat buffer bounds the TOTAL bytes instead, POSIX ARG_MAX style, so it serves
+ * both few-long-args and many-short-args. Overflow → copy fails (E2BIG-ish),
+ * never silent truncation. kva-allocated: too large for a 4-page kernel stack. */
+#define EXECVE_MAX_ARGV      1024
+#define EXECVE_MAX_ENV       256
+#define EXECVE_ARGV_STRBYTES (128 * 1024)
+#define EXECVE_ENV_STRBYTES  (64 * 1024)
 typedef struct {
-    char     argv_bufs[64][256];
-    char    *argv_ptrs[65];
-    uint64_t str_ptrs[64];
-    char     env_bufs[32][256];
-    char    *env_ptrs[33];
-    uint64_t env_str_ptrs[32];
+    char     argv_strs[EXECVE_ARGV_STRBYTES];
+    char    *argv_ptrs[EXECVE_MAX_ARGV + 1];
+    uint64_t str_ptrs[EXECVE_MAX_ARGV];
+    char     env_strs[EXECVE_ENV_STRBYTES];
+    char    *env_ptrs[EXECVE_MAX_ENV + 1];
+    uint64_t env_str_ptrs[EXECVE_MAX_ENV];
 } execve_argbuf_t;
 
-#define EXECVE_ARGBUF_PAGES 7   /* ceil(25912 / 4096) */
+/* ceil(sizeof(execve_argbuf_t) / 4096): 131072 + 8200 + 8192 + 65536 + 2056
+ * + 2048 = 217104 → 54 pages. */
+#define EXECVE_ARGBUF_PAGES 54
 
 /* Value single-sourced in limits.h (AEGIS_MAX_PROCESSES). */
 #define MAX_PROCESSES AEGIS_MAX_PROCESSES

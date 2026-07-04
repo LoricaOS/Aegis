@@ -97,6 +97,13 @@ typedef struct {
      * NULL is the default — caller falls back to PIT-tick polling for
      * fds without a waitq. */
     struct waitq *(*get_waitq)(void *priv);
+    /* seekable — 1 if this driver backs a byte-addressable regular file whose
+     * f->offset is meaningful (ext2/ramfs/memfd/initrd). 0 (default) for stream
+     * fds (pipes, console, kbd, char devices) where lseek must return ESPIPE.
+     * Only consulted for empty (size==0) files: a size-0 regular file is still
+     * seekable (e.g. `as` seeks around a freshly-created .o to lay out the ELF),
+     * whereas a size-0 stream is not. */
+    int seekable;
 } vfs_ops_t;
 
 /* Open file descriptor. Stored in fd_table_t.fds[].

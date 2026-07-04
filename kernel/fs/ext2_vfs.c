@@ -154,6 +154,7 @@ ext2_vfs_stat_fn(void *priv, k_stat_t *st)
 }
 
 const vfs_ops_t s_ext2_ops = {
+    .seekable = 1,
     .read    = ext2_vfs_read_fn,
     .write   = ext2_vfs_write_fn,
     .close   = ext2_vfs_close_fn,
