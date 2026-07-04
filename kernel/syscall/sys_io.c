@@ -39,6 +39,22 @@ sys_audio_stop(void)
     return 0;
 }
 
+/*
+ * sys_audio_position — syscall 505.  Return the milliseconds of audio actually
+ * played on the current /dev/audio stream (the A/V master clock a video player
+ * syncs frames to). Ungated (a playback-progress query, no authority). 0 when
+ * idle or no HDA.
+ */
+uint64_t
+sys_audio_position(void)
+{
+#ifdef __x86_64__
+    return hda_play_position_ms();
+#else
+    return 0;
+#endif
+}
+
 /* vfs_read_nonblock — set by sys_read before calling f->ops->read() when the
  * fd has O_NONBLOCK set.  Blocking VFS read ops (PTY master, pipes) check this
  * global and return -EAGAIN instead of sleeping.  Reset to 0 after the call.

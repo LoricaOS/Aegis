@@ -149,6 +149,7 @@ uint64_t sys_set_ntp(uint64_t enable);
 /* ── sys_io.c ──────────────────────────────────────────────────────────── */
 uint64_t sys_audio_volume(uint64_t pct);
 uint64_t sys_audio_stop(void);
+uint64_t sys_audio_position(void);
 
 /* ── sys_hostname.c ────────────────────────────────────────────────────── */
 uint64_t sys_sethostname(uint64_t name_uptr, uint64_t len);
