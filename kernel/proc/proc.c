@@ -416,6 +416,11 @@ proc_spawn(const uint8_t *elf_data, size_t elf_len)
     /* Pre-open fd 2 (stderr) to console device. */
     proc->fd_table->fds[2] = *console_open();
 
+    /* Honest access modes — sys_read/sys_write enforce them now. */
+    proc->fd_table->fds[0].flags = VFS_O_RDONLY;
+    proc->fd_table->fds[1].flags = VFS_O_RDWR;
+    proc->fd_table->fds[2].flags = VFS_O_RDWR;
+
     /* Initialise heap break to top of ELF segments. */
     proc->brk      = brk_start;
     proc->brk_base = brk_start;
