@@ -139,6 +139,7 @@ static int memfd_vfs_stat(void *priv, k_stat_t *st)
  * to wake, so get_waitq stays NULL and sys_poll falls through to
  * its permissive default. */
 const vfs_ops_t g_memfd_ops = {
+    .seekable = 1,
     .read    = memfd_vfs_read,
     .write   = memfd_vfs_write,
     .close   = memfd_vfs_close,

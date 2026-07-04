@@ -265,6 +265,7 @@ dir_stat_fn(void *priv, k_stat_t *st)
 }
 
 static const vfs_ops_t initrd_ops = {
+    .seekable = 1,
     .read    = initrd_read_fn,
     .write   = (void *)0,
     .close   = initrd_close_fn,

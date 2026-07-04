@@ -644,8 +644,12 @@ sys_lseek(uint64_t arg1, uint64_t arg2, uint64_t arg3)
         return SYS_ERR(EBADF);
     vfs_file_t *f = &proc->fd_table->fds[arg1];
 
-    /* Non-seekable fd (no size): return ESPIPE */
-    if (f->size == 0)
+    /* Stream fds (pipe/console/kbd/char devices) are non-seekable: ESPIPE.
+     * We only need to disambiguate at size==0 — a non-empty fd is already a
+     * real file. A size-0 fd is a stream UNLESS its driver marks itself
+     * seekable (a freshly-created regular file, e.g. an .o `as` is about to
+     * seek around while writing the ELF). */
+    if (f->size == 0 && !(f->ops && f->ops->seekable))
         return SYS_ERR(ESPIPE);   /* -ESPIPE */
 
     int64_t new_off;

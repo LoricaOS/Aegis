@@ -127,11 +127,15 @@
 
 /* User stack: top, page count, base. Single-sourced here — was duplicated as
  * USER_STACK_TOP_EXEC/NPAGES (sys_impl.h; exec + spawn paths) and
- * USER_STACK_TOP/NPAGES (proc.c; init). 256 KB because 16 KB overflowed on
- * deep recursion / the sntrup761 post-quantum KEX. Top 0x7FFFFFFF000 is page-
+ * USER_STACK_TOP/NPAGES (proc.c; init). 1 MB: 16 KB then 256 KB both overflowed
+ * (sntrup761 KEX, deep recursion) — and real self-hosting toolchains want more:
+ * gcc's recursive-descent parser and shells nesting recipe execution (stsh's
+ * pipeline frames) blew past 256 KB when building the kernel ON Aegis. The stack
+ * is mapped eagerly (no growth-on-fault yet), so this is 1 MB of real pages per
+ * process; acceptable for the process counts we run. Top 0x7FFFFFFF000 is page-
  * aligned (and therefore 16-byte aligned), as the SysV ABI entry requires. */
 #define AEGIS_USER_STACK_TOP    0x7FFFFFFF000ULL
-#define AEGIS_USER_STACK_PAGES  64ULL
+#define AEGIS_USER_STACK_PAGES  256ULL
 #define AEGIS_USER_STACK_BASE   (AEGIS_USER_STACK_TOP - AEGIS_USER_STACK_PAGES * AEGIS_PAGE_SIZE)
 
 /*
