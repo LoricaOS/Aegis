@@ -97,6 +97,14 @@ typedef struct {
      * NULL is the default — caller falls back to PIT-tick polling for
      * fds without a waitq. */
     struct waitq *(*get_waitq)(void *priv);
+    /* seek — reposition the driver's internal WRITE cursor to `offset`.
+     * ops->write takes no offset (unlike ops->read, which gets f->offset), so a
+     * driver that keeps its own sequential write position (ext2) needs lseek to
+     * update it — otherwise a seek-then-write (e.g. `as` patching an ELF header
+     * after writing sections) writes at the stale position and corrupts the
+     * file. sys_lseek calls this after updating f->offset. NULL = writes ignore
+     * lseek (streams; append-only ramfs). */
+    void (*seek)(void *priv, uint64_t offset);
     /* seekable — 1 if this driver backs a byte-addressable regular file whose
      * f->offset is meaningful (ext2/ramfs/memfd/initrd). 0 (default) for stream
      * fds (pipes, console, kbd, char devices) where lseek must return ESPIPE.

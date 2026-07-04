@@ -14,8 +14,11 @@
  * browser frontend loads ~137 .so (~350 VMAs after per-segment splits), which
  * overflowed the table — mmap then rolled back and the dynamic linker SIGSEGV'd.
  * 8 pages ≈ 1360 entries. The shared refcount (vma_rc) lives in the tail of the
- * block; VMA_CAPACITY reserves room for it. Cost: 32 KB per address space. */
-#define VMA_TABLE_PAGES 8
+ * block; VMA_CAPACITY reserves room for it. 32 pages ≈ 5440 entries: a
+ * self-hosting `ld` linking the ~150 kernel objects (each mmap'd, plus mallocng
+ * arenas) blew past 1360 and failed mid-link with "Out of memory". Cost: 128 KB
+ * per address space (kva; only live user processes pay it). */
+#define VMA_TABLE_PAGES 32
 
 /* The shared table HEADER lives in the tail of the table page, AFTER the
  * entries. It holds BOTH the refcount AND the live entry count, so that all
