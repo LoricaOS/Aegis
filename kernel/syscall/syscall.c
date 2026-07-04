@@ -245,6 +245,7 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 502: return sys_set_ntp(arg1);
     case 503: return sys_audio_volume(arg1);
     case 504: return sys_audio_stop();
+    case 505: return sys_audio_position();
     case 318: return sys_getrandom(arg1, arg2, arg3);
     case 202: return sys_futex(arg1, arg2, arg3, arg4, arg5, arg6);
     case 510: return sys_blkdev_list(arg1, arg2);
