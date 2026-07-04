@@ -111,8 +111,10 @@ uint64_t sys_mprotect(uint64_t a1, uint64_t a2, uint64_t a3);
 uint64_t sys_exit(uint64_t a1);
 uint64_t sys_exit_group(uint64_t a1);
 uint64_t sys_clone(syscall_frame_t *frame, uint64_t flags, uint64_t child_stack,
-                   uint64_t ptid, uint64_t ctid, uint64_t tls);
+                   uint64_t ptid, uint64_t ctid, uint64_t tls,
+                   uint64_t u_rdi, uint64_t u_rsi, uint64_t u_rdx);
 uint64_t sys_fork(syscall_frame_t *frame, uint64_t u_rdi, uint64_t u_rsi, uint64_t u_rdx);
+uint64_t sys_vfork(syscall_frame_t *frame, uint64_t u_rdi, uint64_t u_rsi, uint64_t u_rdx);
 uint64_t sys_waitpid(uint64_t a1, uint64_t a2, uint64_t a3);
 
 /* ── sys_exec.c ────────────────────────────────────────────────────────── */
