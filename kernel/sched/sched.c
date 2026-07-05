@@ -390,7 +390,12 @@ sched_add(aegis_task_t *task)
      * leave on_cpu == 0 ("running on CPU 0").  Force the not-running sentinel
      * so the SMP picker treats the new task as free. */
     task->on_cpu  = -1;
-    task->last_cpu = -1;   /* no affinity yet — stealable by any core on first pick */
+    /* Inherit the CREATING core's affinity: a fork/spawn child prefers the core
+     * its parent runs on (warm shared cache; keeps a serial fork/exec pipeline —
+     * make->gcc->cc1->as — on ONE core instead of hopping to whichever core is
+     * free). Pass 2 still steals it onto an idle core when the parent's core is
+     * busy with other work, so parallel builds spread. */
+    task->last_cpu = (int8_t)percpu_self()->cpu_id;
     task->is_idle = 0;
     aegis_task_t *cur = sched_current();
     if (!cur) {
