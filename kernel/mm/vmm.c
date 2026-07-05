@@ -778,8 +778,10 @@ vmm_free_user_pml4(uint64_t pml4_phys)
      * frame is reallocated, such a CPU would access it through the stale
      * translation → wrong-physical-frame corruption.  Flush all CPUs (CR3
      * reload) so no stale node survives.  Called after dropping vmm_window_lock
-     * (shootdown deadlock rule); single-CPU degrades to a local flush. */
-    tlb_flush_all_cpus();
+     * (shootdown deadlock rule); single-CPU degrades to a local flush.
+     * Targeted at only cores still running this (dying) CR3 — the owner already
+     * switched away, so this is normally a lone local reload, not a broadcast. */
+    tlb_flush_cr3(pml4_phys);
 
     /* T1 diagnostic: per-teardown PMM ref/unref scoreboard (off unless the
      * `pmm_acct` cmdline token is set → oracle-safe). Done after the shootdown,

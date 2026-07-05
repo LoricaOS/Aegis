@@ -36,6 +36,10 @@ void tlb_shootdown_kernel(uint64_t va_start, uint64_t va_end);
  * walk nodes.  Call OUTSIDE vmm_window_lock (shootdown deadlock rule). */
 void tlb_flush_all_cpus(void);
 
+/* tlb_flush_cr3 — full flush targeted at only the cores currently running
+ * `pml4_phys` (address-space teardown; usually zero other cores → local only). */
+void tlb_flush_cr3(uint64_t pml4_phys);
+
 /* tlb_note_cr3 — record that this CPU is about to load `pml4_phys` into CR3, so
  * per-CR3 shootdowns can target only the CPUs running an address space. Call
  * immediately before the `mov %cr3` (see vmm_switch_to). */

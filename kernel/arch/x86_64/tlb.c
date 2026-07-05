@@ -272,6 +272,63 @@ tlb_flush_all_cpus(void)
     arch_irq_restore(fl);
 }
 
+/* tlb_flush_cr3 — like tlb_flush_all_cpus (full CR3-reload flush for freed
+ * page-table frames), but IPI ONLY the cores currently running `pml4_phys`.
+ * Freeing a dead/replaced address space (exec/exit teardown) runs AFTER the
+ * owner switched to another CR3 — which already dropped its paging-structure
+ * caches — so typically ZERO other cores match and this is a lone local reload
+ * with no broadcast, instead of interrupting every idle sibling. A core that
+ * merely ran this CR3 earlier and switched away is already clean (its CR3 load
+ * flushed it); one still running it is targeted. The address space is being
+ * torn down (unschedulable), so no core races into it. */
+void
+tlb_flush_cr3(uint64_t pml4_phys)
+{
+    {
+        uint64_t cr3;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+        __asm__ volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
+    }
+    if (!lapic_active() || g_cpu_count <= 1)
+        return;
+
+    irqflags_t fl = arch_irq_save();
+    while (!spin_trylock(&s_shootdown_lock)) {
+        tlb_service_incoming();
+        arch_pause();
+    }
+
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    uint8_t my_id = percpu_self()->cpu_id;
+    uint16_t target_mask = 0;
+    for (uint32_t i = 0; i < MAX_CPUS && i < 16; i++) {
+        if (i == my_id) continue;
+        if (!g_ap_online[i]) continue;
+        if (g_cpu_cr3[i] != pml4_phys) continue;
+        target_mask |= (uint16_t)(1u << i);
+    }
+    if (target_mask == 0) {
+        spin_unlock(&s_shootdown_lock);
+        arch_irq_restore(fl);
+        return;
+    }
+
+    s_target_cr3 = TLB_TARGET_ALL;   /* IPI'd cores full-flush unconditionally */
+    s_va_start   = 0;
+    s_va_end     = 0;
+    s_full_flush = 1;
+    s_ack        = 0;
+    g_bc_full++;
+    __atomic_store_n(&s_pending, target_mask, __ATOMIC_RELEASE);
+    lapic_send_ipi_all_excl_self(TLB_SHOOTDOWN_VECTOR);
+    while (__atomic_load_n(&s_ack, __ATOMIC_ACQUIRE) != target_mask)
+        arch_pause();
+    s_full_flush = 0;
+
+    spin_unlock(&s_shootdown_lock);
+    arch_irq_restore(fl);
+}
+
 void
 tlb_shootdown_handler(void)
 {
