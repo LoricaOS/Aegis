@@ -154,6 +154,19 @@ run_list_remove_locked(aegis_task_t *task)
  * blocks; single-core test bed).  SMP would want this under sched_lock + a stack. */
 uint32_t s_vfork_frozen_tgid = 0;
 
+/* task_pickable — true if `t` is a real, runnable task this CPU may switch to:
+ * not the sentinel, not already live on another core (on_cpu >= 0 && != me,
+ * which would run its single kernel stack on two CPUs = corruption), and not
+ * frozen by an in-flight vfork in its thread group. */
+static inline int
+task_pickable(aegis_task_t *t, int me)
+{
+    return t != &s_run_sentinel &&
+           (t->on_cpu < 0 || t->on_cpu == me) &&
+           !(s_vfork_frozen_tgid && t->is_user &&
+             ((aegis_process_t *)t)->tgid == s_vfork_frozen_tgid);
+}
+
 static aegis_task_t *
 run_list_next_locked(aegis_task_t *cur)
 {
@@ -164,20 +177,52 @@ run_list_next_locked(aegis_task_t *cur)
     else
         start = s_run_sentinel.next_run;
 
-    /* Walk the ring once from `start`, returning the first task that is NOT
-     * already executing on another CPU.  A task with on_cpu >= 0 && != me is
-     * live on some other core — picking it would run it on two CPUs at once
-     * (shared kernel stack/registers = corruption), so skip it.  on_cpu == me
-     * means it is `cur` itself (still marked from when we switched in); it is a
-     * valid fallback when nothing else is runnable.  When every task in the
-     * ring is busy elsewhere (or the ring is empty), fall back to THIS CPU's
-     * own idle task. */
+    /* Single core: affinity is moot (nowhere to migrate) and the two-pass walk
+     * only adds overhead — first pickable in strict round-robin, as before. */
+    if (g_cpu_count <= 1) {
+        aegis_task_t *t = start;
+        do {
+            if (task_pickable(t, me))
+                return t;
+            t = t->next_run;
+        } while (t != start);
+        return this_cpu_idle();
+    }
+
+    /* Affinity-preserving work-stealing. A task that blocks then wakes used to
+     * be grabbed by whichever core ticked next, so a single busy task (a serial
+     * build) ping-ponged between cores, cold-starting cache + TLB every hop —
+     * ~5x slower at smp2. Two round-robin passes from `start`:
+     *
+     *  Pass 1 — OWN CORE (last_cpu == me): warm cache/TLB, no cross-core cost.
+     *  Pass 2 — STEAL, but ONLY a task whose home core is right now running a
+     *  DIFFERENT non-idle task (so the owner won't reclaim it soon). A task whose
+     *  home core is idle is left for that core's own pass 1 — this is exactly
+     *  what keeps a lone task from bouncing. home < 0 (never ran) is free to grab.
+     *
+     * A task waits at most ~one tick for its home core, so pass 2's restraint
+     * never starves it. Nothing pickable → this CPU's idle. */
     aegis_task_t *t = start;
     do {
-        if (t != &s_run_sentinel && (t->on_cpu < 0 || t->on_cpu == me) &&
-            !(s_vfork_frozen_tgid && t->is_user &&
-              ((aegis_process_t *)t)->tgid == s_vfork_frozen_tgid))
+        if (task_pickable(t, me) && t->last_cpu == me)
             return t;
+        t = t->next_run;
+    } while (t != start);
+
+    t = start;
+    do {
+        if (task_pickable(t, me)) {
+            int home  = t->last_cpu;
+            int steal = (home < 0);
+            if (!steal && home < (int)MAX_CPUS) {
+                aegis_task_t *hc = (aegis_task_t *)g_percpu[home].current_task;
+                steal = (hc && !hc->is_idle && hc != t);
+            }
+            if (steal) {
+                t->last_cpu = (int8_t)me;   /* migrate: this core is its new home */
+                return t;
+            }
+        }
         t = t->next_run;
     } while (t != start);
 
@@ -260,6 +305,7 @@ sched_spawn_task_locked(void (*fn)(void))
     task->wake_pending     = 0;
     task->waiting_for      = 0;
     task->on_cpu           = -1;   /* not running on any CPU yet */
+    task->last_cpu         = -1;   /* scheduler affinity: no home core yet */
     task->is_idle          = 0;
     task->next_run         = (aegis_task_t *)0;
     task->prev_run         = (aegis_task_t *)0;
@@ -344,6 +390,7 @@ sched_add(aegis_task_t *task)
      * leave on_cpu == 0 ("running on CPU 0").  Force the not-running sentinel
      * so the SMP picker treats the new task as free. */
     task->on_cpu  = -1;
+    task->last_cpu = -1;   /* no affinity yet — stealable by any core on first pick */
     task->is_idle = 0;
     aegis_task_t *cur = sched_current();
     if (!cur) {

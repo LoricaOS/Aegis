@@ -27,7 +27,8 @@ typedef struct aegis_task_t {
      * task is safely suspended and may be picked up by another CPU. */
     int32_t              on_cpu;           /* offset 8 */
     uint8_t              is_idle;          /* offset 12 — 1 = per-CPU idle task (never queued) */
-    uint8_t              _pad_on_cpu[3];   /* offset 13-15 — keep fpu_state 16-aligned */
+    int8_t               last_cpu;         /* offset 13 — scheduler affinity: last core this task ran on (-1 = none) */
+    uint8_t              _pad_on_cpu[2];   /* offset 14-15 — keep fpu_state 16-aligned */
 #if defined(__aarch64__)
     /* fpu_state — AArch64 FP/SIMD save area for this task's user NEON state:
      * 32 × 128-bit V registers (512 bytes) + FPSR + FPCR (2 × 32-bit) at
