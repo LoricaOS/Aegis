@@ -86,70 +86,41 @@ static spinlock_t vmm_window_lock = SPINLOCK_INIT;
  * Do NOT call this while a previous vmm_window_map result is still in use
  * unless you are intentionally overwriting the mapping (walk-overwrite pattern).
  */
-/* DIAG (hwwatch): detect concurrent CROSS-CPU use of the single global window.
- * The window (VMM_WINDOW_VA) is the prime wrong-physical-frame suspect: if two
- * CPUs map it at once, one CPU's write (page-table entries / copied page data)
- * lands in the other CPU's mapped frame → sprays kernel memory.  Every window
- * user holds vmm_window_lock, so g_win_owner must only ever be ONE cpu; a
- * mismatch proves the lock failed to serialize.  Uses lapic_id() (GS-independent
- * — robust even if percpu/GS is corrupted).  Owner set on slot-1/slot-2 map,
- * cleared on slot-1 unmap (held across the fork copy's map+map2). */
-static volatile int g_win_owner = -1;
-static inline void win_enter(void)
-{
-    if (!g_hwwatch) return;
-    int me = (int)lapic_id();
-    int prev = g_win_owner;
-    if (prev != -1 && prev != me)
-        printk("[WINRACE] VMM window: cpu%d entered while cpu%d already owns it "
-               "(lock failed to serialize)\n", me, prev);
-    g_win_owner = me;
-}
-static inline void win_exit(void)
-{
-    if (g_hwwatch) g_win_owner = -1;
-}
-
+/*
+ * Physmap-backed window: vmm_init installs a full direct map of usable RAM at
+ * ARCH_PHYSMAP_BASE, so every physical frame is permanently reachable at
+ * (phys + ARCH_PHYSMAP_BASE). These keep the map/use/unmap idiom their many
+ * callers use, but are now pure address arithmetic — no PTE store, no invlpg,
+ * no single shared slot. map and map2 therefore return DISTINCT addresses and
+ * never conflict, and unmap is a no-op. This is the whole point of the physmap:
+ * the old per-access window did a PTE write + invlpg thousands of times per
+ * fork (page-table walk + page copy). The legacy VMM_WINDOW_VA slot at pd_hi[4]
+ * is left mapped-to-empty and unused. Callers still hold vmm_window_lock; with
+ * no shared slot it now serializes nothing but page-table structural changes,
+ * which is harmless (a later pass can drop it from the read-only paths).
+ */
 void *
 vmm_window_map(uint64_t phys)
 {
-    win_enter();
-    *s_window_pte = phys | arch_pte_from_flags(VMM_FLAG_PRESENT | VMM_FLAG_WRITABLE);
-    arch_vmm_invlpg(VMM_WINDOW_VA);
-    return (void *)VMM_WINDOW_VA;
+    return (void *)(phys + ARCH_PHYSMAP_BASE);
 }
 
-/*
- * vmm_window_unmap — clear the window PTE and flush TLB.
- * Call this after the last use of any vmm_window_map result.
- */
 void
 vmm_window_unmap(void)
 {
-    *s_window_pte = 0;
-    arch_vmm_invlpg(VMM_WINDOW_VA);
-    win_exit();
+    /* no-op: the physmap is permanent */
 }
 
-/* vmm_window_map2 — map phys into the second window slot (VMM_WINDOW_VA + 4096).
- * Returns the VA of the mapped page.
- * Non-reentrant with vmm_window_map: never hold both simultaneously
- * across any call that may call vmm_window_map/map2 internally. */
 static void *
 vmm_window_map2(uint64_t phys)
 {
-    win_enter();
-    *s_window_pte2 = phys | arch_pte_from_flags(VMM_FLAG_PRESENT | VMM_FLAG_WRITABLE);
-    arch_vmm_invlpg(VMM_WINDOW_VA + 4096);
-    return (void *)(VMM_WINDOW_VA + 4096);
+    return (void *)(phys + ARCH_PHYSMAP_BASE);
 }
 
-/* vmm_window_unmap2 — clear the second window PTE and flush TLB. */
 static void
 vmm_window_unmap2(void)
 {
-    *s_window_pte2 = 0;
-    arch_vmm_invlpg(VMM_WINDOW_VA + 4096);
+    /* no-op: the physmap is permanent */
 }
 
 /*
@@ -328,6 +299,35 @@ vmm_init(void)
         pd_hi[4]      = win_phys | arch_pte_from_flags(VMM_FLAG_PRESENT | VMM_FLAG_WRITABLE);
         s_window_pte  = &s_window_pt[0];
         s_window_pte2 = &s_window_pt[1];
+    }
+
+    /* Physmap: direct-map all usable RAM at ARCH_PHYSMAP_BASE (PML4[256]) with
+     * 2MB huge pages, so any frame is reachable at phys + ARCH_PHYSMAP_BASE.
+     * This is what the vmm_window_* helpers now return — no per-access page-table
+     * window (PTE store + invlpg) on any fork / page-table walk / page copy.
+     * Built with the early (boot-page-table) allocator, still valid here.
+     * One PDPT spans 512GB. ponytail: >512GB RAM would need more PDPTs. */
+    {
+        uint64_t top = pmm_ram_max_page() << 12;      /* top usable byte */
+        top = (top + 0x3FFFFFFFUL) & ~0x3FFFFFFFUL;   /* round up to 1GB */
+        if (top < 0x40000000UL) top = 0x40000000UL;   /* map at least 1GB */
+        uint64_t ngb = top >> 30;
+        if (ngb > 512) ngb = 512;                     /* single-PDPT cap */
+        uint64_t pm_pdpt_phys = alloc_table_early();
+        uint64_t *pm_pdpt = early_pv(pm_pdpt_phys);
+        for (uint64_t g = 0; g < ngb; g++) {
+            uint64_t pd_phys = alloc_table_early();
+            uint64_t *pd = early_pv(pd_phys);
+            for (uint64_t e = 0; e < 512; e++)
+                pd[e] = ((g << 30) + (e << 21))
+                        | arch_pte_from_flags(VMM_FLAG_PRESENT | VMM_FLAG_WRITABLE)
+                        | (1UL << 7);                 /* PS: 2MB huge page */
+            pm_pdpt[g] = pd_phys
+                         | arch_pte_from_flags(VMM_FLAG_PRESENT | VMM_FLAG_WRITABLE);
+        }
+        pml4[256] = pm_pdpt_phys
+                    | arch_pte_from_flags(VMM_FLAG_PRESENT | VMM_FLAG_WRITABLE);
+        printk("[VMM] OK: physmap %u GB direct-mapped\n", (unsigned)ngb);
     }
 
     s_pml4_phys = pml4_phys;

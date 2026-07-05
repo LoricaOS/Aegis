@@ -178,6 +178,13 @@ uint64_t arch_early_pv_off(void);
 /* Virtual base address of the kernel in the higher half. */
 #define ARCH_KERNEL_VIRT_BASE 0xFFFFFFFF80000000UL
 
+/* Physmap (direct map): all usable physical RAM is mapped 1:1 at this base by
+ * vmm_init, so any frame is reachable at (phys + ARCH_PHYSMAP_BASE) without a
+ * per-access page-table window. PML4[256], the canonical higher-half start;
+ * one PML4 entry spans 512GB. Distinct from the kernel image map (PML4[511])
+ * and the torn-down boot identity map (PML4[0]). */
+#define ARCH_PHYSMAP_BASE 0xFFFF800000000000UL
+
 /* -------------------------------------------------------------------------
  * Virtual memory interface (Phase 3+)
  * ------------------------------------------------------------------------- */
