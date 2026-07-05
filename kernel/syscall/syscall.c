@@ -39,6 +39,7 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case  64: num = 1;   break;  /* write */
     case  66: num = 20;  break;  /* writev */
     case  73: num = 271; break;  /* ppoll (aarch64 has no poll; musl poll()→ppoll) */
+    case  72: num = 270; break;  /* pselect6 (aarch64 has no select; musl select()→pselect6) */
     case  36: num = 88; arg1 = arg2; arg2 = arg3; break;  /* symlinkat → symlink (skip dirfd) */
     case  78: num = 89; arg1 = arg2; arg2 = arg3; arg3 = arg4; break;  /* readlinkat → readlink (skip dirfd) */
     case  53: num = 90; arg1 = arg2; arg2 = arg3; break;  /* fchmodat → chmod (skip dirfd+flags) */
@@ -244,6 +245,7 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case   7: return sys_poll(arg1, arg2, arg3);
     case 271: return sys_ppoll(arg1, arg2, arg3, arg4, arg5);
     case  23: return sys_select(arg1, arg2, arg3, arg4, arg5);
+    case 270: return sys_pselect6(arg1, arg2, arg3, arg4, arg5, arg6);
     case 291: return sys_epoll_create1(arg1);
     case 233: return sys_epoll_ctl(arg1, arg2, arg3, arg4);
     case 232: return sys_epoll_wait(arg1, arg2, arg3, arg4);
