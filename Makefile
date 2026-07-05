@@ -165,6 +165,37 @@ DRIVER_OBJS    = $(patsubst kernel/%.c,$(BUILD)/%.o,$(DRIVER_SRCS))
 NET_OBJS       = $(patsubst kernel/%.c,$(BUILD)/%.o,$(NET_SRCS))
 USERSPACE_OBJS = $(patsubst kernel/%.c,$(BUILD)/%.o,$(USERSPACE_SRCS))
 
+# ── Optional unity / jumbo build (UNITY=1) ──────────────────────────────────
+# Compile each collision-free subsystem as ONE translation unit (a generated
+# build/<grp>_unity.c that #includes its sources) instead of one cc1+as per
+# file. Far fewer process spawns + headers parsed once → a faster clean build,
+# byte-for-byte the same code. DRIVERS are excluded: several define a private
+# `static _memcpy`/`_memset`, which redefine in a single TU. Off by default so
+# incremental dev rebuilds don't recompile a whole subsystem for one file.
+ifeq ($(UNITY),1)
+fs_SRCS     := $(FS_SRCS)
+net_SRCS    := $(NET_SRCS)
+mm_SRCS     := $(MM_SRCS)
+sched_SRCS  := $(SCHED_SRCS)
+tty_SRCS    := $(TTY_SRCS)
+signal_SRCS := $(SIGNAL_SRCS)
+define UNITY_template
+$(BUILD)/$(1)_unity.c: $$($(1)_SRCS)
+	@mkdir -p $$(@D)
+	@echo "/* GENERATED unity TU (UNITY=1) — do not edit */" > $$@
+	@for s in $$($(1)_SRCS); do echo "#include \"$$$$s\"" >> $$@; done
+$(BUILD)/$(1)_unity.o: $(BUILD)/$(1)_unity.c
+	$$(CC) $$(CFLAGS) -I. -c $$< -o $$@
+endef
+$(foreach g,fs net mm sched tty signal,$(eval $(call UNITY_template,$(g))))
+FS_OBJS     = $(BUILD)/fs_unity.o
+NET_OBJS    = $(BUILD)/net_unity.o
+MM_OBJS     = $(BUILD)/mm_unity.o
+SCHED_OBJS  = $(BUILD)/sched_unity.o
+TTY_OBJS    = $(BUILD)/tty_unity.o
+SIGNAL_OBJS = $(BUILD)/signal_unity.o
+endif
+
 # ── No embedded userland (Linux model) ──────────────────────────────────────
 # The kernel embeds NO userland binaries. Init (/bin/vigil) and all other
 # programs load from the ext2 root filesystem (rootfs module on live media,
