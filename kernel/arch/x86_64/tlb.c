@@ -36,6 +36,28 @@
 
 #define TLB_SHOOTDOWN_VECTOR 0xFE
 
+/* DIAG: broadcast-IPI counters by source (read via sys_reboot). */
+volatile uint32_t g_bc_kernel;   /* TLB_TARGET_ALL ranged (kva/kernel maps) */
+volatile uint32_t g_bc_user;     /* per-CR3 user-page unmap/mprotect/COW */
+volatile uint32_t g_bc_full;     /* tlb_flush_all_cpus (address-space teardown) */
+
+/* g_cpu_cr3[i] = the PML4 phys CPU i currently has loaded (updated by
+ * vmm_switch_to via tlb_note_cr3). A per-CR3 (user) shootdown then IPIs only the
+ * CPUs actually running that address space — a process unmapping its own page
+ * while every other core runs a different CR3 flushes locally with NO IPI. */
+volatile uint64_t g_cpu_cr3[MAX_CPUS];
+
+void
+tlb_note_cr3(uint64_t pml4_phys)
+{
+    g_cpu_cr3[percpu_self()->cpu_id] = pml4_phys;
+    /* Publish the new CR3 before the caller's `mov %cr3` repopulates the TLB.
+     * Pairs with the fence in tlb_shootdown: a shootdown that samples the OLD
+     * value here skips this CPU, but this CPU's imminent CR3 load walks the page
+     * table fresh (after the unmapper's PTE clear) so it caches nothing stale. */
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+
 /* Shared shootdown request (protected by s_shootdown_lock). */
 static spinlock_t        s_shootdown_lock = SPINLOCK_INIT;
 static volatile uint64_t s_target_cr3;
@@ -135,11 +157,23 @@ tlb_shootdown(uint64_t target_cr3, uint64_t va_start, uint64_t va_end)
      * g_ap_online[0] covers the BSP (set in smp_percpu_init_bsp), so a
      * shootdown initiated on an AP reaches the BSP too. */
     uint8_t my_id = percpu_self()->cpu_id;
+    /* For a per-CR3 (user) target, IPI ONLY the CPUs currently running that
+     * address space (g_cpu_cr3). A single-threaded process unmapping its own
+     * page while other cores run different CR3s then flushes locally with no
+     * IPI — this collapses the ~69k user-page broadcasts a build fires. Kernel
+     * (TLB_TARGET_ALL) maps live under every CR3, so still target all online.
+     * The fence orders the caller's PTE clear before we sample g_cpu_cr3 (pairs
+     * with tlb_note_cr3): if a CPU is racing into `target_cr3` we either see it
+     * here (and IPI it) or it loads CR3 after the PTE clear (and caches nothing
+     * stale) — never both-miss. */
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
     uint16_t target_mask = 0;
-    for (uint32_t i = 0; i < MAX_CPUS; i++) {
+    for (uint32_t i = 0; i < MAX_CPUS && i < 16; i++) {
         if (i == my_id)
             continue;
         if (!g_ap_online[i])
+            continue;
+        if (target_cr3 != TLB_TARGET_ALL && g_cpu_cr3[i] != target_cr3)
             continue;
         target_mask |= (uint16_t)(1u << i);
     }
@@ -164,6 +198,7 @@ tlb_shootdown(uint64_t target_cr3, uint64_t va_start, uint64_t va_end)
     __atomic_store_n(&s_pending, target_mask, __ATOMIC_RELEASE);
 
     /* Broadcast IPI to all other CPUs. */
+    if (target_cr3 == TLB_TARGET_ALL) g_bc_kernel++; else g_bc_user++;
     lapic_send_ipi_all_excl_self(TLB_SHOOTDOWN_VECTOR);
 
     /* Spin until all targets acknowledge.  Targets that are themselves
@@ -226,6 +261,7 @@ tlb_flush_all_cpus(void)
     s_va_end     = 0;
     s_full_flush = 1;
     s_ack        = 0;
+    g_bc_full++;
     __atomic_store_n(&s_pending, target_mask, __ATOMIC_RELEASE);
     lapic_send_ipi_all_excl_self(TLB_SHOOTDOWN_VECTOR);
     while (__atomic_load_n(&s_ack, __ATOMIC_ACQUIRE) != target_mask)

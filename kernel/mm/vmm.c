@@ -688,6 +688,7 @@ vmm_try_map_user_page(uint64_t pml4_phys, uint64_t virt,
 void
 vmm_switch_to(uint64_t pml4_phys)
 {
+    tlb_note_cr3(pml4_phys);        /* record before the CR3 load (per-CR3 shootdown targeting) */
     arch_vmm_load_pml4(pml4_phys);
 }
 
