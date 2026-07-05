@@ -247,6 +247,8 @@ uint64_t sys_ppoll(uint64_t fds, uint64_t nfds, uint64_t ts_ptr,
                    uint64_t sigmask, uint64_t sigsetsize);
 uint64_t sys_select(uint64_t nfds, uint64_t rfds, uint64_t wfds,
                     uint64_t efds, uint64_t timeout);
+uint64_t sys_pselect6(uint64_t nfds, uint64_t rfds, uint64_t wfds,
+                      uint64_t efds, uint64_t ts_ptr, uint64_t sigmask);
 uint64_t sys_epoll_create1(uint64_t flags);
 uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd, uint64_t event);
 uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events,
