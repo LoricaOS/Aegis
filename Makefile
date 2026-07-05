@@ -173,27 +173,19 @@ USERSPACE_OBJS = $(patsubst kernel/%.c,$(BUILD)/%.o,$(USERSPACE_SRCS))
 # `static _memcpy`/`_memset`, which redefine in a single TU. Off by default so
 # incremental dev rebuilds don't recompile a whole subsystem for one file.
 ifeq ($(UNITY),1)
-fs_SRCS     := $(FS_SRCS)
-net_SRCS    := $(NET_SRCS)
-mm_SRCS     := $(MM_SRCS)
-sched_SRCS  := $(SCHED_SRCS)
-tty_SRCS    := $(TTY_SRCS)
-signal_SRCS := $(SIGNAL_SRCS)
-define UNITY_template
-$(BUILD)/$(1)_unity.c: $$($(1)_SRCS)
-	@mkdir -p $$(@D)
-	@echo "/* GENERATED unity TU (UNITY=1) — do not edit */" > $$@
-	@for s in $$($(1)_SRCS); do echo "#include \"$$$$s\"" >> $$@; done
-$(BUILD)/$(1)_unity.o: $(BUILD)/$(1)_unity.c
-	$$(CC) $$(CFLAGS) -I. -c $$< -o $$@
-endef
-$(foreach g,fs net mm sched tty signal,$(eval $(call UNITY_template,$(g))))
-FS_OBJS     = $(BUILD)/fs_unity.o
-NET_OBJS    = $(BUILD)/net_unity.o
-MM_OBJS     = $(BUILD)/mm_unity.o
-SCHED_OBJS  = $(BUILD)/sched_unity.o
-TTY_OBJS    = $(BUILD)/tty_unity.o
-SIGNAL_OBJS = $(BUILD)/signal_unity.o
+# Unity/jumbo build: compile each clean subsystem as ONE TU (build/<grp>_unity.c
+# that #includes its sources) — far fewer cc1+as spawns, the dominant self-build
+# cost. The generating RULES live after `all:` (below) so their targets can't
+# hijack the default goal; here we only redirect the *_OBJS the final link reads.
+# A group must have no duplicate file-scope statics / clashing macros across files.
+CORE_OBJS      = $(BUILD)/core_unity.o
+MM_OBJS        = $(BUILD)/mm_unity.o
+FS_OBJS        = $(BUILD)/fs_unity.o
+NET_OBJS       = $(BUILD)/net_unity.o
+SCHED_OBJS     = $(BUILD)/sched_unity.o
+TTY_OBJS       = $(BUILD)/tty_unity.o
+SIGNAL_OBJS    = $(BUILD)/signal_unity.o
+USERSPACE_OBJS = $(BUILD)/syscall_unity.o
 endif
 
 # ── No embedded userland (Linux model) ──────────────────────────────────────
@@ -208,6 +200,28 @@ ALL_OBJS = $(BOOT_OBJ) $(ARCH_OBJS) $(ARCH_ASM_OBJS) $(CORE_OBJS) $(SIGNAL_OBJS)
 
 .PHONY: all iso test clean version sym dist arm64 arm64-iso test-arm64
 all: $(BUILD)/aegis.elf
+
+# ── Unity rule bodies (after all: so targets don't become the default goal) ──
+ifeq ($(UNITY),1)
+$(BUILD)/core_unity.c: $(CORE_SRCS)
+	@mkdir -p $(@D) && echo "/* GENERATED unity (UNITY=1) */" > $@ && for s in $(CORE_SRCS); do echo "#include \"$$s\"" >> $@; done
+$(BUILD)/mm_unity.c: $(MM_SRCS)
+	@mkdir -p $(@D) && echo "/* GENERATED unity (UNITY=1) */" > $@ && for s in $(MM_SRCS); do echo "#include \"$$s\"" >> $@; done
+$(BUILD)/fs_unity.c: $(FS_SRCS)
+	@mkdir -p $(@D) && echo "/* GENERATED unity (UNITY=1) */" > $@ && for s in $(FS_SRCS); do echo "#include \"$$s\"" >> $@; done
+$(BUILD)/net_unity.c: $(NET_SRCS)
+	@mkdir -p $(@D) && echo "/* GENERATED unity (UNITY=1) */" > $@ && for s in $(NET_SRCS); do echo "#include \"$$s\"" >> $@; done
+$(BUILD)/sched_unity.c: $(SCHED_SRCS)
+	@mkdir -p $(@D) && echo "/* GENERATED unity (UNITY=1) */" > $@ && for s in $(SCHED_SRCS); do echo "#include \"$$s\"" >> $@; done
+$(BUILD)/tty_unity.c: $(TTY_SRCS)
+	@mkdir -p $(@D) && echo "/* GENERATED unity (UNITY=1) */" > $@ && for s in $(TTY_SRCS); do echo "#include \"$$s\"" >> $@; done
+$(BUILD)/signal_unity.c: $(SIGNAL_SRCS)
+	@mkdir -p $(@D) && echo "/* GENERATED unity (UNITY=1) */" > $@ && for s in $(SIGNAL_SRCS); do echo "#include \"$$s\"" >> $@; done
+$(BUILD)/syscall_unity.c: $(USERSPACE_SRCS)
+	@mkdir -p $(@D) && echo "/* GENERATED unity (UNITY=1) */" > $@ && for s in $(USERSPACE_SRCS); do echo "#include \"$$s\"" >> $@; done
+$(BUILD)/%_unity.o: $(BUILD)/%_unity.c
+	$(CC) $(CFLAGS) -I. -c $< -o $@
+endif
 
 # ── ARM64 build (aarch64-linux-gnu toolchain; see Makefile.arm64) ───────────
 arm64:
