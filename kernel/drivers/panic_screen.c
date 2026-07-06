@@ -70,35 +70,67 @@ _panic_draw_hex(uint32_t *px_x, uint32_t px_y, uint64_t val, uint32_t fg)
 }
 #endif /* __x86_64__ */
 
-/* Blit an RGBA logo onto the framebuffer with alpha blending.
- * Pixel format: 0xAARRGGBB. bg = background color for blending. */
+/* Blit a white-on-transparent logo (8-bit coverage mask) onto the framebuffer,
+ * alpha-blended over bg. `scale` box-averages a scale*scale source block per
+ * output pixel (scale=1 full size, scale=2 half, ...) so one full-res mask
+ * serves any display size. The art is greyscale, so a single coverage byte per
+ * pixel reproduces it: out = white*cov + bg*(255-cov). */
 static void
-_blit_logo_rgba(const uint32_t *data, uint32_t logo_w, uint32_t logo_h,
-                uint32_t dst_x, uint32_t dst_y, uint32_t bg)
+_blit_logo_cov(const unsigned char *cov, uint32_t logo_w, uint32_t logo_h,
+               uint32_t dst_x, uint32_t dst_y, uint32_t bg, uint32_t scale)
 {
     uint32_t bg_r = (bg >> 16) & 0xFF;
     uint32_t bg_g = (bg >> 8)  & 0xFF;
     uint32_t bg_b =  bg        & 0xFF;
+    uint32_t ow = logo_w / scale, oh = logo_h / scale;
     uint32_t y, x;
-    for (y = 0; y < logo_h; y++) {
+    for (y = 0; y < oh; y++) {
         if (dst_y + y >= s_fb_height) break;
-        for (x = 0; x < logo_w; x++) {
+        for (x = 0; x < ow; x++) {
             if (dst_x + x >= s_fb_width) break;
-            uint32_t px = data[y * logo_w + x];
-            uint32_t a = (px >> 24) & 0xFF;
+            /* box-average the scale*scale source block */
+            uint32_t sum = 0, n = 0, yy, xx;
+            for (yy = 0; yy < scale; yy++)
+                for (xx = 0; xx < scale; xx++) {
+                    sum += cov[(y * scale + yy) * logo_w + (x * scale + xx)];
+                    n++;
+                }
+            uint32_t a = sum / n;
             if (a == 0) continue;  /* fully transparent */
-            uint32_t r = (px >> 16) & 0xFF;
-            uint32_t g = (px >> 8)  & 0xFF;
-            uint32_t b =  px        & 0xFF;
-            if (a < 255) {
-                /* Alpha blend: out = fg * a/255 + bg * (255-a)/255 */
-                r = (r * a + bg_r * (255 - a)) / 255;
-                g = (g * a + bg_g * (255 - a)) / 255;
-                b = (b * a + bg_b * (255 - a)) / 255;
+            uint32_t r, g, b;
+            if (a >= 255) {
+                r = g = b = 255;   /* pure white */
+            } else {
+                r = (255 * a + bg_r * (255 - a)) / 255;
+                g = (255 * a + bg_g * (255 - a)) / 255;
+                b = (255 * a + bg_b * (255 - a)) / 255;
             }
             uint32_t idx = (dst_y + y) * s_pitch_px + (dst_x + x);
             s_fb_va[idx] = (r << 16) | (g << 8) | b;
         }
+    }
+}
+
+/* Draw a string in the Terminus font, writing ONLY lit pixels (transparent
+ * background) so it composites cleanly over the boot splash's fill. */
+static void
+_splash_draw_string(uint32_t px_x, uint32_t px_y, const char *s, uint32_t fg)
+{
+    while (*s) {
+        const uint8_t *glyph = &font_terminus[(uint8_t)*s * PANIC_FONT_H * 2];
+        uint32_t row, col;
+        for (row = 0; row < PANIC_FONT_H; row++) {
+            uint16_t bits = ((uint16_t)glyph[row * 2] << 8) | glyph[row * 2 + 1];
+            for (col = 0; col < PANIC_FONT_W; col++) {
+                if (!(bits & (0x8000u >> col)))
+                    continue;
+                uint32_t X = px_x + col, Y = px_y + row;
+                if (X < s_fb_width && Y < s_fb_height)
+                    s_fb_va[Y * s_pitch_px + X] = fg;
+            }
+        }
+        px_x += PANIC_FONT_W;
+        s++;
     }
 }
 
@@ -133,8 +165,8 @@ panic_bluescreen(uint64_t vector, uint64_t rip, uint64_t error_code,
     uint32_t x;
 
     /* Logo in top-left */
-    _blit_logo_rgba(logo_panic_data, LOGO_PANIC_W, LOGO_PANIC_H,
-                    margin_x, y, PANIC_BG);
+    _blit_logo_cov(logo_panic_cov, LOGO_PANIC_W, LOGO_PANIC_H,
+                    margin_x, y, PANIC_BG, 1);
     y += LOGO_PANIC_H + PANIC_FONT_H;
 
     /* Title */
@@ -239,8 +271,8 @@ panic_halt(const char *msg)
     uint32_t x;
 
     /* Logo */
-    _blit_logo_rgba(logo_panic_data, LOGO_PANIC_W, LOGO_PANIC_H,
-                    margin_x, y, PANIC_BG);
+    _blit_logo_cov(logo_panic_cov, LOGO_PANIC_W, LOGO_PANIC_H,
+                    margin_x, y, PANIC_BG, 1);
     y += LOGO_PANIC_H + PANIC_FONT_H;
 
     /* Title */
@@ -281,6 +313,7 @@ phalt:
  * the boot splash → greeter handoff has no color jump. Kernel can't include the
  * userland token header, so the value is mirrored here — keep them in sync. */
 #define SPLASH_BG 0x001B2230u  /* == THEME_SURFACE */
+#define SPLASH_LOGO_SCALE 2    /* boot logo shown at 1/2 the mask resolution */
 
 void
 fb_boot_splash(void)
@@ -296,16 +329,24 @@ fb_boot_splash(void)
             s_fb_va[i] = SPLASH_BG;
     }
 
-    /* Center the logo — must match Bastion's: y = fb_h/2 - (logo_h/2) */
-    uint32_t lx = s_fb_width / 2 - LOGO_BOOT_W / 2;
-    uint32_t ly = s_fb_height / 2 - LOGO_BOOT_H / 2;
+    /* Logo drawn at half size, with the "Capability-Secured" tagline below it;
+     * the logo + gap + text group is vertically centered. */
+    const char *tag = "Capability-Secured";
+    uint32_t dw = LOGO_BOOT_W / SPLASH_LOGO_SCALE;   /* on-screen logo size */
+    uint32_t dh = LOGO_BOOT_H / SPLASH_LOGO_SCALE;
+    uint32_t tw = (uint32_t)(sizeof("Capability-Secured") - 1) * PANIC_FONT_W;
+    uint32_t gap = 18;
+    uint32_t group_h = dh + gap + PANIC_FONT_H;
 
-    /* Debug: print position to serial so we can compare with Bastion */
-    printk("[SPLASH] logo at y=%u (fb_h=%u, logo_h=%u)\n",
-           (unsigned)ly, (unsigned)s_fb_height, (unsigned)LOGO_BOOT_H);
+    uint32_t top = s_fb_height / 2 - group_h / 2;
+    uint32_t lx  = s_fb_width / 2 - dw / 2;
+    uint32_t ly  = top;
+    uint32_t tx  = s_fb_width / 2 - tw / 2;
+    uint32_t ty  = ly + dh + gap;
 
-    _blit_logo_rgba(logo_boot_data, LOGO_BOOT_W, LOGO_BOOT_H,
-                    lx, ly, SPLASH_BG);
+    _blit_logo_cov(logo_boot_cov, LOGO_BOOT_W, LOGO_BOOT_H,
+                   lx, ly, SPLASH_BG, SPLASH_LOGO_SCALE);
+    _splash_draw_string(tx, ty, tag, 0x00E6EAF0u);  /* soft white */
 
     /* No lock — printk_quiet already suppresses FB output in graphical
      * mode. The splash persists until Bastion paints over it. */
