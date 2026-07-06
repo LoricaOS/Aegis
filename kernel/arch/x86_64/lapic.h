@@ -14,6 +14,7 @@ void     lapic_send_init(uint8_t dest_apic_id);
 void     lapic_send_sipi(uint8_t dest_apic_id, uint8_t vector);
 int      lapic_active(void);
 void     lapic_timer_init(void);
+void     lapic_timer_calibrate(void);   /* one-time BSP period+TSC measurement; APs inherit */
 void     lapic_timer_handler(void);
 
 #endif
