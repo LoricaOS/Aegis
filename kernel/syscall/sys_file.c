@@ -849,6 +849,37 @@ copy_path_from_user(char *kpath, uint64_t user_ptr, uint32_t bufsz)
     return -ENAMETOOLONG;
 }
 
+/* copy_path_from_user + resolve a relative result against proc->cwd (as sys_open
+ * does). The dir-mutating syscalls (mkdir/rmdir/unlink/rename/link) historically
+ * passed the raw user path straight to ext2, which walks from the fs ROOT — so a
+ * RELATIVE path from a process with cwd != "/" (e.g. a parallel build's atomic
+ * temp+rename of build/foo.o with cwd=/aegis) failed "parent dir open". Absolute
+ * paths pass through unchanged. */
+int
+copy_path_resolved(char *kpath, uint64_t user_ptr, uint32_t bufsz)
+{
+    int r = copy_path_from_user(kpath, user_ptr, bufsz);
+    if (r != 0)
+        return r;
+    if (kpath[0] == '/' || kpath[0] == '\0')
+        return 0;                       /* absolute or empty — nothing to do */
+
+    aegis_process_t *proc = current_proc();
+    char tmp[256];
+    uint32_t cwdlen = 0;
+    while (proc->cwd[cwdlen]) cwdlen++;
+    uint32_t plen = 0;
+    while (kpath[plen]) plen++;
+    uint32_t sep = (cwdlen > 0 && proc->cwd[cwdlen - 1] == '/') ? 0u : 1u;
+    if (cwdlen + sep + plen >= sizeof(tmp) || cwdlen + sep + plen >= bufsz)
+        return -ENAMETOOLONG;
+    __builtin_memcpy(tmp, proc->cwd, cwdlen);
+    if (sep) tmp[cwdlen] = '/';
+    __builtin_memcpy(tmp + cwdlen + sep, kpath, plen + 1);
+    __builtin_memcpy(kpath, tmp, cwdlen + sep + plen + 1);
+    return 0;
+}
+
 /*
  * sys_sync — syscall 162
  *

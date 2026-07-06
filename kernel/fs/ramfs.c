@@ -294,6 +294,13 @@ ramfs_open(ramfs_t *inst, const char *name, int flags, vfs_file_t *out)
             return -ENOMEM;
         }
     } else {
+        /* O_CREAT|O_EXCL on an existing entry: fail EEXIST (atomic create —
+         * mkstemp's collision detection; two same-name creators must not both
+         * "succeed" into one file). */
+        if ((flags & (int)VFS_O_CREAT) && (flags & (int)VFS_O_EXCL)) {
+            spin_unlock_irqrestore(&inst->lock, fl);
+            return -EEXIST;
+        }
         n = &inst->inodes[d->inode];
     }
     if (flags & (int)VFS_O_TRUNC) {

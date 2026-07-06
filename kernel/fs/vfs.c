@@ -165,6 +165,9 @@ vfs_open(const char *path, int flags, uint16_t create_mode, vfs_file_t *out)
     {
         uint32_t ino = 0;
         if (ext2_open(path, &ino) >= 0) {
+            /* O_CREAT|O_EXCL on an existing file: fail EEXIST (atomic create). */
+            if ((flags & (int)VFS_O_CREAT) && (flags & (int)VFS_O_EXCL))
+                return -EEXIST;
             /* DAC permission check */
             if (sched_current()->is_user) {
                 aegis_process_t *pr = current_proc();
