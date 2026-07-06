@@ -366,8 +366,9 @@ static int parse_firmware(void)
                 /* connect-path commands live in LONG_GROUP (g1): PHY_CTXT 0x8 v3,
                  * ADD_STA 0x18 v12, TX 0x1c v7, MAC_CTXT 0x28 v5, BINDING 0x2b v2 */
                 if (c == 0x17 && g == 0x05) s_scd_qcfg_ver = v;   /* new txq path */
-                if ((c == 0x17 && g == 0x05) || c == 0x1d || (c == 0x1c && g == 0x01))
-                    printk("[AX200] qcmdver 0x%x/g%u=v%u\n", c, g, v);
+                /* DATA_PATH_GROUP(5): TLC 0x0f, RLC 0x08, STA_HE 0x07 */
+                if (g == 0x05 && (c==0x0f||c==0x08||c==0x07||c==0x0d||c==0x17))
+                    printk("[AX200] dpcmdver 0x%x/g%u=v%u\n", c, g, v);
             }
         }
         off += 8 + ((tlen + 3u) & ~3u);    /* TLVs are 4-byte padded */
@@ -968,6 +969,22 @@ do_connect(void)
     /* station_flags @20 = 0 (20MHz SISO); station_type @35 = IWL_STA_LINK(0) */
     if (send_check(0x118, c, 48, "ADD_STA") != 0) return;
     printk("[AX200] ADD_STA ok — AP peer added\n");
+
+    /* Step 4b: TLC_MNG_CONFIG_CMD (0x50f, DATA_PATH_GROUP) — the station's
+     * rate-scaling config. THE MISSING PIECE: the FW won't service the station's
+     * TX queue until this is set (found via iwlwifi fw-59 ftrace: 0x05.0x0f is
+     * sent right after ADD_STA, before the queue + first TX). iwl_tlc_config_cmd
+     * v3/v4 are both 36B with these fields at identical offsets. */
+    {
+        uint8_t tlc[36];
+        for (int i = 0; i < 36; i++) tlc[i] = 0;
+        /* sta_id@0=0; max_ch_width@4=20MHz(0); mode@5=CCK/NON_HT(0) */
+        tlc[6] = 1;                          /* chains = IWL_TLC_MNG_CHAIN_A_MSK */
+        tlc[10] = 0xff; tlc[11] = 0x0f;      /* non_ht_rates = 0x0fff (all legacy) */
+        /* fw-59 uses the older TLC struct: ht_rates[2][2] -> 28 bytes, not 36. */
+        if (send_check(0x50f, tlc, 28, "TLC_CONFIG") != 0) return;
+        printk("[AX200] TLC_CONFIG ok — station rate table set\n");
+    }
 
     /* Step 5: allocate a data TX queue for the station. */
     if (alloc_tx_queue() != 0) return;
