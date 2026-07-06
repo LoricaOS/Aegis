@@ -133,6 +133,7 @@ static volatile uint8_t *s_rb_stts;          /* KVA of the RB status block */
 static volatile uint8_t *s_used_bd;          /* KVA of the used-RBD completion ring */
 static volatile uint8_t *s_cmd_ring;         /* KVA of the command TFD ring */
 static uint16_t          s_cmd_wr;           /* command queue write pointer */
+static uint16_t          s_rx_read;          /* next RX buffer index to examine */
 
 static inline uint32_t csr_rd(uint32_t off) { return *(volatile uint32_t *)(s_mmio + off); }
 static inline void     csr_wr(uint32_t off, uint32_t v) { *(volatile uint32_t *)(s_mmio + off) = v; }
@@ -267,6 +268,8 @@ find_pm_pmcsr(const pcie_device_t *d)
 #define IWL_TLV_MAGIC          0x0a4c5749u
 #define TLV_HDR_SIZE           88
 #define IWL_UCODE_TLV_SEC_RT   19
+#define IWL_UCODE_TLV_DEF_CALIB 22
+#define IWL_UCODE_TLV_PHY_SKU  23
 #define CPU1_CPU2_SEPARATOR    0xFFFFCCCCu
 #define PAGING_SEPARATOR       0xAAAABBBBu
 #define MAX_FW_SEC             64   /* IWL_MAX_DRAM_ENTRY; firmware has ~27+ secs */
@@ -276,6 +279,8 @@ static struct fw_sec s_sec[MAX_FW_SEC];
 static int      s_num_sec;
 static uint32_t s_fw_ver;
 static int      s_lmac_cnt, s_umac_cnt, s_paging_cnt;
+static uint32_t s_phy_config;               /* from PHY_SKU TLV */
+static uint32_t s_calib_flow, s_calib_event; /* from DEF_CALIB TLV (regular ucode) */
 
 static inline uint32_t rd_le32(const uint8_t *p)
 {
@@ -324,6 +329,12 @@ static int parse_firmware(void)
             s_sec[s_num_sec].data   = tdata + 4;
             s_sec[s_num_sec].len    = tlen - 4;
             s_num_sec++;
+        } else if (type == IWL_UCODE_TLV_PHY_SKU && tlen >= 4) {
+            s_phy_config = rd_le32(tdata);                 /* phy_cfg for PHY_CONFIG */
+        } else if (type == IWL_UCODE_TLV_DEF_CALIB && tlen >= 12 &&
+                   rd_le32(tdata) == 0 /* IWL_UCODE_REGULAR */) {
+            s_calib_flow  = rd_le32(tdata + 4);
+            s_calib_event = rd_le32(tdata + 8);
         }
         off += 8 + ((tlen + 3u) & ~3u);    /* TLVs are 4-byte padded */
     }
@@ -332,8 +343,9 @@ static int parse_firmware(void)
     s_umac_cnt   = sec_count_from(s_lmac_cnt + 1);
     s_paging_cnt = sec_count_from(s_lmac_cnt + s_umac_cnt + 2);
 
-    printk("[AX200] fw ver=0x%x: %d secs (lmac=%d umac=%d paging=%d)\n",
-           (unsigned)s_fw_ver, s_num_sec, s_lmac_cnt, s_umac_cnt, s_paging_cnt);
+    printk("[AX200] fw ver=0x%x: %d secs (lmac=%d umac=%d paging=%d) phy_cfg=0x%x calib=%x/%x\n",
+           (unsigned)s_fw_ver, s_num_sec, s_lmac_cnt, s_umac_cnt, s_paging_cnt,
+           (unsigned)s_phy_config, (unsigned)s_calib_flow, (unsigned)s_calib_event);
     if (s_lmac_cnt == 0 || s_umac_cnt == 0) {
         printk("[AX200] FAIL: no lmac/umac sections parsed\n");
         return -1;
@@ -510,34 +522,85 @@ send_cmd(uint16_t cmd_id, const void *payload, uint16_t plen)
 
 /* Send a command and dump the FW's response packet (cmd/group + 24 payload
  * bytes). The response is the newest RX buffer once rb_stts advances. */
-static void
-send_and_dump(uint16_t cmd_id, const void *pl, uint16_t plen, const char *tag)
+static void wr_le32b(uint8_t *p, uint32_t v)
 {
-    uint16_t before = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
-    send_cmd(cmd_id, pl, plen);
-    uint16_t after = before;
-    for (int t = 0; t < 50000; t++) {
-        after = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
-        if (after != before)
-            break;
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+
+/* Wait for a FW notification with the given cmd/group to arrive via RX, scanning
+ * each new RB in order (buffer i = RB i). Returns the buffer index, or -1. */
+static int
+wait_notif(uint8_t want_cmd, uint8_t want_grp, int timeout_ms)
+{
+    for (int t = 0; t < timeout_ms * 100; t++) {
+        uint16_t closed = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
+        while (s_rx_read != closed) {
+            const uint8_t *r = s_rx_buf_va[s_rx_read & 511];
+            uint8_t c = r[4], g = r[5];
+            printk("[AX200]   ntf cmd=0x%x grp=0x%x\n", c, g);
+            s_rx_read++;
+            if (c == want_cmd && g == want_grp)
+                return (s_rx_read - 1) & 511;
+        }
         uint32_t ie = csr_rd(CSR_INT);
         if (ie & (CSR_INT_BIT_SW_ERR | CSR_INT_BIT_HW_ERR)) {
-            printk("[AX200] %s -> FW error CSR_INT=0x%x umacPC=0x%x\n",
-                   tag, ie, rd_prph(UREG_UMAC_CURRENT_PC));
-            return;
+            printk("[AX200] FW error waiting for ntf 0x%x/0x%x: CSR_INT=0x%x umacPC=0x%x\n",
+                   want_cmd, want_grp, ie, rd_prph(UREG_UMAC_CURRENT_PC));
+            return -1;
         }
         busy_wait_us(10);
     }
-    if (after == before) {
-        printk("[AX200] %s: no response (rb_stts %u)\n", tag, before);
-        return;
+    return -1;
+}
+
+/* Post-ALIVE init sequence (iwl_run_unified_mvm_ucode): INIT_EXTENDED_CFG ->
+ * NVM_ACCESS_COMPLETE -> PHY_CONFIGURATION_CMD -> wait INIT_COMPLETE_NOTIF. The
+ * NVM load is skipped (the AX200 uses its on-die OTP). */
+/* Send a command and watch ~100ms for a FW assert, to isolate a failing step. */
+static int
+send_check(uint16_t cmd_id, const void *pl, uint16_t plen, const char *tag)
+{
+    send_cmd(cmd_id, pl, plen);
+    for (int t = 0; t < 10000; t++) {
+        uint32_t ie = csr_rd(CSR_INT);
+        if (ie & (CSR_INT_BIT_SW_ERR | CSR_INT_BIT_HW_ERR)) {
+            printk("[AX200] %s ASSERTED CSR_INT=0x%x umacPC=0x%x\n",
+                   tag, ie, rd_prph(UREG_UMAC_CURRENT_PC));
+            return -1;
+        }
+        busy_wait_us(10);
     }
-    const uint8_t *r = s_rx_buf_va[(after - 1) & 511];   /* iwl_rx_packet, data @+8 */
-    printk("[AX200] %s resp cmd=0x%x grp=0x%x len=0x%x data: "
-           "%x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x\n",
-           tag, r[4], r[5], (uint16_t)(r[0] | (r[1] << 8)) & 0x3FFF,
-           r[8],r[9],r[10],r[11],r[12],r[13],r[14],r[15],r[16],r[17],r[18],r[19],
-           r[20],r[21],r[22],r[23],r[24],r[25],r[26],r[27],r[28],r[29],r[30],r[31]);
+    printk("[AX200] %s ok (no assert; rb_stts=%u)\n",
+           tag, *(volatile uint16_t *)s_rb_stts & 0x0FFFu);
+    return 0;
+}
+
+static int
+init_after_alive(void)
+{
+    s_rx_read = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;   /* skip past the alive ntf */
+
+    uint8_t buf[28];
+    /* 1. INIT_EXTENDED_CFG_CMD (SYSTEM_GROUP 0x2, cmd 0x03): flag NVM access. */
+    wr_le32b(buf, 1u << 1 /* BIT(IWL_INIT_NVM) */);
+    if (send_check((SYSTEM_GROUP << 8) | 0x03, buf, 4, "INIT_EXTENDED_CFG") != 0) return -1;
+
+    /* 2. NVM_ACCESS_COMPLETE (REGULATORY_AND_NVM_GROUP 0xc, cmd 0x00). */
+    wr_le32b(buf, 0);
+    if (send_check((REGULATORY_AND_NVM_GROUP << 8) | 0x00, buf, 4, "NVM_ACCESS_COMPLETE") != 0) return -1;
+
+    /* PHY_CONFIGURATION_CMD is intentionally NOT sent: iwl_send_phy_cfg_cmd is a
+     * no-op for the unified ucode (returns early), and sending it asserts. */
+
+    /* 3. Wait for INIT_COMPLETE_NOTIF (cmd 0x04, legacy group 0x0). */
+    if (wait_notif(0x04, 0x00, 3000) < 0) {
+        printk("[AX200] no INIT_COMPLETE (rb_stts=%u)\n",
+               *(volatile uint16_t *)s_rb_stts & 0x0FFFu);
+        return -1;
+    }
+    printk("[AX200] *** INIT_COMPLETE *** FW fully initialized past ALIVE!\n");
+    return 0;
 }
 
 static int
@@ -630,11 +693,8 @@ load_firmware_and_kick(uint32_t hw_rev)
             csr_wr(RFH_Q0_FRBDCB_WIDX_TRG, (uint32_t)(NRBDS - 8));
             process_rx_alive();
 
-            /* Phase 3b: prove the command interface with a read-only query +
-             * response parse. (The full init sequence — SOC cfg, NVM, PHY cfg —
-             * must run in order before queries like NVM_GET_INFO; sending those
-             * standalone asserts the FW. That's the Phase 3c work.) */
-            send_and_dump((SYSTEM_GROUP << 8) | SHARED_MEM_CFG_CMD, 0, 0, "SHARED_MEM_CFG");
+            /* Phase 3c: run the post-ALIVE init sequence to INIT_COMPLETE. */
+            init_after_alive();
             return 0;
         }
         if (inta & (CSR_INT_BIT_SW_ERR | CSR_INT_BIT_HW_ERR)) {
