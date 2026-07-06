@@ -776,6 +776,54 @@ static volatile uint8_t *s_tx_ring;
 static uint64_t          s_tx_ring_phys;
 static int               s_tx_qid = -1;
 static uint16_t          s_tx_wr;
+static volatile uint8_t *s_tx_bc_va;              /* byte-count table (iwlagn_scd_bc_tbl) */
+static const uint8_t     s_our_mac[6] = {0x02,0x00,0x00,0xae,0x61,0x5a};
+
+/* Transmit an 802.11 frame: a TX_CMD (0x11c) on the data queue, wrapping
+ * iwl_tx_cmd_gen2 (len, offload_assist, flags, dram_info, rate_n_flags) + frame. */
+static void
+send_frame(const uint8_t *frame, uint16_t flen, const char *tag)
+{
+    if (s_tx_qid < 0) return;
+    uint16_t plen = (uint16_t)(20 + flen);          /* tx_cmd_gen2 hdr + frame */
+    uint64_t cmd_phys = 0, ftb_phys = 0;
+    uint8_t *cmd = dma_alloc((uint64_t)8 + plen + 64, &cmd_phys);
+    uint8_t *ftb = dma_alloc(64, &ftb_phys);
+    if (!cmd || !ftb) { printk("[AX200] TX dma fail\n"); return; }
+
+    uint16_t seq = (uint16_t)(QUEUE_TO_SEQ(s_tx_qid) | INDEX_TO_SEQ(s_tx_wr));
+    cmd[0] = 0x1c; cmd[1] = 0x01;                    /* TX_CMD, LONG_GROUP */
+    cmd[2] = (uint8_t)(seq & 0xff); cmd[3] = (uint8_t)(seq >> 8);
+    cmd[4] = (uint8_t)(plen & 0xff); cmd[5] = (uint8_t)(plen >> 8);
+    cmd[6] = 0; cmd[7] = 0;
+    uint8_t *tc = cmd + 8;                           /* iwl_tx_cmd_gen2 */
+    tc[0] = (uint8_t)(flen & 0xff); tc[1] = (uint8_t)(flen >> 8);   /* len */
+    /* offload_assist @2 = 0 */
+    wr_le32b(tc + 4, 0x3);                           /* flags CMD_RATE|ENCRYPT_DIS */
+    /* dram_info @8 = 0 (8 bytes) */
+    wr_le32b(tc + 16, 0x420a);                       /* rate_n_flags: CCK 1M ANT_A (v1) */
+    mcopy(tc + 20, frame, flen);
+
+    uint16_t copy_size = (uint16_t)(8 + plen);
+    uint16_t tb0 = copy_size < IWL_FIRST_TB_SIZE ? copy_size : IWL_FIRST_TB_SIZE;
+    mcopy(ftb, cmd, tb0);
+    volatile uint8_t *tfd = s_tx_ring + (uint32_t)s_tx_wr * 256;
+    tfd[0] = 0; tfd[1] = 0;
+    set_tfd_tb(tfd, ftb_phys, tb0);
+    if (copy_size > tb0)
+        set_tfd_tb(tfd, cmd_phys + tb0, (uint16_t)(copy_size - tb0));
+
+    /* Byte-count table entry for this TFD (gen2: dword count, 2 TBs -> 0 chunks).
+     * byte_cnt = tx_cmd_gen2.len = the 802.11 frame length. */
+    uint16_t idx = s_tx_wr;
+    uint16_t bc = (uint16_t)((flen + 3) / 4);
+    s_tx_bc_va[idx * 2]     = (uint8_t)(bc & 0xff);
+    s_tx_bc_va[idx * 2 + 1] = (uint8_t)((bc >> 8) & 0xff);
+
+    s_tx_wr = (uint16_t)((s_tx_wr + 1) & (TXQ_SLOTS - 1));
+    csr_wr(HBUS_TARG_WRPTR, (uint32_t)(s_tx_wr | (s_tx_qid << 16)));
+    printk("[AX200] TX %s (%u B) on qid %d wr->%u\n", tag, flen, s_tx_qid, s_tx_wr);
+}
 
 /* Allocate a dynamic TX queue for sta_id 0: driver owns the TFD ring + byte-count
  * table, tells the FW their addresses (SCD_QUEUE_CFG 0x11d v2), reads back the qid. */
@@ -787,6 +835,7 @@ alloc_tx_queue(void)
     uint8_t *bc = dma_alloc(4096, &bp);
     if (!s_tx_ring || !bc) { printk("[AX200] txq DMA fail\n"); return -1; }
     s_tx_ring_phys = rp;
+    s_tx_bc_va = bc;
 
     uint8_t cmd[24];
     for (int i = 0; i < 24; i++) cmd[i] = 0;
@@ -852,14 +901,13 @@ do_connect(void)
 
     /* Step 2: MAC_CONTEXT_CMD (0x128 v5, 144B) — add our BSS_STA MAC, not yet
      * associated. iwl_mac_ctx_cmd: common hdr + ac[5] EDCA + iwl_mac_data_sta. */
-    static const uint8_t our_mac[6] = {0x02,0x00,0x00,0xae,0x61,0x5a};
     uint8_t *m = dma_alloc(256, &phys); (void)phys;
     for (int i = 0; i < 256; i++) m[i] = 0;
     wr_le32b(m + 0, 0x100);                    /* id_and_color: id=0 color=1 */
     wr_le32b(m + 4, FW_CTXT_ACTION_ADD);
     wr_le32b(m + 8, 5);                        /* mac_type = FW_MAC_TYPE_BSS_STA */
     /* tsf_id @12 = 0 */
-    for (int i = 0; i < 6; i++) m[16 + i] = our_mac[i];      /* node_addr */
+    for (int i = 0; i < 6; i++) m[16 + i] = s_our_mac[i];    /* node_addr */
     for (int i = 0; i < 6; i++) m[24 + i] = s_ap_bssid[i];   /* bssid_addr */
     wr_le32b(m + 32, 0x0f);                    /* cck_rates (1/2/5.5/11) */
     wr_le32b(m + 36, 0xff);                    /* ofdm_rates */
@@ -908,7 +956,73 @@ do_connect(void)
 
     /* Step 5: allocate a data TX queue for the station. */
     if (alloc_tx_queue() != 0) return;
-    printk("[AX200] TX queue ready — next: auth/assoc frames\n");
+    printk("[AX200] TX queue ready\n");
+
+    /* Step 5b: session protection — reserve on-channel airtime for the auth/assoc
+     * exchange (a non-associated station isn't otherwise kept on-channel).
+     * SESSION_PROTECTION_CMD (0x305, MAC_CONF_GROUP): action=ADD, conf=ASSOC. */
+    {
+        uint8_t sp[24];
+        for (int i = 0; i < 24; i++) sp[i] = 0;
+        wr_le32b(sp + 0, 0x100);              /* id_and_color */
+        wr_le32b(sp + 4, FW_CTXT_ACTION_ADD); /* action */
+        wr_le32b(sp + 8, 0);                  /* conf_id = SESSION_PROTECT_CONF_ASSOC */
+        wr_le32b(sp + 12, 1000);              /* duration_tu */
+        wr_le32b(sp + 16, 1);                 /* repetition_count */
+        if (send_check(0x305, sp, 24, "SESSION_PROT") != 0) return;
+        s_rx_read = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
+        for (int t = 0; t < 150000; t++) {    /* wait for on-channel notif (0xFB) */
+            uint16_t closed = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
+            int got = 0;
+            while (s_rx_read != closed) {
+                const uint8_t *r = s_rx_buf_va[s_rx_read & 511];
+                s_rx_read++;
+                if (r[4] == 0xfb) { printk("[AX200] on-channel (session-prot notif)\n"); got = 1; }
+            }
+            if (got) break;
+            busy_wait_us(10);
+        }
+    }
+
+    /* Step 6: send an open-system 802.11 auth request and watch for the AP's
+     * reply (a mgmt frame addressed to our MAC). */
+    uint8_t f[64];
+    for (int i = 0; i < 64; i++) f[i] = 0;
+    f[0] = 0xb0;                               /* FC: mgmt, subtype auth */
+    for (int i = 0; i < 6; i++) { f[4+i] = s_ap_bssid[i]; f[10+i] = s_our_mac[i]; f[16+i] = s_ap_bssid[i]; }
+    f[24] = 0; f[25] = 0;                      /* auth alg = open system */
+    f[26] = 1; f[27] = 0;                      /* auth transaction seq = 1 */
+    f[28] = 0; f[29] = 0;                      /* status = 0 */
+
+    s_rx_read = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
+    send_frame(f, 30, "auth-req");
+
+    for (int t = 0; t < 400000; t++) {         /* ~4s */
+        uint32_t ie = csr_rd(CSR_INT);
+        if (ie & (CSR_INT_BIT_SW_ERR | CSR_INT_BIT_HW_ERR)) {
+            printk("[AX200] auth TX ASSERTED CSR_INT=0x%x\n", ie); dump_fw_error(); return;
+        }
+        uint16_t closed = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
+        while (s_rx_read != closed) {
+            const uint8_t *r = s_rx_buf_va[s_rx_read & 511];
+            uint8_t c = r[4], g = r[5];
+            s_rx_read++;
+            printk("[AX200] ntf cmd=0x%x/g%u data=%x %x %x %x %x %x %x %x\n",
+                   c, g, r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15]);
+            if (c == 0x1c)                     /* TX response: status in the payload */
+                printk("[AX200]   TX-RESP status=0x%x %x %x %x\n", r[8], r[9], r[10], r[11]);
+            for (int o = 8; o < 300; o++) {    /* find a frame addressed to us */
+                if (r[o]==s_our_mac[0] && r[o+1]==s_our_mac[1] && r[o+2]==s_our_mac[2] &&
+                    r[o+3]==s_our_mac[3] && r[o+4]==s_our_mac[4] && r[o+5]==s_our_mac[5]) {
+                    printk("[AX200] *** RX frame to us *** cmd=0x%x @+%d FC=0x%x body=%x %x %x %x %x %x\n",
+                           c, o, r[o-4], r[o+20], r[o+21], r[o+22], r[o+23], r[o+24], r[o+25]);
+                    break;
+                }
+            }
+        }
+        busy_wait_us(10);
+    }
+    printk("[AX200] auth: done watching\n");
 }
 
 static int
