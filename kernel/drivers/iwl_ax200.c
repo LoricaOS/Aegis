@@ -832,7 +832,19 @@ do_connect(void)
     wr_le32b(c + 20, 0x100);                   /* phy = PHY id_and_color */
     /* lmac_id @24 = 0 */
     if (send_check(0x12b, c, 28, "BINDING") != 0) return;
-    printk("[AX200] BINDING ok — MAC bound to PHY. next: ADD_STA + auth/assoc\n");
+    printk("[AX200] BINDING ok — MAC bound to PHY\n");
+
+    /* Step 4: ADD_STA (0x118 v12, 48B) — add the AP as our peer station.
+     * iwl_mvm_add_sta_cmd: add_modify, mac_id_n_color, addr, sta_id, flags,
+     * station_type. gen2 allocates TX queues separately (tfd_queue_msk=0). */
+    for (int i = 0; i < 64; i++) c[i] = 0;
+    c[0] = 0;                                  /* add_modify = STA_MODE_ADD */
+    wr_le32b(c + 4, 0x100);                    /* mac_id_n_color */
+    for (int i = 0; i < 6; i++) c[8 + i] = s_ap_bssid[i];   /* addr = AP */
+    c[16] = 0;                                 /* sta_id = 0 */
+    /* station_flags @20 = 0 (20MHz SISO); station_type @35 = IWL_STA_LINK(0) */
+    if (send_check(0x118, c, 48, "ADD_STA") != 0) return;
+    printk("[AX200] ADD_STA ok — AP peer added. next: TX queue + auth/assoc\n");
 }
 
 static int
