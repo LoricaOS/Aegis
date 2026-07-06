@@ -270,6 +270,7 @@ find_pm_pmcsr(const pcie_device_t *d)
 #define IWL_UCODE_TLV_SEC_RT   19
 #define IWL_UCODE_TLV_DEF_CALIB 22
 #define IWL_UCODE_TLV_PHY_SKU  23
+#define IWL_UCODE_TLV_CMD_VERSIONS 48
 #define CPU1_CPU2_SEPARATOR    0xFFFFCCCCu
 #define PAGING_SEPARATOR       0xAAAABBBBu
 #define MAX_FW_SEC             64   /* IWL_MAX_DRAM_ENTRY; firmware has ~27+ secs */
@@ -281,6 +282,8 @@ static uint32_t s_fw_ver;
 static int      s_lmac_cnt, s_umac_cnt, s_paging_cnt;
 static uint32_t s_phy_config;               /* from PHY_SKU TLV */
 static uint32_t s_calib_flow, s_calib_event; /* from DEF_CALIB TLV (regular ucode) */
+static uint8_t  s_scan_req_ver, s_scan_req_grp;   /* SCAN_REQ_UMAC (cmd 0x0d) */
+static uint8_t  s_scan_cfg_ver, s_scan_cfg_grp;   /* SCAN_CFG_CMD (cmd 0x0c) */
 
 static inline uint32_t rd_le32(const uint8_t *p)
 {
@@ -335,6 +338,14 @@ static int parse_firmware(void)
                    rd_le32(tdata) == 0 /* IWL_UCODE_REGULAR */) {
             s_calib_flow  = rd_le32(tdata + 4);
             s_calib_event = rd_le32(tdata + 8);
+        } else if (type == IWL_UCODE_TLV_CMD_VERSIONS) {
+            for (uint32_t o = 0; o + 4 <= tlen; o += 4) {   /* iwl_fw_cmd_version[] */
+                uint8_t c = tdata[o], g = tdata[o + 1], v = tdata[o + 2];
+                if (c == 0x0d && g == 0x00) { s_scan_req_ver = v; s_scan_req_grp = g; }
+                if (c == 0x0c && g == 0x01) { s_scan_cfg_ver = v; s_scan_cfg_grp = g; }
+                if (c == 0x0d || c == 0x0c)
+                    printk("[AX200] cmdver 0x%x/g%u=v%u\n", c, g, v);
+            }
         }
         off += 8 + ((tlen + 3u) & ~3u);    /* TLVs are 4-byte padded */
     }
@@ -346,6 +357,8 @@ static int parse_firmware(void)
     printk("[AX200] fw ver=0x%x: %d secs (lmac=%d umac=%d paging=%d) phy_cfg=0x%x calib=%x/%x\n",
            (unsigned)s_fw_ver, s_num_sec, s_lmac_cnt, s_umac_cnt, s_paging_cnt,
            (unsigned)s_phy_config, (unsigned)s_calib_flow, (unsigned)s_calib_event);
+    printk("[AX200] cmd_ver: SCAN_REQ_UMAC=v%u(grp%u) SCAN_CFG=v%u(grp%u)\n",
+           s_scan_req_ver, s_scan_req_grp, s_scan_cfg_ver, s_scan_cfg_grp);
     if (s_lmac_cnt == 0 || s_umac_cnt == 0) {
         printk("[AX200] FAIL: no lmac/umac sections parsed\n");
         return -1;
@@ -603,6 +616,101 @@ init_after_alive(void)
     return 0;
 }
 
+/* Phase 3d: a passive scan of the 2.4GHz band (SCAN_REQ_UMAC v14, group 1). We
+ * build the ~1940-byte iwl_scan_req_umac_v17 for v14, force a passive/pass-all
+ * scan, list channels 1-13, then watch RX for beacon frames and print any that
+ * contain the target SSID. */
+static void
+do_scan(void)
+{
+    uint64_t phys;
+    uint8_t *cmd = dma_alloc(2560, &phys);   /* zeroed */
+    if (!cmd) { printk("[AX200] scan: DMA alloc failed\n"); return; }
+    (void)phys;
+
+    wr_le32b(cmd + 0, 1);                     /* uid */
+    wr_le32b(cmd + 4, 6);                     /* ooc_priority = EXT_6 */
+
+    /* general_params_v11 @ +8. flags = PASS_ALL(0x2)|USE_ALL_RX_CHAINS(0x40)|
+     * FORCE_PASSIVE(0x800) = 0x842 (iwl_mvm_scan_umac_flags_v2). */
+    cmd[8] = 0x42; cmd[9] = 0x08;
+    cmd[12] = 10; cmd[13] = 10;               /* active_dwell[2] */
+    cmd[14] = 10; cmd[15] = 10; cmd[16] = 10; /* adwell 2g/5g/social */
+    cmd[18] = 44; cmd[19] = 1;                /* adwell_max_budget (le16) = 300 */
+    wr_le32b(cmd + 36, 6);                    /* scan_priority = EXT_6 */
+    cmd[40] = 110; cmd[41] = 110;             /* passive_dwell[2] */
+
+    /* channel_params_v7 @ +44: count + channel_config[] (each 8B: flags(4)+
+     * v2{channel_num,band,iter_count,iter_interval}). Band 1 = 2.4GHz. */
+    cmd[45] = 13;                             /* count */
+    for (int i = 0; i < 13; i++) {
+        uint8_t *ch = cmd + 48 + i * 8;
+        ch[4] = (uint8_t)(i + 1);             /* channel_num 1..13 */
+        ch[5] = 1;                            /* band = PHY_BAND_24 */
+        ch[6] = 1;                            /* iter_count */
+    }
+
+    /* periodic_params_v1 @ +584: schedule[0].iter_count = 1 */
+    cmd[584 + 2] = 1;
+
+    /* probe_params_v4 @ +596. preq (iwl_scan_probe_req) = mac_header seg (4) +
+     * band_data[3] seg (12) + common_data seg (4) + buf[512]. Build a minimal
+     * broadcast probe request in buf so the FW's preq validation passes. */
+    uint8_t *buf = cmd + 596 + 4 + 12 + 4;    /* preq.buf */
+    /* 802.11 MAC header (24 bytes): probe request, broadcast DA/BSSID. */
+    buf[0] = 0x40; buf[1] = 0x00;             /* frame control = probe req */
+    for (int i = 4; i < 10; i++)  buf[i] = 0xff;  /* addr1 DA = broadcast */
+    /* addr2 SA (10..15) = 0 (any) */
+    for (int i = 16; i < 22; i++) buf[i] = 0xff;  /* addr3 BSSID = broadcast */
+    /* IEs @ buf+24: SSID (wildcard, len 0) + supported rates. */
+    buf[24] = 0x00; buf[25] = 0x00;           /* SSID IE id=0 len=0 */
+    buf[26] = 0x01; buf[27] = 0x04;           /* rates IE id=1 len=4 */
+    buf[28] = 0x82; buf[29] = 0x84; buf[30] = 0x8b; buf[31] = 0x96;
+    /* Segments (each __le16 offset, __le16 len into buf). */
+    uint8_t *seg = cmd + 596;
+    seg[0] = 0;  seg[1] = 0;  seg[2] = 24; seg[3] = 0;   /* mac_header: off 0, len 24 */
+    /* band_data[3] @ seg+4: leave zero */
+    seg[16] = 24; seg[17] = 0; seg[18] = 8; seg[19] = 0; /* common_data: off 24, len 8 */
+    /* Total struct = 1940 bytes. */
+
+    send_cmd(0x10d, cmd, 1940);              /* SCAN_REQ_UMAC, group 1 */
+    printk("[AX200] SCAN_REQ_UMAC sent (passive, ch 1-13); watching for beacons...\n");
+
+    s_rx_read = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
+    int found = 0;
+    for (int t = 0; t < 600000; t++) {        /* up to ~6s */
+        uint16_t closed = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
+        while (s_rx_read != closed) {
+            const uint8_t *r = s_rx_buf_va[s_rx_read & 511];
+            uint8_t c = r[4], g = r[5];
+            s_rx_read++;
+            /* Scan the RB for the target SSID (pragmatic: find it in the beacon). */
+            for (int o = 8; o < 4090; o++) {
+                if (r[o]=='H' && r[o+1]=='a' && r[o+2]=='r' && r[o+3]=='t') {
+                    char ss[40]; int j = 0;
+                    for (int k = o; k < o + 32 && r[k] >= 0x20 && r[k] < 0x7f; k++)
+                        ss[j++] = (char)r[k];
+                    ss[j] = 0;
+                    printk("[AX200] *** SCAN FOUND SSID: '%s' *** (ntf cmd=0x%x grp=0x%x)\n", ss, c, g);
+                    found = 1;
+                }
+            }
+            if (c == 0x0f && g == 0x00) {
+                printk("[AX200] SCAN_COMPLETE (found Hart=%d)\n", found);
+                return;
+            }
+        }
+        uint32_t ie = csr_rd(CSR_INT);
+        if (ie & (CSR_INT_BIT_SW_ERR | CSR_INT_BIT_HW_ERR)) {
+            printk("[AX200] scan FW error CSR_INT=0x%x umacPC=0x%x\n",
+                   ie, rd_prph(UREG_UMAC_CURRENT_PC));
+            return;
+        }
+        busy_wait_us(10);
+    }
+    printk("[AX200] scan timeout (found Hart=%d)\n", found);
+}
+
 static int
 load_firmware_and_kick(uint32_t hw_rev)
 {
@@ -693,8 +801,9 @@ load_firmware_and_kick(uint32_t hw_rev)
             csr_wr(RFH_Q0_FRBDCB_WIDX_TRG, (uint32_t)(NRBDS - 8));
             process_rx_alive();
 
-            /* Phase 3c: run the post-ALIVE init sequence to INIT_COMPLETE. */
-            init_after_alive();
+            /* Phase 3c: init sequence → INIT_COMPLETE, then 3d: scan. */
+            if (init_after_alive() == 0)
+                do_scan();
             return 0;
         }
         if (inta & (CSR_INT_BIT_SW_ERR | CSR_INT_BIT_HW_ERR)) {
