@@ -809,9 +809,14 @@ send_frame(const uint8_t *frame, uint16_t flen, uint32_t rate, const char *tag)
     mcopy(ftb, cmd, tb0);
     volatile uint8_t *tfd = s_tx_ring + (uint32_t)s_tx_wr * 256;
     tfd[0] = 0; tfd[1] = 0;
-    set_tfd_tb(tfd, ftb_phys, tb0);
-    if (copy_size > tb0)
-        set_tfd_tb(tfd, cmd_phys + tb0, (uint16_t)(copy_size - tb0));
+    set_tfd_tb(tfd, ftb_phys, tb0);                        /* TB0: first 20 bytes */
+    /* Match iwlwifi's TB layout: TB1 ends exactly at the end of the 802.11 header
+     * (4 hdr + 20 tx_cmd + 24 mac hdr = 48), payload goes in its own TB. */
+    uint16_t hdr_end = 4 + 20 + 24;
+    if (hdr_end > tb0)
+        set_tfd_tb(tfd, cmd_phys + tb0, (uint16_t)(hdr_end - tb0));   /* TB1 */
+    if (copy_size > hdr_end)
+        set_tfd_tb(tfd, cmd_phys + hdr_end, (uint16_t)(copy_size - hdr_end)); /* TB2: payload */
 
     /* Byte-count table entry for this TFD (gen2: dword count, 2 TBs -> 0 chunks).
      * byte_cnt = tx_cmd_gen2.len = the 802.11 frame length. */
@@ -820,9 +825,17 @@ send_frame(const uint8_t *frame, uint16_t flen, uint32_t rate, const char *tag)
     s_tx_bc_va[idx * 2]     = (uint8_t)(bc & 0xff);
     s_tx_bc_va[idx * 2 + 1] = (uint8_t)((bc >> 8) & 0xff);
 
+    /* Dump the built TFD + command so we can byte-compare against iwlwifi. */
+    volatile uint8_t *td = tfd;
+    printk("[AX200] TFD: ntb=%u tb0[len=%u] tb1[len=%u] | cmd: %x %x %x %x tc.len=%u off=%x%x rate=%x%x%x%x\n",
+           td[0], td[2] | (td[3] << 8), td[12] | (td[13] << 8),
+           cmd[0], cmd[1], cmd[2], cmd[3], tc[0] | (tc[1] << 8),
+           tc[3], tc[2], tc[19], tc[18], tc[17], tc[16]);
+
     s_tx_wr = (uint16_t)((s_tx_wr + 1) & (TXQ_SLOTS - 1));
-    csr_wr(HBUS_TARG_WRPTR, (uint32_t)(s_tx_wr | (s_tx_qid << 16)));
-    printk("[AX200] TX %s (%u B) on qid %d wr->%u\n", tag, flen, s_tx_qid, s_tx_wr);
+    csr_wr(HBUS_TARG_WRPTR, (uint32_t)(s_tx_wr | (s_tx_qid << 16)));   /* v6.6: qid<<16 */
+    printk("[AX200] TX %s (%u B) on qid %d wr->%u bc[%u]=%u\n", tag, flen, s_tx_qid,
+           s_tx_wr, idx, s_tx_bc_va[idx*2] | (s_tx_bc_va[idx*2+1] << 8));
 }
 
 /* Allocate a dynamic TX queue for sta_id 0: driver owns the TFD ring + byte-count
@@ -865,6 +878,8 @@ alloc_tx_queue(void)
                 s_tx_wr = 0;
                 printk("[AX200] *** TX queue: qid=%u resp=%x %x %x %x %x %x %x %x ***\n",
                        s_tx_qid, r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15]);
+                /* Bring the queue up: ring the doorbell with the initial SSN (0). */
+                csr_wr(HBUS_TARG_WRPTR, (uint32_t)(0 | (s_tx_qid << 16)));
                 return 0;
             }
         }
