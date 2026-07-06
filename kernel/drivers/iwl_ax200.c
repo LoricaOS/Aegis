@@ -75,13 +75,7 @@
 #define CSR_INT_BIT_FH_RX       (1u << 31)
 #define CTXT_INFO_TFD_FORMAT_LONG  0x0100
 #define CTXT_INFO_RB_SIZE_4K       0x4
-#define NRBDS                   512    /* RX free-buffer ring depth — MUST match
-                                        * RFH_RXF_DMA_RBDCB_SIZE_512 + cb_size=9 */
-#define IWL_RX_ENABLE           1      /* bisect: 0 = program RFH but don't enable RX DMA */
-#define IWL_RFH_INIT            1      /* bisect: 0 = skip rx_hw_init entirely */
-#define IWL_RFH_REGS            1      /* bisect: 0 = skip the RFH register writes */
-#define IWL_RFH_GENCFG          1      /* bisect: 0 = skip the RFH_GEN_CFG write */
-#define IWL_RFH_BASES           1      /* bisect: 0 = skip the RFH base-address writes */
+#define NRBDS                   512    /* RX free-buffer ring depth (cb_size=9) */
 
 /* RX/command doorbell (HBUS_BASE+0x060). Low 16 bits = write pointer, high bits
  * select the queue: (q<<16) for TX, ((q+512)<<16) for RX. */
@@ -137,11 +131,6 @@ static void wr_prph(uint32_t addr, uint32_t val)
 {
     csr_wr(HBUS_TARG_PRPH_WADDR, (addr & PRPH_ADDR_MASK) | (3u << 24));
     csr_wr(HBUS_TARG_PRPH_WDAT, val);
-}
-static void wr_prph64(uint32_t addr, uint64_t val)
-{
-    wr_prph(addr, (uint32_t)(val & 0xFFFFFFFFu));
-    wr_prph(addr + 4, (uint32_t)(val >> 32));
 }
 static uint32_t rd_prph(uint32_t addr)
 {
@@ -433,72 +422,19 @@ process_rx_alive(void)
         return;
     }
 
-    uint16_t rbid = *(volatile uint16_t *)(s_used_bd + 4);
-    int idx = (int)rbid - 1;
-    if (idx < 0 || idx >= NRBDS) {
-        printk("[AX200] RX: bad rbid=%u (closed=%u)\n", rbid, closed);
-        return;
-    }
-    const uint8_t *pkt = s_rx_buf_va[idx];
-    uint8_t  cmd = pkt[4], grp = pkt[5];
-    uint16_t status = (uint16_t)(pkt[8] | (pkt[9] << 8));
-    printk("[AX200] RX pkt: cmd=0x%x grp=0x%x (closed=%u rbid=%u)\n",
-           cmd, grp, closed, rbid);
-    if (cmd == UCODE_ALIVE_NTFY)
+    printk("[AX200] RX closed=%u used_bd[0..11]=%x %x %x %x %x %x %x %x %x %x %x %x\n", closed,
+           s_used_bd[0], s_used_bd[1], s_used_bd[2], s_used_bd[3], s_used_bd[4], s_used_bd[5],
+           s_used_bd[6], s_used_bd[7], s_used_bd[8], s_used_bd[9], s_used_bd[10], s_used_bd[11]);
+    /* The first RX uses free_rbd[0] (vid 1) = buffer 0; read the packet there:
+     * iwl_rx_packet = len_n_flags(4) + cmd_header{cmd,grp,seq}(4) + data. */
+    const uint8_t *pkt = s_rx_buf_va[0];
+    printk("[AX200] buf0: len_n_flags=0x%x cmd=0x%x grp=0x%x status=0x%x\n",
+           rd_le32(pkt), pkt[4], pkt[5], (uint16_t)(pkt[8] | (pkt[9] << 8)));
+    if (pkt[4] == UCODE_ALIVE_NTFY) {
+        uint16_t status = (uint16_t)(pkt[8] | (pkt[9] << 8));
         printk("[AX200] ALIVE ntf: status=0x%x (%s) — FW fully initialized\n",
                status, status == IWL_ALIVE_STATUS_OK ? "OK" : "ERR");
-}
-
-/* Program the gen2 Receive Flow Handler for queue 0 (== iwl_pcie_rx_mq_hw_init).
- * The context-info block alone doesn't start RX DMA — this does: it points the
- * RFH at our free/used RBD rings + status block, resets the indices, sets the
- * RB size/count, enables snooping, and activates the queue. Must run before the
- * FW self-load kick. */
-static void
-rx_hw_init(uint64_t free_phys, uint64_t used_phys, uint64_t stts_phys)
-{
-    /* Request MAC access for the prph writes (clock already up from power_up). */
-    csr_set(CSR_GP_CNTRL, GP_CNTRL_MAC_ACCESS_REQ);
-    csr_poll(CSR_GP_CNTRL, GP_CNTRL_MAC_CLOCK_READY, GP_CNTRL_MAC_CLOCK_READY, 15000);
-
-    /* Part of gen2 nic-init (iwl_pcie_gen2_nic_init). */
-    csr_set(CSR_MAC_SHADOW_REG_CTRL, 0x800FFFFFu);
-
-#if IWL_RFH_REGS
-    wr_prph(RFH_RXF_DMA_CFG, 0);            /* stop RX DMA */
-    wr_prph(RFH_RXF_RXQ_ACTIVE, 0);         /* disable free+used queue op */
-#if IWL_RFH_BASES
-    wr_prph64(RFH_Q0_FRBDCB_BA_LSB, free_phys);
-    wr_prph64(RFH_Q0_URBDCB_BA_LSB, used_phys);
-    wr_prph64(RFH_Q0_URBD_STTS_WPTR_LSB, stts_phys);
-#else
-    (void)free_phys; (void)used_phys; (void)stts_phys; (void)wr_prph64;
-#endif
-    wr_prph(RFH_Q0_FRBDCB_WIDX, 0);
-    wr_prph(RFH_Q0_FRBDCB_RIDX, 0);
-    wr_prph(RFH_Q0_URBDCB_WIDX, 0);
-#if IWL_RFH_GENCFG
-    wr_prph(RFH_GEN_CFG, RFH_GEN_CFG_VAL);          /* snoop + default rxq 0 */
-#endif
-#else
-    (void)free_phys; (void)used_phys; (void)stts_phys; (void)wr_prph64;
-#endif
-#if IWL_RX_ENABLE
-    wr_prph(RFH_RXF_DMA_CFG, RFH_RXF_DMA_CFG_VAL);  /* enable RX DMA */
-    wr_prph(RFH_RXF_RXQ_ACTIVE, RFH_RXQ0_ENABLE);   /* activate queue 0 */
-#endif
-
-    /* Interrupt coalescing default (8-bit reg — not a 32-bit access). */
-    *(volatile uint8_t *)(s_mmio + CSR_INT_COALESCING) = 0x40;
-
-    /* Read the RFH registers back — do the prph writes actually land? */
-    printk("[AX200] RFH readback: DMA_CFG=0x%x GEN_CFG=0x%x FRBDCB_BA_lo=0x%x RXQ_ACTIVE=0x%x\n",
-           rd_prph(RFH_RXF_DMA_CFG), rd_prph(RFH_GEN_CFG),
-           rd_prph(RFH_Q0_FRBDCB_BA_LSB), rd_prph(RFH_RXF_RXQ_ACTIVE));
-
-    /* Release MAC access so the firmware owns the MAC when it boots (iwlwifi
-     * release_nic_access). Holding MAC_ACCESS_REQ while the FW starts asserts. */
-    csr_clr(CSR_GP_CNTRL, GP_CNTRL_MAC_ACCESS_REQ);
+    }
 }
 
 static int
@@ -531,14 +467,10 @@ load_firmware_and_kick(uint32_t hw_rev)
         free_rbd[i] = bp | (uint64_t)(i + 1);
     }
 
-    /* Bring up the RX DMA engine (RFH), then publish the free buffers via the
-     * gen2 RX doorbell (a direct CSR; write pointer must be a multiple of 8). */
-#if IWL_RFH_INIT
-    rx_hw_init(free_phys, used_phys, stts_phys);
-    csr_wr(RFH_Q0_FRBDCB_WIDX_TRG, (uint32_t)(NRBDS - 8));
-#else
-    (void)free_phys; (void)used_phys; (void)stts_phys; (void)rx_hw_init;
-#endif
+    /* NB: the AX200's context-info firmware configures the RFH itself from
+     * context_info.rbd_cfg (below) — the driver must NOT run iwl_pcie_rx_mq_hw_init
+     * here; doing so makes the UMAC assert before ALIVE. We only publish the free
+     * buffers via the RX doorbell, and that is done after ALIVE. */
 
     /* Firmware sections → DRAM map (indexing mirrors iwl_pcie_init_fw_sec:
      * lmac=sec[0..L-1], umac=sec[L+1..L+U], paging=sec[L+U+2..]). */
@@ -587,7 +519,11 @@ load_firmware_and_kick(uint32_t hw_rev)
         if (inta & CSR_INT_BIT_ALIVE) {
             printk("[AX200] *** FW ALIVE *** CSR_INT=0x%x — firmware is running!\n", inta);
             csr_wr(CSR_INT, inta);   /* ACK */
-            process_rx_alive();      /* RX engine is already live (rx_hw_init) */
+            /* Theory: the FW self-configured the RFH from context_info.rbd_cfg;
+             * just publish the free buffers via the RX doorbell and see if the
+             * ALIVE notification lands. */
+            csr_wr(RFH_Q0_FRBDCB_WIDX_TRG, (uint32_t)(NRBDS - 8));
+            process_rx_alive();
             return 0;
         }
         if (inta & (CSR_INT_BIT_SW_ERR | CSR_INT_BIT_HW_ERR)) {
