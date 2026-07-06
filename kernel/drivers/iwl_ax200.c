@@ -18,6 +18,7 @@
 #include "arch.h"
 #include "kva.h"
 #include "vmm.h"
+#include "pmm.h"
 #include "ramdisk.h"
 #include "printk.h"
 #include <stdint.h>
@@ -45,6 +46,24 @@
 #define GP_CNTRL_INIT_DONE            0x00000004
 #define GIO_CHICKEN_L1A_NO_L0S_RX     0x00800000
 #define DBG_HPET_MEM_REG_VAL          0xFFFF0000
+
+/* Context-info firmware self-load (step C). CSR_CTXT_INFO_BA is the 64-bit
+ * register the chip reads the context-info block address from; writing it kicks
+ * the load. Prph writes go through the HBUS indirect window. */
+#define CSR_CTXT_INFO_BA        0x040
+#define CSR_INT_MASK            0x00C
+#define HBUS_TARG_PRPH_WADDR    0x444   /* HBUS_BASE(0x400)+0x044 */
+#define HBUS_TARG_PRPH_WDAT     0x44C
+#define UREG_CPU_INIT_RUN       0xA05C44
+#define PRPH_ADDR_MASK          0x000FFFFF   /* 22000 family: 20-bit prph addr */
+#define CSR_INT_BIT_ALIVE       (1u << 0)
+#define CSR_INT_BIT_RF_KILL     (1u << 7)
+#define CSR_INT_BIT_SW_ERR      (1u << 25)
+#define CSR_INT_BIT_HW_ERR      (1u << 29)
+#define CSR_INT_BIT_FH_RX       (1u << 31)
+#define CTXT_INFO_TFD_FORMAT_LONG  0x0100
+#define CTXT_INFO_RB_SIZE_4K       0x4
+#define NRBDS                   128    /* RX free-buffer ring depth (cb_size=7) */
 
 /* PCI command register bits + PM capability id */
 #define PCI_CMD_MEM    0x02
@@ -250,6 +269,168 @@ static int parse_firmware(void)
     return 0;
 }
 
+/* ── Context-info firmware self-load (Phase 2 step C) ──────────────────
+ * The gen2 chip loads its own firmware: we build an iwl_context_info block in
+ * host DMA memory pointing at the ucode sections + the RX/command queues, write
+ * its address to CSR_CTXT_INFO_BA, start the CPU (UREG_CPU_INIT_RUN), and the
+ * chip DMA-loads the ucode and raises an ALIVE interrupt (CSR_INT bit 0). */
+
+/* iwl_context_info — exact on-wire layout (packed, little-endian; x86 is LE). */
+struct ci_dram {
+    uint64_t umac_img[64];
+    uint64_t lmac_img[64];
+    uint64_t virtual_img[64];
+} __attribute__((packed));
+
+struct context_info {
+    uint16_t ver_mac_id, ver_version, ver_size, ver_reserved;      /* +0   version */
+    uint32_t control_flags, control_reserved;                       /* +8   control */
+    uint64_t reserved0;                                             /* +16  */
+    uint64_t free_rbd_addr, used_rbd_addr, status_wr_ptr;           /* +24  rbd_cfg */
+    uint64_t cmd_queue_addr; uint8_t cmd_queue_size, hcmd_rsvd[7];  /* +48  hcmd_cfg */
+    uint32_t reserved1[4];                                          /* +64  */
+    uint64_t dump_addr; uint32_t dump_size, dump_rsvd;              /* +80  dump_cfg */
+    uint64_t edbg_addr; uint32_t edbg_size, edbg_rsvd;              /* +96  edbg_cfg */
+    uint64_t pnvm_addr; uint32_t pnvm_size, pnvm_rsvd;              /* +112 pnvm_cfg */
+    uint32_t reserved2[16];                                        /* +128 */
+    struct ci_dram dram;                                            /* +192 */
+    uint32_t reserved3[16];                                        /* +1728 (total 1792) */
+} __attribute__((packed));
+
+/* Allocate `bytes` of physically-contiguous, zeroed, cacheable DMA memory
+ * (<4GB; x86 RAM is DMA-coherent). Returns KVA, *phys_out = physical base. */
+static void *
+dma_alloc(uint64_t bytes, uint64_t *phys_out)
+{
+    uint64_t pages = (bytes + 4095) / 4096;
+    uint64_t phys = pmm_alloc_contig_low(pages);
+    if (!phys)
+        return 0;
+    uintptr_t va = (uintptr_t)kva_alloc_pages(pages);
+    if (!va)
+        return 0;
+    for (uint64_t i = 0; i < pages; i++) {
+        vmm_unmap_page(va + i * 4096);
+        vmm_map_page(va + i * 4096, phys + i * 4096, VMM_FLAG_WRITABLE);
+    }
+    for (uint64_t i = 0; i < pages * 4096; i++)
+        ((volatile uint8_t *)va)[i] = 0;
+    *phys_out = phys;
+    return (void *)va;
+}
+
+static void
+mcopy(void *dst, const void *src, uint64_t n)
+{
+    volatile uint8_t *d = dst;
+    const uint8_t *s = src;
+    for (uint64_t i = 0; i < n; i++)
+        d[i] = s[i];
+}
+
+/* DMA a firmware section; return its physical address (0 on failure).
+ * Returned by value (not via &slot) so callers avoid taking the address of a
+ * packed DRAM-map member. */
+static uint64_t
+load_sec(int sec_idx)
+{
+    uint64_t p;
+    void *m = dma_alloc(s_sec[sec_idx].len, &p);
+    if (!m)
+        return 0;
+    mcopy(m, s_sec[sec_idx].data, s_sec[sec_idx].len);
+    return p;
+}
+
+static int
+load_firmware_and_kick(uint32_t hw_rev)
+{
+    uint64_t ci_phys = 0, free_phys = 0, used_phys = 0, stts_phys = 0, cmd_phys = 0;
+    struct context_info *ci = dma_alloc(sizeof(*ci), &ci_phys);
+    uint64_t *free_rbd = dma_alloc(NRBDS * 8, &free_phys);
+    void     *used_bd  = dma_alloc(NRBDS * 32, &used_phys);   /* iwl_rx_completion_desc = 32B */
+    void     *rb_stts  = dma_alloc(4096, &stts_phys);
+    void     *cmd_ring = dma_alloc(32 * 256, &cmd_phys);      /* 32 × iwl_tfh_tfd(256B) */
+    if (!ci || !free_rbd || !used_bd || !rb_stts || !cmd_ring) {
+        printk("[AX200] FAIL: DMA alloc for context-info/queues\n");
+        return -1;
+    }
+
+    /* Populate the RX free-buffer ring: entry = buffer_phys | vid (vid in the
+     * low bits, buffers are 4K-aligned so they don't collide). */
+    for (int i = 0; i < NRBDS; i++) {
+        uint64_t bp;
+        if (!dma_alloc(4096, &bp)) {
+            printk("[AX200] FAIL: RX buffer alloc\n");
+            return -1;
+        }
+        free_rbd[i] = bp | (uint64_t)(i + 1);
+    }
+
+    /* Firmware sections → DRAM map (indexing mirrors iwl_pcie_init_fw_sec:
+     * lmac=sec[0..L-1], umac=sec[L+1..L+U], paging=sec[L+U+2..]). */
+    for (int i = 0; i < s_lmac_cnt; i++) {
+        uint64_t p = load_sec(i);
+        if (!p) goto oom;
+        ci->dram.lmac_img[i] = p;
+    }
+    for (int i = 0; i < s_umac_cnt; i++) {
+        uint64_t p = load_sec(s_lmac_cnt + 1 + i);
+        if (!p) goto oom;
+        ci->dram.umac_img[i] = p;
+    }
+    for (int i = 0; i < s_paging_cnt; i++) {
+        uint64_t p = load_sec(s_lmac_cnt + s_umac_cnt + 2 + i);
+        if (!p) goto oom;
+        ci->dram.virtual_img[i] = p;
+    }
+
+    /* Control fields. cb_size=ilog2(NRBDS)=7; rb_size=4K; long TFD format. */
+    ci->ver_mac_id = (uint16_t)hw_rev;
+    ci->ver_size   = (uint16_t)(sizeof(*ci) / 4);
+    ci->control_flags = CTXT_INFO_TFD_FORMAT_LONG | (7u << 4) |
+                        ((uint32_t)CTXT_INFO_RB_SIZE_4K << 9);
+    ci->free_rbd_addr  = free_phys;
+    ci->used_rbd_addr  = used_phys;
+    ci->status_wr_ptr  = stts_phys;
+    ci->cmd_queue_addr = cmd_phys;
+    ci->cmd_queue_size = 2;    /* TFD_QUEUE_CB_SIZE(32) = ilog2(32)-3 */
+
+    /* Enable ALIVE + FH-RX causes and clear stale status (we poll CSR_INT). */
+    csr_wr(CSR_INT_MASK, CSR_INT_BIT_ALIVE | CSR_INT_BIT_FH_RX);
+    csr_wr(CSR_INT, 0xFFFFFFFFu);
+
+    /* Kick: point the chip at the context-info block, then start the CPU. */
+    csr_wr(CSR_CTXT_INFO_BA,     (uint32_t)(ci_phys & 0xFFFFFFFFu));
+    csr_wr(CSR_CTXT_INFO_BA + 4, (uint32_t)(ci_phys >> 32));
+    csr_wr(HBUS_TARG_PRPH_WADDR, (UREG_CPU_INIT_RUN & PRPH_ADDR_MASK) | (3u << 24));
+    csr_wr(HBUS_TARG_PRPH_WDAT, 1);
+
+    printk("[AX200] firmware loaded, self-load kicked (ci@0x%x); waiting for ALIVE...\n",
+           (unsigned)ci_phys);
+
+    /* The FW DMA-loads the ucode then raises ALIVE (CSR_INT bit 0). */
+    for (uint32_t t = 0; t < 2000000; t += 200) {
+        uint32_t inta = csr_rd(CSR_INT);
+        if (inta & CSR_INT_BIT_ALIVE) {
+            printk("[AX200] *** FW ALIVE *** CSR_INT=0x%x — firmware is running!\n", inta);
+            return 0;
+        }
+        if (inta & (CSR_INT_BIT_SW_ERR | CSR_INT_BIT_HW_ERR)) {
+            printk("[AX200] FAIL: FW error interrupt CSR_INT=0x%x\n", inta);
+            return -1;
+        }
+        busy_wait_us(200);
+    }
+    printk("[AX200] no ALIVE (CSR_INT=0x%x GP_CNTRL=0x%x) — load path needs work\n",
+           csr_rd(CSR_INT), csr_rd(CSR_GP_CNTRL));
+    return -1;
+
+oom:
+    printk("[AX200] FAIL: DMA alloc for firmware sections\n");
+    return -1;
+}
+
 void
 iwl_ax200_init(void)
 {
@@ -321,5 +502,6 @@ iwl_ax200_init(void)
     /* Phase 2 step B: parse the embedded firmware into LMAC/UMAC/paging sections. */
     if (parse_firmware() != 0)
         return;
-    /* Next (step C): build the context-info block + kick FW self-load → ALIVE. */
+    /* Phase 2 step C: build the context-info block + kick FW self-load → ALIVE. */
+    load_firmware_and_kick(hw_rev);
 }
