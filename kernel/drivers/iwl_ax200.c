@@ -82,6 +82,16 @@
 #define HBUS_TARG_WRPTR         0x460
 #define UCODE_ALIVE_NTFY        0x01
 #define IWL_ALIVE_STATUS_OK     0xCAFE
+
+/* Host command TX (Phase 3b). Command queue id 0 (IWL_MVM_DQA_CMD_QUEUE); the
+ * TX doorbell is HBUS_TARG_WRPTR = write_ptr | (q<<16). Commands use the 8-byte
+ * wide header and a 2-TB TFD (first 20 bytes in a dedicated first-TB buffer). */
+#define CMD_Q_ID                0
+#define QUEUE_TO_SEQ(q)         (((q) & 0x1fu) << 8)
+#define INDEX_TO_SEQ(i)         ((i) & 0xffu)
+#define IWL_FIRST_TB_SIZE       20
+#define SYSTEM_GROUP            0x02
+#define SHARED_MEM_CFG_CMD      0x00   /* in SYSTEM_GROUP — a read-only query */
 #define GP_CNTRL_MAC_ACCESS_REQ 0x00000008
 
 /* Receive Flow Handler (RFH) registers — gen2 RX must be set up here directly,
@@ -119,6 +129,8 @@ static volatile uint8_t *s_mmio;   /* BAR0 kernel VA */
 static uint8_t          *s_rx_buf_va[512];   /* KVA of each RX buffer (NRBDS) */
 static volatile uint8_t *s_rb_stts;          /* KVA of the RB status block */
 static volatile uint8_t *s_used_bd;          /* KVA of the used-RBD completion ring */
+static volatile uint8_t *s_cmd_ring;         /* KVA of the command TFD ring */
+static uint16_t          s_cmd_wr;           /* command queue write pointer */
 
 static inline uint32_t csr_rd(uint32_t off) { return *(volatile uint32_t *)(s_mmio + off); }
 static inline void     csr_wr(uint32_t off, uint32_t v) { *(volatile uint32_t *)(s_mmio + off) = v; }
@@ -437,6 +449,63 @@ process_rx_alive(void)
     }
 }
 
+/* Append a transmit buffer to a gen2 TFD (iwl_tfh_tfd: num_tbs(2) then tbs[];
+ * iwl_tfh_tb = tb_len(2) + addr(8), 10 bytes each). */
+static void
+set_tfd_tb(volatile uint8_t *tfd, uint64_t addr, uint16_t len)
+{
+    uint16_t n = (uint16_t)(tfd[0] | (tfd[1] << 8));
+    volatile uint8_t *tb = tfd + 2 + (uint32_t)n * 10;
+    tb[0] = (uint8_t)(len & 0xff);
+    tb[1] = (uint8_t)((len >> 8) & 0xff);
+    for (int i = 0; i < 8; i++)
+        tb[2 + i] = (uint8_t)(addr >> (i * 8));
+    n++;
+    tfd[0] = (uint8_t)(n & 0xff);
+    tfd[1] = (uint8_t)((n >> 8) & 0xff);
+}
+
+/* Send a host command (id = (group_id<<8)|opcode) with an optional payload.
+ * Builds the wide-header command in DMA, copies its first 20 bytes into a
+ * first-TB buffer, builds a 2-TB TFD in the command queue, rings the doorbell. */
+static void
+send_cmd(uint16_t cmd_id, const void *payload, uint16_t plen)
+{
+    uint64_t cmd_phys = 0, ftb_phys = 0;
+    uint8_t *cmd = dma_alloc((uint64_t)8 + plen + 64, &cmd_phys);
+    uint8_t *ftb = dma_alloc(64, &ftb_phys);
+    if (!cmd || !ftb) {
+        printk("[AX200] send_cmd: DMA alloc failed\n");
+        return;
+    }
+
+    uint16_t seq = (uint16_t)(QUEUE_TO_SEQ(CMD_Q_ID) | INDEX_TO_SEQ(s_cmd_wr));
+    cmd[0] = (uint8_t)(cmd_id & 0xff);          /* opcode */
+    cmd[1] = (uint8_t)((cmd_id >> 8) & 0xff);   /* group_id */
+    cmd[2] = (uint8_t)(seq & 0xff);
+    cmd[3] = (uint8_t)((seq >> 8) & 0xff);       /* sequence (le16) */
+    cmd[4] = (uint8_t)(plen & 0xff);
+    cmd[5] = (uint8_t)((plen >> 8) & 0xff);      /* length (le16) */
+    cmd[6] = 0; cmd[7] = 0;                       /* reserved, version */
+    if (plen)
+        mcopy(cmd + 8, payload, plen);
+
+    uint16_t copy_size = (uint16_t)(8 + plen);
+    uint16_t tb0 = copy_size < IWL_FIRST_TB_SIZE ? copy_size : IWL_FIRST_TB_SIZE;
+    mcopy(ftb, cmd, tb0);
+
+    volatile uint8_t *tfd = s_cmd_ring + (uint32_t)s_cmd_wr * 256;
+    tfd[0] = 0; tfd[1] = 0;                       /* num_tbs = 0 */
+    set_tfd_tb(tfd, ftb_phys, tb0);
+    if (copy_size > tb0)
+        set_tfd_tb(tfd, cmd_phys + tb0, (uint16_t)(copy_size - tb0));
+
+    s_cmd_wr = (uint16_t)((s_cmd_wr + 1) & 31);
+    csr_wr(HBUS_TARG_WRPTR, (uint32_t)(s_cmd_wr | (CMD_Q_ID << 16)));
+    printk("[AX200] sent cmd 0x%x (seq=0x%x, %u bytes) wr->%u\n",
+           cmd_id, seq, copy_size, s_cmd_wr);
+}
+
 static int
 load_firmware_and_kick(uint32_t hw_rev)
 {
@@ -452,6 +521,8 @@ load_firmware_and_kick(uint32_t hw_rev)
     }
     s_rb_stts = rb_stts;
     s_used_bd = used_bd;
+    s_cmd_ring = cmd_ring;
+    s_cmd_wr = 0;
 
     /* Populate the RX free-buffer ring: entry = buffer_phys | vid (vid in the
      * low bits, buffers are 4K-aligned so they don't collide). Keep each
@@ -524,6 +595,31 @@ load_firmware_and_kick(uint32_t hw_rev)
              * ALIVE notification lands. */
             csr_wr(RFH_Q0_FRBDCB_WIDX_TRG, (uint32_t)(NRBDS - 8));
             process_rx_alive();
+
+            /* Phase 3b: exercise the command TX path with a read-only query
+             * (SHARED_MEM_CFG) and watch for the FW's response via RX. */
+            uint16_t before = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
+            send_cmd((SYSTEM_GROUP << 8) | SHARED_MEM_CFG_CMD, 0, 0);
+            uint16_t after = before;
+            for (int t = 0; t < 50000; t++) {   /* up to ~500ms */
+                after = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
+                if (after != before)
+                    break;
+                uint32_t ie = csr_rd(CSR_INT);
+                if (ie & (CSR_INT_BIT_SW_ERR | CSR_INT_BIT_HW_ERR)) {
+                    printk("[AX200] cmd caused FW error CSR_INT=0x%x umacPC=0x%x\n",
+                           ie, rd_prph(UREG_UMAC_CURRENT_PC));
+                    return -1;
+                }
+                busy_wait_us(10);
+            }
+            if (after != before) {
+                const uint8_t *r = s_rx_buf_va[(after - 1) & 511];
+                printk("[AX200] *** CMD RESPONSE *** closed=%u cmd=0x%x grp=0x%x — TX path WORKS!\n",
+                       after, r[4], r[5]);
+            } else {
+                printk("[AX200] no cmd response (rb_stts still %u) — cmd not consumed\n", before);
+            }
             return 0;
         }
         if (inta & (CSR_INT_BIT_SW_ERR | CSR_INT_BIT_HW_ERR)) {
