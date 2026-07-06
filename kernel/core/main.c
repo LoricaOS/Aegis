@@ -298,6 +298,7 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     pmm_set_alloc_high_pref(1);
     arch_set_master_pml4(vmm_get_master_pml4()); /* store master PML4 for ISR/SYSCALL */
     fb_init();              /* linear framebuffer — [FB] OK or silent        */
+    bph("fb");
     if (!text_mode)
         fb_boot_splash();   /* draw logo immediately (graphical boot only)   */
     cap_init();             /* capability stub — [CAP] OK                    */
@@ -345,10 +346,12 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     console_init();         /* register stdout device (silent)               */
     bph("fs-base");
     acpi_init();            /* parse MCFG+MADT — [ACPI] OK                   */
+    bph("acpi");
     fw_cfg_init();          /* QEMU/Proxmox fw_cfg host-injected config; silent */
     hyperv_init();          /* Hyper-V hypercall + SynIC foundation; silent off-HV */
     lapic_init();           /* Local APIC — [LAPIC] OK or silent skip        */
     ioapic_init();          /* I/O APIC — [IOAPIC] OK or silent skip         */
+    bph("apic");
     /* Flush i8042 output buffer after PIC→IOAPIC transition.
      * Stale scancodes from BIOS/GRUB can hold IRQ1 asserted on the
      * i8042, preventing new keyboard interrupts until the buffer is
