@@ -326,6 +326,12 @@ kernel_main(uint32_t mb_magic, void *mb_info)
          (inb(0x64) & 0x01) && i8042_drain < 64;
          i8042_drain++)
         (void)inb(0x60);
+    /* Calibrate the LAPIC-timer period + TSC ONCE, on the BSP, before any AP is
+     * woken (smp_start_aps below). Each AP's lapic_timer_init then inherits this
+     * value instead of re-running the ~10ms PIT-channel-2 spin — which, because
+     * PIT ch2 is a single shared resource, serialized AP bring-up at ~10ms/core.
+     * This is a no-op-cost move for single-CPU boots and saves ~10ms×(ncpu-1). */
+    lapic_timer_calibrate();
     pcie_init();            /* enumerate PCIe devices — [PCIE] OK            */
     fb_check_amd();         /* warn if AMD GPU present but no UEFI fb tag    */
     virtio_gpu_init();      /* virtio-gpu 2D scanout — [GPU] OK or silent    */
