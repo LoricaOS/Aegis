@@ -56,6 +56,16 @@
 #define CSR_INT_MASK            0x00C
 #define HBUS_TARG_PRPH_WADDR    0x444   /* HBUS_BASE(0x400)+0x044 */
 #define HBUS_TARG_PRPH_WDAT     0x44C
+#define HBUS_TARG_PRPH_RADDR    0x448
+#define HBUS_TARG_PRPH_RDAT     0x450
+/* FW boot-status / program-counter regs — readable without ALIVE, so they name
+ * an early assert (SB = secure-boot status; report the ROM/IML/uCode stage). */
+#define SB_CPU_1_STATUS         0xA01E30
+#define SB_CPU_2_STATUS         0xA01E34
+#define UMAG_SB_CPU_1_STATUS    0xA038C0
+#define UMAG_SB_CPU_2_STATUS    0xA038C4
+#define UREG_UMAC_CURRENT_PC    0xA05C18
+#define UREG_LMAC1_CURRENT_PC   0xA05C1C
 #define UREG_CPU_INIT_RUN       0xA05C44
 #define PRPH_ADDR_MASK          0x000FFFFF   /* 22000 family: 20-bit prph addr */
 #define CSR_INT_BIT_ALIVE       (1u << 0)
@@ -67,6 +77,11 @@
 #define CTXT_INFO_RB_SIZE_4K       0x4
 #define NRBDS                   512    /* RX free-buffer ring depth — MUST match
                                         * RFH_RXF_DMA_RBDCB_SIZE_512 + cb_size=9 */
+#define IWL_RX_ENABLE           1      /* bisect: 0 = program RFH but don't enable RX DMA */
+#define IWL_RFH_INIT            1      /* bisect: 0 = skip rx_hw_init entirely */
+#define IWL_RFH_REGS            1      /* bisect: 0 = skip the RFH register writes */
+#define IWL_RFH_GENCFG          1      /* bisect: 0 = skip the RFH_GEN_CFG write */
+#define IWL_RFH_BASES           1      /* bisect: 0 = skip the RFH base-address writes */
 
 /* RX/command doorbell (HBUS_BASE+0x060). Low 16 bits = write pointer, high bits
  * select the queue: (q<<16) for TX, ((q+512)<<16) for RX. */
@@ -127,6 +142,11 @@ static void wr_prph64(uint32_t addr, uint64_t val)
 {
     wr_prph(addr, (uint32_t)(val & 0xFFFFFFFFu));
     wr_prph(addr + 4, (uint32_t)(val >> 32));
+}
+static uint32_t rd_prph(uint32_t addr)
+{
+    csr_wr(HBUS_TARG_PRPH_RADDR, (addr & PRPH_ADDR_MASK) | (3u << 24));
+    return csr_rd(HBUS_TARG_PRPH_RDAT);
 }
 
 /* Approximate busy-wait (no scheduler in early init); mirrors rtl8169. */
@@ -444,20 +464,37 @@ rx_hw_init(uint64_t free_phys, uint64_t used_phys, uint64_t stts_phys)
     /* Part of gen2 nic-init (iwl_pcie_gen2_nic_init). */
     csr_set(CSR_MAC_SHADOW_REG_CTRL, 0x800FFFFFu);
 
+#if IWL_RFH_REGS
     wr_prph(RFH_RXF_DMA_CFG, 0);            /* stop RX DMA */
     wr_prph(RFH_RXF_RXQ_ACTIVE, 0);         /* disable free+used queue op */
+#if IWL_RFH_BASES
     wr_prph64(RFH_Q0_FRBDCB_BA_LSB, free_phys);
     wr_prph64(RFH_Q0_URBDCB_BA_LSB, used_phys);
     wr_prph64(RFH_Q0_URBD_STTS_WPTR_LSB, stts_phys);
+#else
+    (void)free_phys; (void)used_phys; (void)stts_phys; (void)wr_prph64;
+#endif
     wr_prph(RFH_Q0_FRBDCB_WIDX, 0);
     wr_prph(RFH_Q0_FRBDCB_RIDX, 0);
     wr_prph(RFH_Q0_URBDCB_WIDX, 0);
-    wr_prph(RFH_RXF_DMA_CFG, RFH_RXF_DMA_CFG_VAL);  /* enable RX DMA */
+#if IWL_RFH_GENCFG
     wr_prph(RFH_GEN_CFG, RFH_GEN_CFG_VAL);          /* snoop + default rxq 0 */
+#endif
+#else
+    (void)free_phys; (void)used_phys; (void)stts_phys; (void)wr_prph64;
+#endif
+#if IWL_RX_ENABLE
+    wr_prph(RFH_RXF_DMA_CFG, RFH_RXF_DMA_CFG_VAL);  /* enable RX DMA */
     wr_prph(RFH_RXF_RXQ_ACTIVE, RFH_RXQ0_ENABLE);   /* activate queue 0 */
+#endif
 
     /* Interrupt coalescing default (8-bit reg — not a 32-bit access). */
     *(volatile uint8_t *)(s_mmio + CSR_INT_COALESCING) = 0x40;
+
+    /* Read the RFH registers back — do the prph writes actually land? */
+    printk("[AX200] RFH readback: DMA_CFG=0x%x GEN_CFG=0x%x FRBDCB_BA_lo=0x%x RXQ_ACTIVE=0x%x\n",
+           rd_prph(RFH_RXF_DMA_CFG), rd_prph(RFH_GEN_CFG),
+           rd_prph(RFH_Q0_FRBDCB_BA_LSB), rd_prph(RFH_RXF_RXQ_ACTIVE));
 
     /* Release MAC access so the firmware owns the MAC when it boots (iwlwifi
      * release_nic_access). Holding MAC_ACCESS_REQ while the FW starts asserts. */
@@ -496,8 +533,12 @@ load_firmware_and_kick(uint32_t hw_rev)
 
     /* Bring up the RX DMA engine (RFH), then publish the free buffers via the
      * gen2 RX doorbell (a direct CSR; write pointer must be a multiple of 8). */
+#if IWL_RFH_INIT
     rx_hw_init(free_phys, used_phys, stts_phys);
     csr_wr(RFH_Q0_FRBDCB_WIDX_TRG, (uint32_t)(NRBDS - 8));
+#else
+    (void)free_phys; (void)used_phys; (void)stts_phys; (void)rx_hw_init;
+#endif
 
     /* Firmware sections → DRAM map (indexing mirrors iwl_pcie_init_fw_sec:
      * lmac=sec[0..L-1], umac=sec[L+1..L+U], paging=sec[L+U+2..]). */
@@ -550,7 +591,12 @@ load_firmware_and_kick(uint32_t hw_rev)
             return 0;
         }
         if (inta & (CSR_INT_BIT_SW_ERR | CSR_INT_BIT_HW_ERR)) {
-            printk("[AX200] FAIL: FW error interrupt CSR_INT=0x%x\n", inta);
+            csr_set(CSR_GP_CNTRL, GP_CNTRL_MAC_ACCESS_REQ);
+            csr_poll(CSR_GP_CNTRL, GP_CNTRL_MAC_CLOCK_READY, GP_CNTRL_MAC_CLOCK_READY, 15000);
+            printk("[AX200] FW error CSR_INT=0x%x SB1=0x%x SB2=0x%x UMAG1=0x%x UMAG2=0x%x umacPC=0x%x lmacPC=0x%x\n",
+                   inta, rd_prph(SB_CPU_1_STATUS), rd_prph(SB_CPU_2_STATUS),
+                   rd_prph(UMAG_SB_CPU_1_STATUS), rd_prph(UMAG_SB_CPU_2_STATUS),
+                   rd_prph(UREG_UMAC_CURRENT_PC), rd_prph(UREG_LMAC1_CURRENT_PC));
             return -1;
         }
         busy_wait_us(200);
