@@ -51,6 +51,7 @@
 #include "rtl8139.h"
 #include "e1000.h"
 #include "vmxnet3.h"
+#include "iwl_ax200.h"
 #include "hda.h"
 #include "pvpanic.h"
 #include "fb.h"
@@ -449,6 +450,7 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     rtl8139_init();         /* RTL8139 NIC — [NET] OK or silent skip        */
     e1000_init();           /* Intel e1000 NIC — [NET] OK or silent skip    */
     vmxnet3_init();         /* VMware vmxnet3 NIC — [NET] OK or silent skip  */
+    iwl_ax200_init();       /* Intel Wi-Fi 6 AX200 — Phase 1 bring-up or skip */
     hda_init();             /* Intel HD Audio — [HDA] OK or silent skip      */
     pvpanic_init();         /* pvpanic guest→host notify — [PVPANIC] or skip */
     net_init();             /* Phase 25: protocol stack init + ICMP self-test ping */
