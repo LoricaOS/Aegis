@@ -115,6 +115,11 @@ kernel_main(uint32_t mb_magic, void *mb_info)
 {
     (void)mb_magic;
 
+    /* Boot stopwatch: raw TSC at kernel entry, converted to ms once the TSC is
+     * calibrated and reported just before init is spawned. A permanent baseline
+     * for boot-speed work — see the [BOOT] line below. */
+    uint64_t boot_tsc0 = arch_get_cycles();
+
     arch_init();            /* serial_init + vga_init                        */
     arch_pat_init();        /* PAT MSR: PA1=WC for framebuffer mapping       */
     arch_mm_init(mb_info);  /* parse multiboot2 memory map + cmdline         */
@@ -422,6 +427,11 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     if (g_ap_sched_enabled)
         for (uint32_t c = 1; c < g_cpu_count; c++)
             sched_spawn_idle_for(c, task_idle);
+    /* Boot stopwatch readout: kernel entry → here (all in-kernel init done,
+     * about to enter ring 3). Guard on a calibrated TSC (0 without invariant). */
+    if (arch_tsc_hz())
+        printk("[BOOT] kernel init: %lu ms\n",
+               (arch_get_cycles() - boot_tsc0) / (arch_tsc_hz() / 1000));
     proc_spawn_init();      /* spawn init user process in ring 3             */
     /* All TCBs and stacks are in kva range at this point —
      * safe to remove the identity map. */
