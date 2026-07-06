@@ -110,6 +110,22 @@ kernel_main_limine(const aegis_bootinfo_t *bi)
     kernel_main(0, NULL);
 }
 
+/* Boot phase profiler: record raw TSC at each milestone; converted to ms and
+ * dumped once the TSC is calibrated (see the [BOOTPROF] table near the end). */
+#define BOOT_NPHASE 24
+static struct { const char *name; uint64_t tsc; } s_bph[BOOT_NPHASE];
+static int s_bph_n;
+static int g_bootprof;   /* `bootprof` cmdline → print the per-phase [BOOTPROF] table */
+static void
+bph(const char *name)
+{
+    if (s_bph_n < BOOT_NPHASE) {
+        s_bph[s_bph_n].name = name;
+        s_bph[s_bph_n].tsc  = arch_get_cycles();
+        s_bph_n++;
+    }
+}
+
 void
 kernel_main(uint32_t mb_magic, void *mb_info)
 {
@@ -119,6 +135,7 @@ kernel_main(uint32_t mb_magic, void *mb_info)
      * calibrated and reported just before init is spawned. A permanent baseline
      * for boot-speed work — see the [BOOT] line below. */
     uint64_t boot_tsc0 = arch_get_cycles();
+    bph("(entry)");
 
     arch_init();            /* serial_init + vga_init                        */
     arch_pat_init();        /* PAT MSR: PA1=WC for framebuffer mapping       */
@@ -198,6 +215,17 @@ kernel_main(uint32_t mb_magic, void *mb_info)
                 q++;
             }
         }
+        /* `bootprof` — print the per-phase boot timing table ([BOOTPROF] lines).
+         * Off by default (the one-line [BOOT] total is always printed). */
+        {
+            const char *q = cmdline;
+            while (*q) {
+                if (q[0]=='b'&&q[1]=='o'&&q[2]=='o'&&q[3]=='t'&&q[4]=='p'&&
+                    q[5]=='r'&&q[6]=='o'&&q[7]=='f')
+                    { g_bootprof = 1; break; }
+                q++;
+            }
+        }
         /* Demand-paged file-backed mmap is the DEFAULT (g_lazyfile=1): a
          * MAP_PRIVATE ext2 file mapping records inode+offset and populates per
          * page on fault instead of eager-copying the whole file at mmap time.
@@ -259,6 +287,7 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     pmm_init();             /* bitmap allocator — [PMM] OK                   */
     vmm_init();             /* page tables, higher-half map — [VMM] OK       */
     kva_init();             /* kernel virtual allocator — [KVA] OK           */
+    bph("mem");
     /* Swap the 4GB bootstrap bitmap for a full RAM-sized one now that KVA is
      * up (needs no identity map — it's higher-half). After this, all of RAM
      * is usable; before it, only the first 4GB. No-op on a <=4GB machine. */
@@ -286,6 +315,7 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     arch_smep_init();       /* SMEP detect + enable — [SMEP] OK/WARN         */
     arch_sse_init();        /* enable SSE for user mode (CR0/CR4 bits)       */
     random_init();          /* ChaCha20 CSPRNG — [RNG] OK                    */
+    bph("cpu+io");
 
     /* Map boot modules into KVA as RAM blkdevs */
     {
@@ -313,6 +343,7 @@ kernel_main(uint32_t mb_magic, void *mb_info)
 
     vfs_init();             /* [VFS] OK + [INITRD] OK                        */
     console_init();         /* register stdout device (silent)               */
+    bph("fs-base");
     acpi_init();            /* parse MCFG+MADT — [ACPI] OK                   */
     fw_cfg_init();          /* QEMU/Proxmox fw_cfg host-injected config; silent */
     hyperv_init();          /* Hyper-V hypercall + SynIC foundation; silent off-HV */
@@ -337,7 +368,9 @@ kernel_main(uint32_t mb_magic, void *mb_info)
      * PIT ch2 is a single shared resource, serialized AP bring-up at ~10ms/core.
      * This is a no-op-cost move for single-CPU boots and saves ~10ms×(ncpu-1). */
     lapic_timer_calibrate();
+    bph("intr+calib");
     pcie_init();            /* enumerate PCIe devices — [PCIE] OK            */
+    bph("pcie");
     fb_check_amd();         /* warn if AMD GPU present but no UEFI fb tag    */
     virtio_gpu_init();      /* virtio-gpu 2D scanout — [GPU] OK or silent    */
     virtio_rng_init();      /* virtio-rng entropy — [RNG] mix or silent skip */
@@ -361,6 +394,7 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     hv_heartbeat_init();    /* Hyper-V heartbeat IC → guest reports healthy; silent if absent */
     hv_shutdown_init();     /* Hyper-V shutdown IC → host-initiated graceful stop; silent if absent */
     hv_kvp_init();          /* Hyper-V KVP/data-exchange IC → guest OS info to host; silent if absent */
+    bph("dev-probe");
     gpt_scan("nvme0");      /* GPT partitions — [GPT] OK or silent (no NVMe) */
     gpt_scan("sata0");      /* GPT on AHCI/SATA — silent if absent           */
     gpt_scan("vblk0");      /* GPT on virtio-blk — silent if absent          */
@@ -404,6 +438,7 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     ext2_anchors_reload();  /* register /etc/aegis/anchors install-anchors    */
     cap_anchor_audit();     /* WARN if a granting anchor isn't write-protected */
     poll_test();            /* VFS .poll self-test — [POLL] OK               */
+    bph("mount+cap");
     xhci_init();            /* xHCI USB host — [XHCI] OK or silent skip     */
     gpt_scan("usb0");       /* GPT on a USB mass-storage device — silent if absent */
     virtio_net_init();      /* virtio-net NIC — [NET] OK or silent skip      */
@@ -414,7 +449,9 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     hda_init();             /* Intel HD Audio — [HDA] OK or silent skip      */
     pvpanic_init();         /* pvpanic guest→host notify — [PVPANIC] or skip */
     net_init();             /* Phase 25: protocol stack init + ICMP self-test ping */
+    bph("usb+net");
     smp_start_aps();        /* wake APs via INIT-SIPI-SIPI — [SMP] OK       */
+    bph("smp");
     hwwatch_arm_local();    /* DIAG: arm BSP watchpoints (no-op unless hwwatch);
                              * all g_percpu[].self are set by smp_start_aps now */
     sched_init();           /* init run queue (no tasks yet)                 */
@@ -427,11 +464,21 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     if (g_ap_sched_enabled)
         for (uint32_t c = 1; c < g_cpu_count; c++)
             sched_spawn_idle_for(c, task_idle);
-    /* Boot stopwatch readout: kernel entry → here (all in-kernel init done,
-     * about to enter ring 3). Guard on a calibrated TSC (0 without invariant). */
-    if (arch_tsc_hz())
-        printk("[BOOT] kernel init: %lu ms\n",
-               (arch_get_cycles() - boot_tsc0) / (arch_tsc_hz() / 1000));
+    bph("sched");
+    /* Boot stopwatch readout + per-phase breakdown (µs per phase, ms total).
+     * kernel entry → here = all in-kernel init done, about to enter ring 3.
+     * Guard on a calibrated TSC (0 without invariant). */
+    if (arch_tsc_hz()) {
+        uint64_t mhz = arch_tsc_hz() / 1000000;
+        if (mhz) {
+            if (g_bootprof)
+                for (int i = 1; i < s_bph_n; i++)
+                    printk("[BOOTPROF] %s %lu us\n", s_bph[i].name,
+                           (s_bph[i].tsc - s_bph[i - 1].tsc) / mhz);
+            printk("[BOOT] kernel init: %lu ms\n",
+                   (arch_get_cycles() - boot_tsc0) / (mhz * 1000));
+        }
+    }
     proc_spawn_init();      /* spawn init user process in ring 3             */
     /* All TCBs and stacks are in kva range at this point —
      * safe to remove the identity map. */
