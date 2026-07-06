@@ -92,6 +92,8 @@
 #define IWL_FIRST_TB_SIZE       20
 #define SYSTEM_GROUP            0x02
 #define SHARED_MEM_CFG_CMD      0x00   /* in SYSTEM_GROUP — a read-only query */
+#define REGULATORY_AND_NVM_GROUP 0x0c
+#define NVM_GET_INFO            0x02   /* in REGULATORY_AND_NVM_GROUP */
 #define GP_CNTRL_MAC_ACCESS_REQ 0x00000008
 
 /* Receive Flow Handler (RFH) registers — gen2 RX must be set up here directly,
@@ -506,6 +508,38 @@ send_cmd(uint16_t cmd_id, const void *payload, uint16_t plen)
            cmd_id, seq, copy_size, s_cmd_wr);
 }
 
+/* Send a command and dump the FW's response packet (cmd/group + 24 payload
+ * bytes). The response is the newest RX buffer once rb_stts advances. */
+static void
+send_and_dump(uint16_t cmd_id, const void *pl, uint16_t plen, const char *tag)
+{
+    uint16_t before = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
+    send_cmd(cmd_id, pl, plen);
+    uint16_t after = before;
+    for (int t = 0; t < 50000; t++) {
+        after = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
+        if (after != before)
+            break;
+        uint32_t ie = csr_rd(CSR_INT);
+        if (ie & (CSR_INT_BIT_SW_ERR | CSR_INT_BIT_HW_ERR)) {
+            printk("[AX200] %s -> FW error CSR_INT=0x%x umacPC=0x%x\n",
+                   tag, ie, rd_prph(UREG_UMAC_CURRENT_PC));
+            return;
+        }
+        busy_wait_us(10);
+    }
+    if (after == before) {
+        printk("[AX200] %s: no response (rb_stts %u)\n", tag, before);
+        return;
+    }
+    const uint8_t *r = s_rx_buf_va[(after - 1) & 511];   /* iwl_rx_packet, data @+8 */
+    printk("[AX200] %s resp cmd=0x%x grp=0x%x len=0x%x data: "
+           "%x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x\n",
+           tag, r[4], r[5], (uint16_t)(r[0] | (r[1] << 8)) & 0x3FFF,
+           r[8],r[9],r[10],r[11],r[12],r[13],r[14],r[15],r[16],r[17],r[18],r[19],
+           r[20],r[21],r[22],r[23],r[24],r[25],r[26],r[27],r[28],r[29],r[30],r[31]);
+}
+
 static int
 load_firmware_and_kick(uint32_t hw_rev)
 {
@@ -596,30 +630,11 @@ load_firmware_and_kick(uint32_t hw_rev)
             csr_wr(RFH_Q0_FRBDCB_WIDX_TRG, (uint32_t)(NRBDS - 8));
             process_rx_alive();
 
-            /* Phase 3b: exercise the command TX path with a read-only query
-             * (SHARED_MEM_CFG) and watch for the FW's response via RX. */
-            uint16_t before = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
-            send_cmd((SYSTEM_GROUP << 8) | SHARED_MEM_CFG_CMD, 0, 0);
-            uint16_t after = before;
-            for (int t = 0; t < 50000; t++) {   /* up to ~500ms */
-                after = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
-                if (after != before)
-                    break;
-                uint32_t ie = csr_rd(CSR_INT);
-                if (ie & (CSR_INT_BIT_SW_ERR | CSR_INT_BIT_HW_ERR)) {
-                    printk("[AX200] cmd caused FW error CSR_INT=0x%x umacPC=0x%x\n",
-                           ie, rd_prph(UREG_UMAC_CURRENT_PC));
-                    return -1;
-                }
-                busy_wait_us(10);
-            }
-            if (after != before) {
-                const uint8_t *r = s_rx_buf_va[(after - 1) & 511];
-                printk("[AX200] *** CMD RESPONSE *** closed=%u cmd=0x%x grp=0x%x — TX path WORKS!\n",
-                       after, r[4], r[5]);
-            } else {
-                printk("[AX200] no cmd response (rb_stts still %u) — cmd not consumed\n", before);
-            }
+            /* Phase 3b: prove the command interface with a read-only query +
+             * response parse. (The full init sequence — SOC cfg, NVM, PHY cfg —
+             * must run in order before queries like NVM_GET_INFO; sending those
+             * standalone asserts the FW. That's the Phase 3c work.) */
+            send_and_dump((SYSTEM_GROUP << 8) | SHARED_MEM_CFG_CMD, 0, 0, "SHARED_MEM_CFG");
             return 0;
         }
         if (inta & (CSR_INT_BIT_SW_ERR | CSR_INT_BIT_HW_ERR)) {
