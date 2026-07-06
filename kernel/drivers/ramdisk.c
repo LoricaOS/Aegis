@@ -137,6 +137,20 @@ ramdisk_init(uint64_t phys_base, uint64_t size)
            (unsigned)(true_size / (1024 * 1024)));
 }
 
+/* Raw access to ramdisk0's KVA-backed bytes. Lets a driver consume a boot
+ * module directly (e.g. WiFi firmware on the kernel-only smoke ISO, where
+ * module0 is the .ucode rather than a rootfs). Callers must validate the
+ * contents themselves. Returns -1 if no ramdisk0 was registered. */
+int
+ramdisk_get_blob(const uint8_t **out, uint64_t *size)
+{
+    if (!s_base || !s_size)
+        return -1;
+    *out  = s_base;
+    *size = s_size;
+    return 0;
+}
+
 /* ── Second ramdisk (ramdisk1) for ESP image ───────────────────────── */
 
 static uint8_t *s_base2;

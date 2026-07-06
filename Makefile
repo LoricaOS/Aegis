@@ -306,12 +306,17 @@ $(LIMINE_BIN): $(LIMINE_DIR)/limine.c $(LIMINE_DIR)/limine-bios-hdd.h
 	@mkdir -p $(BUILD)
 	$(HOSTCC) -std=c99 -O2 -I$(LIMINE_DIR) -o $@ $(LIMINE_DIR)/limine.c
 
+# Optional dev firmware blob: if the AX200 .ucode is staged in kernel/drivers,
+# ship it as boot module0 so the iwl_ax200 driver can load it on the smoke ISO.
+IWL_FW := $(wildcard kernel/drivers/iwlwifi-cc-a0-59.ucode)
+
 iso: $(BUILD)/aegis.iso
 $(BUILD)/aegis.iso: $(KERNEL_STRIPPED) $(LIMINE_BIN)
 	@rm -rf $(ISO_DIR)
 	@mkdir -p $(ISO_DIR)/boot/limine $(ISO_DIR)/EFI/BOOT
 	cp $(KERNEL_STRIPPED) $(ISO_DIR)/boot/aegis.elf
-	printf 'timeout: 0\n\n/Aegis kernel\n    protocol: limine\n    path: boot():/boot/aegis.elf\n    cmdline: boot=text\n' > $(ISO_DIR)/boot/limine/limine.conf
+	$(if $(IWL_FW),cp $(IWL_FW) $(ISO_DIR)/boot/iwlwifi.ucode,@true)
+	printf 'timeout: 0\n\n/Aegis kernel\n    protocol: limine\n    path: boot():/boot/aegis.elf\n$(if $(IWL_FW),    module_path: boot():/boot/iwlwifi.ucode\n,)    cmdline: boot=text\n' > $(ISO_DIR)/boot/limine/limine.conf
 	cp $(LIMINE_DIR)/limine-bios.sys $(LIMINE_DIR)/limine-bios-cd.bin $(LIMINE_DIR)/limine-uefi-cd.bin $(ISO_DIR)/boot/limine/
 	cp $(LIMINE_DIR)/BOOTX64.EFI $(LIMINE_DIR)/BOOTIA32.EFI $(ISO_DIR)/EFI/BOOT/
 	xorriso -as mkisofs -R -r -J \

@@ -18,6 +18,7 @@
 #include "arch.h"
 #include "kva.h"
 #include "vmm.h"
+#include "ramdisk.h"
 #include "printk.h"
 #include <stdint.h>
 
@@ -32,6 +33,18 @@
 #define CSR_GP_CNTRL           0x024
 #define CSR_HW_REV             0x028
 #define CSR_HW_RF_ID           0x09C
+#define CSR_GIO_CHICKEN_BITS   0x100
+#define CSR_DBG_HPET_MEM_REG   0x240
+
+/* CSR bit fields used by the power-up handshake (iwl-csr.h). */
+#define HW_IF_CONFIG_HAP_WAKE_L1A     0x00080000
+#define HW_IF_CONFIG_NIC_READY        0x00400000  /* PCI_OWN_SEM */
+#define HW_IF_CONFIG_NIC_PREPARE_DONE 0x02000000  /* ME_OWN */
+#define HW_IF_CONFIG_PREPARE          0x08000000  /* WAKE_ME */
+#define GP_CNTRL_MAC_CLOCK_READY      0x00000001
+#define GP_CNTRL_INIT_DONE            0x00000004
+#define GIO_CHICKEN_L1A_NO_L0S_RX     0x00800000
+#define DBG_HPET_MEM_REG_VAL          0xFFFF0000
 
 /* PCI command register bits + PM capability id */
 #define PCI_CMD_MEM    0x02
@@ -45,6 +58,77 @@ static volatile uint8_t *s_mmio;   /* BAR0 kernel VA */
 
 static inline uint32_t csr_rd(uint32_t off) { return *(volatile uint32_t *)(s_mmio + off); }
 static inline void     csr_wr(uint32_t off, uint32_t v) { *(volatile uint32_t *)(s_mmio + off) = v; }
+static inline void csr_set(uint32_t off, uint32_t m) { csr_wr(off, csr_rd(off) | m); }
+static inline void csr_clr(uint32_t off, uint32_t m) { csr_wr(off, csr_rd(off) & ~m); }
+
+/* Approximate busy-wait (no scheduler in early init); mirrors rtl8169. */
+static void busy_wait_us(uint32_t us)
+{
+    for (volatile uint32_t i = 0; i < us * 100u; i++)
+        __asm__ volatile("pause");
+}
+
+/* Poll a CSR until (reg & mask) == want, up to timeout_us. Returns us waited, or -1. */
+static int csr_poll(uint32_t off, uint32_t want, uint32_t mask, uint32_t timeout_us)
+{
+    for (uint32_t t = 0; t <= timeout_us; t += 10) {
+        if ((csr_rd(off) & mask) == want)
+            return (int)t;
+        busy_wait_us(10);
+    }
+    return -1;
+}
+
+/* Request device ownership (PCI_OWN_SEM). Returns 0 if the NIC is ready. */
+static int set_hw_ready(void)
+{
+    csr_set(CSR_HW_IF_CONFIG_REG, HW_IF_CONFIG_NIC_READY);
+    return csr_poll(CSR_HW_IF_CONFIG_REG, HW_IF_CONFIG_NIC_READY,
+                    HW_IF_CONFIG_NIC_READY, 50) >= 0 ? 0 : -1;
+}
+
+/* Take the device from firmware/ME ownership if needed (iwl_pcie_prepare_card_hw).
+ * On a VFIO-passed device this usually succeeds on the first try. */
+static int prepare_card(void)
+{
+    if (set_hw_ready() == 0)
+        return 0;
+    csr_set(CSR_HW_IF_CONFIG_REG, HW_IF_CONFIG_PREPARE);
+    csr_poll(CSR_HW_IF_CONFIG_REG, 0, HW_IF_CONFIG_NIC_PREPARE_DONE, 2000);
+    for (int i = 0; i < 15; i++) {
+        if (set_hw_ready() == 0)
+            return 0;
+        busy_wait_us(10000);
+    }
+    return -1;
+}
+
+/* Power up the NIC: APM init + finish_nic_init → MAC clock stable, prph/SRAM
+ * accessible. AX200 is device-family 22000 (< BZ): set INIT_DONE, poll CLOCK_READY. */
+static int power_up(void)
+{
+    if (prepare_card() != 0) {
+        printk("[AX200] FAIL: prepare_card (device not ready / owned by ME)\n");
+        return -1;
+    }
+    /* APM init (gen2): chicken bits + HPET wait threshold + HAP wake. */
+    csr_set(CSR_GIO_CHICKEN_BITS, GIO_CHICKEN_L1A_NO_L0S_RX);
+    csr_set(CSR_DBG_HPET_MEM_REG, DBG_HPET_MEM_REG_VAL);
+    csr_set(CSR_HW_IF_CONFIG_REG, HW_IF_CONFIG_HAP_WAKE_L1A);
+
+    /* finish_nic_init: move D0U*->D0A*, then wait for the MAC clock. */
+    csr_set(CSR_GP_CNTRL, GP_CNTRL_INIT_DONE);
+    int us = csr_poll(CSR_GP_CNTRL, GP_CNTRL_MAC_CLOCK_READY,
+                      GP_CNTRL_MAC_CLOCK_READY, 25000);
+    if (us < 0) {
+        printk("[AX200] FAIL: MAC clock not ready (GP_CNTRL=0x%x)\n",
+               csr_rd(CSR_GP_CNTRL));
+        return -1;
+    }
+    printk("[AX200] power-up OK: MAC clock ready in ~%uus (GP_CNTRL=0x%x)\n",
+           (unsigned)us, csr_rd(CSR_GP_CNTRL));
+    return 0;
+}
 
 /* Map a BAR's physical range into kernel VA as uncached MMIO. Mirrors the
  * rtl8169 helper — kva_alloc_pages reserves the VA, then remap each page to the
@@ -76,6 +160,92 @@ find_pm_pmcsr(const pcie_device_t *d)
         if (id == PCI_CAP_ID_PM)
             return (uint8_t)(cap + 4);
         cap = next & 0xFCu;
+    }
+    return 0;
+}
+
+/* ── Firmware image: embedded blob + TLV parse (Phase 2 step B) ────────
+ * The .ucode is a TLV container: 88-byte header, then {type,len,data} TLVs.
+ * The runtime image is carried in IWL_UCODE_TLV_SEC_RT sections; each section's
+ * data begins with a __le32 destination offset (or a separator marker) followed
+ * by the section bytes. Sections are grouped LMAC | sep | UMAC | sep | paging.
+ *
+ * The blob is delivered as a Limine boot module (module0 → ramdisk0 on the
+ * smoke ISO); we read it straight from there. ponytail: dev-time module load;
+ * a shipped kernel would defer firmware load to userspace/rootfs. */
+#define IWL_TLV_MAGIC          0x0a4c5749u
+#define TLV_HDR_SIZE           88
+#define IWL_UCODE_TLV_SEC_RT   19
+#define CPU1_CPU2_SEPARATOR    0xFFFFCCCCu
+#define PAGING_SEPARATOR       0xAAAABBBBu
+#define MAX_FW_SEC             64   /* IWL_MAX_DRAM_ENTRY; firmware has ~27+ secs */
+
+struct fw_sec { uint32_t offset; const uint8_t *data; uint32_t len; };
+static struct fw_sec s_sec[MAX_FW_SEC];
+static int      s_num_sec;
+static uint32_t s_fw_ver;
+static int      s_lmac_cnt, s_umac_cnt, s_paging_cnt;
+
+static inline uint32_t rd_le32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/* Count sections from `start` until a separator (== iwl_pcie_get_num_sections). */
+static int sec_count_from(int start)
+{
+    int i = 0;
+    while (start < s_num_sec &&
+           s_sec[start].offset != CPU1_CPU2_SEPARATOR &&
+           s_sec[start].offset != PAGING_SEPARATOR) {
+        start++; i++;
+    }
+    return i;
+}
+
+static int parse_firmware(void)
+{
+    const uint8_t *fw;
+    uint64_t len64;
+    if (ramdisk_get_blob(&fw, &len64) != 0) {
+        printk("[AX200] no firmware module (boot the .ucode as module0)\n");
+        return -1;
+    }
+    uint32_t len = (uint32_t)len64;
+
+    if (len < TLV_HDR_SIZE || rd_le32(fw + 4) != IWL_TLV_MAGIC) {
+        printk("[AX200] FAIL: module is not iwlwifi firmware (len=%u)\n", (unsigned)len);
+        return -1;
+    }
+    s_fw_ver = rd_le32(fw + 4 + 4 + 64);   /* ver field after zero,magic,human[64] */
+
+    s_num_sec = 0;
+    uint32_t off = TLV_HDR_SIZE;
+    while (off + 8 <= len) {
+        uint32_t type = rd_le32(fw + off);
+        uint32_t tlen = rd_le32(fw + off + 4);
+        const uint8_t *tdata = fw + off + 8;
+        if ((uint64_t)off + 8 + tlen > len)
+            break;
+        if (type == IWL_UCODE_TLV_SEC_RT && tlen >= 4 && s_num_sec < MAX_FW_SEC) {
+            s_sec[s_num_sec].offset = rd_le32(tdata);
+            s_sec[s_num_sec].data   = tdata + 4;
+            s_sec[s_num_sec].len    = tlen - 4;
+            s_num_sec++;
+        }
+        off += 8 + ((tlen + 3u) & ~3u);    /* TLVs are 4-byte padded */
+    }
+
+    s_lmac_cnt   = sec_count_from(0);
+    s_umac_cnt   = sec_count_from(s_lmac_cnt + 1);
+    s_paging_cnt = sec_count_from(s_lmac_cnt + s_umac_cnt + 2);
+
+    printk("[AX200] fw ver=0x%x: %d secs (lmac=%d umac=%d paging=%d)\n",
+           (unsigned)s_fw_ver, s_num_sec, s_lmac_cnt, s_umac_cnt, s_paging_cnt);
+    if (s_lmac_cnt == 0 || s_umac_cnt == 0) {
+        printk("[AX200] FAIL: no lmac/umac sections parsed\n");
+        return -1;
     }
     return 0;
 }
@@ -144,5 +314,12 @@ iwl_ax200_init(void)
            (unsigned)((hw_rev >> 2) & 0x3),
            (unsigned)(hw_rev & 0x3),
            rf_id, if_cfg);
-    printk("[AX200] Phase 1 OK: MMIO alive. Next: firmware upload.\n");
+
+    /* Phase 2 step A: power the NIC up to a clock-stable state. */
+    if (power_up() != 0)
+        return;
+    /* Phase 2 step B: parse the embedded firmware into LMAC/UMAC/paging sections. */
+    if (parse_firmware() != 0)
+        return;
+    /* Next (step C): build the context-info block + kick FW self-load → ALIVE. */
 }
