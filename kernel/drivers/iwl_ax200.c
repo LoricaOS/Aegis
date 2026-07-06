@@ -64,7 +64,8 @@
 #define CSR_INT_BIT_FH_RX       (1u << 31)
 #define CTXT_INFO_TFD_FORMAT_LONG  0x0100
 #define CTXT_INFO_RB_SIZE_4K       0x4
-#define NRBDS                   128    /* RX free-buffer ring depth (cb_size=7) */
+#define NRBDS                   512    /* RX free-buffer ring depth — MUST match
+                                        * RFH_RXF_DMA_RBDCB_SIZE_512 + cb_size=9 */
 
 /* RX/command doorbell (HBUS_BASE+0x060). Low 16 bits = write pointer, high bits
  * select the queue: (q<<16) for TX, ((q+512)<<16) for RX. */
@@ -105,7 +106,7 @@
 static volatile uint8_t *s_mmio;   /* BAR0 kernel VA */
 
 /* RX queue state (kept so we can read FW->host notifications). */
-static uint8_t          *s_rx_buf_va[128];   /* KVA of each RX buffer (NRBDS) */
+static uint8_t          *s_rx_buf_va[512];   /* KVA of each RX buffer (NRBDS) */
 static volatile uint8_t *s_rb_stts;          /* KVA of the RB status block */
 static volatile uint8_t *s_used_bd;          /* KVA of the used-RBD completion ring */
 
@@ -508,10 +509,10 @@ load_firmware_and_kick(uint32_t hw_rev)
         ci->dram.virtual_img[i] = p;
     }
 
-    /* Control fields. cb_size=ilog2(NRBDS)=7; rb_size=4K; long TFD format. */
+    /* Control fields. cb_size=ilog2(NRBDS)=9; rb_size=4K; long TFD format. */
     ci->ver_mac_id = (uint16_t)hw_rev;
     ci->ver_size   = (uint16_t)(sizeof(*ci) / 4);
-    ci->control_flags = CTXT_INFO_TFD_FORMAT_LONG | (7u << 4) |
+    ci->control_flags = CTXT_INFO_TFD_FORMAT_LONG | (9u << 4) |
                         ((uint32_t)CTXT_INFO_RB_SIZE_4K << 9);
     ci->free_rbd_addr  = free_phys;
     ci->used_rbd_addr  = used_phys;
