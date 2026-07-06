@@ -65,6 +65,12 @@
 #define CTXT_INFO_RB_SIZE_4K       0x4
 #define NRBDS                   128    /* RX free-buffer ring depth (cb_size=7) */
 
+/* RX/command doorbell (HBUS_BASE+0x060). Low 16 bits = write pointer, high bits
+ * select the queue: (q<<16) for TX, ((q+512)<<16) for RX. */
+#define HBUS_TARG_WRPTR         0x460
+#define UCODE_ALIVE_NTFY        0x01
+#define IWL_ALIVE_STATUS_OK     0xCAFE
+
 /* PCI command register bits + PM capability id */
 #define PCI_CMD_MEM    0x02
 #define PCI_CMD_BM     0x04
@@ -74,6 +80,11 @@
 #define MMIO_FLAGS (VMM_FLAG_WRITABLE | VMM_FLAG_WC | VMM_FLAG_UCMINUS)
 
 static volatile uint8_t *s_mmio;   /* BAR0 kernel VA */
+
+/* RX queue state (kept so we can read FW->host notifications). */
+static uint8_t          *s_rx_buf_va[128];   /* KVA of each RX buffer (NRBDS) */
+static volatile uint8_t *s_rb_stts;          /* KVA of the RB status block */
+static volatile uint8_t *s_used_bd;          /* KVA of the used-RBD completion ring */
 
 static inline uint32_t csr_rd(uint32_t off) { return *(volatile uint32_t *)(s_mmio + off); }
 static inline void     csr_wr(uint32_t off, uint32_t v) { *(volatile uint32_t *)(s_mmio + off) = v; }
@@ -342,6 +353,44 @@ load_sec(int sec_idx)
     return p;
 }
 
+/* Read the FW's ALIVE notification out of the RX queue. Each RX buffer holds an
+ * iwl_rx_packet: len_n_flags(4) + cmd_header{cmd,group_id,seq}(4) + data. The
+ * FW advances rb_stts.closed_rb_num and writes the buffer's rbid into the used
+ * ring (iwl_rx_completion_desc: rbid at byte 4). We mapped rbid = index+1. */
+static void
+process_rx_alive(void)
+{
+    uint16_t closed = 0;
+    for (int t = 0; t < 20000; t++) {             /* up to ~200ms for the ntf */
+        closed = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
+        if (closed != 0)
+            break;
+        busy_wait_us(10);
+    }
+    if (closed == 0) {
+        printk("[AX200] no RX ntf: rb_stts[0..3]=%x %x %x %x CSR_INT=0x%x used[0..7]=%x %x %x %x %x %x %x %x\n",
+               s_rb_stts[0], s_rb_stts[1], s_rb_stts[2], s_rb_stts[3], csr_rd(CSR_INT),
+               s_used_bd[0], s_used_bd[1], s_used_bd[2], s_used_bd[3],
+               s_used_bd[4], s_used_bd[5], s_used_bd[6], s_used_bd[7]);
+        return;
+    }
+
+    uint16_t rbid = *(volatile uint16_t *)(s_used_bd + 4);
+    int idx = (int)rbid - 1;
+    if (idx < 0 || idx >= NRBDS) {
+        printk("[AX200] RX: bad rbid=%u (closed=%u)\n", rbid, closed);
+        return;
+    }
+    const uint8_t *pkt = s_rx_buf_va[idx];
+    uint8_t  cmd = pkt[4], grp = pkt[5];
+    uint16_t status = (uint16_t)(pkt[8] | (pkt[9] << 8));
+    printk("[AX200] RX pkt: cmd=0x%x grp=0x%x (closed=%u rbid=%u)\n",
+           cmd, grp, closed, rbid);
+    if (cmd == UCODE_ALIVE_NTFY)
+        printk("[AX200] ALIVE ntf: status=0x%x (%s) — FW fully initialized\n",
+               status, status == IWL_ALIVE_STATUS_OK ? "OK" : "ERR");
+}
+
 static int
 load_firmware_and_kick(uint32_t hw_rev)
 {
@@ -355,15 +404,20 @@ load_firmware_and_kick(uint32_t hw_rev)
         printk("[AX200] FAIL: DMA alloc for context-info/queues\n");
         return -1;
     }
+    s_rb_stts = rb_stts;
+    s_used_bd = used_bd;
 
     /* Populate the RX free-buffer ring: entry = buffer_phys | vid (vid in the
-     * low bits, buffers are 4K-aligned so they don't collide). */
+     * low bits, buffers are 4K-aligned so they don't collide). Keep each
+     * buffer's KVA so we can read notifications the FW writes into them. */
     for (int i = 0; i < NRBDS; i++) {
         uint64_t bp;
-        if (!dma_alloc(4096, &bp)) {
+        void *bva = dma_alloc(4096, &bp);
+        if (!bva) {
             printk("[AX200] FAIL: RX buffer alloc\n");
             return -1;
         }
+        s_rx_buf_va[i] = bva;
         free_rbd[i] = bp | (uint64_t)(i + 1);
     }
 
@@ -414,6 +468,12 @@ load_firmware_and_kick(uint32_t hw_rev)
         uint32_t inta = csr_rd(CSR_INT);
         if (inta & CSR_INT_BIT_ALIVE) {
             printk("[AX200] *** FW ALIVE *** CSR_INT=0x%x — firmware is running!\n", inta);
+            /* ACK the interrupt, then make RX buffers available (write pointer
+             * doorbell, queue 0; must be a multiple of 8). Only now is the FW's
+             * RX engine live, so the ALIVE notification lands after this. */
+            csr_wr(CSR_INT, inta);
+            csr_wr(HBUS_TARG_WRPTR, (uint32_t)((NRBDS - 8) | ((0 + 512) << 16)));
+            process_rx_alive();
             return 0;
         }
         if (inta & (CSR_INT_BIT_SW_ERR | CSR_INT_BIT_HW_ERR)) {
