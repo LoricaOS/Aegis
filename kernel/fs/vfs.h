@@ -162,6 +162,11 @@ void vfs_init(void);
 /* Linux O_CREAT flag value (used by vfs_open for ext2 file creation) */
 #define VFS_O_CREAT 0x40U
 
+/* Linux O_EXCL: with O_CREAT, open MUST fail EEXIST if the file exists —
+ * the atomic-create guarantee mkstemp/lockfiles depend on. Ignoring it let
+ * two concurrent gcc's open the SAME /tmp temp file (interleaved asm). */
+#define VFS_O_EXCL 0x80U
+
 /* VFS_O_CLOEXEC — Linux O_CLOEXEC flag value, as passed in open/pipe2 flags arg.
  * Must match VFS_FD_CLOEXEC so that `flags & VFS_O_CLOEXEC` maps to the fd bit. */
 #define VFS_O_CLOEXEC 0x80000U

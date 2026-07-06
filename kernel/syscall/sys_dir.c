@@ -75,7 +75,7 @@ sys_mkdir(uint64_t arg1, uint64_t arg2)
         return SYS_ERR(EPERM);
     char kpath[256];
     (void)arg2; /* mode ignored for now */
-    if (copy_path_from_user(kpath, arg1, sizeof(kpath)) != 0)
+    if (copy_path_resolved(kpath, arg1, sizeof(kpath)) != 0)
         return SYS_ERR(EFAULT);
     /* Install-tree mutation gate: a ring-3 process mutating /apps or
      * /etc/aegis must hold CAP_KIND_INSTALL. Boot-time (is_user == 0) exempt. */
@@ -91,6 +91,18 @@ sys_mkdir(uint64_t arg1, uint64_t arg2)
         int rc;
         if (vfs_ramfs_mkdir(kpath, &rc))
             return (rc < 0) ? (uint64_t)(int64_t)rc : 0;
+    }
+    /* POSIX/Linux ordering: an EXISTING target is EEXIST regardless of parent
+     * write permission — `mkdir -p` re-mkdirs every path component and relies
+     * on EEXIST for the ones already present. Checking parent W+X first
+     * returned EACCES for existing components whose parent the caller cannot
+     * write (e.g. "/" during mkdir -p of a build tree), breaking mkdir -p.
+     * (Masked historically by the unresolved-relative-path bug, which skipped
+     * these checks entirely.) Creation below still requires parent W+X. */
+    {
+        uint32_t existing;
+        if (ext2_open(kpath, &existing) == 0)
+            return SYS_ERR(EEXIST);
     }
     /* Check W+X permission on parent directory */
     {
@@ -123,7 +135,7 @@ sys_rmdir(uint64_t arg1)
                   CAP_KIND_VFS_WRITE, CAP_RIGHTS_WRITE) != 0)
         return SYS_ERR(EPERM);
     char kpath[256];
-    if (copy_path_from_user(kpath, arg1, sizeof(kpath)) != 0)
+    if (copy_path_resolved(kpath, arg1, sizeof(kpath)) != 0)
         return SYS_ERR(EFAULT);
     /* Check W+X permission on parent directory */
     {
@@ -155,7 +167,7 @@ sys_unlink(uint64_t arg1)
                   CAP_KIND_VFS_WRITE, CAP_RIGHTS_WRITE) != 0)
         return SYS_ERR(EPERM);
     char kpath[256];
-    if (copy_path_from_user(kpath, arg1, sizeof(kpath)) != 0)
+    if (copy_path_resolved(kpath, arg1, sizeof(kpath)) != 0)
         return SYS_ERR(EFAULT);
     /* Install-tree mutation gate: a ring-3 process mutating /apps or
      * /etc/aegis must hold CAP_KIND_INSTALL. Boot-time (is_user == 0) exempt. */
@@ -201,9 +213,9 @@ sys_rename(uint64_t arg1, uint64_t arg2)
                   CAP_KIND_VFS_WRITE, CAP_RIGHTS_WRITE) != 0)
         return SYS_ERR(EPERM);
     char kold[256], knew[256];
-    if (copy_path_from_user(kold, arg1, sizeof(kold)) != 0)
+    if (copy_path_resolved(kold, arg1, sizeof(kold)) != 0)
         return SYS_ERR(EFAULT);
-    if (copy_path_from_user(knew, arg2, sizeof(knew)) != 0)
+    if (copy_path_resolved(knew, arg2, sizeof(knew)) != 0)
         return SYS_ERR(EFAULT);
     /* Install-tree mutation gate: a ring-3 process mutating /apps or
      * /etc/aegis must hold CAP_KIND_INSTALL. Guard if EITHER the source or

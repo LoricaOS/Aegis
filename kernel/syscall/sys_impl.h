@@ -101,6 +101,8 @@ void     proc_inc_fork_count(void);
 
 /* ── Path helpers (sys_file.c) ──────────────────────────────────────────── */
 int copy_path_from_user(char *kpath, uint64_t user_ptr, uint32_t bufsz);
+/* Like copy_path_from_user but resolves a relative result against proc->cwd. */
+int copy_path_resolved(char *kpath, uint64_t user_ptr, uint32_t bufsz);
 int stat_copy_path(uint64_t user_ptr, char *out, uint32_t bufsz);
 
 /* ── sys_io.c ───────────────────────────────────────────────────────────── */
