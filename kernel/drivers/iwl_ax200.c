@@ -782,29 +782,28 @@ static const uint8_t     s_our_mac[6] = {0x02,0x00,0x00,0xae,0x61,0x5a};
 /* Transmit an 802.11 frame: a TX_CMD (0x11c) on the data queue, wrapping
  * iwl_tx_cmd_gen2 (len, offload_assist, flags, dram_info, rate_n_flags) + frame. */
 static void
-send_frame(const uint8_t *frame, uint16_t flen, const char *tag)
+send_frame(const uint8_t *frame, uint16_t flen, uint32_t rate, const char *tag)
 {
     if (s_tx_qid < 0) return;
-    uint16_t plen = (uint16_t)(20 + flen);          /* tx_cmd_gen2 hdr + frame */
+    /* TX frames use the SHORT 4-byte cmd header (not the 8-byte wide header that
+     * host commands use): [hdr 4][iwl_tx_cmd_gen2 20][802.11 frame]. */
     uint64_t cmd_phys = 0, ftb_phys = 0;
-    uint8_t *cmd = dma_alloc((uint64_t)8 + plen + 64, &cmd_phys);
+    uint8_t *cmd = dma_alloc((uint64_t)4 + 20 + flen + 64, &cmd_phys);
     uint8_t *ftb = dma_alloc(64, &ftb_phys);
     if (!cmd || !ftb) { printk("[AX200] TX dma fail\n"); return; }
 
     uint16_t seq = (uint16_t)(QUEUE_TO_SEQ(s_tx_qid) | INDEX_TO_SEQ(s_tx_wr));
     cmd[0] = 0x1c; cmd[1] = 0x01;                    /* TX_CMD, LONG_GROUP */
     cmd[2] = (uint8_t)(seq & 0xff); cmd[3] = (uint8_t)(seq >> 8);
-    cmd[4] = (uint8_t)(plen & 0xff); cmd[5] = (uint8_t)(plen >> 8);
-    cmd[6] = 0; cmd[7] = 0;
-    uint8_t *tc = cmd + 8;                           /* iwl_tx_cmd_gen2 */
+    uint8_t *tc = cmd + 4;                           /* iwl_tx_cmd_gen2 */
     tc[0] = (uint8_t)(flen & 0xff); tc[1] = (uint8_t)(flen >> 8);   /* len */
     /* offload_assist @2 = 0 */
     wr_le32b(tc + 4, 0x3);                           /* flags CMD_RATE|ENCRYPT_DIS */
     /* dram_info @8 = 0 (8 bytes) */
-    wr_le32b(tc + 16, 0x420a);                       /* rate_n_flags: CCK 1M ANT_A (v1) */
+    wr_le32b(tc + 16, rate);                          /* rate_n_flags */
     mcopy(tc + 20, frame, flen);
 
-    uint16_t copy_size = (uint16_t)(8 + plen);
+    uint16_t copy_size = (uint16_t)(4 + 20 + flen);
     uint16_t tb0 = copy_size < IWL_FIRST_TB_SIZE ? copy_size : IWL_FIRST_TB_SIZE;
     mcopy(ftb, cmd, tb0);
     volatile uint8_t *tfd = s_tx_ring + (uint32_t)s_tx_wr * 256;
@@ -863,8 +862,8 @@ alloc_tx_queue(void)
             if (r[4] == 0x1d) {                 /* SCD_QUEUE_CFG response */
                 s_tx_qid = (int)(r[8] | (r[9] << 8));   /* iwl_tx_queue_cfg_rsp.queue_number */
                 s_tx_wr = 0;
-                printk("[AX200] *** TX queue allocated: qid=%u (wptr=%u) ***\n",
-                       s_tx_qid, r[12] | (r[13] << 8));
+                printk("[AX200] *** TX queue: qid=%u resp=%x %x %x %x %x %x %x %x ***\n",
+                       s_tx_qid, r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15]);
                 return 0;
             }
         }
@@ -995,9 +994,14 @@ do_connect(void)
     f[28] = 0; f[29] = 0;                      /* status = 0 */
 
     s_rx_read = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
-    send_frame(f, 30, "auth-req");
+    send_frame(f, 30, 0x420a, "auth-v1");       /* CCK 1M ANT_A, v1 format */
 
+    uint16_t rb0 = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
+    printk("[AX200] watch start rb_stts=%u qid=%d tx_wr=%u\n", rb0, s_tx_qid, s_tx_wr);
     for (int t = 0; t < 400000; t++) {         /* ~4s */
+        if (t == 150000) send_frame(f, 30, 0x4000, "auth-v2");  /* v2 rate format */
+        if (t == 399999)
+            printk("[AX200] watch end rb_stts=%u\n", *(volatile uint16_t *)s_rb_stts & 0x0FFFu);
         uint32_t ie = csr_rd(CSR_INT);
         if (ie & (CSR_INT_BIT_SW_ERR | CSR_INT_BIT_HW_ERR)) {
             printk("[AX200] auth TX ASSERTED CSR_INT=0x%x\n", ie); dump_fw_error(); return;
