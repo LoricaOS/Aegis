@@ -303,6 +303,7 @@ static uint8_t  s_ap_bssid[6];                     /* target AP BSSID (addr3) */
 static uint8_t  s_ap_channel;                      /* target AP channel (DS param) */
 static uint8_t  s_scan_req_ver, s_scan_req_grp;   /* SCAN_REQ_UMAC (cmd 0x0d) */
 static uint8_t  s_scan_cfg_ver, s_scan_cfg_grp;   /* SCAN_CFG_CMD (cmd 0x0c) */
+static uint8_t  s_scd_qcfg_ver;                   /* SCD_QUEUE_CONFIG_CMD (0x17/g5) */
 
 static inline uint32_t rd_le32(const uint8_t *p)
 {
@@ -364,6 +365,9 @@ static int parse_firmware(void)
                 if (c == 0x0c && g == 0x01) { s_scan_cfg_ver = v; s_scan_cfg_grp = g; }
                 /* connect-path commands live in LONG_GROUP (g1): PHY_CTXT 0x8 v3,
                  * ADD_STA 0x18 v12, TX 0x1c v7, MAC_CTXT 0x28 v5, BINDING 0x2b v2 */
+                if (c == 0x17 && g == 0x05) s_scd_qcfg_ver = v;   /* new txq path */
+                if ((c == 0x17 && g == 0x05) || c == 0x1d || (c == 0x1c && g == 0x01))
+                    printk("[AX200] qcmdver 0x%x/g%u=v%u\n", c, g, v);
             }
         }
         off += 8 + ((tlen + 3u) & ~3u);    /* TLVs are 4-byte padded */
@@ -766,6 +770,62 @@ do_scan(void)
     printk("[AX200] scan timeout (found Hart=%d)\n", found);
 }
 
+/* Data TX queue (allocated dynamically; the FW returns its qid). */
+#define TXQ_SLOTS 256
+static volatile uint8_t *s_tx_ring;
+static uint64_t          s_tx_ring_phys;
+static int               s_tx_qid = -1;
+static uint16_t          s_tx_wr;
+
+/* Allocate a dynamic TX queue for sta_id 0: driver owns the TFD ring + byte-count
+ * table, tells the FW their addresses (SCD_QUEUE_CFG 0x11d v2), reads back the qid. */
+static int
+alloc_tx_queue(void)
+{
+    uint64_t rp = 0, bp = 0;
+    s_tx_ring = dma_alloc(TXQ_SLOTS * 256, &rp);
+    uint8_t *bc = dma_alloc(4096, &bp);
+    if (!s_tx_ring || !bc) { printk("[AX200] txq DMA fail\n"); return -1; }
+    s_tx_ring_phys = rp;
+
+    uint8_t cmd[24];
+    for (int i = 0; i < 24; i++) cmd[i] = 0;
+    cmd[0] = 0;                  /* sta_id */
+    cmd[1] = 0;                  /* tid */
+    cmd[2] = 1;                  /* flags = TX_QUEUE_CFG_ENABLE_QUEUE (le16) */
+    wr_le32b(cmd + 4, 5);        /* cb_size = ilog2(256) - 3 */
+    wr_le32b(cmd + 8,  (uint32_t)bp);          /* byte_cnt_addr (le64) */
+    wr_le32b(cmd + 12, (uint32_t)(bp >> 32));
+    wr_le32b(cmd + 16, (uint32_t)rp);          /* tfdq_addr (le64) */
+    wr_le32b(cmd + 20, (uint32_t)(rp >> 32));
+
+    uint16_t before = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
+    send_cmd(0x11d, cmd, 24);
+    for (int t = 0; t < 30000; t++) {
+        uint32_t ie = csr_rd(CSR_INT);
+        if (ie & (CSR_INT_BIT_SW_ERR | CSR_INT_BIT_HW_ERR)) {
+            printk("[AX200] TX_QUEUE_CFG ASSERTED CSR_INT=0x%x\n", ie);
+            dump_fw_error();
+            return -1;
+        }
+        uint16_t closed = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
+        for (uint16_t i = before; i != closed; i = (uint16_t)((i + 1) & 511)) {
+            const uint8_t *r = s_rx_buf_va[i & 511];
+            if (r[4] == 0x1d) {                 /* SCD_QUEUE_CFG response */
+                s_tx_qid = (int)(r[8] | (r[9] << 8));   /* iwl_tx_queue_cfg_rsp.queue_number */
+                s_tx_wr = 0;
+                printk("[AX200] *** TX queue allocated: qid=%u (wptr=%u) ***\n",
+                       s_tx_qid, r[12] | (r[13] << 8));
+                return 0;
+            }
+        }
+        before = closed;
+        busy_wait_us(10);
+    }
+    printk("[AX200] TX_QUEUE_CFG: no response\n");
+    return -1;
+}
+
 /* Phase 4: associate to the (open) target AP. Built up command-by-command; each
  * step uses send_check so one boot reports the first command that asserts. */
 #define FW_CTXT_ACTION_ADD 1
@@ -844,7 +904,11 @@ do_connect(void)
     c[16] = 0;                                 /* sta_id = 0 */
     /* station_flags @20 = 0 (20MHz SISO); station_type @35 = IWL_STA_LINK(0) */
     if (send_check(0x118, c, 48, "ADD_STA") != 0) return;
-    printk("[AX200] ADD_STA ok — AP peer added. next: TX queue + auth/assoc\n");
+    printk("[AX200] ADD_STA ok — AP peer added\n");
+
+    /* Step 5: allocate a data TX queue for the station. */
+    if (alloc_tx_queue() != 0) return;
+    printk("[AX200] TX queue ready — next: auth/assoc frames\n");
 }
 
 static int
