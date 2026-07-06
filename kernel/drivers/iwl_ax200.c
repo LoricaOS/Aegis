@@ -628,6 +628,16 @@ do_scan(void)
     if (!cmd) { printk("[AX200] scan: DMA alloc failed\n"); return; }
     (void)phys;
 
+    /* SCAN_CFG_CMD (v4, group 1, cmd 0x0c => 0x10c): the reduced scan config,
+     * required once before any scan request. struct iwl_scan_config (12B):
+     * bcast_sta_id=0xff (cmd_ver<5), tx/rx chains = ANT_AB (AX200 2x2, from
+     * phy_cfg 0x330018). */
+    uint8_t cfg[12] = {0};
+    cfg[2] = 0xff;
+    wr_le32b(cfg + 4, 3);
+    wr_le32b(cfg + 8, 3);
+    if (send_check(0x10c, cfg, 12, "SCAN_CFG") != 0) return;
+
     wr_le32b(cmd + 0, 1);                     /* uid */
     wr_le32b(cmd + 4, 6);                     /* ooc_priority = EXT_6 */
 
