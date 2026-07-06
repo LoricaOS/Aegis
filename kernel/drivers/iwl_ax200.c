@@ -794,7 +794,10 @@ send_frame(const uint8_t *frame, uint16_t flen, uint32_t rate, const char *tag)
     if (!cmd || !ftb) { printk("[AX200] TX dma fail\n"); return; }
 
     uint16_t seq = (uint16_t)(QUEUE_TO_SEQ(s_tx_qid) | INDEX_TO_SEQ(s_tx_wr));
-    cmd[0] = 0x1c; cmd[1] = 0x01;                    /* TX_CMD, LONG_GROUP */
+    cmd[0] = 0x1c; cmd[1] = 0x00;                    /* TX_CMD, group 0 (legacy) —
+                                                        iwlwifi leaves group_id=0 for
+                                                        the gen2 TX cmd; group 1 makes
+                                                        the FW silently drop the TFD */
     cmd[2] = (uint8_t)(seq & 0xff); cmd[3] = (uint8_t)(seq >> 8);
     uint8_t *tc = cmd + 4;                           /* iwl_tx_cmd_gen2 */
     tc[0] = (uint8_t)(flen & 0xff); tc[1] = (uint8_t)(flen >> 8);   /* len */
