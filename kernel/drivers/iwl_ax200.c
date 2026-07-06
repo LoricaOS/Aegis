@@ -45,6 +45,7 @@
 #define GP_CNTRL_MAC_CLOCK_READY      0x00000001
 #define GP_CNTRL_INIT_DONE            0x00000004
 #define CSR_RESET_SW_RESET            0x00000080
+#define CSR_MAC_SHADOW_REG_CTRL       0x0A8
 #define GIO_CHICKEN_L1A_NO_L0S_RX     0x00800000
 #define DBG_HPET_MEM_REG_VAL          0xFFFF0000
 
@@ -440,6 +441,9 @@ rx_hw_init(uint64_t free_phys, uint64_t used_phys, uint64_t stts_phys)
     csr_set(CSR_GP_CNTRL, GP_CNTRL_MAC_ACCESS_REQ);
     csr_poll(CSR_GP_CNTRL, GP_CNTRL_MAC_CLOCK_READY, GP_CNTRL_MAC_CLOCK_READY, 15000);
 
+    /* Part of gen2 nic-init (iwl_pcie_gen2_nic_init). */
+    csr_set(CSR_MAC_SHADOW_REG_CTRL, 0x800FFFFFu);
+
     wr_prph(RFH_RXF_DMA_CFG, 0);            /* stop RX DMA */
     wr_prph(RFH_RXF_RXQ_ACTIVE, 0);         /* disable free+used queue op */
     wr_prph64(RFH_Q0_FRBDCB_BA_LSB, free_phys);
@@ -454,6 +458,10 @@ rx_hw_init(uint64_t free_phys, uint64_t used_phys, uint64_t stts_phys)
 
     /* Interrupt coalescing default (8-bit reg — not a 32-bit access). */
     *(volatile uint8_t *)(s_mmio + CSR_INT_COALESCING) = 0x40;
+
+    /* Release MAC access so the firmware owns the MAC when it boots (iwlwifi
+     * release_nic_access). Holding MAC_ACCESS_REQ while the FW starts asserts. */
+    csr_clr(CSR_GP_CNTRL, GP_CNTRL_MAC_ACCESS_REQ);
 }
 
 static int
