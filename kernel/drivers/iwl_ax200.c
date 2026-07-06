@@ -44,6 +44,7 @@
 #define HW_IF_CONFIG_PREPARE          0x08000000  /* WAKE_ME */
 #define GP_CNTRL_MAC_CLOCK_READY      0x00000001
 #define GP_CNTRL_INIT_DONE            0x00000004
+#define CSR_RESET_SW_RESET            0x00000080
 #define GIO_CHICKEN_L1A_NO_L0S_RX     0x00800000
 #define DBG_HPET_MEM_REG_VAL          0xFFFF0000
 
@@ -70,6 +71,28 @@
 #define HBUS_TARG_WRPTR         0x460
 #define UCODE_ALIVE_NTFY        0x01
 #define IWL_ALIVE_STATUS_OK     0xCAFE
+#define GP_CNTRL_MAC_ACCESS_REQ 0x00000008
+
+/* Receive Flow Handler (RFH) registers — gen2 RX must be set up here directly,
+ * not just via the context-info block (iwl_pcie_rx_mq_hw_init). All are prph
+ * (masked to 20 bits by write_prph) except WIDX_TRG which is a direct CSR. */
+#define RFH_Q0_FRBDCB_BA_LSB       0xA08000   /* free RBD ring base (64-bit) */
+#define RFH_Q0_FRBDCB_WIDX         0xA08080
+#define RFH_Q0_FRBDCB_RIDX         0xA080C0
+#define RFH_Q0_URBDCB_BA_LSB       0xA08100   /* used RBD ring base (64-bit) */
+#define RFH_Q0_URBDCB_WIDX         0xA08180
+#define RFH_Q0_URBD_STTS_WPTR_LSB  0xA08200   /* RB status write ptr (64-bit) */
+#define RFH_Q0_FRBDCB_WIDX_TRG     0x1C80     /* RX doorbell — DIRECT CSR */
+#define RFH_RXF_DMA_CFG            0xA09820
+#define RFH_RXF_RXQ_ACTIVE         0xA0980C
+#define RFH_GEN_CFG               0xA09800
+/* DMA_CFG = enable | RB_4K(0x4<<16) | min-RB-4/8(3<<24) | drop-too-large(bit26)
+ * | RBDCB-512(0x9<<20). */
+#define RFH_RXF_DMA_CFG_VAL       0x87940000u
+/* GEN_CFG = RFH_DMA_SNOOP(b1) | SERVICE_DMA_SNOOP(b0) | RB_CHUNK_128(b4, discrete). */
+#define RFH_GEN_CFG_VAL           0x13u
+#define RFH_RXQ0_ENABLE           0x00010001u   /* BIT(0)|BIT(16) */
+#define CSR_INT_COALESCING        0x004         /* 8-bit reg */
 
 /* PCI command register bits + PM capability id */
 #define PCI_CMD_MEM    0x02
@@ -90,6 +113,19 @@ static inline uint32_t csr_rd(uint32_t off) { return *(volatile uint32_t *)(s_mm
 static inline void     csr_wr(uint32_t off, uint32_t v) { *(volatile uint32_t *)(s_mmio + off) = v; }
 static inline void csr_set(uint32_t off, uint32_t m) { csr_wr(off, csr_rd(off) | m); }
 static inline void csr_clr(uint32_t off, uint32_t m) { csr_wr(off, csr_rd(off) & ~m); }
+
+/* Indirect peripheral (prph) register writes via the HBUS window. 22000 family
+ * masks the address to 20 bits (the 0xA00000 UMAC prefix is implicit). */
+static void wr_prph(uint32_t addr, uint32_t val)
+{
+    csr_wr(HBUS_TARG_PRPH_WADDR, (addr & PRPH_ADDR_MASK) | (3u << 24));
+    csr_wr(HBUS_TARG_PRPH_WDAT, val);
+}
+static void wr_prph64(uint32_t addr, uint64_t val)
+{
+    wr_prph(addr, (uint32_t)(val & 0xFFFFFFFFu));
+    wr_prph(addr + 4, (uint32_t)(val >> 32));
+}
 
 /* Approximate busy-wait (no scheduler in early init); mirrors rtl8169. */
 static void busy_wait_us(uint32_t us)
@@ -391,6 +427,34 @@ process_rx_alive(void)
                status, status == IWL_ALIVE_STATUS_OK ? "OK" : "ERR");
 }
 
+/* Program the gen2 Receive Flow Handler for queue 0 (== iwl_pcie_rx_mq_hw_init).
+ * The context-info block alone doesn't start RX DMA — this does: it points the
+ * RFH at our free/used RBD rings + status block, resets the indices, sets the
+ * RB size/count, enables snooping, and activates the queue. Must run before the
+ * FW self-load kick. */
+static void
+rx_hw_init(uint64_t free_phys, uint64_t used_phys, uint64_t stts_phys)
+{
+    /* Request MAC access for the prph writes (clock already up from power_up). */
+    csr_set(CSR_GP_CNTRL, GP_CNTRL_MAC_ACCESS_REQ);
+    csr_poll(CSR_GP_CNTRL, GP_CNTRL_MAC_CLOCK_READY, GP_CNTRL_MAC_CLOCK_READY, 15000);
+
+    wr_prph(RFH_RXF_DMA_CFG, 0);            /* stop RX DMA */
+    wr_prph(RFH_RXF_RXQ_ACTIVE, 0);         /* disable free+used queue op */
+    wr_prph64(RFH_Q0_FRBDCB_BA_LSB, free_phys);
+    wr_prph64(RFH_Q0_URBDCB_BA_LSB, used_phys);
+    wr_prph64(RFH_Q0_URBD_STTS_WPTR_LSB, stts_phys);
+    wr_prph(RFH_Q0_FRBDCB_WIDX, 0);
+    wr_prph(RFH_Q0_FRBDCB_RIDX, 0);
+    wr_prph(RFH_Q0_URBDCB_WIDX, 0);
+    wr_prph(RFH_RXF_DMA_CFG, RFH_RXF_DMA_CFG_VAL);  /* enable RX DMA */
+    wr_prph(RFH_GEN_CFG, RFH_GEN_CFG_VAL);          /* snoop + default rxq 0 */
+    wr_prph(RFH_RXF_RXQ_ACTIVE, RFH_RXQ0_ENABLE);   /* activate queue 0 */
+
+    /* Interrupt coalescing default (8-bit reg — not a 32-bit access). */
+    *(volatile uint8_t *)(s_mmio + CSR_INT_COALESCING) = 0x40;
+}
+
 static int
 load_firmware_and_kick(uint32_t hw_rev)
 {
@@ -420,6 +484,11 @@ load_firmware_and_kick(uint32_t hw_rev)
         s_rx_buf_va[i] = bva;
         free_rbd[i] = bp | (uint64_t)(i + 1);
     }
+
+    /* Bring up the RX DMA engine (RFH), then publish the free buffers via the
+     * gen2 RX doorbell (a direct CSR; write pointer must be a multiple of 8). */
+    rx_hw_init(free_phys, used_phys, stts_phys);
+    csr_wr(RFH_Q0_FRBDCB_WIDX_TRG, (uint32_t)(NRBDS - 8));
 
     /* Firmware sections → DRAM map (indexing mirrors iwl_pcie_init_fw_sec:
      * lmac=sec[0..L-1], umac=sec[L+1..L+U], paging=sec[L+U+2..]). */
@@ -457,8 +526,7 @@ load_firmware_and_kick(uint32_t hw_rev)
     /* Kick: point the chip at the context-info block, then start the CPU. */
     csr_wr(CSR_CTXT_INFO_BA,     (uint32_t)(ci_phys & 0xFFFFFFFFu));
     csr_wr(CSR_CTXT_INFO_BA + 4, (uint32_t)(ci_phys >> 32));
-    csr_wr(HBUS_TARG_PRPH_WADDR, (UREG_CPU_INIT_RUN & PRPH_ADDR_MASK) | (3u << 24));
-    csr_wr(HBUS_TARG_PRPH_WDAT, 1);
+    wr_prph(UREG_CPU_INIT_RUN, 1);
 
     printk("[AX200] firmware loaded, self-load kicked (ci@0x%x); waiting for ALIVE...\n",
            (unsigned)ci_phys);
@@ -468,12 +536,8 @@ load_firmware_and_kick(uint32_t hw_rev)
         uint32_t inta = csr_rd(CSR_INT);
         if (inta & CSR_INT_BIT_ALIVE) {
             printk("[AX200] *** FW ALIVE *** CSR_INT=0x%x — firmware is running!\n", inta);
-            /* ACK the interrupt, then make RX buffers available (write pointer
-             * doorbell, queue 0; must be a multiple of 8). Only now is the FW's
-             * RX engine live, so the ALIVE notification lands after this. */
-            csr_wr(CSR_INT, inta);
-            csr_wr(HBUS_TARG_WRPTR, (uint32_t)((NRBDS - 8) | ((0 + 512) << 16)));
-            process_rx_alive();
+            csr_wr(CSR_INT, inta);   /* ACK */
+            process_rx_alive();      /* RX engine is already live (rx_hw_init) */
             return 0;
         }
         if (inta & (CSR_INT_BIT_SW_ERR | CSR_INT_BIT_HW_ERR)) {
@@ -539,11 +603,19 @@ iwl_ax200_init(void)
         s_mmio = (volatile uint8_t *)(map_bar(pa, 4) + (found->bar[0] & 0xFFFULL));
     }
 
+    /* 4b. SW-reset the device core. A bare PCI FLR (e.g. VFIO on VM restart)
+     * resets the bus interface but NOT the WiFi microcontroller, so after a
+     * previous firmware run the MAC clock is stopped and CSRs read poison
+     * (0xA5A5A5A5). CSR_RESET.SW_RESET restarts the core (iwl_trans_sw_reset). */
+    csr_wr(CSR_RESET, CSR_RESET_SW_RESET);
+    busy_wait_us(6000);
+    csr_poll(CSR_RESET, 0, CSR_RESET_SW_RESET, 20000);   /* bit self-clears */
+
     /* 5. First register reads. CSR_HW_REV is always-on, so a valid (non-0xFF..)
      * value proves the MMIO window is live and gives us the silicon stepping. */
     uint32_t hw_rev = csr_rd(CSR_HW_REV);
-    if (hw_rev == 0xFFFFFFFFu) {
-        printk("[AX200] FAIL: CSR read 0xFFFFFFFF (BAR0 wrong or device asleep)\n");
+    if (hw_rev == 0xFFFFFFFFu || hw_rev == 0xA5A5A5A5u) {
+        printk("[AX200] FAIL: CSR read 0x%x (BAR0 wrong / core not clocked)\n", hw_rev);
         return;
     }
     uint32_t rf_id  = csr_rd(CSR_HW_RF_ID);
