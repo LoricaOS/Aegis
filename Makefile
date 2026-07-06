@@ -116,6 +116,7 @@ DRIVER_SRCS = \
     kernel/drivers/virtio_vsock.c \
     kernel/drivers/rtl8169.c kernel/drivers/rtl8139.c \
     kernel/drivers/e1000.c kernel/drivers/vmxnet3.c \
+    kernel/drivers/iwl_ax200.c \
     kernel/drivers/hda.c kernel/drivers/pvpanic.c \
     kernel/drivers/pvscsi.c \
     kernel/drivers/vmbus.c kernel/drivers/storvsc.c kernel/drivers/netvsc.c \
