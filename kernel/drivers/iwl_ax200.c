@@ -282,6 +282,9 @@ static uint32_t s_fw_ver;
 static int      s_lmac_cnt, s_umac_cnt, s_paging_cnt;
 static uint32_t s_phy_config;               /* from PHY_SKU TLV */
 static uint32_t s_calib_flow, s_calib_event; /* from DEF_CALIB TLV (regular ucode) */
+static int      s_ap_found;                       /* target AP seen in scan */
+static uint8_t  s_ap_bssid[6];                     /* target AP BSSID (addr3) */
+static uint8_t  s_ap_channel;                      /* target AP channel (DS param) */
 static uint8_t  s_scan_req_ver, s_scan_req_grp;   /* SCAN_REQ_UMAC (cmd 0x0d) */
 static uint8_t  s_scan_cfg_ver, s_scan_cfg_grp;   /* SCAN_CFG_CMD (cmd 0x0c) */
 
@@ -343,8 +346,8 @@ static int parse_firmware(void)
                 uint8_t c = tdata[o], g = tdata[o + 1], v = tdata[o + 2];
                 if (c == 0x0d && g == 0x00) { s_scan_req_ver = v; s_scan_req_grp = g; }
                 if (c == 0x0c && g == 0x01) { s_scan_cfg_ver = v; s_scan_cfg_grp = g; }
-                if (c == 0x0d || c == 0x0c)
-                    printk("[AX200] cmdver 0x%x/g%u=v%u\n", c, g, v);
+                /* connect-path commands live in LONG_GROUP (g1): PHY_CTXT 0x8 v3,
+                 * ADD_STA 0x18 v12, TX 0x1c v7, MAC_CTXT 0x28 v5, BINDING 0x2b v2 */
             }
         }
         off += 8 + ((tlen + 3u) & ~3u);    /* TLVs are 4-byte padded */
@@ -703,6 +706,25 @@ do_scan(void)
                     ss[j] = 0;
                     printk("[AX200] *** SCAN FOUND SSID: '%s' *** (ntf cmd=0x%x grp=0x%x)\n", ss, c, g);
                     found = 1;
+                    /* For "Hart Guest": capture BSSID + channel from the beacon.
+                     * o points at the SSID value; the 802.11 frame body starts 38
+                     * bytes back (24 hdr + 12 fixed + 2 IE hdr), so addr3/BSSID is
+                     * at o-22 and the IE list at o-2. */
+                    if (!s_ap_found && o >= 40 &&
+                        ss[0]=='H'&&ss[4]==' '&&ss[5]=='G') {   /* "Hart Guest" */
+                        for (int k = 0; k < 6; k++) s_ap_bssid[k] = r[o - 22 + k];
+                        int slen = r[o - 1];
+                        int p = (o - 2) + 2 + slen;            /* IE after SSID */
+                        for (int gd = 0; gd < 32 && p < 4088; gd++) {
+                            uint8_t id = r[p], ln = r[p + 1];
+                            if (id == 3 && ln >= 1) { s_ap_channel = r[p + 2]; break; }
+                            p += 2 + ln;
+                        }
+                        s_ap_found = 1;
+                        printk("[AX200] target 'Hart Guest' BSSID %x:%x:%x:%x:%x:%x ch=%u\n",
+                               s_ap_bssid[0],s_ap_bssid[1],s_ap_bssid[2],
+                               s_ap_bssid[3],s_ap_bssid[4],s_ap_bssid[5], s_ap_channel);
+                    }
                 }
             }
             if (c == 0x0f && g == 0x00) {
@@ -719,6 +741,30 @@ do_scan(void)
         busy_wait_us(10);
     }
     printk("[AX200] scan timeout (found Hart=%d)\n", found);
+}
+
+/* Phase 4: associate to the (open) target AP. Built up command-by-command; each
+ * step uses send_check so one boot reports the first command that asserts. */
+#define FW_CTXT_ACTION_ADD 1
+static void
+do_connect(void)
+{
+    printk("[AX200] --- connect: target ch=%u ---\n", s_ap_channel);
+    uint8_t c[64];
+    for (int i = 0; i < 64; i++) c[i] = 0;
+
+    /* Step 1: PHY_CONTEXT_CMD (0x08, group 0) — configure the PHY for the AP's
+     * channel. iwl_phy_context_cmd (32B): id_and_color, action, ci(8), lmac_id,
+     * rxchain_info, dsp_cfg_flags, reserved. */
+    wr_le32b(c + 0, (0) | (1 << 8));            /* id_and_color: id=0, color=1 */
+    wr_le32b(c + 4, FW_CTXT_ACTION_ADD);
+    wr_le32b(c + 8, s_ap_channel);             /* ci.channel */
+    c[12] = 1;                                 /* ci.band = PHY_BAND_24 */
+    c[13] = 0;                                 /* ci.width = MODE20 */
+    c[14] = 0;                                 /* ci.ctrl_pos */
+    wr_le32b(c + 20, (3 << 1) | (1 << 10) | (1 << 12)); /* rxchain: valid AB, 1/1 */
+    if (send_check(0x108, c, 32, "PHY_CONTEXT") != 0) return;   /* LONG_GROUP */
+    printk("[AX200] PHY_CONTEXT ok — next: MAC_CONTEXT\n");
 }
 
 static int
@@ -812,8 +858,11 @@ load_firmware_and_kick(uint32_t hw_rev)
             process_rx_alive();
 
             /* Phase 3c: init sequence → INIT_COMPLETE, then 3d: scan. */
-            if (init_after_alive() == 0)
+            if (init_after_alive() == 0) {
                 do_scan();
+                if (s_ap_found)
+                    do_connect();
+            }
             return 0;
         }
         if (inta & (CSR_INT_BIT_SW_ERR | CSR_INT_BIT_HW_ERR)) {
