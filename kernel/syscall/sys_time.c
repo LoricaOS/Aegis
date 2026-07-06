@@ -78,10 +78,12 @@ sys_clock_gettime(uint64_t clk_id, uint64_t timespec_uptr)
         tv_sec  = (int64_t)sec;
         tv_nsec = (int64_t)nsec;
     } else {
-        /* CLOCK_MONOTONIC — raw ticks, no epoch offset */
-        uint64_t ticks = arch_get_ticks();
-        tv_sec  = (int64_t)(ticks / 100ULL);
-        tv_nsec = (int64_t)((ticks % 100ULL) * 10000000ULL);
+        /* CLOCK_MONOTONIC — ns resolution (TSC/CNTVCT-derived), no epoch
+         * offset. Was 10 ms tick-quantized, which made musl mkstemp derive
+         * IDENTICAL temp names in same-tick processes (parallel-build killer). */
+        uint64_t ns = arch_clock_mono_ns();
+        tv_sec  = (int64_t)(ns / 1000000000ULL);
+        tv_nsec = (int64_t)(ns % 1000000000ULL);
     }
     copy_to_user((void *)(uintptr_t)timespec_uptr,       &tv_sec,  8);
     copy_to_user((void *)(uintptr_t)(timespec_uptr + 8), &tv_nsec, 8);

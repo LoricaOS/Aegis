@@ -75,6 +75,7 @@ struct aegis_bootinfo;
 void arch_mm_ingest(const struct aegis_bootinfo *bi);
 uint64_t arch_kern_phys_slide(void);
 uint64_t arch_early_pv_off(void);
+uint64_t arch_get_dtb_phys(void);
 
 /* Highest canonical user-space virtual address (48-bit VA, TTBR0 half). */
 #define USER_ADDR_MAX 0x0000FFFFFFFFFFFFUL
@@ -148,6 +149,7 @@ void timer_init(void);
 uint64_t arch_get_ticks(void);
 void arch_tsc_calibrate(uint64_t cycles_per_10ms);
 uint64_t arch_tsc_hz(void);
+uint64_t arch_clock_mono_ns(void);   /* ns since counter start (CNTVCT-derived) */
 void arch_clock_gettime(uint64_t *sec, uint64_t *nsec);
 void arch_clock_settime(uint64_t sec);
 

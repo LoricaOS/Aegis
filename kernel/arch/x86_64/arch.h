@@ -243,6 +243,11 @@ void arch_tsc_calibrate(uint64_t cycles_per_10ms);
 /* arch_tsc_hz — calibrated TSC frequency in cycles/sec (0 if uncalibrated). */
 uint64_t arch_tsc_hz(void);
 
+/* arch_clock_mono_ns — nanoseconds since boot, TSC-derived (ns resolution once
+ * calibrated; 10 ms tick granularity before). Monotonic clock + mkstemp
+ * temp-name entropy depend on this being fine-grained. */
+uint64_t arch_clock_mono_ns(void);
+
 /* arch_clock_gettime — returns {seconds, nanoseconds} since Unix epoch.
  * seconds = epoch_offset + ticks/100, nanoseconds = (ticks%100)*10000000.
  * epoch_offset is set by arch_clock_settime (NTP daemon). */
