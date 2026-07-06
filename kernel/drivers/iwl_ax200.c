@@ -915,6 +915,18 @@ do_connect(void)
     if (send_check(0x108, c, 32, "PHY_CONTEXT") != 0) return;   /* LONG_GROUP */
     printk("[AX200] PHY_CONTEXT ok\n");
 
+    /* RLC_CONFIG_CMD (0x508, DATA_PATH_GROUP): configure the PHY's rx chains.
+     * iwl_rlc_config_cmd (32B): phy_id + rlc{rx_chain_info,rsvd} + sad(16) +
+     * flags + rsvd[3]. iwlwifi sends this after PHY_CONTEXT on fw-59. */
+    {
+        uint8_t rlc[32];
+        for (int i = 0; i < 32; i++) rlc[i] = 0;
+        /* phy_id @0 = 0 (the PHY context index, not id_and_color) */
+        wr_le32b(rlc + 4, 0x6);              /* rx_chain_info: valid chains A+B */
+        if (send_check(0x508, rlc, 32, "RLC_CONFIG") != 0) return;
+        printk("[AX200] RLC_CONFIG ok\n");
+    }
+
     /* Step 2: MAC_CONTEXT_CMD (0x128 v5, 144B) — add our BSS_STA MAC, not yet
      * associated. iwl_mac_ctx_cmd: common hdr + ac[5] EDCA + iwl_mac_data_sta. */
     uint8_t *m = dma_alloc(256, &phys); (void)phys;
@@ -957,6 +969,23 @@ do_connect(void)
     /* lmac_id @24 = 0 */
     if (send_check(0x12b, c, 28, "BINDING") != 0) return;
     printk("[AX200] BINDING ok — MAC bound to PHY\n");
+
+    /* MAC_PM_POWER_TABLE (0x1a9, LONG_GROUP): disable power save so the station
+     * stays awake to service its TX queue. iwl_mac_power_cmd = 40B; flags=0 = no
+     * power-save. iwlwifi sends this before the first TX. */
+    {
+        uint8_t pm[40];
+        for (int i = 0; i < 40; i++) pm[i] = 0;
+        wr_le32b(pm + 0, 0x100);             /* id_and_color (MAC 0) */
+        if (send_check(0x1a9, pm, 40, "MAC_PM") != 0) return;
+        printk("[AX200] MAC_PM ok — power-save off\n");
+    }
+
+    /* MAC_CONTEXT MODIFY: iwlwifi sends MAC_CONTEXT twice — add, then modify after
+     * binding — to activate the MAC on the bound PHY. Re-send m with action=MODIFY. */
+    wr_le32b(m + 4, 2 /* FW_CTXT_ACTION_MODIFY */);
+    if (send_check(0x128, m, 148, "MAC_CTXT_MODIFY") != 0) return;
+    printk("[AX200] MAC_CONTEXT MODIFY ok\n");
 
     /* Step 4: ADD_STA (0x118 v12, 48B) — add the AP as our peer station.
      * iwl_mvm_add_sta_cmd: add_modify, mac_id_n_color, addr, sta_id, flags,
