@@ -58,6 +58,8 @@
 #define HBUS_TARG_PRPH_WDAT     0x44C
 #define HBUS_TARG_PRPH_RADDR    0x448
 #define HBUS_TARG_PRPH_RDAT     0x450
+#define HBUS_TARG_MEM_RADDR     0x40C   /* device SRAM read (auto-increment) */
+#define HBUS_TARG_MEM_RDAT      0x41C
 /* FW boot-status / program-counter regs — readable without ALIVE, so they name
  * an early assert (SB = secure-boot status; report the ROM/IML/uCode stage). */
 #define SB_CPU_1_STATUS         0xA01E30
@@ -151,6 +153,20 @@ static uint32_t rd_prph(uint32_t addr)
 {
     csr_wr(HBUS_TARG_PRPH_RADDR, (addr & PRPH_ADDR_MASK) | (3u << 24));
     return csr_rd(HBUS_TARG_PRPH_RDAT);
+}
+
+/* Read device SRAM: write the address once, then read RDAT (auto-increments). */
+static uint32_t s_umac_err_addr;   /* UMAC error-log SRAM addr (from ALIVE ntf) */
+static void
+dump_fw_error(void)
+{
+    if (!s_umac_err_addr) return;
+    csr_wr(HBUS_TARG_MEM_RADDR, s_umac_err_addr);
+    uint32_t w[6];
+    for (int i = 0; i < 6; i++) w[i] = csr_rd(HBUS_TARG_MEM_RDAT);
+    /* iwl_umac_error_event_table: valid@0, error_id@4, blink1/2@8/12, ilink1/2@16/20 */
+    printk("[AX200] FW-ERR umac@0x%x valid=0x%x error_id=0x%x blink=%x/%x ilink=%x/%x\n",
+           s_umac_err_addr, w[0], w[1], w[2], w[3], w[4], w[5]);
 }
 
 /* Approximate busy-wait (no scheduler in early init); mirrors rtl8169. */
@@ -476,6 +492,12 @@ process_rx_alive(void)
         uint16_t status = (uint16_t)(pkt[8] | (pkt[9] << 8));
         printk("[AX200] ALIVE ntf: status=0x%x (%s) — FW fully initialized\n",
                status, status == IWL_ALIVE_STATUS_OK ? "OK" : "ERR");
+        /* umac error_info_addr: alive body @pkt+8; umac_data after lmac_data[].
+         * v6 (2 lmac) -> +108, v5 (1 lmac) -> +60. Pick the plausible SRAM addr. */
+        uint32_t a_v6 = rd_le32(pkt + 8 + 108);
+        uint32_t a_v5 = rd_le32(pkt + 8 + 60);
+        printk("[AX200] err_info_addr candidates v6=0x%x v5=0x%x\n", a_v6, a_v5);
+        s_umac_err_addr = a_v6;
     }
 }
 
@@ -583,6 +605,7 @@ send_check(uint16_t cmd_id, const void *pl, uint16_t plen, const char *tag)
         if (ie & (CSR_INT_BIT_SW_ERR | CSR_INT_BIT_HW_ERR)) {
             printk("[AX200] %s ASSERTED CSR_INT=0x%x umacPC=0x%x\n",
                    tag, ie, rd_prph(UREG_UMAC_CURRENT_PC));
+            dump_fw_error();
             return -1;
         }
         busy_wait_us(10);
@@ -750,6 +773,7 @@ static void
 do_connect(void)
 {
     printk("[AX200] --- connect: target ch=%u ---\n", s_ap_channel);
+    uint64_t phys;
     uint8_t c[64];
     for (int i = 0; i < 64; i++) c[i] = 0;
 
@@ -764,7 +788,51 @@ do_connect(void)
     c[14] = 0;                                 /* ci.ctrl_pos */
     wr_le32b(c + 20, (3 << 1) | (1 << 10) | (1 << 12)); /* rxchain: valid AB, 1/1 */
     if (send_check(0x108, c, 32, "PHY_CONTEXT") != 0) return;   /* LONG_GROUP */
-    printk("[AX200] PHY_CONTEXT ok — next: MAC_CONTEXT\n");
+    printk("[AX200] PHY_CONTEXT ok\n");
+
+    /* Step 2: MAC_CONTEXT_CMD (0x128 v5, 144B) — add our BSS_STA MAC, not yet
+     * associated. iwl_mac_ctx_cmd: common hdr + ac[5] EDCA + iwl_mac_data_sta. */
+    static const uint8_t our_mac[6] = {0x02,0x00,0x00,0xae,0x61,0x5a};
+    uint8_t *m = dma_alloc(256, &phys); (void)phys;
+    for (int i = 0; i < 256; i++) m[i] = 0;
+    wr_le32b(m + 0, 0x100);                    /* id_and_color: id=0 color=1 */
+    wr_le32b(m + 4, FW_CTXT_ACTION_ADD);
+    wr_le32b(m + 8, 5);                        /* mac_type = FW_MAC_TYPE_BSS_STA */
+    /* tsf_id @12 = 0 */
+    for (int i = 0; i < 6; i++) m[16 + i] = our_mac[i];      /* node_addr */
+    for (int i = 0; i < 6; i++) m[24 + i] = s_ap_bssid[i];   /* bssid_addr */
+    wr_le32b(m + 32, 0x0f);                    /* cck_rates (1/2/5.5/11) */
+    wr_le32b(m + 36, 0xff);                    /* ofdm_rates */
+    /* protection/preamble/short_slot @40,44,48 = 0 */
+    wr_le32b(m + 52, 0x04 | 0x40);             /* filter: ACCEPT_GRP | IN_BEACON */
+    /* qos_flags @56 = 0. ac[5] @60: reasonable EDCA defaults, fifo per index. */
+    for (int i = 0; i < 5; i++) {
+        uint8_t *a = m + 60 + i * 8;
+        a[0] = 15; a[1] = 0;                   /* cw_min = 15 */
+        a[2] = 0xff; a[3] = 0x03;              /* cw_max = 1023 */
+        a[4] = 3;                              /* aifsn */
+        a[5] = (uint8_t)(1u << (i < 4 ? i : 5)); /* fifos_mask */
+    }
+    /* iwl_mac_data_sta @100: is_assoc=0, bi=100, dtim_interval=100, listen=10 */
+    wr_le32b(m + 116, 100);                    /* bi */
+    wr_le32b(m + 124, 100);                    /* dtim_interval */
+    wr_le32b(m + 132, 10);                     /* listen_interval */
+    /* size = 100 (hdr+ac[5]) + 48 (union max = iwl_mac_data_p2p_sta) = 148 */
+    if (send_check(0x128, m, 148, "MAC_CONTEXT") != 0) return;
+    printk("[AX200] MAC_CONTEXT ok\n");
+
+    /* Step 3: BINDING_CONTEXT_CMD (0x12b v2, 28B) — bind our MAC to the PHY.
+     * iwl_binding_cmd: id_and_color, action, macs[3], phy, lmac_id. */
+    for (int i = 0; i < 64; i++) c[i] = 0;
+    wr_le32b(c + 0, 0x100);                    /* binding id=0 color=1 */
+    wr_le32b(c + 4, FW_CTXT_ACTION_ADD);
+    wr_le32b(c + 8,  0x100);                   /* macs[0] = our MAC id_and_color */
+    wr_le32b(c + 12, 0xffffffff);              /* macs[1] = invalid */
+    wr_le32b(c + 16, 0xffffffff);              /* macs[2] = invalid */
+    wr_le32b(c + 20, 0x100);                   /* phy = PHY id_and_color */
+    /* lmac_id @24 = 0 */
+    if (send_check(0x12b, c, 28, "BINDING") != 0) return;
+    printk("[AX200] BINDING ok — MAC bound to PHY. next: ADD_STA + auth/assoc\n");
 }
 
 static int
