@@ -274,6 +274,36 @@ isr_post_dispatch:
 .iretq_go:
     iretq
 
+; sigreturn_iretq — return to user space from a signal handler via IRETQ with
+; the FULL interrupted register set restored (rdi/rsi/rdx/rcx/r11 included).
+;
+; The SYSRET path (syscall_entry.asm) structurally cannot do this: SYSRET forces
+; rcx=RIP and r11=RFLAGS, and it pops rdi/rsi/rdx from the slots saved at THIS
+; sigreturn syscall's entry (i.e. musl __restore_rt's registers, not the
+; interrupted context's). A signal that lands mid-`rep movs`/memcpy then resumes
+; with a garbage rdi and faults (observed: GNU make SIGSEGV, dst=0xffffffff,
+; under `make -j`). sys_rt_sigreturn calls this instead (noreturn):
+;
+;   rdi = const cpu_state_t *  (all GPRs + vector/error + rip/cs/rflags/rsp/ss)
+;   rsi = user CR3 (proc->pml4_phys)
+;
+; It builds an isr_post_dispatch frame ([CR3][cpu_state_t]) on the current
+; kernel stack and jumps into isr_post_dispatch, which restores CR3, pops every
+; GPR, swapgs, and iretqs. Abandoning the syscall_entry stack frame is safe: the
+; per-CPU kernel stack is reloaded from percpu on the next entry.
+global sigreturn_iretq
+sigreturn_iretq:
+    cli                          ; hand-build the frame without preemption
+    mov  r8, rsi                 ; r8 = user CR3 (rsi is about to drive rep movsq)
+    mov  rsi, rdi                ; rsi = src cpu_state_t *
+    sub  rsp, 184                ; CR3 (8) + cpu_state_t (176 = 22 qwords)
+    mov  [rsp], r8               ; [rsp+0] = CR3 slot (isr_post_dispatch pops it)
+    lea  rdi, [rsp + 8]          ; dst = cpu_state area (src is above, no overlap)
+    mov  rcx, 22
+    cld
+    rep  movsq                   ; copy the 22-qword cpu_state_t onto the stack
+    jmp  isr_post_dispatch       ; pop CR3 -> pop GPRs -> swapgs -> iretq
+
 ; Jump table — isr_stubs[i] = pointer to isr_i
 ; idt.c references this as: extern void *isr_stubs[48];
 section .data
