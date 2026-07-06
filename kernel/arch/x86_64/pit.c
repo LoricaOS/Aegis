@@ -32,6 +32,7 @@ static volatile uint64_t s_ticks = 0;
 static uint64_t s_tsc_hz         = 0;   /* TSC cycles/sec; 0 = uncalibrated     */
 static uint64_t s_tsc_base       = 0;   /* TSC at calibration                   */
 static uint64_t s_tsc_ticks_base = 0;   /* s_ticks at calibration (continuity)  */
+static uint64_t s_ns_per_cyc_fp  = 0;   /* (1e9 << 32) / tsc_hz — ns/cycle Q32  */
 
 /* cur_ticks — authoritative 100 Hz tick value: TSC-derived once calibrated,
  * else the raw interrupt counter. */
@@ -185,6 +186,11 @@ arch_tsc_calibrate(uint64_t cycles_per_10ms)
     s_tsc_ticks_base = s_ticks;
     s_tsc_base       = arch_get_cycles();
     s_tsc_hz         = hz;
+    /* ns/cycle in Q32 fixed point: (1e9 << 32) fits u64 (≈2^61.9), and the hz
+     * range gate above keeps the result nonzero. Lets arch_clock_mono_ns use a
+     * u128 multiply (inline mulq) instead of a u128 divide (__udivti3 libcall,
+     * unlinkable in the freestanding kernel). */
+    s_ns_per_cyc_fp  = (1000000000ULL << 32) / hz;
     printk("[TSC] OK: monotonic clock TSC-based, %lu MHz (invariant=%u)\n",
            (unsigned long)(hz / 1000000ULL), (unsigned)invariant);
 }
@@ -198,22 +204,41 @@ arch_tsc_hz(void)
     return s_tsc_hz;
 }
 
+/* arch_clock_mono_ns — nanoseconds since boot, TSC-derived when calibrated
+ * (else 10 ms tick granularity). The 10 ms-quantized clock broke concurrent
+ * builds: musl's mkstemp derives temp names from clock_gettime nanoseconds, so
+ * two gcc's spawned in the same tick got IDENTICAL /tmp/ccXXXXXX.s names — and
+ * its 100 collision retries re-derived from the same frozen value.
+ * ns = cycles * s_ns_per_cyc_fp >> 32 (fixed-point, precomputed at calibrate):
+ * a u128 MULTIPLY inlines to one mulq at any -O level, whereas u128 DIVISION
+ * emits a __udivti3 libcall the freestanding kernel can't link (-O0 selfhost). */
+uint64_t
+arch_clock_mono_ns(void)
+{
+    if (s_tsc_hz && s_ns_per_cyc_fp) {
+        uint64_t d = arch_get_cycles() - s_tsc_base;
+        return s_tsc_ticks_base * 10000000ULL +
+               (uint64_t)(((__uint128_t)d * s_ns_per_cyc_fp) >> 32);
+    }
+    return s_ticks * 10000000ULL;
+}
+
 /* arch_clock_gettime — returns {seconds, nanoseconds} since Unix epoch.
- * seconds = epoch_offset + ticks/100
- * nanoseconds = (ticks % 100) * 10000000 */
+ * Sub-second part is TSC-derived (see arch_clock_mono_ns), not tick-quantized. */
 void
 arch_clock_gettime(uint64_t *sec, uint64_t *nsec)
 {
-    uint64_t t = cur_ticks();
-    *sec  = s_epoch_offset + t / 100;
-    *nsec = (t % 100) * 10000000UL;
+    uint64_t ns = arch_clock_mono_ns();
+    *sec  = s_epoch_offset + ns / 1000000000ULL;
+    *nsec = ns % 1000000000ULL;
 }
 
-/* arch_clock_settime — set wall clock. Computes epoch_offset from current ticks. */
+/* arch_clock_settime — set wall clock. Offset derived from the same
+ * mono-ns source arch_clock_gettime reads, so set/get stay consistent. */
 void
 arch_clock_settime(uint64_t sec)
 {
-    s_epoch_offset = sec - cur_ticks() / 100;
+    s_epoch_offset = sec - arch_clock_mono_ns() / 1000000000ULL;
 }
 
 /* ── CMOS RTC → wall-clock seed ─────────────────────────────────────────── */
