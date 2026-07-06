@@ -797,7 +797,8 @@ send_frame(const uint8_t *frame, uint16_t flen, uint32_t rate, const char *tag)
     cmd[2] = (uint8_t)(seq & 0xff); cmd[3] = (uint8_t)(seq >> 8);
     uint8_t *tc = cmd + 4;                           /* iwl_tx_cmd_gen2 */
     tc[0] = (uint8_t)(flen & 0xff); tc[1] = (uint8_t)(flen >> 8);   /* len */
-    /* offload_assist @2 = 0 */
+    /* offload_assist: MH_SIZE (mac hdr in 2-byte words) << 8. 24B mgmt hdr = 12. */
+    tc[2] = 0x00; tc[3] = 0x0c;                       /* 12 << 8 = 0x0C00 */
     wr_le32b(tc + 4, 0x3);                           /* flags CMD_RATE|ENCRYPT_DIS */
     /* dram_info @8 = 0 (8 bytes) */
     wr_le32b(tc + 16, rate);                          /* rate_n_flags */
@@ -839,7 +840,7 @@ alloc_tx_queue(void)
     uint8_t cmd[24];
     for (int i = 0; i < 24; i++) cmd[i] = 0;
     cmd[0] = 0;                  /* sta_id */
-    cmd[1] = 0;                  /* tid */
+    cmd[1] = 15;                 /* tid = IWL_MGMT_TID (mgmt frames) */
     cmd[2] = 1;                  /* flags = TX_QUEUE_CFG_ENABLE_QUEUE (le16) */
     wr_le32b(cmd + 4, 5);        /* cb_size = ilog2(256) - 3 */
     wr_le32b(cmd + 8,  (uint32_t)bp);          /* byte_cnt_addr (le64) */
