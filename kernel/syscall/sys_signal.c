@@ -5,6 +5,12 @@
 #include "signal.h"
 #include "tty.h"
 #include "kbd.h"
+#ifndef __aarch64__
+#include "arch.h"   /* ARCH_USER_CS/DS */
+#include "idt.h"    /* cpu_state_t */
+/* Return to user space via IRETQ with a full register restore (isr.asm). */
+void sigreturn_iretq(const cpu_state_t *cs, uint64_t user_cr3) __attribute__((noreturn));
+#endif
 
 /*
  * sys_rt_sigaction — syscall 13
@@ -158,41 +164,61 @@ sys_rt_sigreturn(syscall_frame_t *frame)
      * the arithmetic flags NZCV; force EL0t with interrupts enabled. */
     frame->spsr = (uint64_t)sf.gregs[REG_EFL] & 0xF0000000UL;
 #else
-    frame->rip      = (uint64_t)sf.gregs[REG_RIP];
-    frame->rflags   = (uint64_t)sf.gregs[REG_EFL];
-    frame->user_rsp = (uint64_t)sf.gregs[REG_RSP];
-    frame->r8       = (uint64_t)sf.gregs[REG_R8];
-    frame->r9       = (uint64_t)sf.gregs[REG_R9];
-    frame->r10      = (uint64_t)sf.gregs[REG_R10];
-    /* Restore callee-saved registers (C5 audit fix).  These are popped by
-     * syscall_entry.asm after the frame body (r10/r9/r8). */
-    frame->rbx      = (uint64_t)sf.gregs[REG_RBX];
-    frame->rbp      = (uint64_t)sf.gregs[REG_RBP];
-    frame->r12      = (uint64_t)sf.gregs[REG_R12];
-    frame->r13      = (uint64_t)sf.gregs[REG_R13];
-    frame->r14      = (uint64_t)sf.gregs[REG_R14];
-    frame->r15      = (uint64_t)sf.gregs[REG_R15];
+    /* x86-64: restore the FULL interrupted register set by returning through
+     * the IRETQ path, not SYSRET.
+     *
+     * SYSRET cannot faithfully return from a signal handler: it forces rcx=RIP
+     * and r11=RFLAGS, and syscall_entry.asm pops rdi/rsi/rdx from the slots
+     * saved at THIS sigreturn syscall's entry — i.e. musl __restore_rt's
+     * registers, not the interrupted context's. signal_deliver saved the real
+     * rdi/rsi/rdx/rcx/r11 into the sigframe, but the old sysret restore dropped
+     * them. A signal landing mid-`rep movs`/memcpy then resumed with a garbage
+     * rdi and faulted (GNU make SIGSEGV, dst=0xffffffff, under `make -j`).
+     *
+     * Build a cpu_state_t from the (user-controlled, so sanitized) sigframe and
+     * hand it to sigreturn_iretq, which iretqs with every GPR restored — the
+     * same mechanism a fork child uses (isr_post_dispatch). */
+    cpu_state_t cs;
+    cs.r15 = (uint64_t)sf.gregs[REG_R15];
+    cs.r14 = (uint64_t)sf.gregs[REG_R14];
+    cs.r13 = (uint64_t)sf.gregs[REG_R13];
+    cs.r12 = (uint64_t)sf.gregs[REG_R12];
+    cs.r11 = (uint64_t)sf.gregs[REG_R11];
+    cs.r10 = (uint64_t)sf.gregs[REG_R10];
+    cs.r9  = (uint64_t)sf.gregs[REG_R9];
+    cs.r8  = (uint64_t)sf.gregs[REG_R8];
+    cs.rbp = (uint64_t)sf.gregs[REG_RBP];
+    cs.rdi = (uint64_t)sf.gregs[REG_RDI];
+    cs.rsi = (uint64_t)sf.gregs[REG_RSI];
+    cs.rdx = (uint64_t)sf.gregs[REG_RDX];
+    cs.rcx = (uint64_t)sf.gregs[REG_RCX];
+    cs.rbx = (uint64_t)sf.gregs[REG_RBX];
+    cs.rax = (uint64_t)sf.gregs[REG_RAX];
+    cs.vector = 0;
+    cs.error_code = 0;
+    cs.rip = (uint64_t)sf.gregs[REG_RIP];
+    cs.cs  = ARCH_USER_CS;
+    cs.rsp = (uint64_t)sf.gregs[REG_RSP];
+    cs.ss  = ARCH_USER_DS;
 
-    /* SECURITY (X1): Validate restored RIP is canonical and in user space.
-     * On Intel, SYSRET with a non-canonical RCX causes #GP in ring 0 — this
-     * is the CVE-2014-4699 class of vulnerability. A malicious signal frame
-     * could set RIP to a non-canonical address (e.g. 0x8000000000000000) to
-     * trigger a kernel-mode #GP. Reject any RIP above the user-space ceiling. */
-    if (frame->rip > 0x00007FFFFFFFFFFF) {
+    /* SECURITY (X1): restored RIP must be canonical user space — a crafted
+     * frame must not iretq into the kernel half (CVE-2014-4699 class). */
+    if (cs.rip > 0x00007FFFFFFFFFFF) {
         sched_exit(); /* non-canonical or kernel RIP — kill the process */
         __builtin_unreachable();
     }
 
-    /* SECURITY (X2): Sanitize restored RFLAGS to prevent privilege escalation.
-     * The signal frame is user-controlled — a crafted frame could set:
-     *   IF=0  → disable interrupts, hanging the system
-     *   IOPL=3 → grant user-mode direct I/O port access
-     *   NT=1  → crash on iret (nested task flag)
-     *   TF=1  → single-step trap flood
-     *   AC=1  → alignment check exceptions
-     * Preserve only arithmetic flags (CF, PF, AF, ZF, SF, OF) and DF.
-     * Force IF=1 (interrupts enabled), IOPL=0, NT=0, TF=0, AC=0. */
-    frame->rflags = (frame->rflags & 0xCD5) | 0x202;
+    /* SECURITY (X2): sanitize restored RFLAGS. The frame is user-controlled;
+     * preserve only arithmetic flags (CF/PF/AF/ZF/SF/OF) + DF, force IF=1,
+     * IOPL=0, NT=0, TF=0, AC=0 — else a crafted frame could clear IF (hang),
+     * raise IOPL (direct port I/O), or set TF (single-step flood). */
+    cs.rflags = ((uint64_t)sf.gregs[REG_EFL] & 0xCD5) | 0x202;
+
+    /* Restore signal mask (SIGKILL/SIGSTOP can never be masked). */
+    proc->signal_mask = sf.uc_sigmask & ~((1ULL << SIGKILL) | (1ULL << SIGSTOP));
+
+    sigreturn_iretq(&cs, proc->pml4_phys);  /* noreturn: iretq to user space */
+    __builtin_unreachable();
 #endif
 
     /* Restore signal mask from saved uc_sigmask */
@@ -200,17 +226,7 @@ sys_rt_sigreturn(syscall_frame_t *frame)
     /* SIGKILL and SIGSTOP cannot be masked */
     proc->signal_mask &= ~((1ULL << SIGKILL) | (1ULL << SIGSTOP));
 
-    /* Return the interrupted syscall's saved rax (C6 saved it into
-     * gregs[REG_RAX]). The syscall_entry.asm SYSRET path does NOT restore rax
-     * from the frame — it sysrets with whatever this returns. Previously this
-     * returned SIGRETURN_MAGIC (a flag for the asm to skip a second signal
-     * check), which LEAKED 0xdeadbeefcafebabe into the interrupted syscall's
-     * return value whenever a signal was delivered on a syscall's return path —
-     * silently corrupting that syscall's result (e.g. an mmap address turning
-     * into the poison value, crashing musl's pthread_create nondeterministically).
-     * Returning the real saved rax fixes it; the asm's now-vestigial MAGIC
-     * compare simply never matches and falls through to a normal (Linux-correct)
-     * pending-signal check. */
+    /* ARM64 returns the interrupted syscall's saved rax via the frame. */
     return (uint64_t)sf.gregs[REG_RAX];
 }
 
