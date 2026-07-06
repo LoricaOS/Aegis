@@ -986,11 +986,7 @@ do_connect(void)
         printk("[AX200] TLC_CONFIG ok — station rate table set\n");
     }
 
-    /* Step 5: allocate a data TX queue for the station. */
-    if (alloc_tx_queue() != 0) return;
-    printk("[AX200] TX queue ready\n");
-
-    /* Step 5b: session protection — reserve on-channel airtime for the auth/assoc
+    /* Step 5: session protection — reserve on-channel airtime for the auth/assoc
      * exchange (a non-associated station isn't otherwise kept on-channel).
      * SESSION_PROTECTION_CMD (0x305, MAC_CONF_GROUP): action=ADD, conf=ASSOC. */
     {
@@ -1015,6 +1011,11 @@ do_connect(void)
             busy_wait_us(10);
         }
     }
+
+    /* Step 5b: allocate the data TX queue AFTER session protection (iwlwifi order:
+     * the queue is allocated lazily right before the first frame, on-channel). */
+    if (alloc_tx_queue() != 0) return;
+    printk("[AX200] TX queue ready\n");
 
     /* Step 6: send an open-system 802.11 auth request and watch for the AP's
      * reply (a mgmt frame addressed to our MAC). */
