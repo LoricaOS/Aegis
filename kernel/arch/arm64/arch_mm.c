@@ -108,6 +108,7 @@ const aegis_mem_region_t *arch_mm_get_reserved_regions(void)
 }
 
 uint64_t arch_get_rsdp_phys(void)      { return s_rsdp_phys; }
+uint64_t arch_get_dtb_phys(void)       { return s_dtb_phys; }
 uint64_t arch_kern_phys_slide(void)    { return s_kern_phys_slide; }
 uint64_t arch_early_pv_off(void)       { return s_early_pv_off; }
 const char *arch_get_cmdline(void)     { return s_cmdline; }
