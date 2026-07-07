@@ -149,6 +149,7 @@ uint64_t sys_getgid(void);
 uint64_t sys_getegid(void);
 uint64_t sys_reboot(uint64_t cmd);
 uint64_t sys_sysinfo(uint64_t buf);
+uint64_t sys_hwmon(uint64_t ubuf);
 uint64_t sys_sched_getaffinity(uint64_t pid, uint64_t len, uint64_t mask);
 uint64_t sys_prlimit64(uint64_t pid, uint64_t res, uint64_t newp, uint64_t oldp);
 uint64_t sys_inotify_init1(uint64_t flags);
