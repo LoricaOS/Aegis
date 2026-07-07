@@ -622,6 +622,25 @@ sys_fcntl(uint64_t arg1, uint64_t arg2, uint64_t arg3)
         if (f->ops->dup) f->ops->dup(f->priv);
         return (uint64_t)new_fd;
     }
+    /* Advisory record locking. Aegis has no multi-process file locking, but
+     * SQLite (Ladybird's cookie/storage store) locks its DB with fcntl and
+     * reports "disk I/O error" if the call returns EINVAL. Grant locks as
+     * no-ops and report GETLK as unlocked — correct for the only pattern here,
+     * a single writer owning its own database.
+     * ponytail: no-op locks; add real record locking only if concurrent
+     * writers ever contend on one file. */
+    case 6:   /* F_SETLK  — pretend the lock was acquired */
+    case 7:   /* F_SETLKW */
+        return 0;
+    case 5: { /* F_GETLK  — report no conflicting lock (l_type = F_UNLCK) */
+        short unlck = 2; /* F_UNLCK */
+        if (arg3) {
+            if (!user_ptr_valid(arg3, sizeof(unlck)))
+                return SYS_ERR(EFAULT);
+            copy_to_user((void *)(uintptr_t)arg3, &unlck, sizeof(unlck));
+        }
+        return 0;
+    }
     default:
         return SYS_ERR(EINVAL);
     }
