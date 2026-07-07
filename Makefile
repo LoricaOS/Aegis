@@ -70,7 +70,8 @@ ARCH_SRCS = \
     kernel/arch/x86_64/fw_cfg.c \
     kernel/arch/x86_64/hyperv.c \
     kernel/arch/x86_64/poll_sources.c \
-    kernel/arch/x86_64/pcie.c
+    kernel/arch/x86_64/pcie.c \
+    kernel/arch/x86_64/thermal.c
 
 CORE_SRCS = \
     kernel/core/main.c \
