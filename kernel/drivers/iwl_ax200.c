@@ -1064,8 +1064,7 @@ do_connect(void)
     if (alloc_tx_queue() != 0) return;
     printk("[AX200] TX queue ready\n");
 
-    /* Step 6: send an open-system 802.11 auth request and watch for the AP's
-     * reply (a mgmt frame addressed to our MAC). */
+    /* Step 6: open-system AUTH, then (on success) an ASSOCIATION request. */
     uint8_t f[64];
     for (int i = 0; i < 64; i++) f[i] = 0;
     f[0] = 0xb0;                               /* FC: mgmt, subtype auth */
@@ -1074,40 +1073,71 @@ do_connect(void)
     f[26] = 1; f[27] = 0;                      /* auth transaction seq = 1 */
     f[28] = 0; f[29] = 0;                      /* status = 0 */
 
-    s_rx_read = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
-    send_frame(f, 30, 0, "auth-v1");            /* rate_n_flags=0: FW picks from TLC table */
+    /* Association request, built once, sent after AUTH succeeds. */
+    static const char SSID[] = "Hart Guest";
+    uint8_t a[96]; int an;
+    for (int i = 0; i < 96; i++) a[i] = 0;
+    a[0] = 0x00; a[1] = 0x00;                  /* FC: mgmt, subtype assoc-req */
+    for (int i = 0; i < 6; i++) { a[4+i] = s_ap_bssid[i]; a[10+i] = s_our_mac[i]; a[16+i] = s_ap_bssid[i]; }
+    a[22] = 0x10; a[23] = 0;                   /* seq ctrl */
+    an = 24;
+    a[an++] = 0x11; a[an++] = 0x00;            /* capability: ESS + Privacy (WPA2 AP) */
+    a[an++] = 0x0a; a[an++] = 0x00;            /* listen interval */
+    a[an++] = 0;   a[an++] = 10;               /* SSID IE */
+    for (int i = 0; i < 10; i++) a[an++] = (uint8_t)SSID[i];
+    a[an++] = 1;   a[an++] = 8;                /* supported rates */
+    a[an++]=0x82; a[an++]=0x84; a[an++]=0x8b; a[an++]=0x96;
+    a[an++]=0x0c; a[an++]=0x12; a[an++]=0x18; a[an++]=0x24;
+    a[an++] = 50;  a[an++] = 4;                /* extended supported rates */
+    a[an++]=0x30; a[an++]=0x48; a[an++]=0x60; a[an++]=0x6c;
 
-    uint16_t rb0 = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
-    printk("[AX200] watch start rb_stts=%u qid=%d tx_wr=%u\n", rb0, s_tx_qid, s_tx_wr);
+    s_rx_read = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
+    send_frame(f, 30, 0, "auth");
+    printk("[AX200] watch start rb_stts=%u qid=%d\n",
+           *(volatile uint16_t *)s_rb_stts & 0x0FFFu, s_tx_qid);
+
+    int authed = 0;
     for (int t = 0; t < 400000; t++) {         /* ~4s */
-        if (t == 150000) send_frame(f, 30, 0x4000, "auth-v2");  /* v2 rate format */
-        if (t == 399999)
-            printk("[AX200] watch end rb_stts=%u\n", *(volatile uint16_t *)s_rb_stts & 0x0FFFu);
         uint32_t ie = csr_rd(CSR_INT);
         if (ie & (CSR_INT_BIT_SW_ERR | CSR_INT_BIT_HW_ERR)) {
-            printk("[AX200] auth TX ASSERTED CSR_INT=0x%x\n", ie); dump_fw_error(); return;
+            printk("[AX200] TX ASSERTED CSR_INT=0x%x\n", ie); dump_fw_error(); return;
         }
         uint16_t closed = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
         while (s_rx_read != closed) {
             const uint8_t *r = s_rx_buf_va[s_rx_read & 511];
-            uint8_t c = r[4], g = r[5];
             s_rx_read++;
-            printk("[AX200] ntf cmd=0x%x/g%u data=%x %x %x %x %x %x %x %x\n",
-                   c, g, r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15]);
-            if (c == 0x1c)                     /* TX response: status in the payload */
-                printk("[AX200]   TX-RESP status=0x%x %x %x %x\n", r[8], r[9], r[10], r[11]);
-            for (int o = 8; o < 300; o++) {    /* find a frame addressed to us */
+            if (r[4] == 0x1c)                  /* TX response: status in the payload */
+                printk("[AX200]   TX-RESP status=0x%x\n", r[8]);
+            for (int o = 8; o < 300; o++) {    /* find a mgmt frame addressed to us */
                 if (r[o]==s_our_mac[0] && r[o+1]==s_our_mac[1] && r[o+2]==s_our_mac[2] &&
                     r[o+3]==s_our_mac[3] && r[o+4]==s_our_mac[4] && r[o+5]==s_our_mac[5]) {
-                    printk("[AX200] *** RX frame to us *** cmd=0x%x @+%d FC=0x%x body=%x %x %x %x %x %x\n",
-                           c, o, r[o-4], r[o+20], r[o+21], r[o+22], r[o+23], r[o+24], r[o+25]);
+                    uint8_t fc = r[o-4];       /* 802.11 FC (addr1/DA is at frame off 4) */
+                    if (fc == 0xb0 && !authed) {           /* AUTH reply */
+                        uint8_t st = r[o+24];
+                        printk("[AX200] AUTH reply: seq=%u status=%u\n", r[o+22], st);
+                        if (st == 0) {
+                            authed = 1;
+                            send_frame(a, (uint16_t)an, 0, "assoc-req");
+                            printk("[AX200] authenticated — assoc request sent\n");
+                        }
+                    } else if (fc == 0x10) {               /* ASSOC response */
+                        uint16_t status = (uint16_t)(r[o+22] | (r[o+23] << 8));
+                        uint16_t aid = (uint16_t)((r[o+24] | (r[o+25] << 8)) & 0x3fff);
+                        printk("[AX200] *** ASSOC RESP status=%u AID=%u ***\n", status, aid);
+                        if (status == 0)
+                            printk("[AX200] *** ASSOCIATED to Hart Guest (AID=%u) — link up ***\n", aid);
+                        else
+                            printk("[AX200] assoc rejected (status=%u) — open assoc; WPA2/RSN needed next\n", status);
+                        printk("[AX200] connect: done\n");
+                        return;
+                    }
                     break;
                 }
             }
         }
         busy_wait_us(10);
     }
-    printk("[AX200] auth: done watching\n");
+    printk("[AX200] connect: done watching (authed=%d)\n", authed);
 }
 
 static int
