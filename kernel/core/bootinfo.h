@@ -15,7 +15,7 @@
 #include <stdint.h>
 
 #define BOOTINFO_MAX_REGIONS 64
-#define BOOTINFO_MAX_MODULES 2      /* 0 = rootfs, 1 = ESP image */
+#define BOOTINFO_MAX_MODULES 3      /* 0 = rootfs, 1 = ESP image, 2 = iwlwifi firmware */
 #define BOOTINFO_CMDLINE_MAX 256
 
 typedef struct {

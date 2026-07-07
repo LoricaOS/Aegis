@@ -323,10 +323,13 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     {
         uint64_t mod_phys = 0,  mod_size = 0;
         uint64_t mod2_phys = 0, mod2_size = 0;
+        uint64_t mod3_phys = 0, mod3_size = 0;
         arch_get_module(&mod_phys, &mod_size);
         ramdisk_init(mod_phys, mod_size);    /* ramdisk0 = rootfs */
         arch_get_module2(&mod2_phys, &mod2_size);
         ramdisk_init2(mod2_phys, mod2_size); /* ramdisk1 = ESP image */
+        arch_get_module3(&mod3_phys, &mod3_size);
+        ramdisk_init_fw(mod3_phys, mod3_size); /* module2 = iwlwifi firmware blob */
 
         /* ramdisk_init/ramdisk_init2 COPY the module bytes into fresh KVA
          * pages (the originals may overlap future VMM page-table frames),
@@ -336,9 +339,10 @@ kernel_main(uint32_t mb_magic, void *mb_info)
          * pmm_init-time input only and are never consulted again, so the
          * stale array entries are harmless. Installed-system boots have
          * no modules; this block is silent there. */
-        if (mod_size > 0 || mod2_size > 0) {
+        if (mod_size > 0 || mod2_size > 0 || mod3_size > 0) {
             pmm_unreserve_region(mod_phys, mod_size);
             pmm_unreserve_region(mod2_phys, mod2_size);
+            pmm_unreserve_region(mod3_phys, mod3_size);
             printk("[PMM] OK: module pages reclaimed\n");
         }
     }

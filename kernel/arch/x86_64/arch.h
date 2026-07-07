@@ -138,6 +138,10 @@ int arch_get_module(uint64_t *phys_out, uint64_t *size_out);
  * module (ESP image for installer). Returns 1 if found, 0 if not present. */
 int arch_get_module2(uint64_t *phys_out, uint64_t *size_out);
 
+/* arch_get_module3 — physical address + size of the third module (iwlwifi
+ * firmware on the desktop/graphical ISOs). Returns 1 if found, 0 if not. */
+int arch_get_module3(uint64_t *phys_out, uint64_t *size_out);
+
 /* arch_get_cmdline — return kernel command line from multiboot2 tag.
  * Returns pointer to static buffer (empty string if no cmdline tag). */
 const char *arch_get_cmdline(void);
