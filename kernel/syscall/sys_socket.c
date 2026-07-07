@@ -1686,6 +1686,20 @@ typedef struct {
     uint32_t gateway;
 } netcfg_info_t;
 
+/* WiFi control surface — implemented in kernel/drivers/iwl_ax200.c. The struct
+ * mirrors wifi_net_pub_t there and in lumen-netman; keep the three in sync. */
+typedef struct {
+    char    ssid[33];
+    uint8_t channel;
+    uint8_t sec;         /* 0 = open, 1 = secured */
+    uint8_t connected;   /* 1 = currently associated */
+    uint8_t pad;
+} wifi_net_pub_t;
+extern int iwl_wifi_present(void);
+extern int iwl_wifi_list(wifi_net_pub_t *out, int max);
+extern int iwl_wifi_connect(const char *ssid);
+extern int iwl_wifi_rescan(void);
+
 uint64_t
 sys_netcfg(uint64_t op, uint64_t arg1, uint64_t arg2, uint64_t arg3)
 {
@@ -1735,6 +1749,52 @@ sys_netcfg(uint64_t op, uint64_t arg1, uint64_t arg2, uint64_t arg3)
         info.gateway = gw;
         copy_to_user((void *)(uintptr_t)arg1, &info, sizeof(info));
         return 0;
+    }
+    if (op == 2) {
+        /* op=2 (list WiFi networks): arg1 = user wifi_net_pub_t[], arg2 = max
+         * entries. Returns the count. A read of scan state -> NET_SOCKET. */
+        if (cap_check(proc->caps, CAP_TABLE_SIZE,
+                      CAP_KIND_NET_SOCKET, CAP_RIGHTS_READ) != 0)
+            return SYS_ERR(ENOCAP);
+        if (!iwl_wifi_present()) return SYS_ERR(ENODEV);
+        int max = (int)arg2;
+        if (max <= 0) return SYS_ERR(EINVAL);
+        if (max > 24) max = 24;                       /* WIFI_MAX_NETS */
+        if (!user_ptr_valid(arg1, (uint64_t)max * sizeof(wifi_net_pub_t)))
+            return SYS_ERR(EFAULT);
+        wifi_net_pub_t tmp[24];
+        __builtin_memset(tmp, 0, sizeof(tmp));
+        int n = iwl_wifi_list(tmp, max);
+        if (n > 0)
+            copy_to_user((void *)(uintptr_t)arg1, tmp, (uint64_t)n * sizeof(wifi_net_pub_t));
+        return (uint64_t)n;
+    }
+    if (op == 4) {
+        /* op=4 (rescan): re-run the WiFi scan (blocking a few seconds), returns
+         * the new count. Benign radio activity -> NET_SOCKET. */
+        if (cap_check(proc->caps, CAP_TABLE_SIZE,
+                      CAP_KIND_NET_SOCKET, CAP_RIGHTS_READ) != 0)
+            return SYS_ERR(ENOCAP);
+        if (!iwl_wifi_present()) return SYS_ERR(ENODEV);
+        int n = iwl_wifi_rescan();
+        return n < 0 ? SYS_ERR(EIO) : (uint64_t)n;
+    }
+    if (op == 3) {
+        /* op=3 (connect to SSID): arg1 = user SSID string. Active control that
+         * changes the host's network association -> NET_ADMIN (same class as
+         * op=0), intentionally not held by the plain netman GUI. */
+        if (cap_check(proc->caps, CAP_TABLE_SIZE,
+                      CAP_KIND_NET_ADMIN, CAP_RIGHTS_WRITE) != 0)
+            return SYS_ERR(ENOCAP);
+        if (!iwl_wifi_present()) return SYS_ERR(ENODEV);
+        if (!user_ptr_valid(arg1, 1)) return SYS_ERR(EFAULT);
+        char ssid[33];
+        __builtin_memset(ssid, 0, sizeof(ssid));
+        if (copy_from_user(ssid, (const void *)(uintptr_t)arg1, sizeof(ssid) - 1) != 0)
+            return SYS_ERR(EFAULT);
+        ssid[32] = 0;
+        int rc = iwl_wifi_connect(ssid);
+        return rc == 0 ? 0 : SYS_ERR(EIO);
     }
     return SYS_ERR(EINVAL);
 }

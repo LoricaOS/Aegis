@@ -301,6 +301,42 @@ static uint32_t s_calib_flow, s_calib_event; /* from DEF_CALIB TLV (regular ucod
 static int      s_ap_found;                       /* target AP seen in scan */
 static uint8_t  s_ap_bssid[6];                     /* target AP BSSID (addr3) */
 static uint8_t  s_ap_channel;                      /* target AP channel (DS param) */
+static char     s_target_ssid[33];                /* SSID for the assoc request */
+
+/* Scan results table — populated by do_scan(), read out via iwl_wifi_list()
+ * (sys_netcfg WiFi ops) so the network manager can show a live network list. */
+#define WIFI_MAX_NETS 24
+struct wifi_net {
+    char     ssid[33];
+    uint8_t  bssid[6];
+    uint8_t  channel;
+    uint8_t  sec;        /* 0 = open, 1 = secured (Privacy bit or RSN IE) */
+};
+static struct wifi_net s_nets[WIFI_MAX_NETS];
+static int             s_net_count;
+static int             s_present;      /* 1 once an AX200 is found + brought up */
+static int             s_associated;   /* 1 after a successful (status=0) assoc */
+
+static void wifi_add(const char *ssid, const uint8_t *bssid, uint8_t ch, uint8_t sec)
+{
+    if (!ssid[0]) return;                                /* skip hidden SSIDs */
+    for (int i = 0; i < s_net_count; i++) {              /* dedup by SSID */
+        int k = 0;
+        while (ssid[k] && s_nets[i].ssid[k] == ssid[k]) k++;
+        if (s_nets[i].ssid[k] == 0 && ssid[k] == 0) {
+            if (sec) s_nets[i].sec = 1;                  /* upgrade to secured */
+            return;
+        }
+    }
+    if (s_net_count >= WIFI_MAX_NETS) return;
+    struct wifi_net *n = &s_nets[s_net_count++];
+    int j = 0;
+    for (; ssid[j] && j < 32; j++) n->ssid[j] = ssid[j];
+    n->ssid[j] = 0;
+    for (int k = 0; k < 6; k++) n->bssid[k] = bssid[k];
+    n->channel = ch;
+    n->sec = sec;
+}
 static uint8_t  s_scan_req_ver, s_scan_req_grp;   /* SCAN_REQ_UMAC (cmd 0x0d) */
 static uint8_t  s_scan_cfg_ver, s_scan_cfg_grp;   /* SCAN_CFG_CMD (cmd 0x0c) */
 static uint8_t  s_scd_qcfg_ver;                   /* SCD_QUEUE_CONFIG_CMD (0x17/g5) */
@@ -725,35 +761,45 @@ do_scan(void)
             const uint8_t *r = s_rx_buf_va[s_rx_read & 511];
             uint8_t c = r[4], g = r[5];
             s_rx_read++;
-            /* Scan the RB for the target SSID (pragmatic: find it in the beacon). */
-            for (int o = 8; o < 4090; o++) {
-                if (r[o]=='H' && r[o+1]=='a' && r[o+2]=='r' && r[o+3]=='t') {
-                    char ss[40]; int j = 0;
-                    for (int k = o; k < o + 32 && r[k] >= 0x20 && r[k] < 0x7f; k++)
-                        ss[j++] = (char)r[k];
-                    ss[j] = 0;
-                    printk("[AX200] *** SCAN FOUND SSID: '%s' *** (ntf cmd=0x%x grp=0x%x)\n", ss, c, g);
-                    found = 1;
-                    /* For "Hart Guest": capture BSSID + channel from the beacon.
-                     * o points at the SSID value; the 802.11 frame body starts 38
-                     * bytes back (24 hdr + 12 fixed + 2 IE hdr), so addr3/BSSID is
-                     * at o-22 and the IE list at o-2. */
-                    if (!s_ap_found && o >= 40 &&
-                        ss[0]=='H'&&ss[4]==' '&&ss[5]=='G') {   /* "Hart Guest" */
-                        for (int k = 0; k < 6; k++) s_ap_bssid[k] = r[o - 22 + k];
-                        int slen = r[o - 1];
-                        int p = (o - 2) + 2 + slen;            /* IE after SSID */
-                        for (int gd = 0; gd < 32 && p < 4088; gd++) {
-                            uint8_t id = r[p], ln = r[p + 1];
-                            if (id == 3 && ln >= 1) { s_ap_channel = r[p + 2]; break; }
-                            p += 2 + ln;
-                        }
-                        s_ap_found = 1;
-                        printk("[AX200] target 'Hart Guest' BSSID %x:%x:%x:%x:%x:%x ch=%u\n",
-                               s_ap_bssid[0],s_ap_bssid[1],s_ap_bssid[2],
-                               s_ap_bssid[3],s_ap_bssid[4],s_ap_bssid[5], s_ap_channel);
-                    }
+            /* Parse any beacon in this notif into the scan table. Beacon signature:
+             * FC=0x80 0x00, broadcast DA (addr1), and the SSID IE (id 0) first at
+             * frame+36 (24 hdr + 8 tsf + 2 bcn-int + 2 cap). */
+            if (c == 0xc1) for (int p = 8; p < 4000; p++) {
+                if (r[p] != 0x80 || r[p+1] != 0x00) continue;
+                if (r[p+4]!=0xff || r[p+5]!=0xff || r[p+9]!=0xff) continue;
+                if (r[p+36] != 0x00) continue;            /* first IE must be SSID */
+                uint8_t slen = r[p+37];
+                if (slen == 0 || slen > 32) break;        /* hidden / bogus */
+                char ss[33]; int ok = 1;
+                for (int j = 0; j < slen; j++) {
+                    uint8_t ch = r[p+38+j];
+                    if (ch < 0x20 || ch > 0x7e) { ok = 0; break; }
+                    ss[j] = (char)ch;
                 }
+                if (!ok) break;
+                ss[slen] = 0;
+                uint16_t cap = (uint16_t)(r[p+34] | (r[p+35] << 8));
+                uint8_t sec = (cap & 0x0010) ? 1 : 0;     /* Privacy bit */
+                uint8_t chan = s_ap_channel;              /* fallback if no DS param */
+                int q = p + 36;                            /* walk IEs */
+                for (int gd = 0; gd < 40 && q < 4090; gd++) {
+                    uint8_t id = r[q], ln = r[q+1];
+                    if (id == 3 && ln >= 1) chan = r[q+2];      /* DS param -> channel (2.4GHz) */
+                    if (id == 61 && ln >= 1 && chan == 0)
+                        chan = r[q+2];                            /* HT Operation -> primary ch (5GHz) */
+                    if (id == 48) sec = 1;                       /* RSN IE -> secured (WPA2/3) */
+                    if (id == 221 && ln >= 4 && r[q+2]==0x00 && r[q+3]==0x50 &&
+                        r[q+4]==0xf2 && r[q+5]==0x01) sec = 1;   /* WPA1 vendor IE -> secured */
+                    q += 2 + ln;
+                }
+                uint8_t bssid[6];
+                for (int k = 0; k < 6; k++) bssid[k] = r[p+16+k];
+                int before = s_net_count;
+                wifi_add(ss, bssid, chan, sec);
+                if (s_net_count != before)
+                    printk("[AX200] scan: '%s' ch=%u %s\n", ss, chan, sec ? "[secured]" : "[open]");
+                found = 1;
+                break;
             }
             if (c == 0x0f && g == 0x00) {
                 printk("[AX200] SCAN_COMPLETE (found Hart=%d)\n", found);
@@ -1074,7 +1120,8 @@ do_connect(void)
     f[28] = 0; f[29] = 0;                      /* status = 0 */
 
     /* Association request, built once, sent after AUTH succeeds. */
-    static const char SSID[] = "Hart Guest";
+    int ssid_len = 0;
+    while (s_target_ssid[ssid_len] && ssid_len < 32) ssid_len++;
     uint8_t a[96]; int an;
     for (int i = 0; i < 96; i++) a[i] = 0;
     a[0] = 0x00; a[1] = 0x00;                  /* FC: mgmt, subtype assoc-req */
@@ -1083,8 +1130,8 @@ do_connect(void)
     an = 24;
     a[an++] = 0x11; a[an++] = 0x00;            /* capability: ESS + Privacy (WPA2 AP) */
     a[an++] = 0x0a; a[an++] = 0x00;            /* listen interval */
-    a[an++] = 0;   a[an++] = 10;               /* SSID IE */
-    for (int i = 0; i < 10; i++) a[an++] = (uint8_t)SSID[i];
+    a[an++] = 0;   a[an++] = (uint8_t)ssid_len;               /* SSID IE */
+    for (int i = 0; i < ssid_len; i++) a[an++] = (uint8_t)s_target_ssid[i];
     a[an++] = 1;   a[an++] = 8;                /* supported rates */
     a[an++]=0x82; a[an++]=0x84; a[an++]=0x8b; a[an++]=0x96;
     a[an++]=0x0c; a[an++]=0x12; a[an++]=0x18; a[an++]=0x24;
@@ -1124,9 +1171,11 @@ do_connect(void)
                         uint16_t status = (uint16_t)(r[o+22] | (r[o+23] << 8));
                         uint16_t aid = (uint16_t)((r[o+24] | (r[o+25] << 8)) & 0x3fff);
                         printk("[AX200] *** ASSOC RESP status=%u AID=%u ***\n", status, aid);
-                        if (status == 0)
-                            printk("[AX200] *** ASSOCIATED to Hart Guest (AID=%u) — link up ***\n", aid);
-                        else
+                        if (status == 0) {
+                            s_associated = 1;
+                            printk("[AX200] *** ASSOCIATED to '%s' (AID=%u) — link up ***\n",
+                                   s_target_ssid, aid);
+                        } else
                             printk("[AX200] assoc rejected (status=%u) — open assoc; WPA2/RSN needed next\n", status);
                         printk("[AX200] connect: done\n");
                         return;
@@ -1138,6 +1187,58 @@ do_connect(void)
         busy_wait_us(10);
     }
     printk("[AX200] connect: done watching (authed=%d)\n", authed);
+}
+
+/* ── WiFi control surface (called from sys_netcfg on behalf of the netman GUI) ── */
+int iwl_wifi_present(void) { return s_present; }
+
+int iwl_wifi_list(wifi_net_pub_t *out, int max)
+{
+    int n = s_net_count < max ? s_net_count : max;
+    for (int i = 0; i < n; i++) {
+        int j = 0;
+        for (; s_nets[i].ssid[j] && j < 32; j++) out[i].ssid[j] = s_nets[i].ssid[j];
+        out[i].ssid[j] = 0;
+        out[i].channel = s_nets[i].channel;
+        out[i].sec = s_nets[i].sec;
+        int same = s_associated && s_target_ssid[0];
+        for (int k = 0; same; k++) {
+            if (s_target_ssid[k] != s_nets[i].ssid[k]) { same = 0; break; }
+            if (!s_target_ssid[k]) break;
+        }
+        out[i].connected = (uint8_t)(same ? 1 : 0);
+        out[i].pad = 0;
+    }
+    return n;
+}
+
+int iwl_wifi_rescan(void)
+{
+    if (!s_present) return -1;
+    s_net_count = 0;
+    do_scan();
+    return s_net_count;
+}
+
+int iwl_wifi_connect(const char *ssid)
+{
+    if (!s_present) return -1;
+    for (int i = 0; i < s_net_count; i++) {
+        int k = 0;
+        while (ssid[k] && s_nets[i].ssid[k] == ssid[k]) k++;
+        if (s_nets[i].ssid[k] == 0 && ssid[k] == 0) {   /* match */
+            for (int b = 0; b < 6; b++) s_ap_bssid[b] = s_nets[i].bssid[b];
+            s_ap_channel = s_nets[i].channel;
+            int j = 0;
+            for (; s_nets[i].ssid[j]; j++) s_target_ssid[j] = s_nets[i].ssid[j];
+            s_target_ssid[j] = 0;
+            s_ap_found = 1;
+            s_associated = 0;
+            do_connect();
+            return s_associated ? 0 : -3;   /* -3 = attempted but not associated */
+        }
+    }
+    return -2;                                /* SSID not in the scan table */
 }
 
 static int
@@ -1230,11 +1331,13 @@ load_firmware_and_kick(uint32_t hw_rev)
             csr_wr(RFH_Q0_FRBDCB_WIDX_TRG, (uint32_t)(NRBDS - 8));
             process_rx_alive();
 
-            /* Phase 3c: init sequence → INIT_COMPLETE, then 3d: scan. */
+            /* Phase 3c: init sequence → INIT_COMPLETE, then an initial scan to
+             * populate the network list. Connecting is driven on-demand by the
+             * network manager via iwl_wifi_connect() (no auto-connect). */
             if (init_after_alive() == 0) {
+                s_present = 1;
                 do_scan();
-                if (s_ap_found)
-                    do_connect();
+                printk("[AX200] ready — %d network(s) scanned\n", s_net_count);
             }
             return 0;
         }
