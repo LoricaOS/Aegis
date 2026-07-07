@@ -5,10 +5,16 @@
 
 #include "arch.h"
 #include "printk.h"
+#include "fdt.h"
 #include <stdint.h>
 
+/* QEMU-virt defaults; overridden from the DTB's arm,gic-v3 node at init
+ * (Apple Virtualization.framework puts these at 0x1000_0000/0x1001_0000). */
 #define GICD_PHYS   0x08000000UL
 #define GICR_PHYS   0x080A0000UL
+
+static uint64_t s_gicd_phys = GICD_PHYS;
+static uint64_t s_gicr_phys = GICR_PHYS;
 
 #define GICD_CTLR        0x0000
 #define GICD_IGROUPR     0x0080
@@ -40,7 +46,7 @@ static inline void     rw32(uint32_t off, uint32_t v){ *(volatile uint32_t *)(s_
 static volatile uint8_t *
 gicr_for(uint32_t cpu)
 {
-    return (volatile uint8_t *)arch_dmap(GICR_PHYS + (uint64_t)cpu * GICR_STRIDE);
+    return (volatile uint8_t *)arch_dmap(s_gicr_phys + (uint64_t)cpu * GICR_STRIDE);
 }
 
 /* gic_cpu_init — per-CPU GICv3 bring-up: wake THIS core's redistributor,
@@ -74,15 +80,26 @@ gic_cpu_init(uint32_t cpu)
 void
 gic_init(void)
 {
-    s_gicd = (volatile uint8_t *)arch_dmap(GICD_PHYS);
-    s_gicr = (volatile uint8_t *)arch_dmap(GICR_PHYS);
+    /* Prefer the DTB's arm,gic-v3 node (reg[0]=distributor, reg[1]=first
+     * redistributor frame); fall back to the QEMU-virt constants. */
+    uint64_t d, r, sz;
+    int from_dtb = fdt_reg_by_compat("arm,gic-v3", 0, &d, &sz) &&
+                   fdt_reg_by_compat("arm,gic-v3", 1, &r, &sz);
+    if (from_dtb) {
+        s_gicd_phys = d;
+        s_gicr_phys = r;
+    }
+
+    s_gicd = (volatile uint8_t *)arch_dmap(s_gicd_phys);
+    s_gicr = (volatile uint8_t *)arch_dmap(s_gicr_phys);
 
     /* Distributor: affinity routing + group-1 forwarding (once, BSP). */
     dw32(GICD_CTLR, (1u << 4) | (1u << 1) | (1u << 0));
 
     gic_cpu_init(0);   /* BSP's own redistributor + CPU interface */
 
-    printk("[GIC] OK: GICv3 distributor + redistributor online\n");
+    printk("[GIC] OK: GICv3 dist@%lx redist@%lx (%s)\n",
+           s_gicd_phys, s_gicr_phys, from_dtb ? "DTB" : "builtin");
 }
 
 /* gic_enable_ppi — enable a private interrupt (INTID < 32) on this CPU. */

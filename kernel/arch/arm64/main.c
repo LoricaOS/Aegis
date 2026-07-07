@@ -26,6 +26,7 @@
 #include "ext2.h"
 #include "gpt.h"
 #include "pcie.h"
+#include "fdt.h"
 #include "virtio.h"   /* virtio_blk_init */
 #include "virtio_gpu.h"
 #include "fb.h"
@@ -69,6 +70,8 @@ kernel_main_limine(const aegis_bootinfo_t *bi)
         else
             printk("[CMDLINE] OK: (none)\n");
     }
+
+    fdt_init();               /* capture DTB now — HHDM dies at vmm_init */
 
     pmm_init();
     vmm_init();               /* TTBR1 kernel tables + DMAP go live     */
