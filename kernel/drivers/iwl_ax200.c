@@ -886,8 +886,8 @@ alloc_tx_queue(void)
                 s_tx_wr = 0;
                 printk("[AX200] *** TX queue: qid=%u resp=%x %x %x %x %x %x %x %x ***\n",
                        s_tx_qid, r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15]);
-                /* Bring the queue up: ring the doorbell with the initial SSN (0). */
-                csr_wr(HBUS_TARG_WRPTR, (uint32_t)(0 | (s_tx_qid << 16)));
+                /* No alloc-time doorbell — iwlwifi only rings HBUS_TARG_WRPTR when
+                 * it actually queues a TFD. A spurious wr=0 ring can disturb the SCD. */
                 return 0;
             }
         }
@@ -1033,15 +1033,26 @@ do_connect(void)
         wr_le32b(sp + 8, 0);                  /* conf_id = SESSION_PROTECT_CONF_ASSOC */
         wr_le32b(sp + 12, 1000);              /* duration_tu */
         wr_le32b(sp + 16, 1);                 /* repetition_count */
+        /* Capture the RX read index BEFORE sending: the FW delivers the
+         * session-prot START notif (start=1) within ~us of the command, i.e.
+         * DURING send_check's response wait. Scanning from here catches it;
+         * resetting s_rx_read to "now" afterwards would skip start=1 and only
+         * see the later start=0 (session ENDED) notif — leaving us off-channel. */
+        uint16_t pre_sp = s_rx_read;
         if (send_check(0x305, sp, 24, "SESSION_PROT") != 0) return;
-        s_rx_read = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
-        for (int t = 0; t < 150000; t++) {    /* wait for on-channel notif (0xFB) */
+        s_rx_read = pre_sp;
+        for (int t = 0; t < 150000; t++) {    /* wait for the START notif (0xFB, start=1) */
             uint16_t closed = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
             int got = 0;
             while (s_rx_read != closed) {
                 const uint8_t *r = s_rx_buf_va[s_rx_read & 511];
                 s_rx_read++;
-                if (r[4] == 0xfb) { printk("[AX200] on-channel (session-prot notif)\n"); got = 1; }
+                /* iwl_mvm_session_prot_notif: status[12], start[16], conf[20]. */
+                if (r[4] == 0xfb && r[16] == 1) {
+                    printk("[AX200] session-prot STARTED (status=%u conf=%u) — on-channel\n",
+                           r[12], r[20]);
+                    got = 1;
+                }
             }
             if (got) break;
             busy_wait_us(10);
