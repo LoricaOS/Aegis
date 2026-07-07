@@ -361,18 +361,23 @@ static int sec_count_from(int start)
 
 static int parse_firmware(void)
 {
-    const uint8_t *fw;
-    uint64_t len64;
-    if (ramdisk_get_blob(&fw, &len64) != 0) {
-        printk("[AX200] no firmware module (boot the .ucode as module0)\n");
+    /* The .ucode can arrive as module0 (kernel-only smoke ISO) or as the
+     * dedicated firmware module (module2 on the desktop/graphical ISOs, where
+     * module0 is the rootfs and module1 the ESP). Try both. */
+    const uint8_t *fw = 0;
+    uint64_t len64 = 0;
+    if (ramdisk_get_blob(&fw, &len64) == 0 &&
+        len64 >= TLV_HDR_SIZE && rd_le32(fw + 4) == IWL_TLV_MAGIC) {
+        /* module0 is the firmware */
+    } else if (ramdisk_get_fw_blob(&fw, &len64) == 0 &&
+               len64 >= TLV_HDR_SIZE && rd_le32(fw + 4) == IWL_TLV_MAGIC) {
+        /* dedicated firmware module */
+    } else {
+        printk("[AX200] FAIL: no iwlwifi firmware module found\n");
         return -1;
     }
     uint32_t len = (uint32_t)len64;
-
-    if (len < TLV_HDR_SIZE || rd_le32(fw + 4) != IWL_TLV_MAGIC) {
-        printk("[AX200] FAIL: module is not iwlwifi firmware (len=%u)\n", (unsigned)len);
-        return -1;
-    }
+    printk("[AX200] firmware module: %u KB\n", (unsigned)(len / 1024));
     s_fw_ver = rd_le32(fw + 4 + 4 + 64);   /* ver field after zero,magic,human[64] */
 
     s_num_sec = 0;

@@ -7,6 +7,9 @@
 static uint8_t *s_base;   /* KVA pointer to mapped module */
 static uint64_t s_size;   /* byte size */
 
+static uint8_t *s_fw_base; /* KVA copy of the firmware module (module 2) */
+static uint64_t s_fw_size;
+
 static blkdev_t s_ramdisk;
 
 static int
@@ -148,6 +151,41 @@ ramdisk_get_blob(const uint8_t **out, uint64_t *size)
         return -1;
     *out  = s_base;
     *size = s_size;
+    return 0;
+}
+
+/* ── Firmware blob (module 2) — a raw driver blob, not a blkdev ─────────
+ * Copied into fresh KVA (like the rootfs) so it survives main.c reclaiming the
+ * module's physical pages. Read back via ramdisk_get_fw_blob. */
+void
+ramdisk_init_fw(uint64_t phys_base, uint64_t size)
+{
+    if (phys_base == 0 || size == 0)
+        return;
+    uint32_t src_pages = 0;
+    const uint8_t *src = map_module(phys_base, size, &src_pages);
+    if (!src) {
+        printk("[RAMDISK] FAIL: cannot map firmware module\n");
+        return;
+    }
+    uint32_t num_pages = (uint32_t)((size + 4095) / 4096);
+    s_fw_base = (uint8_t *)kva_alloc_pages(num_pages);
+    if (s_fw_base) {
+        for (uint64_t i = 0; i < size; i++)
+            s_fw_base[i] = src[i];
+        s_fw_size = size;
+        printk("[RAMDISK] OK: firmware module copied (%u KB)\n", (unsigned)(size / 1024));
+    }
+    unmap_module((uint8_t *)src, src_pages);
+}
+
+int
+ramdisk_get_fw_blob(const uint8_t **out, uint64_t *size)
+{
+    if (!s_fw_base || !s_fw_size)
+        return -1;
+    *out  = s_fw_base;
+    *size = s_fw_size;
     return 0;
 }
 
