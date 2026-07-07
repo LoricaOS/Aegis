@@ -252,17 +252,28 @@ extern void sched_tick(void);
 /*
  * lapic_timer_init — calibrate and start the LAPIC timer in periodic mode.
  */
+/* BSP-measured LAPIC-timer period (ticks per ~10ms scheduler tick) + TSC. The
+ * LAPIC timer and TSC run at the same frequency on every core, so this is
+ * measured ONCE (on the BSP, before the APs are woken) and every other core
+ * inherits it. Re-measuring per-AP was the dominant SMP bring-up cost: the
+ * measurement is a ~10ms PIT-channel-2 spin, and because PIT ch2 is a single
+ * shared resource the APs serialized through it (~10ms × (ncpu-1)). This
+ * matches how Linux shares one calibrated lapic_timer_period across all CPUs. */
+static uint32_t s_lapic_timer_ticks;
+static int      s_lapic_timer_calibrated;
+
+/* lapic_timer_calibrate — measure the LAPIC-timer period + TSC frequency over a
+ * ~10ms window, ONCE. Idempotent: the first caller (the BSP, early in
+ * kernel_main) does the spin; every later call returns immediately. Does not
+ * program this core's timer — that is per-core work done by lapic_timer_init. */
 void
-lapic_timer_init(void)
+lapic_timer_calibrate(void)
 {
-    if (!s_active)
+    if (!s_active || s_lapic_timer_calibrated)
         return;
 
-    /* Divide configuration: divide by 16 (DCR value 0x03) */
-    lapic_write(LAPIC_TIMER_DCR, 0x03);
-
-    /* Mask timer during calibration: masked (bit 16), vector 0x30 */
-    lapic_write(LAPIC_TIMER_LVT, 0x00010030);
+    lapic_write(LAPIC_TIMER_DCR, 0x03);        /* divide by 16 */
+    lapic_write(LAPIC_TIMER_LVT, 0x00010030);  /* masked, vector 0x30 */
 
     /* Measure how many LAPIC ticks elapse in a known ~10ms window.  The 8254
      * PIT is the reference on real hardware / QEMU, but Hyper-V Gen 2 VMs do
@@ -300,15 +311,34 @@ lapic_timer_init(void)
      * on CPUs without an invariant TSC). */
     arch_tsc_calibrate(arch_get_cycles() - tsc_c0);
 
-    /* Mask the timer while we reconfigure */
-    lapic_write(LAPIC_TIMER_LVT, 0x00010030);
+    s_lapic_timer_ticks = elapsed;
+    s_lapic_timer_calibrated = 1;
+}
 
-    /* Configure periodic mode (bit 17), vector 0x30, unmasked */
-    lapic_write(LAPIC_TIMER_LVT, (1u << 17) | 0x30);
-    lapic_write(LAPIC_TIMER_ICR, elapsed);
+/*
+ * lapic_timer_init — program THIS core's LAPIC timer for periodic preemption.
+ * The period is inherited from the one-time BSP calibration (lapic_timer_calibrate),
+ * so an AP does zero measurement here — it just points its own LAPIC at the
+ * shared period. Only the LAPIC register writes are per-core.
+ */
+void
+lapic_timer_init(void)
+{
+    if (!s_active)
+        return;
+
+    /* Ensure the shared period exists. On the BSP's first call (if it never ran
+     * the early calibrate) this measures; on every AP it is already set and this
+     * returns immediately — no 10ms spin, no PIT-ch2 serialization. */
+    lapic_timer_calibrate();
+
+    lapic_write(LAPIC_TIMER_DCR, 0x03);                /* divide by 16 */
+    lapic_write(LAPIC_TIMER_LVT, 0x00010030);          /* mask while reconfiguring */
+    lapic_write(LAPIC_TIMER_LVT, (1u << 17) | 0x30);   /* periodic, vector 0x30, unmasked */
+    lapic_write(LAPIC_TIMER_ICR, s_lapic_timer_ticks);
     if (hyperv_present())   /* Hyper-V-only: confirms the ref-counter calibration */
         printk("[LAPIC] OK: timer calibrated via HV ref counter (icr=%u)\n",
-               (unsigned)elapsed);
+               (unsigned)s_lapic_timer_ticks);
 }
 
 /*

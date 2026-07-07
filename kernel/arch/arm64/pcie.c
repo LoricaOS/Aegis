@@ -10,14 +10,16 @@
  *   ranges: 32-bit MMIO window @ 0x10000000 (in the kernel device map),
  *           64-bit MMIO window @ 0x80_00000000 (drivers map BARs via KVA)
  *
- * ponytail: the ECAM base is the fixed QEMU-virt value, not DTB-parsed —
- * add an FDT walk when a second arm64 platform appears. Only bus 0 is
- * scanned/mapped (QEMU virt puts every device, virtio included, on bus 0;
- * there are no PCI-PCI bridges by default).
+ * The ECAM base is read from the DTB's pci-host-ecam-generic node at init
+ * (Apple Virtualization.framework puts it at 0x4000_0000, QEMU virt at
+ * 0x40_1000_0000); ECAM_BASE below is the QEMU-virt fallback. Only bus 0
+ * is scanned/mapped (both platforms put every device, virtio included, on
+ * bus 0; there are no PCI-PCI bridges by default).
  */
 #include "pcie.h"
 #include "printk.h"
 #include "kva.h"
+#include "fdt.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -99,11 +101,17 @@ enumerate_function(uint8_t bus, uint8_t dev, uint8_t fn)
 void
 pcie_init(void)
 {
-    s_ecam_base = (volatile uint8_t *)kva_map_mmio(ECAM_BASE, ECAM_BUSES * 256u);
+    uint64_t ecam = ECAM_BASE, sz;
+    int from_dtb = fdt_reg_by_compat("pci-host-ecam-generic", 0, &ecam, &sz);
+    if (!from_dtb)
+        ecam = ECAM_BASE;
+
+    s_ecam_base = (volatile uint8_t *)kva_map_mmio(ecam, ECAM_BUSES * 256u);
     if (!s_ecam_base) {
         printk("[PCIE] WARN: ECAM map failed\n");
         return;
     }
+    printk("[PCIE] ECAM@%lx (%s)\n", ecam, from_dtb ? "DTB" : "builtin");
     for (uint8_t dev = 0; dev < 32; dev++) {
         if (pcie_read16(0, dev, 0, 0x00) == 0xFFFF)
             continue;

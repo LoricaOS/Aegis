@@ -6,7 +6,6 @@
 CC      = x86_64-elf-gcc
 AS      = nasm
 LD      = x86_64-elf-ld
-CARGO   = cargo +nightly
 OBJCOPY = x86_64-elf-objcopy
 NM      = x86_64-elf-nm
 HOSTCC ?= cc
@@ -37,7 +36,14 @@ CFLAGS = \
     $(EXTRA_CFLAGS)
 
 ASFLAGS = -f elf64
-LDFLAGS = -T tools/linker.ld -nostdlib
+# -z noseparate-code: emit ONE combined RWX PT_LOAD (text+rodata+data) instead
+# of ld's default W^X-split segments. The kernel is designed to boot RWX (its
+# early Limine-handoff path writes into the image before its own page tables are
+# up; a non-writable text segment faults under Limine — 0 serial, triple fault).
+# It also makes the segment layout DETERMINISTIC: without this, a tiny .text size
+# change (e.g. one added symbol shifting the two-pass ksym blob) flips ld's
+# auto-segment grouping and silently produces a non-booting image.
+LDFLAGS = -T tools/linker.ld -nostdlib -z noseparate-code
 
 # ── Kernel source lists ─────────────────────────────────��───────────────────
 ARCH_SRCS = \
@@ -75,6 +81,7 @@ CORE_SRCS = \
     kernel/core/ksym.c \
     kernel/core/trace.c \
     kernel/core/lockrank.c \
+    kernel/cap/cap.c \
     kernel/cap/cap_policy.c
 
 MM_SRCS = \
@@ -109,6 +116,7 @@ DRIVER_SRCS = \
     kernel/drivers/virtio_vsock.c \
     kernel/drivers/rtl8169.c kernel/drivers/rtl8139.c \
     kernel/drivers/e1000.c kernel/drivers/vmxnet3.c \
+    kernel/drivers/iwl_ax200.c \
     kernel/drivers/hda.c kernel/drivers/pvpanic.c \
     kernel/drivers/pvscsi.c \
     kernel/drivers/vmbus.c kernel/drivers/storvsc.c kernel/drivers/netvsc.c \
@@ -137,7 +145,6 @@ USERSPACE_SRCS = \
     kernel/proc/proc.c kernel/proc/elf.c
 
 BOOT_SRC  = kernel/arch/x86_64/boot.asm
-CAP_LIB   = kernel/cap/target/x86_64-unknown-none/release/libcap.a
 
 ARCH_ASMS = \
     kernel/arch/x86_64/isr.asm \
@@ -159,6 +166,29 @@ DRIVER_OBJS    = $(patsubst kernel/%.c,$(BUILD)/%.o,$(DRIVER_SRCS))
 NET_OBJS       = $(patsubst kernel/%.c,$(BUILD)/%.o,$(NET_SRCS))
 USERSPACE_OBJS = $(patsubst kernel/%.c,$(BUILD)/%.o,$(USERSPACE_SRCS))
 
+# ── Optional unity / jumbo build (UNITY=1) ──────────────────────────────────
+# Compile each collision-free subsystem as ONE translation unit (a generated
+# build/<grp>_unity.c that #includes its sources) instead of one cc1+as per
+# file. Far fewer process spawns + headers parsed once → a faster clean build,
+# byte-for-byte the same code. DRIVERS are excluded: several define a private
+# `static _memcpy`/`_memset`, which redefine in a single TU. Off by default so
+# incremental dev rebuilds don't recompile a whole subsystem for one file.
+ifeq ($(UNITY),1)
+# Unity/jumbo build: compile each clean subsystem as ONE TU (build/<grp>_unity.c
+# that #includes its sources) — far fewer cc1+as spawns, the dominant self-build
+# cost. The generating RULES live after `all:` (below) so their targets can't
+# hijack the default goal; here we only redirect the *_OBJS the final link reads.
+# A group must have no duplicate file-scope statics / clashing macros across files.
+CORE_OBJS      = $(BUILD)/core_unity.o
+MM_OBJS        = $(BUILD)/mm_unity.o
+FS_OBJS        = $(BUILD)/fs_unity.o
+NET_OBJS       = $(BUILD)/net_unity.o
+SCHED_OBJS     = $(BUILD)/sched_unity.o
+TTY_OBJS       = $(BUILD)/tty_unity.o
+SIGNAL_OBJS    = $(BUILD)/signal_unity.o
+USERSPACE_OBJS = $(BUILD)/syscall_unity.o
+endif
+
 # ── No embedded userland (Linux model) ──────────────────────────────────────
 # The kernel embeds NO userland binaries. Init (/bin/vigil) and all other
 # programs load from the ext2 root filesystem (rootfs module on live media,
@@ -171,6 +201,28 @@ ALL_OBJS = $(BOOT_OBJ) $(ARCH_OBJS) $(ARCH_ASM_OBJS) $(CORE_OBJS) $(SIGNAL_OBJS)
 
 .PHONY: all iso test clean version sym dist arm64 arm64-iso test-arm64
 all: $(BUILD)/aegis.elf
+
+# ── Unity rule bodies (after all: so targets don't become the default goal) ──
+ifeq ($(UNITY),1)
+$(BUILD)/core_unity.c: $(CORE_SRCS)
+	@mkdir -p $(@D) && echo "/* GENERATED unity (UNITY=1) */" > $@ && for s in $(CORE_SRCS); do echo "#include \"$$s\"" >> $@; done
+$(BUILD)/mm_unity.c: $(MM_SRCS)
+	@mkdir -p $(@D) && echo "/* GENERATED unity (UNITY=1) */" > $@ && for s in $(MM_SRCS); do echo "#include \"$$s\"" >> $@; done
+$(BUILD)/fs_unity.c: $(FS_SRCS)
+	@mkdir -p $(@D) && echo "/* GENERATED unity (UNITY=1) */" > $@ && for s in $(FS_SRCS); do echo "#include \"$$s\"" >> $@; done
+$(BUILD)/net_unity.c: $(NET_SRCS)
+	@mkdir -p $(@D) && echo "/* GENERATED unity (UNITY=1) */" > $@ && for s in $(NET_SRCS); do echo "#include \"$$s\"" >> $@; done
+$(BUILD)/sched_unity.c: $(SCHED_SRCS)
+	@mkdir -p $(@D) && echo "/* GENERATED unity (UNITY=1) */" > $@ && for s in $(SCHED_SRCS); do echo "#include \"$$s\"" >> $@; done
+$(BUILD)/tty_unity.c: $(TTY_SRCS)
+	@mkdir -p $(@D) && echo "/* GENERATED unity (UNITY=1) */" > $@ && for s in $(TTY_SRCS); do echo "#include \"$$s\"" >> $@; done
+$(BUILD)/signal_unity.c: $(SIGNAL_SRCS)
+	@mkdir -p $(@D) && echo "/* GENERATED unity (UNITY=1) */" > $@ && for s in $(SIGNAL_SRCS); do echo "#include \"$$s\"" >> $@; done
+$(BUILD)/syscall_unity.c: $(USERSPACE_SRCS)
+	@mkdir -p $(@D) && echo "/* GENERATED unity (UNITY=1) */" > $@ && for s in $(USERSPACE_SRCS); do echo "#include \"$$s\"" >> $@; done
+$(BUILD)/%_unity.o: $(BUILD)/%_unity.c
+	$(CC) $(CFLAGS) -I. -c $< -o $@
+endif
 
 # ── ARM64 build (aarch64-linux-gnu toolchain; see Makefile.arm64) ───────────
 arm64:
@@ -205,28 +257,31 @@ $(BUILD)/arch/x86_64/%.o: kernel/arch/x86_64/%.asm
 	@mkdir -p $(dir $@)
 	$(AS) $(ASFLAGS) $< -o $@
 
-# ── Capability library (Rust) ──────────���─────────────────────────────────────
-$(CAP_LIB): kernel/cap/src/lib.rs kernel/cap/Cargo.toml
-	$(CARGO) build --release \
-	    --target x86_64-unknown-none \
-	    --manifest-path kernel/cap/Cargo.toml
-
 # ── User program builds ─��──────────────────────────────────���────────────────
 # ── Final link ────────────────────────────────────────────────────────────────
 # Two-pass link to embed the in-kernel symbol table. No userland blobs are
 # linked in — the kernel loads init from the root filesystem at boot.
 NM = x86_64-elf-nm
-$(BUILD)/aegis.elf: $(ALL_OBJS) $(CAP_LIB) tools/gen-ksyms.sh kernel/core/ksym.h
+$(BUILD)/aegis.elf: $(ALL_OBJS) tools/gen-ksyms.sh kernel/core/ksym.h
 	@# Pass 1: link with the weak (empty) ksym fallbacks to fix function addrs.
-	$(LD) $(LDFLAGS) -o $@.tmp $(ALL_OBJS) $(CAP_LIB)
+	@# Response file: a ~150-object link line is several KB — past some shells'
+	@# command-length limit (self-hosting on Aegis, where `make SHELL=/bin/stsh`
+	@# truncated it and dropped the trailing driver objects). `ld @file` keeps
+	@# the invocation short; make's $(file) writes the list with no shell line.
+	$(file >$(BUILD)/objs.rsp,$(ALL_OBJS))
+	$(LD) $(LDFLAGS) -o $@.tmp @$(BUILD)/objs.rsp
 	@# Generate + compile the in-kernel symbol table from pass 1.  .text precedes
 	@# .rodata in linker.ld, so embedding this const blob does not move any
 	@# function address — the pass-1 addresses stay valid in the relink.
-	NM=$(NM) sh tools/gen-ksyms.sh $@.tmp > $(BUILD)/ksyms.c
+	@# gen-ksyms is best-effort: on failure fall back to an empty table (ksym.c's
+	@# weak ksym_count=0 fallback → hex backtraces) so a self-host build still
+	@# produces a complete kernel. Its stderr is surfaced for a real fix.
+	NM=$(NM) $(SHELL) tools/gen-ksyms.sh $@.tmp > $(BUILD)/ksyms.c || echo "/* gen-ksyms unavailable — empty ksym table (weak fallback) */" > $(BUILD)/ksyms.c
 	$(CC) $(CFLAGS) -c $(BUILD)/ksyms.c -o $(BUILD)/ksyms.o
 	@# Pass 2: relink with the strong symbol table (overrides the weak arrays).
-	$(LD) $(LDFLAGS) -o $@ $(ALL_OBJS) $(CAP_LIB) $(BUILD)/ksyms.o
-	@rm -f $@.tmp
+	$(file >$(BUILD)/objs2.rsp,$(ALL_OBJS) $(BUILD)/ksyms.o)
+	$(LD) $(LDFLAGS) -o $@ @$(BUILD)/objs2.rsp
+	@rm -f $@.tmp || true
 KERNEL_STRIPPED = $(BUILD)/aegis-stripped.elf
 $(KERNEL_STRIPPED): $(BUILD)/aegis.elf
 	$(OBJCOPY) --strip-all $< $@
@@ -251,12 +306,17 @@ $(LIMINE_BIN): $(LIMINE_DIR)/limine.c $(LIMINE_DIR)/limine-bios-hdd.h
 	@mkdir -p $(BUILD)
 	$(HOSTCC) -std=c99 -O2 -I$(LIMINE_DIR) -o $@ $(LIMINE_DIR)/limine.c
 
+# Optional dev firmware blob: if the AX200 .ucode is staged in kernel/drivers,
+# ship it as boot module0 so the iwl_ax200 driver can load it on the smoke ISO.
+IWL_FW := $(wildcard kernel/drivers/iwlwifi-cc-a0-59.ucode)
+
 iso: $(BUILD)/aegis.iso
 $(BUILD)/aegis.iso: $(KERNEL_STRIPPED) $(LIMINE_BIN)
 	@rm -rf $(ISO_DIR)
 	@mkdir -p $(ISO_DIR)/boot/limine $(ISO_DIR)/EFI/BOOT
 	cp $(KERNEL_STRIPPED) $(ISO_DIR)/boot/aegis.elf
-	printf 'timeout: 0\n\n/Aegis kernel\n    protocol: limine\n    path: boot():/boot/aegis.elf\n    cmdline: boot=text\n' > $(ISO_DIR)/boot/limine/limine.conf
+	$(if $(IWL_FW),cp $(IWL_FW) $(ISO_DIR)/boot/iwlwifi.ucode,@true)
+	printf 'timeout: 0\n\n/Aegis kernel\n    protocol: limine\n    path: boot():/boot/aegis.elf\n$(if $(IWL_FW),    module_path: boot():/boot/iwlwifi.ucode\n,)    cmdline: boot=text\n' > $(ISO_DIR)/boot/limine/limine.conf
 	cp $(LIMINE_DIR)/limine-bios.sys $(LIMINE_DIR)/limine-bios-cd.bin $(LIMINE_DIR)/limine-uefi-cd.bin $(ISO_DIR)/boot/limine/
 	cp $(LIMINE_DIR)/BOOTX64.EFI $(LIMINE_DIR)/BOOTIA32.EFI $(ISO_DIR)/EFI/BOOT/
 	xorriso -as mkisofs -R -r -J \
@@ -349,4 +409,3 @@ version:
 
 clean:
 	rm -rf $(BUILD)
-	@$(CARGO) clean --manifest-path kernel/cap/Cargo.toml 2>/dev/null || true

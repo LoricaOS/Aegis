@@ -610,6 +610,22 @@ hda_audio_stop(void)
     waitq_wake_all(&s_space_wq);     /* free any writer blocked on the ring */
 }
 
+/* Milliseconds of audio actually played on the current stream (LPIB-derived,
+ * so it tracks what the user is *hearing* — the A/V master clock, not what's
+ * merely buffered). Resets to 0 at each new write session. 0 when idle or no
+ * HDA. Format is fixed 48 kHz / 16-bit / stereo = 4 bytes/frame → 192 bytes/ms
+ * (matches SD_FMT 0x0011 programmed in hda_start_stream). */
+uint64_t
+hda_play_position_ms(void)
+{
+    if (!s_ready) return 0;
+    irqflags_t f = spin_lock_irqsave(&s_lock);
+    hda_update_ppos();
+    uint64_t bytes = s_ppos;
+    spin_unlock_irqrestore(&s_lock, f);
+    return bytes / 192u;
+}
+
 /* Timer tick: advance the play position, wake a blocked writer (space freed),
  * and stop the DMA once it has played everything the producer wrote. */
 void

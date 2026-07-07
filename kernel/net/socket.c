@@ -297,7 +297,7 @@ int sock_open_fd(uint32_t sock_id, aegis_process_t *proc)
             proc->fd_table->fds[fd].priv   = (void *)(uintptr_t)sock_id;
             proc->fd_table->fds[fd].offset = 0;
             proc->fd_table->fds[fd].size   = 0;
-            proc->fd_table->fds[fd].flags  = 0;
+            proc->fd_table->fds[fd].flags  = VFS_O_RDWR;
             proc->fd_table->fds[fd].kflags = 0;
             return (int)fd;
         }

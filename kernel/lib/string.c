@@ -56,3 +56,38 @@ kmemcmp(const void *a, const void *b, size_t n)
     }
     return 0;
 }
+
+/*
+ * Standard C mem* symbols. GCC emits calls to these for struct assignments,
+ * array initializers, and the like even in a freestanding kernel. They used to
+ * be supplied by the Rust cap crate's bundled compiler_builtins (libcap.a); now
+ * that the cap core is plain C (kernel/cap/cap.c), the kernel must provide them.
+ * They delegate to the kmem* bodies above, which -O2 keeps as real loops rather
+ * than rewriting into a self-call. memmove carries the no-pattern attribute so
+ * its own byte loops are never turned back into a memmove/memcpy call.
+ */
+void *memcpy(void *dst, const void *src, size_t n) { return kmemcpy(dst, src, n); }
+void *memset(void *dst, int val, size_t n)         { return kmemset(dst, val, n); }
+int   memcmp(const void *a, const void *b, size_t n) { return kmemcmp(a, b, n); }
+
+/* strlen: gcc lowers __builtin_strlen(non-const) to a strlen call at -O0 (the
+ * -O2 host build inlines it, which is why this only surfaced self-hosting on
+ * Aegis at -O0). no-pattern attribute so the loop isn't rewritten into a
+ * strlen self-call. */
+__attribute__((optimize("no-tree-loop-distribute-patterns")))
+size_t strlen(const char *s) { const char *p = s; while (*p) p++; return (size_t)(p - s); }
+
+__attribute__((optimize("no-tree-loop-distribute-patterns")))
+void *
+memmove(void *dst, const void *src, size_t n)
+{
+    unsigned char *d = (unsigned char *)dst;
+    const unsigned char *s = (const unsigned char *)src;
+    if (d == s || n == 0)
+        return dst;
+    if (d < s)                          /* forward copy is safe when dst < src */
+        for (size_t i = 0; i < n; i++) d[i] = s[i];
+    else                                /* overlap with dst > src: copy backward */
+        for (size_t i = n; i > 0; i--)  d[i-1] = s[i-1];
+    return dst;
+}

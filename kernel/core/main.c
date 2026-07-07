@@ -51,6 +51,7 @@
 #include "rtl8139.h"
 #include "e1000.h"
 #include "vmxnet3.h"
+#include "iwl_ax200.h"
 #include "hda.h"
 #include "pvpanic.h"
 #include "fb.h"
@@ -110,10 +111,32 @@ kernel_main_limine(const aegis_bootinfo_t *bi)
     kernel_main(0, NULL);
 }
 
+/* Boot phase profiler: record raw TSC at each milestone; converted to ms and
+ * dumped once the TSC is calibrated (see the [BOOTPROF] table near the end). */
+#define BOOT_NPHASE 24
+static struct { const char *name; uint64_t tsc; } s_bph[BOOT_NPHASE];
+static int s_bph_n;
+static int g_bootprof;   /* `bootprof` cmdline → print the per-phase [BOOTPROF] table */
+static void
+bph(const char *name)
+{
+    if (s_bph_n < BOOT_NPHASE) {
+        s_bph[s_bph_n].name = name;
+        s_bph[s_bph_n].tsc  = arch_get_cycles();
+        s_bph_n++;
+    }
+}
+
 void
 kernel_main(uint32_t mb_magic, void *mb_info)
 {
     (void)mb_magic;
+
+    /* Boot stopwatch: raw TSC at kernel entry, converted to ms once the TSC is
+     * calibrated and reported just before init is spawned. A permanent baseline
+     * for boot-speed work — see the [BOOT] line below. */
+    uint64_t boot_tsc0 = arch_get_cycles();
+    bph("(entry)");
 
     arch_init();            /* serial_init + vga_init                        */
     arch_pat_init();        /* PAT MSR: PA1=WC for framebuffer mapping       */
@@ -193,6 +216,17 @@ kernel_main(uint32_t mb_magic, void *mb_info)
                 q++;
             }
         }
+        /* `bootprof` — print the per-phase boot timing table ([BOOTPROF] lines).
+         * Off by default (the one-line [BOOT] total is always printed). */
+        {
+            const char *q = cmdline;
+            while (*q) {
+                if (q[0]=='b'&&q[1]=='o'&&q[2]=='o'&&q[3]=='t'&&q[4]=='p'&&
+                    q[5]=='r'&&q[6]=='o'&&q[7]=='f')
+                    { g_bootprof = 1; break; }
+                q++;
+            }
+        }
         /* Demand-paged file-backed mmap is the DEFAULT (g_lazyfile=1): a
          * MAP_PRIVATE ext2 file mapping records inode+offset and populates per
          * page on fault instead of eager-copying the whole file at mmap time.
@@ -254,6 +288,7 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     pmm_init();             /* bitmap allocator — [PMM] OK                   */
     vmm_init();             /* page tables, higher-half map — [VMM] OK       */
     kva_init();             /* kernel virtual allocator — [KVA] OK           */
+    bph("mem");
     /* Swap the 4GB bootstrap bitmap for a full RAM-sized one now that KVA is
      * up (needs no identity map — it's higher-half). After this, all of RAM
      * is usable; before it, only the first 4GB. No-op on a <=4GB machine. */
@@ -264,6 +299,7 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     pmm_set_alloc_high_pref(1);
     arch_set_master_pml4(vmm_get_master_pml4()); /* store master PML4 for ISR/SYSCALL */
     fb_init();              /* linear framebuffer — [FB] OK or silent        */
+    bph("fb");
     if (!text_mode)
         fb_boot_splash();   /* draw logo immediately (graphical boot only)   */
     cap_init();             /* capability stub — [CAP] OK                    */
@@ -281,15 +317,19 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     arch_smep_init();       /* SMEP detect + enable — [SMEP] OK/WARN         */
     arch_sse_init();        /* enable SSE for user mode (CR0/CR4 bits)       */
     random_init();          /* ChaCha20 CSPRNG — [RNG] OK                    */
+    bph("cpu+io");
 
     /* Map boot modules into KVA as RAM blkdevs */
     {
         uint64_t mod_phys = 0,  mod_size = 0;
         uint64_t mod2_phys = 0, mod2_size = 0;
+        uint64_t mod3_phys = 0, mod3_size = 0;
         arch_get_module(&mod_phys, &mod_size);
         ramdisk_init(mod_phys, mod_size);    /* ramdisk0 = rootfs */
         arch_get_module2(&mod2_phys, &mod2_size);
         ramdisk_init2(mod2_phys, mod2_size); /* ramdisk1 = ESP image */
+        arch_get_module3(&mod3_phys, &mod3_size);
+        ramdisk_init_fw(mod3_phys, mod3_size); /* module2 = iwlwifi firmware blob */
 
         /* ramdisk_init/ramdisk_init2 COPY the module bytes into fresh KVA
          * pages (the originals may overlap future VMM page-table frames),
@@ -299,20 +339,24 @@ kernel_main(uint32_t mb_magic, void *mb_info)
          * pmm_init-time input only and are never consulted again, so the
          * stale array entries are harmless. Installed-system boots have
          * no modules; this block is silent there. */
-        if (mod_size > 0 || mod2_size > 0) {
+        if (mod_size > 0 || mod2_size > 0 || mod3_size > 0) {
             pmm_unreserve_region(mod_phys, mod_size);
             pmm_unreserve_region(mod2_phys, mod2_size);
+            pmm_unreserve_region(mod3_phys, mod3_size);
             printk("[PMM] OK: module pages reclaimed\n");
         }
     }
 
     vfs_init();             /* [VFS] OK + [INITRD] OK                        */
     console_init();         /* register stdout device (silent)               */
+    bph("fs-base");
     acpi_init();            /* parse MCFG+MADT — [ACPI] OK                   */
+    bph("acpi");
     fw_cfg_init();          /* QEMU/Proxmox fw_cfg host-injected config; silent */
     hyperv_init();          /* Hyper-V hypercall + SynIC foundation; silent off-HV */
     lapic_init();           /* Local APIC — [LAPIC] OK or silent skip        */
     ioapic_init();          /* I/O APIC — [IOAPIC] OK or silent skip         */
+    bph("apic");
     /* Flush i8042 output buffer after PIC→IOAPIC transition.
      * Stale scancodes from BIOS/GRUB can hold IRQ1 asserted on the
      * i8042, preventing new keyboard interrupts until the buffer is
@@ -326,7 +370,15 @@ kernel_main(uint32_t mb_magic, void *mb_info)
          (inb(0x64) & 0x01) && i8042_drain < 64;
          i8042_drain++)
         (void)inb(0x60);
+    /* Calibrate the LAPIC-timer period + TSC ONCE, on the BSP, before any AP is
+     * woken (smp_start_aps below). Each AP's lapic_timer_init then inherits this
+     * value instead of re-running the ~10ms PIT-channel-2 spin — which, because
+     * PIT ch2 is a single shared resource, serialized AP bring-up at ~10ms/core.
+     * This is a no-op-cost move for single-CPU boots and saves ~10ms×(ncpu-1). */
+    lapic_timer_calibrate();
+    bph("intr+calib");
     pcie_init();            /* enumerate PCIe devices — [PCIE] OK            */
+    bph("pcie");
     fb_check_amd();         /* warn if AMD GPU present but no UEFI fb tag    */
     virtio_gpu_init();      /* virtio-gpu 2D scanout — [GPU] OK or silent    */
     virtio_rng_init();      /* virtio-rng entropy — [RNG] mix or silent skip */
@@ -350,6 +402,7 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     hv_heartbeat_init();    /* Hyper-V heartbeat IC → guest reports healthy; silent if absent */
     hv_shutdown_init();     /* Hyper-V shutdown IC → host-initiated graceful stop; silent if absent */
     hv_kvp_init();          /* Hyper-V KVP/data-exchange IC → guest OS info to host; silent if absent */
+    bph("dev-probe");
     gpt_scan("nvme0");      /* GPT partitions — [GPT] OK or silent (no NVMe) */
     gpt_scan("sata0");      /* GPT on AHCI/SATA — silent if absent           */
     gpt_scan("vblk0");      /* GPT on virtio-blk — silent if absent          */
@@ -393,6 +446,7 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     ext2_anchors_reload();  /* register /etc/aegis/anchors install-anchors    */
     cap_anchor_audit();     /* WARN if a granting anchor isn't write-protected */
     poll_test();            /* VFS .poll self-test — [POLL] OK               */
+    bph("mount+cap");
     xhci_init();            /* xHCI USB host — [XHCI] OK or silent skip     */
     gpt_scan("usb0");       /* GPT on a USB mass-storage device — silent if absent */
     virtio_net_init();      /* virtio-net NIC — [NET] OK or silent skip      */
@@ -400,10 +454,13 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     rtl8139_init();         /* RTL8139 NIC — [NET] OK or silent skip        */
     e1000_init();           /* Intel e1000 NIC — [NET] OK or silent skip    */
     vmxnet3_init();         /* VMware vmxnet3 NIC — [NET] OK or silent skip  */
+    iwl_ax200_init();       /* Intel Wi-Fi 6 AX200 — Phase 1 bring-up or skip */
     hda_init();             /* Intel HD Audio — [HDA] OK or silent skip      */
     pvpanic_init();         /* pvpanic guest→host notify — [PVPANIC] or skip */
     net_init();             /* Phase 25: protocol stack init + ICMP self-test ping */
+    bph("usb+net");
     smp_start_aps();        /* wake APs via INIT-SIPI-SIPI — [SMP] OK       */
+    bph("smp");
     hwwatch_arm_local();    /* DIAG: arm BSP watchpoints (no-op unless hwwatch);
                              * all g_percpu[].self are set by smp_start_aps now */
     sched_init();           /* init run queue (no tasks yet)                 */
@@ -416,6 +473,21 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     if (g_ap_sched_enabled)
         for (uint32_t c = 1; c < g_cpu_count; c++)
             sched_spawn_idle_for(c, task_idle);
+    bph("sched");
+    /* Boot stopwatch readout + per-phase breakdown (µs per phase, ms total).
+     * kernel entry → here = all in-kernel init done, about to enter ring 3.
+     * Guard on a calibrated TSC (0 without invariant). */
+    if (arch_tsc_hz()) {
+        uint64_t mhz = arch_tsc_hz() / 1000000;
+        if (mhz) {
+            if (g_bootprof)
+                for (int i = 1; i < s_bph_n; i++)
+                    printk("[BOOTPROF] %s %lu us\n", s_bph[i].name,
+                           (s_bph[i].tsc - s_bph[i - 1].tsc) / mhz);
+            printk("[BOOT] kernel init: %lu ms\n",
+                   (arch_get_cycles() - boot_tsc0) / (mhz * 1000));
+        }
+    }
     proc_spawn_init();      /* spawn init user process in ring 3             */
     /* All TCBs and stacks are in kva range at this point —
      * safe to remove the identity map. */

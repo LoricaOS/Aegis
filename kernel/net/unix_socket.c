@@ -929,7 +929,7 @@ int unix_sock_open_fd(uint32_t sock_id, void *proc_ptr)
             proc->fd_table->fds[i].priv   = (void *)(uintptr_t)sock_id;
             proc->fd_table->fds[i].offset = 0;
             proc->fd_table->fds[i].size   = 0;
-            proc->fd_table->fds[i].flags  = 0;
+            proc->fd_table->fds[i].flags  = VFS_O_RDWR;
             return i;
         }
     }

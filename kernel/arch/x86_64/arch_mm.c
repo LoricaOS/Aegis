@@ -84,6 +84,8 @@ static uint64_t s_module_phys = 0;   /* physical start of first multiboot2 modul
 static uint64_t s_module_size = 0;   /* byte size of first module */
 static uint64_t s_module2_phys = 0;  /* physical start of second module (ESP image) */
 static uint64_t s_module2_size = 0;  /* byte size of second module */
+static uint64_t s_module3_phys = 0;  /* physical start of third module (iwlwifi firmware) */
+static uint64_t s_module3_size = 0;  /* byte size of third module */
 static char s_cmdline[256];          /* kernel command line from GRUB */
 
 /* Two static entries: first 1MB + multiboot2 info region.
@@ -91,11 +93,12 @@ static char s_cmdline[256];          /* kernel command line from GRUB */
  * GRUB may place the multiboot2 info above 1MB (in allocatable RAM), so
  * we must reserve those pages before the PMM marks them free.
  * If mb_info is already below 1MB the slot [1] has len=0 and is a no-op. */
-static aegis_mem_region_t x86_reserved[4] = {
+static aegis_mem_region_t x86_reserved[5] = {
     { 0x0UL, 0x100000UL },  /* first 1MB: BIOS data, VGA hole, ISA ROMs */
     { 0x0UL, 0x0UL },       /* multiboot2 info — filled by arch_mm_init */
-    { 0x0UL, 0x0UL },       /* multiboot2 module 1 (rootfs) — filled by arch_mm_init */
-    { 0x0UL, 0x0UL },       /* multiboot2 module 2 (ESP) — filled by arch_mm_init */
+    { 0x0UL, 0x0UL },       /* module 0 (rootfs) — filled by arch_mm_init */
+    { 0x0UL, 0x0UL },       /* module 1 (ESP)    — filled by arch_mm_init */
+    { 0x0UL, 0x0UL },       /* module 2 (iwlwifi fw) — filled by arch_mm_init */
 };
 
 /* fb_ingest — validate + store a boot framebuffer (shared by the mb2 tag
@@ -189,6 +192,18 @@ void arch_mm_ingest(const aegis_bootinfo_t *bi)
         if (region_count < MAX_REGIONS) {
             regions[region_count].base = x86_reserved[3].base;
             regions[region_count].len  = x86_reserved[3].len;
+            region_count++;
+        }
+    }
+    s_module3_phys = bi->module[2].phys;
+    s_module3_size = bi->module[2].size;
+    if (s_module3_size) {
+        x86_reserved[4].base = s_module3_phys & ~0xFFFUL;
+        x86_reserved[4].len  = ((s_module3_phys + s_module3_size + 0xFFF) & ~0xFFFUL)
+                               - x86_reserved[4].base;
+        if (region_count < MAX_REGIONS) {
+            regions[region_count].base = x86_reserved[4].base;
+            regions[region_count].len  = x86_reserved[4].len;
             region_count++;
         }
     }
@@ -364,6 +379,16 @@ arch_get_module2(uint64_t *phys_out, uint64_t *size_out)
         return 0;
     *phys_out = s_module2_phys;
     *size_out = s_module2_size;
+    return 1;
+}
+
+int
+arch_get_module3(uint64_t *phys_out, uint64_t *size_out)
+{
+    if (s_module3_phys == 0 || s_module3_size == 0)
+        return 0;
+    *phys_out = s_module3_phys;
+    *size_out = s_module3_size;
     return 1;
 }
 

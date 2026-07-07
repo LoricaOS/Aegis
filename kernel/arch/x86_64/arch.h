@@ -138,6 +138,10 @@ int arch_get_module(uint64_t *phys_out, uint64_t *size_out);
  * module (ESP image for installer). Returns 1 if found, 0 if not present. */
 int arch_get_module2(uint64_t *phys_out, uint64_t *size_out);
 
+/* arch_get_module3 — physical address + size of the third module (iwlwifi
+ * firmware on the desktop/graphical ISOs). Returns 1 if found, 0 if not. */
+int arch_get_module3(uint64_t *phys_out, uint64_t *size_out);
+
 /* arch_get_cmdline — return kernel command line from multiboot2 tag.
  * Returns pointer to static buffer (empty string if no cmdline tag). */
 const char *arch_get_cmdline(void);
@@ -177,6 +181,13 @@ uint64_t arch_early_pv_off(void);
 
 /* Virtual base address of the kernel in the higher half. */
 #define ARCH_KERNEL_VIRT_BASE 0xFFFFFFFF80000000UL
+
+/* Physmap (direct map): all usable physical RAM is mapped 1:1 at this base by
+ * vmm_init, so any frame is reachable at (phys + ARCH_PHYSMAP_BASE) without a
+ * per-access page-table window. PML4[256], the canonical higher-half start;
+ * one PML4 entry spans 512GB. Distinct from the kernel image map (PML4[511])
+ * and the torn-down boot identity map (PML4[0]). */
+#define ARCH_PHYSMAP_BASE 0xFFFF800000000000UL
 
 /* -------------------------------------------------------------------------
  * Virtual memory interface (Phase 3+)
@@ -235,6 +246,11 @@ void arch_tsc_calibrate(uint64_t cycles_per_10ms);
 
 /* arch_tsc_hz — calibrated TSC frequency in cycles/sec (0 if uncalibrated). */
 uint64_t arch_tsc_hz(void);
+
+/* arch_clock_mono_ns — nanoseconds since boot, TSC-derived (ns resolution once
+ * calibrated; 10 ms tick granularity before). Monotonic clock + mkstemp
+ * temp-name entropy depend on this being fine-grained. */
+uint64_t arch_clock_mono_ns(void);
 
 /* arch_clock_gettime — returns {seconds, nanoseconds} since Unix epoch.
  * seconds = epoch_offset + ticks/100, nanoseconds = (ticks%100)*10000000.

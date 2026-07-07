@@ -829,6 +829,14 @@ pmm_total_pages(void)
 }
 
 uint64_t
+pmm_ram_max_page(void)
+{
+    /* Highest usable-RAM page + 1 (full physical extent, incl. >4GB), set at
+     * pmm_init from the memmap. Sizes the physmap direct map in vmm_init. */
+    return s_ram_max_pages;
+}
+
+uint64_t
 pmm_free_pages(void)
 {
     irqflags_t fl = spin_lock_irqsave(&pmm_lock);

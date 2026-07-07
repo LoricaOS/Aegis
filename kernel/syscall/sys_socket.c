@@ -1469,14 +1469,160 @@ sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms)
     }
 }
 
-/* ── sys_select — minimal stub ──────────────────────────────────────────── */
+/* ── select / pselect6 ──────────────────────────────────────────────────── */
+/* Implemented over the same fd → ops->poll + waitq machinery as sys_poll (the
+ * jobserver in `make -j` waits on its token pipe via pselect). fd_set is a
+ * 1024-bit bitmap; we gather the SET fds into a bounded pollfd array (≤64, the
+ * same cap sys_poll uses) and run one block/wake loop. Security: every user
+ * pointer is bounds-checked (fail closed with EFAULT), nfds is clamped to
+ * [0, FD_SETSIZE], and >64 armed fds is rejected rather than overrunning the
+ * on-stack arrays. */
 
+#define K_FD_SETSIZE 1024
+#define K_FD_WORDS   (K_FD_SETSIZE / 64)
+typedef struct { uint64_t w[K_FD_WORDS]; } k_fd_set;
+
+static int  fdset_isset(const k_fd_set *s, int fd) { return (int)((s->w[fd >> 6] >> (fd & 63)) & 1); }
+static void fdset_set(k_fd_set *s, int fd)          { s->w[fd >> 6] |= (1ULL << (fd & 63)); }
+static void fdset_zero(k_fd_set *s)                 { for (int i = 0; i < K_FD_WORDS; i++) s->w[i] = 0; }
+
+/* Block/wake loop over a KERNEL-resident pollfd array (no user memory touched
+ * in the loop, so no per-iteration re-validation as in sys_poll). Returns the
+ * ready count (>=0) or -EINTR. */
+static int64_t
+do_poll_k(k_pollfd_t *pf, uint64_t nfds, uint64_t timeout_ms)
+{
+    aegis_process_t *proc = current_proc();
+    uint64_t now0 = arch_get_ticks();
+    uint64_t deadline = (timeout_ms == (uint64_t)-1) ? 0
+                       : (timeout_ms == 0)           ? now0
+                                                     : now0 + (timeout_ms / 10);
+    waitq_entry_t fd_entries[64];
+    waitq_t      *fd_queues[64];
+    waitq_entry_t timer_entry;
+    timer_entry.task = sched_current(); timer_entry.next = (void *)0;
+    timer_entry.prev = (void *)0;       timer_entry.on_queue = 0;
+
+    for (;;) {
+        int ready = 0;
+        uint64_t i;
+        for (i = 0; i < nfds; i++) {
+            pf[i].revents = 0;
+            if (pf[i].fd >= 0 && (uint32_t)pf[i].fd < PROC_MAX_FDS &&
+                proc->fd_table->fds[pf[i].fd].ops) {
+                const vfs_ops_t *ops = proc->fd_table->fds[pf[i].fd].ops;
+                if (ops->poll)
+                    pf[i].revents = ops->poll(proc->fd_table->fds[pf[i].fd].priv)
+                                    & (pf[i].events | POLLERR | POLLHUP);
+                else
+                    pf[i].revents = pf[i].events & (POLLIN | POLLOUT);
+            } else {
+                pf[i].revents = POLLNVAL;
+            }
+            if (pf[i].revents) ready++;
+        }
+        if (ready > 0 || timeout_ms == 0) return ready;
+        if (deadline && arch_get_ticks() >= deadline) return 0;
+
+        for (i = 0; i < nfds; i++) {
+            fd_queues[i]           = fd_get_waitq(pf[i].fd);
+            fd_entries[i].task     = sched_current();
+            fd_entries[i].next     = (void *)0;
+            fd_entries[i].prev     = (void *)0;
+            fd_entries[i].on_queue = 0;
+            if (fd_queues[i]) waitq_add(fd_queues[i], &fd_entries[i]);
+        }
+        waitq_add(&g_timer_waitq, &timer_entry);
+        sched_block();
+        for (i = 0; i < nfds; i++)
+            if (fd_queues[i]) waitq_remove(fd_queues[i], &fd_entries[i]);
+        waitq_remove(&g_timer_waitq, &timer_entry);
+
+        if (signal_check_pending()) return -EINTR;
+    }
+}
+
+/* Shared core: fd_sets already resolved to a caller-provided timeout (ms). */
+static uint64_t
+do_select(uint64_t nfds, uint64_t rfds, uint64_t wfds, uint64_t efds,
+          uint64_t timeout_ms)
+{
+    if ((int64_t)nfds < 0 || nfds > K_FD_SETSIZE) return SYS_ERR(EINVAL);
+    uint64_t nbytes = (nfds + 7) / 8;
+
+    k_fd_set R, W, E;
+    fdset_zero(&R); fdset_zero(&W); fdset_zero(&E);
+    if (rfds) { if (!user_ptr_valid(rfds, nbytes)) return SYS_ERR(EFAULT);
+                copy_from_user(&R, (const void *)(uintptr_t)rfds, nbytes); }
+    if (wfds) { if (!user_ptr_valid(wfds, nbytes)) return SYS_ERR(EFAULT);
+                copy_from_user(&W, (const void *)(uintptr_t)wfds, nbytes); }
+    if (efds) { if (!user_ptr_valid(efds, nbytes)) return SYS_ERR(EFAULT);
+                copy_from_user(&E, (const void *)(uintptr_t)efds, nbytes); }
+
+    k_pollfd_t pf[64];
+    int m = 0;
+    for (int fd = 0; fd < (int)nfds; fd++) {
+        int wr = fdset_isset(&R, fd), ww = fdset_isset(&W, fd), we = fdset_isset(&E, fd);
+        if (!(wr || ww || we)) continue;
+        if (m >= 64) return SYS_ERR(EINVAL);
+        pf[m].fd = fd;
+        pf[m].events = (uint16_t)((wr ? POLLIN : 0) | (ww ? POLLOUT : 0));
+        pf[m].revents = 0;
+        m++;
+    }
+
+    int64_t rc = do_poll_k(pf, (uint64_t)m, timeout_ms);
+    if (rc < 0) return SYS_ERR((int)(-rc));
+
+    k_fd_set RO, WO, EO;
+    fdset_zero(&RO); fdset_zero(&WO); fdset_zero(&EO);
+    int count = 0;
+    for (int j = 0; j < m; j++) {
+        int fd = pf[j].fd; uint16_t re = pf[j].revents;
+        if ((re & (POLLIN | POLLHUP | POLLERR)) && fdset_isset(&R, fd)) { fdset_set(&RO, fd); count++; }
+        if ((re & (POLLOUT | POLLERR))         && fdset_isset(&W, fd)) { fdset_set(&WO, fd); count++; }
+        if ((re & (POLLERR | POLLHUP))         && fdset_isset(&E, fd)) { fdset_set(&EO, fd); count++; }
+    }
+    if (rfds) copy_to_user((void *)(uintptr_t)rfds, &RO, nbytes);
+    if (wfds) copy_to_user((void *)(uintptr_t)wfds, &WO, nbytes);
+    if (efds) copy_to_user((void *)(uintptr_t)efds, &EO, nbytes);
+    return (uint64_t)count;
+}
+
+/* select(2): timeout is `struct timeval { long tv_sec, tv_usec; }` (NULL = wait
+ * forever). The kernel does not update it to the remaining time (Linux does;
+ * musl copies it, callers rarely rely on the residual). */
 uint64_t
 sys_select(uint64_t nfds, uint64_t rfds, uint64_t wfds,
            uint64_t efds, uint64_t timeout)
 {
-    (void)nfds; (void)rfds; (void)wfds; (void)efds; (void)timeout;
-    return SYS_ERR(ENOSYS);  /* ENOSYS — select not implemented */
+    uint64_t timeout_ms = (uint64_t)-1;
+    if (timeout) {
+        struct { long tv_sec; long tv_usec; } tv;
+        if (!user_ptr_valid(timeout, sizeof(tv))) return SYS_ERR(EFAULT);
+        copy_from_user(&tv, (const void *)(uintptr_t)timeout, sizeof(tv));
+        if (tv.tv_sec < 0 || tv.tv_usec < 0) return SYS_ERR(EINVAL);
+        timeout_ms = (uint64_t)tv.tv_sec * 1000 + (uint64_t)tv.tv_usec / 1000;
+    }
+    return do_select(nfds, rfds, wfds, efds, timeout_ms);
+}
+
+/* pselect6(2): timeout is `struct timespec { long tv_sec, tv_nsec; }`; the 6th
+ * arg (sigmask) is ignored — same as sys_ppoll, v1 has no poll-with-sigmask. */
+uint64_t
+sys_pselect6(uint64_t nfds, uint64_t rfds, uint64_t wfds,
+             uint64_t efds, uint64_t ts_ptr, uint64_t sigmask)
+{
+    (void)sigmask;
+    uint64_t timeout_ms = (uint64_t)-1;
+    if (ts_ptr) {
+        struct { long tv_sec; long tv_nsec; } ts;
+        if (!user_ptr_valid(ts_ptr, sizeof(ts))) return SYS_ERR(EFAULT);
+        copy_from_user(&ts, (const void *)(uintptr_t)ts_ptr, sizeof(ts));
+        if (ts.tv_sec < 0 || ts.tv_nsec < 0) return SYS_ERR(EINVAL);
+        timeout_ms = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+    }
+    return do_select(nfds, rfds, wfds, efds, timeout_ms);
 }
 
 /* ── sys_epoll_create1 ──────────────────────────────────────────────────── */
@@ -1540,6 +1686,20 @@ typedef struct {
     uint32_t gateway;
 } netcfg_info_t;
 
+/* WiFi control surface — implemented in kernel/drivers/iwl_ax200.c. The struct
+ * mirrors wifi_net_pub_t there and in lumen-netman; keep the three in sync. */
+typedef struct {
+    char    ssid[33];
+    uint8_t channel;
+    uint8_t sec;         /* 0 = open, 1 = secured */
+    uint8_t connected;   /* 1 = currently associated */
+    uint8_t pad;
+} wifi_net_pub_t;
+extern int iwl_wifi_present(void);
+extern int iwl_wifi_list(wifi_net_pub_t *out, int max);
+extern int iwl_wifi_connect(const char *ssid);
+extern int iwl_wifi_rescan(void);
+
 uint64_t
 sys_netcfg(uint64_t op, uint64_t arg1, uint64_t arg2, uint64_t arg3)
 {
@@ -1589,6 +1749,52 @@ sys_netcfg(uint64_t op, uint64_t arg1, uint64_t arg2, uint64_t arg3)
         info.gateway = gw;
         copy_to_user((void *)(uintptr_t)arg1, &info, sizeof(info));
         return 0;
+    }
+    if (op == 2) {
+        /* op=2 (list WiFi networks): arg1 = user wifi_net_pub_t[], arg2 = max
+         * entries. Returns the count. A read of scan state -> NET_SOCKET. */
+        if (cap_check(proc->caps, CAP_TABLE_SIZE,
+                      CAP_KIND_NET_SOCKET, CAP_RIGHTS_READ) != 0)
+            return SYS_ERR(ENOCAP);
+        if (!iwl_wifi_present()) return SYS_ERR(ENODEV);
+        int max = (int)arg2;
+        if (max <= 0) return SYS_ERR(EINVAL);
+        if (max > 24) max = 24;                       /* WIFI_MAX_NETS */
+        if (!user_ptr_valid(arg1, (uint64_t)max * sizeof(wifi_net_pub_t)))
+            return SYS_ERR(EFAULT);
+        wifi_net_pub_t tmp[24];
+        __builtin_memset(tmp, 0, sizeof(tmp));
+        int n = iwl_wifi_list(tmp, max);
+        if (n > 0)
+            copy_to_user((void *)(uintptr_t)arg1, tmp, (uint64_t)n * sizeof(wifi_net_pub_t));
+        return (uint64_t)n;
+    }
+    if (op == 4) {
+        /* op=4 (rescan): re-run the WiFi scan (blocking a few seconds), returns
+         * the new count. Benign radio activity -> NET_SOCKET. */
+        if (cap_check(proc->caps, CAP_TABLE_SIZE,
+                      CAP_KIND_NET_SOCKET, CAP_RIGHTS_READ) != 0)
+            return SYS_ERR(ENOCAP);
+        if (!iwl_wifi_present()) return SYS_ERR(ENODEV);
+        int n = iwl_wifi_rescan();
+        return n < 0 ? SYS_ERR(EIO) : (uint64_t)n;
+    }
+    if (op == 3) {
+        /* op=3 (connect to SSID): arg1 = user SSID string. Active control that
+         * changes the host's network association -> NET_ADMIN (same class as
+         * op=0), intentionally not held by the plain netman GUI. */
+        if (cap_check(proc->caps, CAP_TABLE_SIZE,
+                      CAP_KIND_NET_ADMIN, CAP_RIGHTS_WRITE) != 0)
+            return SYS_ERR(ENOCAP);
+        if (!iwl_wifi_present()) return SYS_ERR(ENODEV);
+        if (!user_ptr_valid(arg1, 1)) return SYS_ERR(EFAULT);
+        char ssid[33];
+        __builtin_memset(ssid, 0, sizeof(ssid));
+        if (copy_from_user(ssid, (const void *)(uintptr_t)arg1, sizeof(ssid) - 1) != 0)
+            return SYS_ERR(EFAULT);
+        ssid[32] = 0;
+        int rc = iwl_wifi_connect(ssid);
+        return rc == 0 ? 0 : SYS_ERR(EIO);
     }
     return SYS_ERR(EINVAL);
 }

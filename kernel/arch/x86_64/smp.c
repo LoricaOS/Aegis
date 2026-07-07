@@ -126,17 +126,21 @@ smp_start_aps(void)
      * sched_start — after this function returns, so the shared PIT
      * channel 2 is never contended. */
 
-    /* 3. For each AP: allocate stack, fill percpu, send INIT-SIPI-SIPI */
+    /* 3. Bring up the APs.
+     *
+     * The mandatory ~10ms INIT settle delay is BATCHED: send INIT to every AP,
+     * wait ONCE, then SIPI + boot each AP serially. Previously the settle was
+     * paid per AP (loop body ran INIT→wait→SIPI→boot for one AP at a time), so
+     * bring-up cost ~settle × (ncpu-1). Each AP has its own trampoline stack
+     * slot (indexed by LAPIC id) and inherits the BSP's LAPIC/TSC calibration
+     * (no PIT-ch2 contention since that fix), so INIT can safely be broadcast;
+     * the actual SIPI→ap_entry boot still runs one AP at a time. */
+    char started[MAX_CPUS] = {0};
+    int any_started = 0;
     for (uint32_t i = 0; i < g_smp_cpu_count; i++) {
         uint8_t apic_id = g_smp_cpus[i].apic_id;
-
-        /* Skip BSP */
-        if (apic_id == g_bsp_apic_id)
-            continue;
-
-        /* Skip disabled CPUs from MADT */
-        if (!g_smp_cpus[i].enabled)
-            continue;
+        if (apic_id == g_bsp_apic_id)      continue;   /* skip BSP */
+        if (!g_smp_cpus[i].enabled)        continue;   /* skip MADT-disabled */
 
         /* Allocate per-AP kernel stack (4 pages = 16KB) */
         void *stack_base = kva_alloc_pages(AP_STACK_PAGES);
@@ -159,58 +163,43 @@ smp_start_aps(void)
         p->lapic_id     = apic_id;
         p->kernel_stack = stack_top;
 
-        /* Clear online flag before sending IPIs */
-        g_ap_online[i] = 0;
+        g_ap_online[i] = 0;             /* clear online flag before IPIs */
+        lapic_send_init(apic_id);       /* INIT — AP now waits for SIPI */
+        started[i] = 1;
+        any_started = 1;
+    }
 
-        /* Send INIT IPI */
-        lapic_send_init(apic_id);
+    /* Single INIT settle delay for ALL APs at once (~20M cycles ≥ 10ms at
+     * ≤2GHz). Skipped entirely on a single-core boot (no AP received INIT). */
+    if (any_started) {
+        uint64_t start = arch_get_cycles();
+        while (arch_get_cycles() - start < 20000000ULL)
+            arch_pause();
+    }
 
-        /* Wait ~20ms via RDTSC busy-loop.
-         * Assume ≥1 GHz TSC (true for all modern x86). 20ms ≈ 20M cycles. */
-        {
-            uint64_t start = arch_get_cycles();
-            while (arch_get_cycles() - start < 20000000ULL)
-                arch_pause();
-        }
+    /* SIPI + boot each started AP serially — the real-mode trampoline runs one
+     * AP at a time, so we wait for each to signal online before the next. */
+    for (uint32_t i = 0; i < g_smp_cpu_count; i++) {
+        if (!started[i])
+            continue;
+        uint8_t apic_id = g_smp_cpus[i].apic_id;
 
-        /* Send first SIPI — vector 0x08 = physical 0x8000 */
-        lapic_send_sipi(apic_id, 0x08);
+        lapic_send_sipi(apic_id, 0x08);            /* first SIPI (vector 0x08) */
+        { volatile uint32_t d = 100000; while (d--) ; }   /* ~200us */
+        lapic_send_sipi(apic_id, 0x08);            /* second SIPI */
 
-        /* Busy-wait ~200us */
-        {
-            volatile uint32_t d = 100000;
-            while (d--)
-                ;
-        }
-
-        /* Send second SIPI */
-        lapic_send_sipi(apic_id, 0x08);
-
-        /* Poll for AP online.  The budget is in raw TSC cycles, but the TSC
-         * frequency varies wildly: a KVM host passes through ~3-5GHz, so the
-         * old 100M-cycle (~25ms at 3.5GHz) budget expired before the AP could
-         * finish lapic_init + per-CPU GDT/TSS + lapic_timer_init (the PIT-ch2
-         * calibration alone is ~10ms).  When the BSP gave up early it fired the
-         * next SIPI while the previous AP was still calibrating ch2, so the APs
-         * contended on the shared PIT and none ever signalled online.  Use 2G
-         * cycles (~0.4s at 5GHz, ~2s at 1GHz) — generous for a ~30-50ms AP
-         * bring-up, and the loop breaks the instant the AP signals, so this
-         * only costs wall-time on a genuine no-show. */
+        /* Poll for AP online. Budget is raw TSC cycles; the TSC freq varies
+         * (KVM passes ~3-5GHz), so use 2G cycles (~0.4s@5GHz .. 2s@1GHz) —
+         * generous for a ~30-50ms bring-up, and the loop breaks the instant the
+         * AP signals, so it only costs wall-time on a genuine no-show. */
         uint64_t poll_start = arch_get_cycles();
-        {
-            while (!g_ap_online[i] &&
-                   (arch_get_cycles() - poll_start) < 2000000000ULL)
-                arch_pause();
-        }
+        while (!g_ap_online[i] &&
+               (arch_get_cycles() - poll_start) < 2000000000ULL)
+            arch_pause();
         uint64_t waited = arch_get_cycles() - poll_start;
 
         if (g_ap_online[i]) {
             g_cpu_count++;
-            /* Checkpoint: how long the AP took to signal online (Mcycles).
-             * If this ever creeps toward the 2000 Mcycle budget, the timeout
-             * is about to start failing — which is exactly the regression
-             * that cost us days when the old 100 Mcycle budget silently
-             * expired before the AP finished lapic_timer_init. */
             printk("[SMP] AP %u (LAPIC %u) online after %lu Mcycles\n",
                    i, apic_id, waited / 1000000UL);
         } else {

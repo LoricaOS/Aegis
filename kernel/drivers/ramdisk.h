@@ -13,4 +13,13 @@ void ramdisk_init(uint64_t phys_base, uint64_t size);
  * Used for the second GRUB module (ESP image for installer). */
 void ramdisk_init2(uint64_t phys_base, uint64_t size);
 
+/* Hand back ramdisk0's raw KVA bytes (a boot module a driver wants to read
+ * directly, e.g. firmware). Returns 0 and fills out+size, or -1 if absent. */
+int ramdisk_get_blob(const uint8_t **out, uint64_t *size);
+
+/* ramdisk_init_fw — copy the third module (iwlwifi firmware) into KVA as a raw
+ * blob (not a blkdev). ramdisk_get_fw_blob hands it back (0 ok, -1 absent). */
+void ramdisk_init_fw(uint64_t phys_base, uint64_t size);
+int  ramdisk_get_fw_blob(const uint8_t **out, uint64_t *size);
+
 #endif /* AEGIS_RAMDISK_H */

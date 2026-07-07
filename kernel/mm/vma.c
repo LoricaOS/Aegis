@@ -14,8 +14,11 @@
  * browser frontend loads ~137 .so (~350 VMAs after per-segment splits), which
  * overflowed the table — mmap then rolled back and the dynamic linker SIGSEGV'd.
  * 8 pages ≈ 1360 entries. The shared refcount (vma_rc) lives in the tail of the
- * block; VMA_CAPACITY reserves room for it. Cost: 32 KB per address space. */
-#define VMA_TABLE_PAGES 8
+ * block; VMA_CAPACITY reserves room for it. 32 pages ≈ 5440 entries: a
+ * self-hosting `ld` linking the ~150 kernel objects (each mmap'd, plus mallocng
+ * arenas) blew past 1360 and failed mid-link with "Out of memory". Cost: 128 KB
+ * per address space (kva; only live user processes pay it). */
+#define VMA_TABLE_PAGES 32
 
 /* The shared table HEADER lives in the tail of the table page, AFTER the
  * entries. It holds BOTH the refcount AND the live entry count, so that all
@@ -116,6 +119,25 @@ vma_entry_t *vma_find(struct aegis_process *proc, uint64_t va) {
     }
     spin_unlock_irqrestore(lk, fl);
     return result;
+}
+
+/* vma_range_covered — 1 if [addr, addr+len) is fully spanned by VMAs. Walks VMA
+ * to VMA (jumping to each one's end), not page to page, so it's O(VMAs spanned)
+ * rather than a per-page windowed PTE walk. Matches vma_find's per-call locking
+ * (fine under the IF=0-during-syscall design). Caller range-checks overflow. */
+int vma_range_covered(struct aegis_process *proc, uint64_t addr, uint64_t len) {
+    if (len == 0) return 1;
+    if (!proc || !proc->vma_table) return 0;
+    uint64_t end = addr + len;
+    uint64_t va  = addr & ~0xFFFULL;
+    while (va < end) {
+        vma_entry_t *v = vma_find(proc, va);
+        if (!v) return 0;                 /* hole → not covered */
+        uint64_t vend = v->base + v->len;
+        if (vend <= va) return 0;         /* defensive: no forward progress */
+        va = vend;                        /* skip to the end of this VMA */
+    }
+    return 1;
 }
 
 void vma_init(struct aegis_process *proc) {

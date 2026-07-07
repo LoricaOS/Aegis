@@ -139,6 +139,7 @@ static int memfd_vfs_stat(void *priv, k_stat_t *st)
  * to wake, so get_waitq stays NULL and sys_poll falls through to
  * its permissive default. */
 const vfs_ops_t g_memfd_ops = {
+    .seekable = 1,
     .read    = memfd_vfs_read,
     .write   = memfd_vfs_write,
     .close   = memfd_vfs_close,
@@ -282,7 +283,7 @@ int memfd_open_fd(uint32_t id, void *proc_ptr)
             proc->fd_table->fds[i].priv   = (void *)(uintptr_t)id;
             proc->fd_table->fds[i].offset = 0;
             proc->fd_table->fds[i].size   = 0;
-            proc->fd_table->fds[i].flags  = 0;
+            proc->fd_table->fds[i].flags  = VFS_O_RDWR;
             return i;
         }
     }

@@ -22,7 +22,7 @@
 #define RAMFS_MAX_INODES     256
 #define RAMFS_MAX_DENTS      256
 #define RAMFS_MAX_NAMELEN    128
-#define RAMFS_PAGES_PER_FILE 64                 /* 64 * 4 KiB = 256 KiB max/file */
+#define RAMFS_PAGES_PER_FILE 256                /* 256 * 4 KiB = 1 MiB max/file  */
 #define RAMFS_MAX_SIZE       (RAMFS_PAGES_PER_FILE * 4096)
 
 struct ramfs;

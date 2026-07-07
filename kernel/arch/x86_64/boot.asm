@@ -95,13 +95,19 @@ gdt64:
     dq 0x0000000000000000
     ; Entry 1 (selector 0x08): 64-bit code segment
     ;   Limit: 0xFFFFF (ignored in 64-bit mode), Base: 0
-    ;   Access: P=1, DPL=0, S=1, Type=1010 (code/execute/read)
+    ;   Access: P=1, DPL=0, S=1, Type=1011 (code/execute/read, Accessed=1)
     ;   Flags: G=1, L=1 (64-bit), D=0
-    dq 0x00AF9A000000FFFF
+    ;   The Accessed bit (0x9A -> 0x9B) is pre-set so a segment-selector load
+    ;   never makes the CPU WRITE it back into the descriptor. gdt64 can land in
+    ;   a page the bootloader maps read-only (it shares the first image page with
+    ;   code/rodata); without A=1 the write faults -> #PF -> #DF -> triple fault,
+    ;   a latent layout-dependent boot crash (exposed when unrelated size changes
+    ;   shifted this page across a PT_LOAD read-only boundary).
+    dq 0x00AF9B000000FFFF
     ; Entry 2 (selector 0x10): 64-bit data segment
-    ;   Access: P=1, DPL=0, S=1, Type=0010 (data/read/write)
+    ;   Access: P=1, DPL=0, S=1, Type=0011 (data/read/write, Accessed=1)
     ;   Flags: G=1, L=0 (data segments ignore L bit)
-    dq 0x00AF92000000FFFF
+    dq 0x00AF93000000FFFF
 gdt64_end:
 
 ; LGDT descriptor for the 32-bit mb2 path: 2-byte limit + 4-byte base.

@@ -97,6 +97,21 @@ typedef struct {
      * NULL is the default — caller falls back to PIT-tick polling for
      * fds without a waitq. */
     struct waitq *(*get_waitq)(void *priv);
+    /* seek — reposition the driver's internal WRITE cursor to `offset`.
+     * ops->write takes no offset (unlike ops->read, which gets f->offset), so a
+     * driver that keeps its own sequential write position (ext2) needs lseek to
+     * update it — otherwise a seek-then-write (e.g. `as` patching an ELF header
+     * after writing sections) writes at the stale position and corrupts the
+     * file. sys_lseek calls this after updating f->offset. NULL = writes ignore
+     * lseek (streams; append-only ramfs). */
+    void (*seek)(void *priv, uint64_t offset);
+    /* seekable — 1 if this driver backs a byte-addressable regular file whose
+     * f->offset is meaningful (ext2/ramfs/memfd/initrd). 0 (default) for stream
+     * fds (pipes, console, kbd, char devices) where lseek must return ESPIPE.
+     * Only consulted for empty (size==0) files: a size-0 regular file is still
+     * seekable (e.g. `as` seeks around a freshly-created .o to lay out the ELF),
+     * whereas a size-0 stream is not. */
+    int seekable;
 } vfs_ops_t;
 
 /* Open file descriptor. Stored in fd_table_t.fds[].
@@ -123,6 +138,16 @@ _Static_assert(sizeof(vfs_file_t) == 40, "vfs_file_t must be 40 bytes");
  * fcntl(F_SETFL).  sys_read sets vfs_read_nonblock before calling a VFS
  * read op so that blocking drivers (PTY master, pipes) can return -EAGAIN
  * instead of sleeping.  Single-core: no locking needed. */
+/* Access-mode field of vfs_file_t.flags (POSIX low 2 bits). sys_read/pread
+ * reject O_WRONLY fds; sys_write/writev reject O_RDONLY fds — the fd's mode
+ * is enforced at the syscall boundary, not just capability-gated at open.
+ * Every fd-creation site must set an honest mode (sockets/ptys/memfds/console
+ * are O_RDWR; a pipe's read end is O_RDONLY, its write end O_WRONLY). */
+#define VFS_O_ACCMODE  0x3U
+#define VFS_O_RDONLY   0x0U
+#define VFS_O_WRONLY   0x1U
+#define VFS_O_RDWR     0x2U
+
 #define VFS_O_NONBLOCK 0x800U
 extern int vfs_read_nonblock;
 
@@ -136,6 +161,11 @@ void vfs_init(void);
 
 /* Linux O_CREAT flag value (used by vfs_open for ext2 file creation) */
 #define VFS_O_CREAT 0x40U
+
+/* Linux O_EXCL: with O_CREAT, open MUST fail EEXIST if the file exists —
+ * the atomic-create guarantee mkstemp/lockfiles depend on. Ignoring it let
+ * two concurrent gcc's open the SAME /tmp temp file (interleaved asm). */
+#define VFS_O_EXCL 0x80U
 
 /* VFS_O_CLOEXEC — Linux O_CLOEXEC flag value, as passed in open/pipe2 flags arg.
  * Must match VFS_FD_CLOEXEC so that `flags & VFS_O_CLOEXEC` maps to the fd bit. */

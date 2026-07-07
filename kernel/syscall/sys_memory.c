@@ -399,7 +399,7 @@ sys_mmap(uint64_t arg1, uint64_t arg2, uint64_t arg3,
                 oom = 1;
                 break;
             }
-            uint64_t sva, hit = 0;
+            uint64_t sva, hit = 0, skip_to = 0;
             for (sva = base; sva < base + len; sva += 4096UL) {
                 /* Occupied if a VMA reserves it OR a stray PTE is present.
                  * The VMA check is load-bearing for lazy anon mmap: a reserved-
@@ -407,15 +407,25 @@ sys_mmap(uint64_t arg1, uint64_t arg2, uint64_t arg3,
                  * scan alone is blind to it and would hand the range out twice,
                  * overlapping a live region (thread stack / lib BSS) and
                  * corrupting it. The phys check still catches stale-freelist /
-                 * incomplete-delist pages with no backing VMA. */
-                if (vma_find(proc, sva) ||
-                    vmm_phys_of_user_raw(proc->pml4_phys, sva) != 0) { hit = sva; break; }
+                 * incomplete-delist pages with no backing VMA.
+                 *
+                 * On a VMA hit, skip past the WHOLE VMA (skip_to = end), not one
+                 * page: bumping a page at a time and re-scanning the full len
+                 * range is O(occupied_pages * len) windowed page-table walks —
+                 * a real meltdown for a big mmap in a fragmented address space
+                 * (a self-hosting cc1 spun the kernel for minutes here). A stray
+                 * PTE with no VMA is rare, so skip just that page. */
+                vma_entry_t *v = vma_find(proc, sva);
+                if (v) { hit = sva; skip_to = v->base + v->len; break; }
+                if (vmm_phys_of_user_raw(proc->pml4_phys, sva) != 0) {
+                    hit = sva; skip_to = sva + 4096UL; break;
+                }
             }
             if (hit) {
-                /* Occupied. Stale freelist range → bump from the monotonic
-                 * mmap_base; bump collision → skip past the occupied page. */
+                /* Occupied. Stale freelist range → restart from the monotonic
+                 * mmap_base; bump collision → skip past the whole colliding VMA. */
                 if (from_free) { base = proc->mmap_base; from_free = 0; }
-                else           { base = hit + 4096UL; }
+                else           { base = skip_to; }
                 continue;
             }
             /* Clear run — try to atomically reserve it. vma_insert self-locks the

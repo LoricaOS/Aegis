@@ -32,6 +32,10 @@ void hda_audio_close(void);
 /* Stop playback immediately, discarding the buffered tail (Stop button). */
 void hda_audio_stop(void);
 
+/* Milliseconds actually played on the current /dev/audio stream (LPIB-derived
+ * = what's being heard, the A/V master clock). 0 when idle or no HDA. */
+uint64_t hda_play_position_ms(void);
+
 /* Timer-tick hook: stops a one-shot playback after a single pass. */
 void hda_poll(void);
 

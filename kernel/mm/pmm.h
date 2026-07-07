@@ -104,6 +104,9 @@ void pmm_acct_dump(const char *tag);
 /* pmm_total_pages — return total managed physical pages. */
 uint64_t pmm_total_pages(void);
 
+/* pmm_ram_max_page — highest usable-RAM page + 1 (full physical extent). */
+uint64_t pmm_ram_max_page(void);
+
 /* pmm_free_pages — return count of currently free physical pages.
  * Scans the bitmap; O(n) where n = PMM_MAX_PAGES/8. */
 uint64_t pmm_free_pages(void);

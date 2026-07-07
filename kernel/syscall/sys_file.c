@@ -622,6 +622,25 @@ sys_fcntl(uint64_t arg1, uint64_t arg2, uint64_t arg3)
         if (f->ops->dup) f->ops->dup(f->priv);
         return (uint64_t)new_fd;
     }
+    /* Advisory record locking. Aegis has no multi-process file locking, but
+     * SQLite (Ladybird's cookie/storage store) locks its DB with fcntl and
+     * reports "disk I/O error" if the call returns EINVAL. Grant locks as
+     * no-ops and report GETLK as unlocked — correct for the only pattern here,
+     * a single writer owning its own database.
+     * ponytail: no-op locks; add real record locking only if concurrent
+     * writers ever contend on one file. */
+    case 6:   /* F_SETLK  — pretend the lock was acquired */
+    case 7:   /* F_SETLKW */
+        return 0;
+    case 5: { /* F_GETLK  — report no conflicting lock (l_type = F_UNLCK) */
+        short unlck = 2; /* F_UNLCK */
+        if (arg3) {
+            if (!user_ptr_valid(arg3, sizeof(unlck)))
+                return SYS_ERR(EFAULT);
+            copy_to_user((void *)(uintptr_t)arg3, &unlck, sizeof(unlck));
+        }
+        return 0;
+    }
     default:
         return SYS_ERR(EINVAL);
     }
@@ -644,8 +663,12 @@ sys_lseek(uint64_t arg1, uint64_t arg2, uint64_t arg3)
         return SYS_ERR(EBADF);
     vfs_file_t *f = &proc->fd_table->fds[arg1];
 
-    /* Non-seekable fd (no size): return ESPIPE */
-    if (f->size == 0)
+    /* Stream fds (pipe/console/kbd/char devices) are non-seekable: ESPIPE.
+     * We only need to disambiguate at size==0 — a non-empty fd is already a
+     * real file. A size-0 fd is a stream UNLESS its driver marks itself
+     * seekable (a freshly-created regular file, e.g. an .o `as` is about to
+     * seek around while writing the ELF). */
+    if (f->size == 0 && !(f->ops && f->ops->seekable))
         return SYS_ERR(ESPIPE);   /* -ESPIPE */
 
     int64_t new_off;
@@ -675,6 +698,11 @@ sys_lseek(uint64_t arg1, uint64_t arg2, uint64_t arg3)
     if (new_off < 0)
         return SYS_ERR(EINVAL);
     f->offset = (uint64_t)new_off;
+    /* Sync the driver's internal write cursor: ops->write takes no offset, so a
+     * seek-then-write (e.g. `as` patching an ELF header) would otherwise write
+     * at the stale position and corrupt the file. */
+    if (f->ops->seek)
+        f->ops->seek(f->priv, (uint64_t)new_off);
     return (uint64_t)new_off;
 }
 
@@ -728,7 +756,7 @@ sys_pipe2(uint64_t arg1, uint64_t arg2)
     proc->fd_table->fds[wfd].priv   = p;
     proc->fd_table->fds[wfd].offset = 0;
     proc->fd_table->fds[wfd].size   = 0;
-    proc->fd_table->fds[wfd].flags  = 0;
+    proc->fd_table->fds[wfd].flags  = VFS_O_WRONLY;
 
     /* Propagate O_CLOEXEC to both pipe ends */
     if (pipe_flags & VFS_O_CLOEXEC) {
@@ -838,6 +866,37 @@ copy_path_from_user(char *kpath, uint64_t user_ptr, uint32_t bufsz)
     kpath[bufsz - 1] = '\0';
     /* Loop completed without finding null — path was truncated */
     return -ENAMETOOLONG;
+}
+
+/* copy_path_from_user + resolve a relative result against proc->cwd (as sys_open
+ * does). The dir-mutating syscalls (mkdir/rmdir/unlink/rename/link) historically
+ * passed the raw user path straight to ext2, which walks from the fs ROOT — so a
+ * RELATIVE path from a process with cwd != "/" (e.g. a parallel build's atomic
+ * temp+rename of build/foo.o with cwd=/aegis) failed "parent dir open". Absolute
+ * paths pass through unchanged. */
+int
+copy_path_resolved(char *kpath, uint64_t user_ptr, uint32_t bufsz)
+{
+    int r = copy_path_from_user(kpath, user_ptr, bufsz);
+    if (r != 0)
+        return r;
+    if (kpath[0] == '/' || kpath[0] == '\0')
+        return 0;                       /* absolute or empty — nothing to do */
+
+    aegis_process_t *proc = current_proc();
+    char tmp[256];
+    uint32_t cwdlen = 0;
+    while (proc->cwd[cwdlen]) cwdlen++;
+    uint32_t plen = 0;
+    while (kpath[plen]) plen++;
+    uint32_t sep = (cwdlen > 0 && proc->cwd[cwdlen - 1] == '/') ? 0u : 1u;
+    if (cwdlen + sep + plen >= sizeof(tmp) || cwdlen + sep + plen >= bufsz)
+        return -ENAMETOOLONG;
+    __builtin_memcpy(tmp, proc->cwd, cwdlen);
+    if (sep) tmp[cwdlen] = '/';
+    __builtin_memcpy(tmp + cwdlen + sep, kpath, plen + 1);
+    __builtin_memcpy(kpath, tmp, cwdlen + sep + plen + 1);
+    return 0;
 }
 
 /*

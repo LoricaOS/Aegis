@@ -67,20 +67,30 @@ typedef struct {
 
 /* execve_argbuf_t — argv+envp working storage allocated from kva.
  *
- * argv_bufs[64][256] alone is 16 KB — larger than a child process's
- * 4-page kernel stack.  Allocating from kva avoids the overflow.
- * Size: 64*256 + 65*8 + 64*8 + 32*256 + 33*8 + 32*8 = 25912 bytes → 7 kva pages.
- */
+ * FLAT string buffers (not [N][256]): a single argv string can be large — a
+ * shell run as a `make` recipe interpreter gets the WHOLE recipe as one arg
+ * (`stsh -c "<400-char gcc line>"`), and a link step passes ~150 object args.
+ * A [N][256] layout truncated the recipe at 255 bytes (dropping the trailing
+ * source file → "gcc: input from standard input") and capped argv at 64. The
+ * flat buffer bounds the TOTAL bytes instead, POSIX ARG_MAX style, so it serves
+ * both few-long-args and many-short-args. Overflow → copy fails (E2BIG-ish),
+ * never silent truncation. kva-allocated: too large for a 4-page kernel stack. */
+#define EXECVE_MAX_ARGV      1024
+#define EXECVE_MAX_ENV       256
+#define EXECVE_ARGV_STRBYTES (128 * 1024)
+#define EXECVE_ENV_STRBYTES  (64 * 1024)
 typedef struct {
-    char     argv_bufs[64][256];
-    char    *argv_ptrs[65];
-    uint64_t str_ptrs[64];
-    char     env_bufs[32][256];
-    char    *env_ptrs[33];
-    uint64_t env_str_ptrs[32];
+    char     argv_strs[EXECVE_ARGV_STRBYTES];
+    char    *argv_ptrs[EXECVE_MAX_ARGV + 1];
+    uint64_t str_ptrs[EXECVE_MAX_ARGV];
+    char     env_strs[EXECVE_ENV_STRBYTES];
+    char    *env_ptrs[EXECVE_MAX_ENV + 1];
+    uint64_t env_str_ptrs[EXECVE_MAX_ENV];
 } execve_argbuf_t;
 
-#define EXECVE_ARGBUF_PAGES 7   /* ceil(25912 / 4096) */
+/* ceil(sizeof(execve_argbuf_t) / 4096): 131072 + 8200 + 8192 + 65536 + 2056
+ * + 2048 = 217104 → 54 pages. */
+#define EXECVE_ARGBUF_PAGES 54
 
 /* Value single-sourced in limits.h (AEGIS_MAX_PROCESSES). */
 #define MAX_PROCESSES AEGIS_MAX_PROCESSES
@@ -91,6 +101,8 @@ void     proc_inc_fork_count(void);
 
 /* ── Path helpers (sys_file.c) ──────────────────────────────────────────── */
 int copy_path_from_user(char *kpath, uint64_t user_ptr, uint32_t bufsz);
+/* Like copy_path_from_user but resolves a relative result against proc->cwd. */
+int copy_path_resolved(char *kpath, uint64_t user_ptr, uint32_t bufsz);
 int stat_copy_path(uint64_t user_ptr, char *out, uint32_t bufsz);
 
 /* ── sys_io.c ───────────────────────────────────────────────────────────── */
@@ -111,8 +123,10 @@ uint64_t sys_mprotect(uint64_t a1, uint64_t a2, uint64_t a3);
 uint64_t sys_exit(uint64_t a1);
 uint64_t sys_exit_group(uint64_t a1);
 uint64_t sys_clone(syscall_frame_t *frame, uint64_t flags, uint64_t child_stack,
-                   uint64_t ptid, uint64_t ctid, uint64_t tls);
-uint64_t sys_fork(syscall_frame_t *frame);
+                   uint64_t ptid, uint64_t ctid, uint64_t tls,
+                   uint64_t u_rdi, uint64_t u_rsi, uint64_t u_rdx);
+uint64_t sys_fork(syscall_frame_t *frame, uint64_t u_rdi, uint64_t u_rsi, uint64_t u_rdx);
+uint64_t sys_vfork(syscall_frame_t *frame, uint64_t u_rdi, uint64_t u_rsi, uint64_t u_rdx);
 uint64_t sys_waitpid(uint64_t a1, uint64_t a2, uint64_t a3);
 
 /* ── sys_exec.c ────────────────────────────────────────────────────────── */
@@ -149,6 +163,7 @@ uint64_t sys_set_ntp(uint64_t enable);
 /* ── sys_io.c ──────────────────────────────────────────────────────────── */
 uint64_t sys_audio_volume(uint64_t pct);
 uint64_t sys_audio_stop(void);
+uint64_t sys_audio_position(void);
 
 /* ── sys_hostname.c ────────────────────────────────────────────────────── */
 uint64_t sys_sethostname(uint64_t name_uptr, uint64_t len);
@@ -234,6 +249,8 @@ uint64_t sys_ppoll(uint64_t fds, uint64_t nfds, uint64_t ts_ptr,
                    uint64_t sigmask, uint64_t sigsetsize);
 uint64_t sys_select(uint64_t nfds, uint64_t rfds, uint64_t wfds,
                     uint64_t efds, uint64_t timeout);
+uint64_t sys_pselect6(uint64_t nfds, uint64_t rfds, uint64_t wfds,
+                      uint64_t efds, uint64_t ts_ptr, uint64_t sigmask);
 uint64_t sys_epoll_create1(uint64_t flags);
 uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd, uint64_t event);
 uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events,

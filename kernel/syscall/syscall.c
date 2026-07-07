@@ -39,6 +39,7 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case  64: num = 1;   break;  /* write */
     case  66: num = 20;  break;  /* writev */
     case  73: num = 271; break;  /* ppoll (aarch64 has no poll; musl poll()→ppoll) */
+    case  72: num = 270; break;  /* pselect6 (aarch64 has no select; musl select()→pselect6) */
     case  36: num = 88; arg1 = arg2; arg2 = arg3; break;  /* symlinkat → symlink (skip dirfd) */
     case  78: num = 89; arg1 = arg2; arg2 = arg3; arg3 = arg4; break;  /* readlinkat → readlink (skip dirfd) */
     case  53: num = 90; arg1 = arg2; arg2 = arg3; break;  /* fchmodat → chmod (skip dirfd+flags) */
@@ -158,8 +159,15 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 130: return sys_rt_sigsuspend(arg1, arg2);
     case 20: return sys_writev(arg1, arg2, arg3);
     case 39: return sys_getpid();
-    case 56: return sys_clone(frame, arg1, arg2, arg3, arg4, arg5);
-    case 57: return sys_fork(frame);
+    case 56: return sys_clone(frame, arg1, arg2, arg3, arg4, arg5, arg1, arg2, arg3);
+    case 57: return sys_fork(frame, arg1, arg2, arg3);
+    /* vfork (58): implemented as fork. POSIX permits this — a conforming vfork
+     * child only execs or _exits, which a plain fork satisfies. musl's vfork()
+     * issues the raw syscall (it does NOT go through clone), so without this
+     * case fork-heavy tools that vfork+exec (gcc spawning cc1/as, shells) get
+     * ENOSYS. No shared-address-space semantics are provided; none are required
+     * by conforming callers. */
+    case 58: return sys_vfork(frame, arg1, arg2, arg3);  /* true vfork (CLONE_VM|VFORK) */
     case 59: return sys_execve(frame, arg1, arg2, arg3);
     case 60: return sys_exit(arg1);
     case 61: return sys_waitpid(arg1, arg2, arg3);
@@ -237,6 +245,7 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case   7: return sys_poll(arg1, arg2, arg3);
     case 271: return sys_ppoll(arg1, arg2, arg3, arg4, arg5);
     case  23: return sys_select(arg1, arg2, arg3, arg4, arg5);
+    case 270: return sys_pselect6(arg1, arg2, arg3, arg4, arg5, arg6);
     case 291: return sys_epoll_create1(arg1);
     case 233: return sys_epoll_ctl(arg1, arg2, arg3, arg4);
     case 232: return sys_epoll_wait(arg1, arg2, arg3, arg4);
@@ -245,6 +254,7 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 502: return sys_set_ntp(arg1);
     case 503: return sys_audio_volume(arg1);
     case 504: return sys_audio_stop();
+    case 505: return sys_audio_position();
     case 318: return sys_getrandom(arg1, arg2, arg3);
     case 202: return sys_futex(arg1, arg2, arg3, arg4, arg5, arg6);
     case 510: return sys_blkdev_list(arg1, arg2);

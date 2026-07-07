@@ -9,6 +9,7 @@
 #include "sched.h"
 #include "proc.h"
 #include "vmm.h"
+#include "vma.h"
 
 int
 uaccess_range_mapped(uint64_t addr, uint64_t len)
@@ -20,6 +21,18 @@ uaccess_range_mapped(uint64_t addr, uint64_t len)
     if (!t || !t->is_user)
         return 1;
     aegis_process_t *p = (aegis_process_t *)t;
+    /* Fast path: fully covered by VMAs → valid. O(VMAs), not O(pages) windowed
+     * PTE walks. Lazy (not-yet-faulted) pages inside a covered VMA are populated
+     * on first access by the #PF handler — for ring-3 AND kernel-mode
+     * copy_*_user (idt.c). So we neither walk PTEs nor eagerly populate here;
+     * that eager walk spun the kernel for minutes validating a self-hosting
+     * cc1's large buffers. A genuinely unmapped pointer has no VMA → fall
+     * through. */
+    if (vma_range_covered(p, addr, len))
+        return 1;
+    /* Fallback for the rare VMA-less-but-live-PTE case (stale-freelist /
+     * incomplete-delist pages with a present PTE but no backing VMA): the
+     * original walk-then-populate path, semantics preserved. */
     if (vmm_user_range_mapped(p->pml4_phys, addr, len))
         return 1;
     /* Demand paging: the range may include not-yet-faulted lazy anon pages.

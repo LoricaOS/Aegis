@@ -17,6 +17,7 @@
 #define TIMER_HZ 100
 
 static uint64_t s_freq;             /* CNTFRQ_EL0 */
+static uint64_t s_ns_per_cnt_fp = 0;  /* (1e9 << 32) / cntfrq — ns/count Q32 */
 static uint64_t s_interval;
 static volatile uint64_t s_ticks;
 static volatile int s_shutdown;
@@ -39,6 +40,9 @@ timer_init(void)
     if (s_freq == 0)
         s_freq = 62500000;          /* QEMU default 62.5 MHz */
     s_interval = s_freq / TIMER_HZ;
+    /* ns/count in Q32 fixed point — u128 multiply (inline) instead of u128
+     * divide (__udivti3 libcall the freestanding kernel can't link). */
+    s_ns_per_cnt_fp = (1000000000ULL << 32) / s_freq;
 
     rearm();
     __asm__ volatile("msr cntv_ctl_el0, %0" : : "r"(1UL));  /* enable, unmasked */
@@ -107,16 +111,30 @@ arch_tsc_hz(void)
     return s_freq;
 }
 
+/* arch_clock_mono_ns — nanoseconds since counter start, from the generic
+ * timer's free-running CNTVCT (ns resolution; the tick counter is 10 ms-
+ * quantized, which made musl mkstemp temp names collide across processes —
+ * see the x86 pit.c twin). 128-bit intermediate avoids v*1e9 overflow. */
+uint64_t
+arch_clock_mono_ns(void)
+{
+    if (!s_freq || !s_ns_per_cnt_fp)
+        return s_ticks * (1000000000ULL / TIMER_HZ);
+    uint64_t v;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v));
+    return (uint64_t)(((__uint128_t)v * s_ns_per_cnt_fp) >> 32);
+}
+
 void
 arch_clock_gettime(uint64_t *sec, uint64_t *nsec)
 {
-    uint64_t t = s_ticks;
-    if (sec)  *sec  = s_epoch_sec + t / TIMER_HZ;
-    if (nsec) *nsec = (t % TIMER_HZ) * (1000000000ULL / TIMER_HZ);
+    uint64_t ns = arch_clock_mono_ns();
+    if (sec)  *sec  = s_epoch_sec + ns / 1000000000ULL;
+    if (nsec) *nsec = ns % 1000000000ULL;
 }
 
 void
 arch_clock_settime(uint64_t sec)
 {
-    s_epoch_sec = sec - s_ticks / TIMER_HZ;
+    s_epoch_sec = sec - arch_clock_mono_ns() / 1000000000ULL;
 }

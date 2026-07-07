@@ -37,9 +37,10 @@ tools/                fetch-limine.sh (pinned bootloader for the smoke-test ISO)
 
 ## Build
 
-x86_64-elf cross toolchain (gcc/ld/objcopy/nm) + `nasm` + Rust nightly with the
-`x86_64-unknown-none` target (the capability subsystem) + `xorriso` and Limine
-(`tools/fetch-limine.sh`) for the smoke-test ISO.
+x86_64-elf cross toolchain (gcc/ld/objcopy/nm) + `nasm` + `xorriso` and Limine
+(`tools/fetch-limine.sh`) for the smoke-test ISO. **No Rust/cargo** — the
+capability core is plain C (`kernel/cap/cap.c`); the kernel builds with a C
+toolchain alone (a prerequisite for LoricaOS self-hosting).
 
 ```
 make           # build/aegis.elf  (the shipped artifact)
@@ -53,8 +54,9 @@ a clean boot ends at the "no init found" panic. Real boots happen in LoricaOS.
 
 ## Conventions
 
-- Match the surrounding code: this is a C kernel with a small Rust capability
-  core. No new abstractions without a second caller; fail closed at the boundary.
+- Match the surrounding code: this is a pure C kernel (the capability core, once
+  Rust, is now `kernel/cap/cap.c`). No new abstractions without a second caller;
+  fail closed at the boundary.
 - Kernel references that are legitimately "Aegis" (the name `aegis.elf`, the
   `/etc/aegis/*` capability paths, "the Aegis kernel") stay — the OS on top is
   "LoricaOS"; do not rebrand kernel identifiers.
