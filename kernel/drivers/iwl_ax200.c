@@ -803,7 +803,10 @@ send_frame(const uint8_t *frame, uint16_t flen, uint32_t rate, const char *tag)
     tc[0] = (uint8_t)(flen & 0xff); tc[1] = (uint8_t)(flen >> 8);   /* len */
     /* offload_assist: MH_SIZE (mac hdr in 2-byte words) << 8. 24B mgmt hdr = 12. */
     tc[2] = 0x00; tc[3] = 0x0c;                       /* 12 << 8 = 0x0C00 */
-    wr_le32b(tc + 4, 0x3);                           /* flags CMD_RATE|ENCRYPT_DIS */
+    wr_le32b(tc + 4, 0x6);                           /* flags ENCRYPT_DIS|HIGH_PRI —
+                                                        matches iwlwifi's live auth TX
+                                                        (0x06, NOT CMD_RATE); rate=0 so
+                                                        the FW uses the TLC rate table */
     /* dram_info @8 = 0 (8 bytes) */
     wr_le32b(tc + 16, rate);                          /* rate_n_flags */
     mcopy(tc + 20, frame, flen);
@@ -859,7 +862,8 @@ alloc_tx_queue(void)
     cmd[0] = 0;                  /* sta_id */
     cmd[1] = 15;                 /* tid = IWL_MGMT_TID (mgmt frames) */
     cmd[2] = 1;                  /* flags = TX_QUEUE_CFG_ENABLE_QUEUE (le16) */
-    wr_le32b(cmd + 4, 5);        /* cb_size = ilog2(256) - 3 */
+    wr_le32b(cmd + 4, 1);        /* cb_size = ilog2(16)-3 = 1 — iwlwifi's mgmt queue is
+                                    size 16 (IWL_MGMT_QUEUE_SIZE); live trace showed cb_size=1 */
     wr_le32b(cmd + 8,  (uint32_t)bp);          /* byte_cnt_addr (le64) */
     wr_le32b(cmd + 12, (uint32_t)(bp >> 32));
     wr_le32b(cmd + 16, (uint32_t)rp);          /* tfdq_addr (le64) */
@@ -908,7 +912,7 @@ do_connect(void)
     /* Step 1: PHY_CONTEXT_CMD (0x08, group 0) — configure the PHY for the AP's
      * channel. iwl_phy_context_cmd (32B): id_and_color, action, ci(8), lmac_id,
      * rxchain_info, dsp_cfg_flags, reserved. */
-    wr_le32b(c + 0, (0) | (1 << 8));            /* id_and_color: id=0, color=1 */
+    wr_le32b(c + 0, 0);                                     /* id_and_color: id=0, color=1 */
     wr_le32b(c + 4, FW_CTXT_ACTION_ADD);
     wr_le32b(c + 8, s_ap_channel);             /* ci.channel */
     c[12] = 1;                                 /* ci.band = PHY_BAND_24 */
@@ -925,7 +929,7 @@ do_connect(void)
         uint8_t rlc[32];
         for (int i = 0; i < 32; i++) rlc[i] = 0;
         /* phy_id @0 = 0 (the PHY context index, not id_and_color) */
-        wr_le32b(rlc + 4, 0x6);              /* rx_chain_info: valid chains A+B */
+        wr_le32b(rlc + 4, 0x1406);              /* rx_chain_info: valid chains A+B */
         if (send_check(0x508, rlc, 32, "RLC_CONFIG") != 0) return;
         printk("[AX200] RLC_CONFIG ok\n");
     }
@@ -934,7 +938,7 @@ do_connect(void)
      * associated. iwl_mac_ctx_cmd: common hdr + ac[5] EDCA + iwl_mac_data_sta. */
     uint8_t *m = dma_alloc(256, &phys); (void)phys;
     for (int i = 0; i < 256; i++) m[i] = 0;
-    wr_le32b(m + 0, 0x100);                    /* id_and_color: id=0 color=1 */
+    wr_le32b(m + 0, 0);                    /* id_and_color: id=0 color=1 */
     wr_le32b(m + 4, FW_CTXT_ACTION_ADD);
     wr_le32b(m + 8, 5);                        /* mac_type = FW_MAC_TYPE_BSS_STA */
     /* tsf_id @12 = 0 */
@@ -963,12 +967,12 @@ do_connect(void)
     /* Step 3: BINDING_CONTEXT_CMD (0x12b v2, 28B) — bind our MAC to the PHY.
      * iwl_binding_cmd: id_and_color, action, macs[3], phy, lmac_id. */
     for (int i = 0; i < 64; i++) c[i] = 0;
-    wr_le32b(c + 0, 0x100);                    /* binding id=0 color=1 */
+    wr_le32b(c + 0, 0);                    /* binding id=0 color=1 */
     wr_le32b(c + 4, FW_CTXT_ACTION_ADD);
-    wr_le32b(c + 8,  0x100);                   /* macs[0] = our MAC id_and_color */
+    wr_le32b(c + 8,  0);                   /* macs[0] = our MAC id_and_color */
     wr_le32b(c + 12, 0xffffffff);              /* macs[1] = invalid */
     wr_le32b(c + 16, 0xffffffff);              /* macs[2] = invalid */
-    wr_le32b(c + 20, 0x100);                   /* phy = PHY id_and_color */
+    wr_le32b(c + 20, 0);                   /* phy = PHY id_and_color */
     /* lmac_id @24 = 0 */
     if (send_check(0x12b, c, 28, "BINDING") != 0) return;
     printk("[AX200] BINDING ok — MAC bound to PHY\n");
@@ -979,7 +983,7 @@ do_connect(void)
     {
         uint8_t pm[40];
         for (int i = 0; i < 40; i++) pm[i] = 0;
-        wr_le32b(pm + 0, 0x100);             /* id_and_color (MAC 0) */
+        wr_le32b(pm + 0, 0);             /* id_and_color (MAC 0) */
         if (send_check(0x1a9, pm, 40, "MAC_PM") != 0) return;
         printk("[AX200] MAC_PM ok — power-save off\n");
     }
@@ -995,7 +999,7 @@ do_connect(void)
      * station_type. gen2 allocates TX queues separately (tfd_queue_msk=0). */
     for (int i = 0; i < 64; i++) c[i] = 0;
     c[0] = 0;                                  /* add_modify = STA_MODE_ADD */
-    wr_le32b(c + 4, 0x100);                    /* mac_id_n_color */
+    wr_le32b(c + 4, 0);                    /* mac_id_n_color */
     for (int i = 0; i < 6; i++) c[8 + i] = s_ap_bssid[i];   /* addr = AP */
     c[16] = 0;                                 /* sta_id = 0 */
     /* station_flags @20 = 0 (20MHz SISO); station_type @35 = IWL_STA_LINK(0) */
@@ -1024,7 +1028,7 @@ do_connect(void)
     {
         uint8_t sp[24];
         for (int i = 0; i < 24; i++) sp[i] = 0;
-        wr_le32b(sp + 0, 0x100);              /* id_and_color */
+        wr_le32b(sp + 0, 0);              /* id_and_color */
         wr_le32b(sp + 4, FW_CTXT_ACTION_ADD); /* action */
         wr_le32b(sp + 8, 0);                  /* conf_id = SESSION_PROTECT_CONF_ASSOC */
         wr_le32b(sp + 12, 1000);              /* duration_tu */
@@ -1060,7 +1064,7 @@ do_connect(void)
     f[28] = 0; f[29] = 0;                      /* status = 0 */
 
     s_rx_read = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
-    send_frame(f, 30, 0x420a, "auth-v1");       /* CCK 1M ANT_A, v1 format */
+    send_frame(f, 30, 0, "auth-v1");            /* rate_n_flags=0: FW picks from TLC table */
 
     uint16_t rb0 = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
     printk("[AX200] watch start rb_stts=%u qid=%d tx_wr=%u\n", rb0, s_tx_qid, s_tx_wr);
