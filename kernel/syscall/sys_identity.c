@@ -93,8 +93,13 @@ sys_hwmon(uint64_t ubuf)
     hw.cpu_temp_c     = t;
     hw.cpu_temp_max_c = (t >= 0) ? tjmax : -1;
 
-    /* Battery: no ACPI/EC path yet — reported absent until a platform driver
-     * (ACPI _BST via the embedded controller, or Smart Battery over SMBus) lands. */
+    int pct, charging, ac;
+    if (battery_read(&pct, &charging, &ac)) {
+        hw.battery_present  = 1;
+        hw.battery_percent  = (uint8_t)pct;
+        hw.battery_charging = (uint8_t)charging;
+        hw.ac_online        = (uint8_t)ac;
+    }
 
     if (!user_ptr_valid(ubuf, sizeof(hw)))
         return SYS_ERR(EFAULT);

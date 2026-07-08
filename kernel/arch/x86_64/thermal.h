@@ -7,4 +7,8 @@
  * SMN read; Intel DTS is a separate TODO. */
 int cpu_temp_read(int *tjmax_out);
 
+/* Battery state. Returns 1 and fills *percent (0-100), *charging (0/1), *ac
+ * (0/1) when a battery is readable; 0 when none is present/readable. */
+int battery_read(int *percent, int *charging, int *ac);
+
 #endif /* AEGIS_THERMAL_H */
