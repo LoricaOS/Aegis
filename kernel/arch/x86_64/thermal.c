@@ -14,6 +14,7 @@
 #include <stdint.h>
 #include "thermal.h"
 #include "pcie.h"
+#include "kva.h"
 
 #define DF_F3_BUS   0
 #define DF_F3_DEV   0x18
@@ -66,4 +67,53 @@ cpu_temp_read(int *tjmax_out)
     if (tjmax_out)
         *tjmax_out = 100;               /* AMD throttles ~95-100 °C; nominal ceiling */
     return milli / 1000;
+}
+
+/* Battery — ThinkPad (Ryzen 4750U) exposes battery data in a memory-mapped EC
+ * region (from its DSDT: OperationRegion ECOE, SystemMemory, 0xFE00DE00). 16-bit
+ * LE fields: SBAC(rate)@0x1A, SBRC(remaining)@0x1E, SBFC(full-charge)@0x22.
+ * percent = SBRC*100/SBFC; charging from SBAC's sign (>=0x8000 = discharging).
+ *
+ * Gated by AMD + a plausibility check, so on any other machine or a VM (where
+ * that physical address isn't battery data) it reads back as "no battery".
+ * ponytail: the address is this ThinkPad's; a machine-general path would need an
+ * AML interpreter to evaluate each system's own _BST — out of scope for now. */
+#define ECOE_PHYS   0xFE00DE00u
+#define ECOE_PAGE   (ECOE_PHYS & ~0xFFFu)
+#define ECOE_OFF    (ECOE_PHYS & 0xFFFu)
+
+static volatile uint8_t *s_ecoe;        /* cached mapping of the ECOE region */
+
+static uint16_t rd16(volatile uint8_t *p, int off) { return (uint16_t)(p[off] | (p[off + 1] << 8)); }
+
+int
+battery_read(int *percent, int *charging, int *ac)
+{
+    uint32_t a, b, c, d;
+    cpuid_leaf(0, &a, &b, &c, &d);
+    if (!(b == 0x68747541u && d == 0x69746E65u && c == 0x444D4163u))
+        return 0;                       /* not AuthenticAMD */
+
+    if (!s_ecoe) {
+        void *va = kva_map_mmio(ECOE_PAGE, 1);
+        if (!va) return 0;
+        s_ecoe = (volatile uint8_t *)va + ECOE_OFF;
+    }
+
+    uint16_t sbac = rd16(s_ecoe, 0x1A);
+    uint16_t sbrc = rd16(s_ecoe, 0x1E);
+    uint16_t sbfc = rd16(s_ecoe, 0x22);
+
+    /* Reject implausible reads (0 / 0xFFFF / remaining>full) — i.e. this isn't
+     * the ThinkPad's battery memory. */
+    if (sbfc < 100 || sbfc >= 0xFFF0 || sbrc == 0xFFFF || sbrc > sbfc + sbfc / 20)
+        return 0;
+
+    int pct = (int)((uint32_t)sbrc * 100 / sbfc);
+    if (pct > 100) pct = 100;
+    if (pct < 0) pct = 0;
+    *percent = pct;
+    *charging = (sbac != 0 && sbac < 0x8000);
+    *ac = *charging || pct >= 99;
+    return 1;
 }
