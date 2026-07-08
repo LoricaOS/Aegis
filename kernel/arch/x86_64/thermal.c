@@ -49,24 +49,29 @@ cpu_temp_read(int *tjmax_out)
     if (fam != 0x17 && fam != 0x19)
         return -1;
 
-    /* The Data Fabric function 3 must be a real AMD device (absent in a VM). */
-    if ((pcie_read32(DF_F3_BUS, DF_F3_DEV, DF_F3_FN, 0x00) & 0xffff) != 0x1022u)
-        return -1;
-
-    /* SMN indirect read of the reported-temperature control register.
+    /* SMN temperature is read through the AMD ROOT COMPLEX (00:00.0), not the
+     * Data Fabric — k10temp writes the SMN address to the root's index register
+     * (0x60) and reads the value back from its data register (0x64). (Reading it
+     * on the DF at 18.3 returned 0 → the widget showed "0C".)
      * ponytail: single reader (the once/sec hwmon poll); add a lock if another
      * SMN consumer ever appears — the 0x60/0x64 index/data pair is stateful. */
-    pcie_write32(DF_F3_BUS, DF_F3_DEV, DF_F3_FN, SMN_INDEX, ZEN_REPORTED_TEMP_CTRL);
-    uint32_t rv = pcie_read32(DF_F3_BUS, DF_F3_DEV, DF_F3_FN, SMN_DATA);
-    if (rv == 0xffffffffu)
+    if ((pcie_read32(0, 0, 0, 0x00) & 0xffff) != 0x1022u)
+        return -1;                      /* root complex absent / not AMD (e.g. a VM) */
+
+    pcie_write32(0, 0, 0, SMN_INDEX, ZEN_REPORTED_TEMP_CTRL);
+    uint32_t rv = pcie_read32(0, 0, 0, SMN_DATA);
+    if (rv == 0xffffffffu || rv == 0)
         return -1;
 
     int milli = (int)((rv >> 21) * 125);        /* 0.125 °C per LSB */
     if (rv & ZEN_TEMP_RANGE_SEL)
         milli -= 49000;
+    int t = milli / 1000;
+    if (t <= 0 || t > 125)              /* implausible → report unavailable, not 0 */
+        return -1;
     if (tjmax_out)
         *tjmax_out = 100;               /* AMD throttles ~95-100 °C; nominal ceiling */
-    return milli / 1000;
+    return t;
 }
 
 /* Battery — ThinkPad (Ryzen 4750U) exposes battery data in a memory-mapped EC
