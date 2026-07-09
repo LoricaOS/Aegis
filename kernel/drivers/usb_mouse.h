@@ -24,6 +24,8 @@ void usb_mouse_process_report(const uint8_t *data, uint32_t len);
 /* Non-blocking poll: copy one event into *out if available.
  * Returns 1 if an event was copied, 0 if ring buffer is empty. */
 int mouse_poll(mouse_event_t *out);
+/* 1 if the ring has an unconsumed event — for sys_poll/epoll POLLIN readiness. */
+int mouse_has_data(void);
 
 /* Blocking read: sleep until at least one event is available, then copy it.
  * Called from VFS read path in syscall context. */
