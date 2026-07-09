@@ -301,6 +301,55 @@ parse_madt(uint64_t hdr_phys)
     }
 }
 
+/* AMD IOMMU (AMD-Vi) — if the firmware left it enabled and TRANSLATING, every
+ * device DMA faults because Aegis has no IOMMU driver / device tables, so the
+ * AX200 firmware asserts HW_ERR and xHCI RX never completes. We have no use for
+ * DMA remapping, so disable translation (clear IommuEn) → all DMA is untranslated
+ * (identity), which is what every driver assumes. Inert on Intel / VMs (no IVRS).
+ *
+ * The IOMMU MMIO base is in each IVHD block of the IVRS table (offset +8); the
+ * MMIO Control Register is at base+0x18 and bit 0 is IommuEn. IVRS layout: a
+ * 48-byte header, then a chain of IVHD blocks {type[7:0], flags[15:8], len[31:16]}. */
+#define AMD_IOMMU_CTRL_OFF   0x18u
+#define AMD_IOMMU_CTRL_EN    0x1u          /* IommuEn (bit 0 of the control reg) */
+
+static void amd_iommu_disable(uint64_t ivrs_phys, uint32_t ivrs_len)
+{
+    uint64_t off = 48;                     /* skip the IVRS header */
+    int disabled = 0, seen = 0;
+
+    while (off + 24 <= (uint64_t)ivrs_len) {
+        uint32_t hdr  = phys_read32(ivrs_phys + off);
+        uint8_t  type = (uint8_t)(hdr & 0xFFu);
+        uint16_t len  = (uint16_t)(hdr >> 16);
+        if (len < 24)
+            break;                         /* malformed — stop walking */
+        /* IVHD types that carry an IOMMU MMIO base at +8. */
+        if (type == 0x10u || type == 0x11u || type == 0x40u) {
+            uint64_t base = (uint64_t)phys_read32(ivrs_phys + off + 8) |
+                            ((uint64_t)phys_read32(ivrs_phys + off + 12) << 32);
+            if (base >= 0x1000u && (base & 0xFFFu) == 0u) {
+                seen++;
+                volatile uint8_t *mmio =
+                    (volatile uint8_t *)kva_map_mmio(base, 1);
+                if (mmio) {
+                    volatile uint32_t *ctrl =
+                        (volatile uint32_t *)(mmio + AMD_IOMMU_CTRL_OFF);
+                    uint32_t v = *ctrl;
+                    if (v & AMD_IOMMU_CTRL_EN) {
+                        *ctrl = v & ~AMD_IOMMU_CTRL_EN;   /* clear IommuEn */
+                        disabled++;
+                    }
+                }
+            }
+        }
+        off += len;
+    }
+    if (seen)
+        printk("[IOMMU] AMD-Vi: %d/%d unit(s) disabled (DMA now untranslated)\n",
+               disabled, seen);
+}
+
 static void scan_table(uint64_t phys)
 {
     char sig[4];
@@ -328,6 +377,8 @@ static void scan_table(uint64_t phys)
     }
     else if (__builtin_memcmp(sig, "FACP", 4) == 0)
         parse_fadt(phys);
+    else if (__builtin_memcmp(sig, "IVRS", 4) == 0)
+        amd_iommu_disable(phys, length);
 }
 
 void acpi_init(void)
