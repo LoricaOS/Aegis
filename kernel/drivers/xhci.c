@@ -1324,7 +1324,7 @@ ax88179_reset(uint8_t slot)
  * PHYSR (0x11): speed in bits 0xC000 (gig/100/10), full-duplex in 0x2000.
  * Currently unused (speed is set statically in probe — MDIO/runtime link_reset
  * are dead on UA2); kept for non-UA2 adapters and future speed re-detect. */
-static void __attribute__((unused))
+static void
 ax88179_link_reset(uint8_t slot, uint16_t physr)
 {
     static const uint8_t bulkin_gig_ss[5] = {0x07, 0x4f, 0x00, 0x12, 0xff}; /* idx0 */
@@ -1666,18 +1666,28 @@ static void
 usb_eth_poll(netdev_t *dev)
 {
     (void)dev;
+    /* On first link-up (interrupt EP), re-run link_reset for the negotiated
+     * speed. The static probe-time MEDIUM write loses the gigabit bits
+     * (GIGAMODE|EN_125MHZ) because it lands before the PHY negotiates, leaving the
+     * MAC at 10/100 while the PHY is gigabit → no RX. MDIO is dead on this UA2
+     * chip, so force gigabit-FD (host confirms 1000, int EP confirms link). Safe:
+     * usb_eth_poll is the non-ISR poll path (control transfers OK here).
+     * ponytail: forced gigabit; parse intdata1 speed bits if a non-gig link matters. */
+    if (s_eth.present && s_eth.configured &&
+        s_eth.link_up_intr && !s_eth.link_reset_done)
+        ax88179_link_reset(s_eth.slot_id, 0xA000u);  /* 1000 Mb/s | full-duplex */
+
     /* ponytail: temporary bring-up heartbeat — dump the AX88179 data-path
      * counters to serial every ~256 polls so RX/TX/link progress is visible
      * without a userland shell. Remove once the data path is solid. */
     static uint32_t hb;
     if (s_eth.present && (++hb & 0xFF) == 0)
-        printk("[USBETH] rx=%u/%uB fr=%u txsub=%u txdone=%u int=%u armed=%u linkI=%u intd1=%x spd=%u\n",
-               (unsigned)s_eth.rx_count, (unsigned)s_eth.rx_bytes,
-               (unsigned)s_eth.rx_frames, (unsigned)s_eth.tx_count,
-               (unsigned)s_eth.tx_done,
-               (unsigned)s_eth.int_count, (unsigned)s_eth.int_armed,
+        printk("[USBETH] rx=%u txsub=%u txdone=%u int=%u linkI=%u intd1=%x | rxctl=%x med=%x burst=%u plink=%x\n",
+               (unsigned)s_eth.rx_count, (unsigned)s_eth.tx_count,
+               (unsigned)s_eth.tx_done, (unsigned)s_eth.int_count,
                (unsigned)s_eth.link_up_intr, (unsigned)s_eth.intdata1,
-               (unsigned)s_eth.det_speed);
+               (unsigned)s_eth.rxctl_rb, (unsigned)s_eth.medium_rb,
+               (unsigned)s_eth.bulk_in_burst, (unsigned)s_eth.plink_rb);
 }
 
 /* xhci_usbnet_diag — snapshot the AX88179 state for /proc/usbnet (read context). */
