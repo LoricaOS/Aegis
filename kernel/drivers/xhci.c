@@ -1071,7 +1071,8 @@ typedef struct {
     uint32_t  rx_frames;    /* Ethernet frames delivered to the stack */
     uint32_t  rx_bytes;
     uint32_t  last_rx_len;
-    uint32_t  tx_count;
+    uint32_t  tx_count;     /* bulk-OUT URBs submitted */
+    uint32_t  tx_done;      /* bulk-OUT URBs completed (event received) */
     uint8_t   registered;   /* netdev registered */
 
     netdev_t  nd;
@@ -1501,7 +1502,10 @@ xhci_eth_submit_rx(void)
 
     trb->param   = s_eth.rx_buf_phys;
     trb->status  = s_eth.rx_buf_len;
-    trb->control = (uint32_t)(XHCI_TRB_NORMAL << 10) | (1u << 5) | s_eth.in_cycle;
+    /* IOC (1<<5) + ISP (1<<2, Interrupt-on Short Packet). ISP is REQUIRED: the
+     * 4 KB buffer only fills on a full burst, but every ethernet frame is a short
+     * packet — without ISP a short RX stops with no event → zero completions. */
+    trb->control = (uint32_t)(XHCI_TRB_NORMAL << 10) | (1u << 5) | (1u << 2) | s_eth.in_cycle;
     s_eth.in_enq++;
     if (s_eth.in_enq >= XHCI_TRANSFER_RING_SIZE - 1u) {
         /* Link carries the current lap's cycle; flip producer cycle after. */
@@ -1526,7 +1530,9 @@ xhci_eth_submit_int(void)
 
     trb->param   = s_eth.int_buf_phys;
     trb->status  = s_eth.int_mps;
-    trb->control = (uint32_t)(XHCI_TRB_NORMAL << 10) | (1u << 5) | s_eth.int_cycle;
+    /* IOC + ISP: link reports are shorter than int_mps, so ISP is needed for the
+     * short-packet completion (same rule as the bulk-IN RX path above). */
+    trb->control = (uint32_t)(XHCI_TRB_NORMAL << 10) | (1u << 5) | (1u << 2) | s_eth.int_cycle;
     s_eth.int_enq++;
     if (s_eth.int_enq >= XHCI_TRANSFER_RING_SIZE - 1u) {
         /* Link carries the current lap's cycle; flip producer cycle after. */
@@ -1660,6 +1666,18 @@ static void
 usb_eth_poll(netdev_t *dev)
 {
     (void)dev;
+    /* ponytail: temporary bring-up heartbeat — dump the AX88179 data-path
+     * counters to serial every ~256 polls so RX/TX/link progress is visible
+     * without a userland shell. Remove once the data path is solid. */
+    static uint32_t hb;
+    if (s_eth.present && (++hb & 0xFF) == 0)
+        printk("[USBETH] rx=%u/%uB fr=%u txsub=%u txdone=%u int=%u armed=%u linkI=%u intd1=%x spd=%u\n",
+               (unsigned)s_eth.rx_count, (unsigned)s_eth.rx_bytes,
+               (unsigned)s_eth.rx_frames, (unsigned)s_eth.tx_count,
+               (unsigned)s_eth.tx_done,
+               (unsigned)s_eth.int_count, (unsigned)s_eth.int_armed,
+               (unsigned)s_eth.link_up_intr, (unsigned)s_eth.intdata1,
+               (unsigned)s_eth.det_speed);
 }
 
 /* xhci_usbnet_diag — snapshot the AX88179 state for /proc/usbnet (read context). */
@@ -2946,6 +2964,7 @@ xhci_poll(void)
                 xhci_eth_submit_rx();           /* re-arm RX */
             } else if (ep_id == s_eth.bulk_out_dci) {
                 s_eth.tx_inflight = 0;          /* TX slot free */
+                s_eth.tx_done++;
             } else if (s_eth.int_dci && ep_id == s_eth.int_dci) {
                 /* Link-status report (mainline ax88179_status): intdata1 bit 16
                  * = AX_INT_PPLS_LINK. On a 0→1 transition, force the MAC to a
