@@ -73,7 +73,9 @@ _Static_assert(CAP_KIND_MAX < CAP_TABLE_SIZE,
 
 /* Maximum caps per policy entry and max policy entries */
 #define CAP_POLICY_MAX_CAPS    16u
-#define CAP_POLICY_MAX_ENTRIES 32u
+#define CAP_POLICY_MAX_ENTRIES 64u   /* must exceed the caps.d file count (was 32; the
+                                      * desktop rootfs ships ~40 → the tail was silently
+                                      * dropped, so netman/editor/… lost their caps) */
 
 /* One capability in a policy entry */
 typedef struct {
