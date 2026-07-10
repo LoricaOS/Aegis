@@ -193,6 +193,8 @@ uint64_t sys_lseek(uint64_t a1, uint64_t a2, uint64_t a3);
 uint64_t sys_pipe2(uint64_t a1, uint64_t a2);
 uint64_t sys_dup(uint64_t a1);
 uint64_t sys_dup2(uint64_t a1, uint64_t a2);
+uint64_t sys_dup3(uint64_t oldfd, uint64_t newfd, uint64_t flags);
+uint64_t sys_getrusage(uint64_t who, uint64_t ubuf);
 uint64_t sys_sync(void);
 
 /* ── sys_time.c ────────────────────────────────────────────────────────── */

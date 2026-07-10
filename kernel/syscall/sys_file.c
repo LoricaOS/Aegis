@@ -840,6 +840,43 @@ sys_dup2(uint64_t arg1, uint64_t arg2)
     return arg2;
 }
 
+/* sys_dup3 — syscall 292 (x86_64) / 24 (arm64): like dup2 but rejects oldfd==newfd
+ * with EINVAL, and O_CLOEXEC (0x80000) in flags sets FD_CLOEXEC on newfd (dup2
+ * clears it). Was previously aliased to plain dup2, dropping the flag + on x86_64
+ * unwired entirely (ENOSYS). musl's fd machinery + posix_spawn rely on it. */
+uint64_t
+sys_dup3(uint64_t oldfd, uint64_t newfd, uint64_t flags)
+{
+    if (oldfd == newfd)
+        return SYS_ERR(EINVAL);
+    uint64_t r = sys_dup2(oldfd, newfd);
+    if (r != newfd)
+        return r;                       /* dup2 errored (SYS_ERR band) */
+    if (flags & 0x80000u) {             /* O_CLOEXEC */
+        aegis_process_t *proc = current_proc();
+        proc->fd_table->fds[newfd].flags |= VFS_FD_CLOEXEC;
+    }
+    return newfd;
+}
+
+/* sys_getrusage — syscall 98: resource usage. Aegis keeps no per-process rusage
+ * yet, so zero the struct and succeed — make/configure/shells call it and only
+ * need it not to fail. ponytail: fill ru_utime/ru_stime/ru_maxrss if a real
+ * consumer ever needs the numbers. struct rusage = 144 bytes on x86-64/arm64. */
+uint64_t
+sys_getrusage(uint64_t who, uint64_t ubuf)
+{
+    (void)who;
+    if (ubuf == 0)
+        return 0;
+    if (!user_ptr_valid(ubuf, 144))
+        return SYS_ERR(EFAULT);
+    char zero[144];
+    __builtin_memset(zero, 0, sizeof(zero));
+    copy_to_user((void *)(uintptr_t)ubuf, zero, sizeof(zero));
+    return 0;
+}
+
 /*
  * copy_path_from_user — copy a null-terminated path string from user space.
  *

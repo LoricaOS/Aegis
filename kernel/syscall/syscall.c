@@ -22,7 +22,8 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     /* File I/O */
     case  17: num = 79;  break;  /* getcwd */
     case  23: num = 33;  break;  /* dup */
-    case  24: num = 33;  break;  /* dup3 → dup (approx) */
+    case  24: num = 292; break;  /* dup3 */
+    case 165: num = 98;  break;  /* getrusage */
     case  25: num = 72;  break;  /* fcntl */
     case  29: num = 16;  break;  /* ioctl */
     case  35: num = 87; arg1 = arg2; break;  /* unlinkat → unlink (skip dirfd) */
@@ -141,6 +142,8 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 22: return sys_pipe2(arg1, 0); /* pipe(2) = pipe2(pipefd, 0) */
     case 32: return sys_dup(arg1);
     case 33: return sys_dup2(arg1, arg2);
+    case 292: return sys_dup3(arg1, arg2, arg3);
+    case 98: return sys_getrusage(arg1, arg2);
     case  9: return sys_mmap(arg1, arg2, arg3, arg4, arg5, arg6);
     case 11: return sys_munmap(arg1, arg2);
     /* madvise(28): advisory only — accept as a no-op success. Aegis has no
