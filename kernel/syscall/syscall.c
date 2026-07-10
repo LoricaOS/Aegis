@@ -43,6 +43,7 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case  73: num = 271; break;  /* ppoll (aarch64 has no poll; musl poll()→ppoll) */
     case  72: num = 270; break;  /* pselect6 (aarch64 has no select; musl select()→pselect6) */
     case  36: num = 88; arg1 = arg2; arg2 = arg3; break;  /* symlinkat → symlink (skip dirfd) */
+    case  37: num = 86; arg1 = arg2; arg2 = arg4; break;  /* linkat → link (skip dirfds) */
     case  78: num = 89; arg1 = arg2; arg2 = arg3; arg3 = arg4; break;  /* readlinkat → readlink (skip dirfd) */
     case  53: num = 90; arg1 = arg2; arg2 = arg3; break;  /* fchmodat → chmod (skip dirfd+flags) */
     case  54: num = 92; arg1 = arg2; arg2 = arg3; arg3 = arg4; break;  /* fchownat → chown (skip dirfd+flags) */
@@ -218,6 +219,7 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case  92: return sys_chown(arg1, arg2, arg3);
     case  93: return sys_fchown(arg1, arg2, arg3);
     case  94: return sys_lchown(arg1, arg2, arg3);
+    case  86: return sys_link(arg1, arg2);
     case 280: return sys_utimensat(arg1, arg2, arg3, arg4);
     case 257: return sys_openat(arg1, arg2, arg3, arg4);
     case 162: return sys_sync();

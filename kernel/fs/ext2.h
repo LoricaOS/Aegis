@@ -188,6 +188,9 @@ int ext2_chown(const char *path, uint16_t uid, uint16_t gid, int follow);
 #define EXT2_UTIME_KEEP 0xFFFFFFFFu
 int ext2_utimes(const char *path, uint32_t atime, uint32_t mtime, int follow);
 
+/* Hard link: newpath becomes another name for oldpath's inode. */
+int ext2_link(const char *oldpath, const char *newpath);
+
 /* Path walk with symlink following control.
  * follow_final: 1 = follow symlinks on final component, 0 = no-follow (lstat). */
 int ext2_open_ex(const char *path, uint32_t *inode_out, int follow_final);

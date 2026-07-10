@@ -218,6 +218,7 @@ uint64_t sys_fchmod(uint64_t arg1, uint64_t arg2);
 uint64_t sys_chown(uint64_t arg1, uint64_t arg2, uint64_t arg3);
 uint64_t sys_fchown(uint64_t arg1, uint64_t arg2, uint64_t arg3);
 uint64_t sys_utimensat(uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4);
+uint64_t sys_link(uint64_t arg1, uint64_t arg2);
 uint64_t sys_lchown(uint64_t arg1, uint64_t arg2, uint64_t arg3);
 
 /* ── sys_signal.c ───────────────────────────────────────────────────────── */

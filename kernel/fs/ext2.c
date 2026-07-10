@@ -1419,6 +1419,61 @@ int ext2_symlink(const char *linkpath, const char *target)
 }
 
 /* ------------------------------------------------------------------ */
+/* ext2_link — create a hard link (newpath → same inode as oldpath)    */
+/* Adds a dirent for the existing inode and bumps i_links_count. The    */
+/* unlink path already only frees the inode when links_count hits 0.    */
+/* ------------------------------------------------------------------ */
+
+int ext2_link(const char *oldpath, const char *newpath)
+{
+    if (!s_mounted)
+        return -1;
+    irqflags_t fl = ext2_lock_acquire();
+
+    uint32_t old_ino;
+    if (ext2_open_ex(oldpath, &old_ino, 1) != 0) {
+        ext2_lock_release(fl);
+        return -ENOENT;
+    }
+
+    ext2_inode_t inode;
+    if (ext2_read_inode(old_ino, &inode) < 0) {
+        ext2_lock_release(fl);
+        return -EIO;
+    }
+    /* POSIX: hard links to directories are not permitted. */
+    if ((inode.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR) {
+        ext2_lock_release(fl);
+        return -EPERM;
+    }
+
+    uint32_t parent_ino;
+    const char *basename;
+    if (ext2_lookup_parent(newpath, &parent_ino, &basename) != 0) {
+        ext2_lock_release(fl);
+        return -ENOENT;
+    }
+    {
+        uint32_t existing;
+        if (ext2_open_ex(newpath, &existing, 0) == 0) {
+            ext2_lock_release(fl);
+            return -EEXIST;
+        }
+    }
+
+    uint8_t ft = ((inode.i_mode & EXT2_S_IFMT) == EXT2_S_IFLNK)
+                     ? EXT2_FT_SYMLINK : EXT2_FT_REG_FILE;
+    int r = ext2_dir_add_entry(parent_ino, old_ino, basename, ft);
+    if (r == 0) {
+        inode.i_links_count++;
+        inode.i_ctime = ext2_now();
+        ext2_write_inode(old_ino, &inode);
+    }
+    ext2_lock_release(fl);
+    return r;
+}
+
+/* ------------------------------------------------------------------ */
 /* ext2_readlink — read symlink target by path (no-follow final)       */
 /* ------------------------------------------------------------------ */
 

@@ -91,6 +91,40 @@ sys_symlink(uint64_t arg1, uint64_t arg2)
 }
 
 /*
+ * sys_link — syscall 86 (hard link)
+ * arg1 = user pointer to oldpath, arg2 = user pointer to newpath.
+ * Both resolved against cwd. newpath must not exist; oldpath's inode gains
+ * a second name and its link count is bumped.
+ */
+uint64_t
+sys_link(uint64_t arg1, uint64_t arg2)
+{
+    aegis_process_t *proc = current_proc();
+    if (cap_check(proc->caps, CAP_TABLE_SIZE,
+                  CAP_KIND_VFS_WRITE, CAP_RIGHTS_WRITE) != 0)
+        return SYS_ERR(ENOCAP);
+
+    char oldp[256], newp[256], rold[256], rnew[256];
+    if (copy_path_from_user(oldp, arg1, sizeof(oldp)) != 0)
+        return SYS_ERR(EFAULT);
+    if (copy_path_from_user(newp, arg2, sizeof(newp)) != 0)
+        return SYS_ERR(EFAULT);
+    if (resolve_path(oldp, proc->cwd, rold, sizeof(rold)) != 0 ||
+        resolve_path(newp, proc->cwd, rnew, sizeof(rnew)) != 0)
+        return SYS_ERR(ENAMETOOLONG);
+
+    /* Linking a system binary/policy file into a new name (or creating the new
+     * name under a protected tree) requires CAP_KIND_INSTALL. */
+    if ((cap_path_is_protected(rold) || cap_path_is_protected(rnew)) &&
+        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
+                  CAP_RIGHTS_READ) != 0)
+        return SYS_ERR(EPERM);
+
+    int r = ext2_link(rold, rnew);
+    return (r < 0) ? (uint64_t)(int64_t)r : 0;
+}
+
+/*
  * sys_readlink — syscall 89
  * arg1 = user pointer to path string
  * arg2 = user pointer to output buffer
