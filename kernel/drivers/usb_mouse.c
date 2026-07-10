@@ -33,7 +33,7 @@ waitq_t g_mouse_waiters = WAITQ_INIT;
 
 /* mouse_has_data — lockless availability hint for wait_event's condition.
  * The authoritative consume happens via mouse_poll() after the wait. */
-static int
+int
 mouse_has_data(void)
 {
     return s_head != s_tail;

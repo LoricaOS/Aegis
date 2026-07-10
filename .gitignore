@@ -8,3 +8,7 @@ kernel/cap/target/
 /vendor/
 /tools/limine/*
 !/tools/limine/VERSION
+
+# Local working notes / throwaway scripts (not for the public repo)
+TODO.md
+regen_o1.sh

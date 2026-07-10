@@ -7,6 +7,9 @@
 #include "printk.h"
 #include "acpi.h"
 #include "nvme.h"
+#ifdef __x86_64__
+#include "thermal.h"
+#endif
 
 /* Build-time version from the Makefile (git describe); see sys_uname. */
 #ifndef AEGIS_VERSION
@@ -61,6 +64,55 @@ sys_set_tid_address(uint64_t arg1)
 uint64_t sys_set_robust_list(uint64_t a, uint64_t b)
 {
     (void)a; (void)b;
+    return 0;
+}
+
+/*
+ * sys_hwmon — syscall 506
+ *
+ * arg1 = user pointer to struct aegis_hwmon. Fills CPU die temperature and,
+ * when a platform battery driver exists, battery state. Read-only telemetry:
+ * no capability gate — querying temperature/charge confers no authority.
+ */
+struct aegis_hwmon {
+    int32_t  cpu_temp_c;        /* CPU die temp °C, -1 = unavailable        */
+    int32_t  cpu_temp_max_c;    /* nominal throttle ceiling °C, -1 = unknown */
+    uint8_t  battery_present;   /* 0 / 1                                     */
+    uint8_t  battery_percent;   /* 0 - 100                                   */
+    uint8_t  battery_charging;  /* 0 / 1                                     */
+    uint8_t  ac_online;         /* 0 / 1                                     */
+    uint8_t  reserved[4];
+};
+
+uint64_t
+sys_hwmon(uint64_t ubuf)
+{
+    struct aegis_hwmon hw;
+    __builtin_memset(&hw, 0, sizeof(hw));
+
+#ifdef __x86_64__
+    int tjmax = -1;
+    int t = cpu_temp_read(&tjmax);
+    hw.cpu_temp_c     = t;
+    hw.cpu_temp_max_c = (t >= 0) ? tjmax : -1;
+
+    int pct, charging, ac;
+    if (battery_read(&pct, &charging, &ac)) {
+        hw.battery_present  = 1;
+        hw.battery_percent  = (uint8_t)pct;
+        hw.battery_charging = (uint8_t)charging;
+        hw.ac_online        = (uint8_t)ac;
+    }
+#else
+    /* arm64: no AMD SMN thermal / battery path yet — report unavailable
+     * (cpu_temp_c = -1, not the memset 0, so the widget hides it). */
+    hw.cpu_temp_c     = -1;
+    hw.cpu_temp_max_c = -1;
+#endif
+
+    if (!user_ptr_valid(ubuf, sizeof(hw)))
+        return SYS_ERR(EFAULT);
+    copy_to_user((void *)(uintptr_t)ubuf, &hw, sizeof(hw));
     return 0;
 }
 
@@ -331,9 +383,11 @@ sys_reboot(uint64_t cmd)
                   CAP_KIND_POWER, CAP_RIGHTS_READ) != 0)
         return SYS_ERR(ENOCAP);
 
+#ifdef __x86_64__
     extern volatile uint32_t g_bc_kernel, g_bc_user, g_bc_full;
     printk("[TLBSTAT] broadcasts kernel=%u user=%u full=%u\n",
            (unsigned)g_bc_kernel, (unsigned)g_bc_user, (unsigned)g_bc_full);
+#endif
 
     if (cmd == 0) {
         /* Power off.  Flush fs + the drive's volatile write cache first —

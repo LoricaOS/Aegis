@@ -620,6 +620,16 @@ mouse_stat_fn(void *priv, k_stat_t *st)
     return 0;
 }
 
+/* Without this, /dev/mouse falls through the NULL-.poll "always ready" default,
+ * so a compositor's idle poll() (which includes the mouse fd) returns instantly
+ * every iteration and busy-loops a whole CPU core instead of sleeping. */
+static uint16_t
+mouse_poll_fn(void *priv)
+{
+    (void)priv;
+    return mouse_has_data() ? 0x0001u : 0u;   /* POLLIN only when the ring has data */
+}
+
 static const vfs_ops_t s_mouse_ops = {
     .read      = mouse_read_fn,
     .write     = (void *)0,
@@ -627,7 +637,7 @@ static const vfs_ops_t s_mouse_ops = {
     .readdir   = (void *)0,
     .dup       = (void *)0,
     .stat      = mouse_stat_fn,
-    .poll      = (void *)0,
+    .poll      = mouse_poll_fn,
     .get_waitq = mouse_get_waitq_fn,
 };
 

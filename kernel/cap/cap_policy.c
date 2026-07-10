@@ -237,8 +237,12 @@ cap_policy_load(void)
         idx++;
         if (dtype != 8)  /* DT_REG = 8, skip non-regular files */
             continue;
-        if (s_entry_count >= CAP_POLICY_MAX_ENTRIES)
+        if (s_entry_count >= CAP_POLICY_MAX_ENTRIES) {
+            printk("[CAP_POLICY] WARN: policy table full (%u) — remaining "
+                   "caps.d files IGNORED (apps will lose their caps)\n",
+                   (unsigned)CAP_POLICY_MAX_ENTRIES);
             break;
+        }
 
         /* Build full path */
         char path[256];
@@ -284,6 +288,7 @@ cap_policy_load(void)
     }
     if (dir.ops->close)
         dir.ops->close(dir.priv);
+    printk("[CAP_POLICY] loaded %u policy file(s)\n", (unsigned)s_entry_count);
 
     /* Load the dynamic trusted-path anchors from /etc/aegis/anchors (one absolute
      * dir per line). ext2.c reads the same file for write-protection inodes;
