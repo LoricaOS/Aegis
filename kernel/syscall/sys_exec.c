@@ -123,6 +123,19 @@ sys_execve(syscall_frame_t *frame,
         path[sizeof(path) - 1] = '\0';
     }
 
+    /* 1.5 Resolve a relative program path against the cwd (execve("./script")
+     * or execve("bin/tool")). Absolute paths and the initrd lookup are
+     * unaffected. Without this, `./configure`-style relative execs — and every
+     * shebang script run as ./foo — fail ENOENT before the shebang is read. */
+    if (path[0] != '/') {
+        char resolved[256];
+        if (resolve_path(path, proc->cwd, resolved, sizeof(resolved)) == 0) {
+            uint64_t i;
+            for (i = 0; i < sizeof(path) - 1 && resolved[i]; i++) path[i] = resolved[i];
+            path[i] = '\0';
+        }
+    }
+
     /* 2. Copy argv (<=64) + envp (<=32) from user — shared helper. */
     {
         int argc = copy_user_argv(argv_uptr, abuf->argv_strs, EXECVE_ARGV_STRBYTES, abuf->argv_ptrs, EXECVE_MAX_ARGV);
@@ -658,6 +671,16 @@ sys_spawn(uint64_t path_uptr, uint64_t argv_uptr,
             if (c == '\0') break;
         }
         path[sizeof(path) - 1] = '\0';
+    }
+
+    /* Resolve a relative spawn path against the cwd (parity with sys_execve). */
+    if (path[0] != '/') {
+        char resolved[256];
+        if (resolve_path(path, parent->cwd, resolved, sizeof(resolved)) == 0) {
+            uint64_t i;
+            for (i = 0; i < sizeof(path) - 1 && resolved[i]; i++) path[i] = resolved[i];
+            path[i] = '\0';
+        }
     }
 
     /* 2. Copy argv (<=64) + envp (<=32) from user — shared helper. */

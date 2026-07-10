@@ -9,7 +9,7 @@
 
 /* ── Helper: resolve relative path against cwd ──────────────────────── */
 
-static int
+int
 resolve_path(const char *kpath, const char *cwd, char *out, uint32_t outsz)
 {
     if (kpath[0] == '/') {

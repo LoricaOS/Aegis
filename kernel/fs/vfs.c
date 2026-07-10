@@ -365,13 +365,18 @@ vfs_stat_path(const char *path, k_stat_t *out)
             __builtin_memset(out, 0, sizeof(*out));
             out->st_dev     = 2;
             out->st_ino     = (uint64_t)ino;
-            out->st_nlink   = 1;
+            out->st_nlink   = inode.i_links_count ? inode.i_links_count : 1;
             out->st_mode    = mode;
             out->st_uid     = (uint32_t)inode.i_uid;
             out->st_gid     = (uint32_t)inode.i_gid;
             out->st_size    = (int64_t)sz;
             out->st_blksize = 4096;
             out->st_blocks  = (int64_t)(((uint64_t)sz + 511) / 512);
+            /* Real inode times (ext2 stores 32-bit unix seconds) so `ls -l`,
+             * make, and git see actual dates instead of the epoch. */
+            out->st_atime   = (int64_t)inode.i_atime;
+            out->st_mtime   = (int64_t)inode.i_mtime;
+            out->st_ctime   = (int64_t)inode.i_ctime;
             return 0;
         }
     }
@@ -425,6 +430,10 @@ vfs_stat_path_ex(const char *path, k_stat_t *out, int follow)
                 out->st_mode = (uint32_t)inode.i_mode;
                 out->st_uid  = (uint32_t)inode.i_uid;
                 out->st_gid  = (uint32_t)inode.i_gid;
+                out->st_nlink = inode.i_links_count ? inode.i_links_count : 1;
+                out->st_atime = (int64_t)inode.i_atime;
+                out->st_mtime = (int64_t)inode.i_mtime;
+                out->st_ctime = (int64_t)inode.i_ctime;
             } else {
                 out->st_mode = S_IFREG | 0644;
             }

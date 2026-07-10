@@ -158,13 +158,16 @@ ext2_vfs_stat_fn(void *priv, k_stat_t *st)
     __builtin_memset(st, 0, sizeof(*st));
     st->st_dev     = 2;           /* device 2 = nvme0 */
     st->st_ino     = (uint64_t)p->ino;
-    st->st_nlink   = 1;
+    st->st_nlink   = inode.i_links_count ? inode.i_links_count : 1;
     st->st_mode    = (uint32_t)inode.i_mode; /* preserves type + permissions from disk */
     st->st_uid     = (uint32_t)inode.i_uid;
     st->st_gid     = (uint32_t)inode.i_gid;
     st->st_size    = (int64_t)sz;
     st->st_blksize = 4096;
     st->st_blocks  = (int64_t)(((uint64_t)sz + 511) / 512);
+    st->st_atime   = (int64_t)inode.i_atime;
+    st->st_mtime   = (int64_t)inode.i_mtime;
+    st->st_ctime   = (int64_t)inode.i_ctime;
     return 0;
 }
 
