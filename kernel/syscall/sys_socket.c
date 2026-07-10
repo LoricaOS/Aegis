@@ -1750,6 +1750,7 @@ sys_netcfg(uint64_t op, uint64_t arg1, uint64_t arg2, uint64_t arg3)
         copy_to_user((void *)(uintptr_t)arg1, &info, sizeof(info));
         return 0;
     }
+#ifdef __x86_64__   /* WiFi ops need the AX200 driver (iwl_ax200.c), x86_64-only */
     if (op == 2) {
         /* op=2 (list WiFi networks): arg1 = user wifi_net_pub_t[], arg2 = max
          * entries. Returns the count. A read of scan state -> NET_SOCKET. */
@@ -1796,5 +1797,6 @@ sys_netcfg(uint64_t op, uint64_t arg1, uint64_t arg2, uint64_t arg3)
         int rc = iwl_wifi_connect(ssid);
         return rc == 0 ? 0 : SYS_ERR(EIO);
     }
+#endif /* __x86_64__ */
     return SYS_ERR(EINVAL);
 }
