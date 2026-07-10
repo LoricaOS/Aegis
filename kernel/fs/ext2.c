@@ -95,6 +95,18 @@ void ext2_lock_release(irqflags_t fl)
  * all shared block-cache access is serialized. */
 static int      ext2_read_inode_impl(uint32_t ino, ext2_inode_t *out);
 static int      ext2_write_inode_impl(uint32_t ino, const ext2_inode_t *inode);
+
+/* Current wall-clock Unix seconds for inode timestamps. 0 until the NTP daemon
+ * sets the epoch offset, but still advances across a boot — enough for make/git
+ * to see a rewritten file as newer (mtime always 0 was silently breaking
+ * incremental builds and `ls -l`). */
+void arch_clock_gettime(uint64_t *sec, uint64_t *nsec);
+static uint32_t ext2_now(void)
+{
+    uint64_t s = 0, n = 0;
+    arch_clock_gettime(&s, &n);
+    return (uint32_t)s;
+}
 static uint32_t ext2_block_num_impl(const ext2_inode_t *inode, uint32_t file_block);
 static uint32_t ext2_ind_get(uint32_t blk, uint32_t idx);
 static int      ext2_read_symlink_target_impl(uint32_t ino, char *buf, uint32_t bufsiz);
@@ -1834,6 +1846,7 @@ int ext2_write(uint32_t inode_num, const void *buf,
         inode.i_size = end;
         inode.i_blocks = (uint32_t)(((uint64_t)inode.i_size + 511u) / 512u);
     }
+    inode.i_mtime = inode.i_ctime = ext2_now();   /* content changed */
     ext2_write_inode(inode_num, &inode);
     ext2_lock_release(fl);
     return (int)bytes_written;
@@ -1863,6 +1876,7 @@ int ext2_truncate(uint32_t inode_num)
     ext2_free_inode_blocks(&inode);   /* frees + zeroes i_block[] */
     inode.i_size   = 0;
     inode.i_blocks = 0;
+    inode.i_mtime  = inode.i_ctime = ext2_now();
     ext2_write_inode(inode_num, &inode);
 
     ext2_lock_release(fl);
@@ -1897,6 +1911,7 @@ int ext2_create(const char *path, uint16_t mode)
     inode.i_mode = EXT2_S_IFREG | (mode & 0x1FFu);
     inode.i_links_count = 1;
     inode.i_generation = ext2_next_gen();   /* secfix M2: unique per allocation */
+    inode.i_atime = inode.i_mtime = inode.i_ctime = ext2_now();
     ext2_write_inode(new_ino, &inode);
     int r = ext2_dir_add_entry(parent_ino, new_ino, basename, EXT2_FT_REG_FILE);
     if (r != 0)
@@ -2017,6 +2032,7 @@ int ext2_mkdir(const char *path, uint16_t mode)
     inode.i_blocks = s_block_size / 512;
     inode.i_block[0] = blk;
     inode.i_generation = ext2_next_gen();   /* secfix M2: unique per allocation */
+    inode.i_atime = inode.i_mtime = inode.i_ctime = ext2_now();
     ext2_write_inode(new_ino, &inode);
 
     /* initialise "." and ".." entries in the new block */
