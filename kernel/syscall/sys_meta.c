@@ -4,6 +4,7 @@
 #include "proc.h"
 #include "vfs.h"
 #include "ext2.h"
+#include "arch.h"
 #include "../lib/string.h"
 
 /* ── Helper: resolve relative path against cwd ──────────────────────── */
@@ -299,6 +300,76 @@ sys_fchown(uint64_t arg1, uint64_t arg2, uint64_t arg3)
     int r = vfs_fchown(f, (uint16_t)arg2, (uint16_t)arg3);
     if (r < 0) return SYS_ERR(EINVAL); /* EINVAL — not an ext2 fd */
     return 0;
+}
+
+/*
+ * sys_utimensat — syscall 280 (touch, make, git, tar)
+ * arg1 = dirfd (only AT_FDCWD supported — CWD-relative / absolute paths)
+ * arg2 = user pointer to pathname
+ * arg3 = user pointer to struct timespec[2] {atime, mtime}, or NULL = both now
+ * arg4 = flags (AT_SYMLINK_NOFOLLOW = 0x100)
+ *
+ * Each timespec's tv_nsec may be UTIME_NOW (use current time) or UTIME_OMIT
+ * (leave that field untouched). Only the file owner may set times (parity with
+ * chmod — metadata mutation is owner-gated; uid 0 is cosmetic in Aegis).
+ */
+#define UTIME_NOW  0x3fffffff
+#define UTIME_OMIT 0x3ffffffe
+
+uint64_t
+sys_utimensat(uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4)
+{
+    (void)arg1;  /* dirfd — only AT_FDCWD (-100) or absolute paths handled */
+    aegis_process_t *proc = current_proc();
+    if (cap_check(proc->caps, CAP_TABLE_SIZE,
+                  CAP_KIND_VFS_WRITE, CAP_RIGHTS_WRITE) != 0)
+        return SYS_ERR(ENOCAP);
+
+    char path[256], resolved[256];
+    if (copy_path_from_user(path, arg2, sizeof(path)) != 0)
+        return SYS_ERR(EFAULT);
+    if (resolve_path(path, proc->cwd, resolved, sizeof(resolved)) != 0)
+        return SYS_ERR(ENAMETOOLONG);
+
+    if (cap_path_is_protected(resolved) &&
+        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
+                  CAP_RIGHTS_READ) != 0)
+        return SYS_ERR(EPERM);
+
+    /* Ownership check: only the file owner may set times. */
+    {
+        uint32_t ino;
+        if (ext2_open(resolved, &ino) == 0) {
+            ext2_inode_t inode;
+            if (ext2_read_inode(ino, &inode) == 0 && proc->uid != inode.i_uid)
+                return SYS_ERR(EACCES);
+        }
+    }
+
+    uint64_t now_sec = 0, now_nsec = 0;
+    arch_clock_gettime(&now_sec, &now_nsec);
+
+    uint32_t atime, mtime;
+    if (arg3 == 0) {
+        /* NULL times → set both to now */
+        atime = mtime = (uint32_t)now_sec;
+    } else {
+        /* struct timespec[2]: two {int64 tv_sec; int64 tv_nsec} = 32 bytes */
+        int64_t ts[4];
+        if (copy_from_user(ts, (const void *)(uintptr_t)arg3, sizeof(ts)) != 0)
+            return SYS_ERR(EFAULT);
+        int64_t a_nsec = ts[1], m_nsec = ts[3];
+        atime = (a_nsec == UTIME_OMIT) ? EXT2_UTIME_KEEP
+              : (a_nsec == UTIME_NOW)  ? (uint32_t)now_sec
+              :                          (uint32_t)ts[0];
+        mtime = (m_nsec == UTIME_OMIT) ? EXT2_UTIME_KEEP
+              : (m_nsec == UTIME_NOW)  ? (uint32_t)now_sec
+              :                          (uint32_t)ts[2];
+    }
+
+    int follow = (arg4 & 0x100) ? 0 : 1;  /* AT_SYMLINK_NOFOLLOW */
+    int r = ext2_utimes(resolved, atime, mtime, follow);
+    return (r < 0) ? SYS_ERR(ENOENT) : 0;
 }
 
 /*

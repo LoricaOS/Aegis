@@ -184,6 +184,10 @@ int ext2_check_perm(uint32_t ino, uint16_t proc_uid, uint16_t proc_gid, int want
 int ext2_chmod(const char *path, uint16_t mode);
 int ext2_chown(const char *path, uint16_t uid, uint16_t gid, int follow);
 
+/* utimensat: leave a timestamp field unchanged (UTIME_OMIT) */
+#define EXT2_UTIME_KEEP 0xFFFFFFFFu
+int ext2_utimes(const char *path, uint32_t atime, uint32_t mtime, int follow);
+
 /* Path walk with symlink following control.
  * follow_final: 1 = follow symlinks on final component, 0 = no-follow (lstat). */
 int ext2_open_ex(const char *path, uint32_t *inode_out, int follow_final);

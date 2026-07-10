@@ -24,6 +24,7 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case  23: num = 33;  break;  /* dup */
     case  24: num = 292; break;  /* dup3 */
     case 165: num = 98;  break;  /* getrusage */
+    case  88: num = 280; break;  /* utimensat (same arg order) */
     case  25: num = 72;  break;  /* fcntl */
     case  29: num = 16;  break;  /* ioctl */
     case  35: num = 87; arg1 = arg2; break;  /* unlinkat → unlink (skip dirfd) */
@@ -217,6 +218,7 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case  92: return sys_chown(arg1, arg2, arg3);
     case  93: return sys_fchown(arg1, arg2, arg3);
     case  94: return sys_lchown(arg1, arg2, arg3);
+    case 280: return sys_utimensat(arg1, arg2, arg3, arg4);
     case 257: return sys_openat(arg1, arg2, arg3, arg4);
     case 162: return sys_sync();
     /* fsync(74)/fdatasync(75): flush via the global sync. Per-file flush would

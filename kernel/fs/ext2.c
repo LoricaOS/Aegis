@@ -1498,6 +1498,38 @@ int ext2_chown(const char *path, uint16_t uid, uint16_t gid, int follow)
 }
 
 /* ------------------------------------------------------------------ */
+/* ext2_utimes — set access/modification times (for utimensat/utimes)  */
+/* atime/mtime are epoch seconds; EXT2_UTIME_KEEP leaves that field.    */
+/* ctime is always bumped to now (the inode metadata just changed).     */
+/* ------------------------------------------------------------------ */
+
+int ext2_utimes(const char *path, uint32_t atime, uint32_t mtime, int follow)
+{
+    if (!s_mounted)
+        return -1;
+    irqflags_t fl = ext2_lock_acquire();
+
+    uint32_t ino;
+    if (ext2_open_ex(path, &ino, follow) != 0) {
+        ext2_lock_release(fl);
+        return -1;
+    }
+
+    ext2_inode_t inode;
+    if (ext2_read_inode(ino, &inode) < 0) {
+        ext2_lock_release(fl);
+        return -EIO;
+    }
+
+    if (atime != EXT2_UTIME_KEEP) inode.i_atime = atime;
+    if (mtime != EXT2_UTIME_KEEP) inode.i_mtime = mtime;
+    inode.i_ctime = ext2_now();
+    ext2_write_inode(ino, &inode);
+    ext2_lock_release(fl);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* Block and inode allocation                                          */
 /* ------------------------------------------------------------------ */
 
