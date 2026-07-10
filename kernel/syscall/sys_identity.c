@@ -7,7 +7,9 @@
 #include "printk.h"
 #include "acpi.h"
 #include "nvme.h"
+#ifdef __x86_64__
 #include "thermal.h"
+#endif
 
 /* Build-time version from the Makefile (git describe); see sys_uname. */
 #ifndef AEGIS_VERSION
@@ -88,6 +90,7 @@ sys_hwmon(uint64_t ubuf)
     struct aegis_hwmon hw;
     __builtin_memset(&hw, 0, sizeof(hw));
 
+#ifdef __x86_64__
     int tjmax = -1;
     int t = cpu_temp_read(&tjmax);
     hw.cpu_temp_c     = t;
@@ -100,6 +103,12 @@ sys_hwmon(uint64_t ubuf)
         hw.battery_charging = (uint8_t)charging;
         hw.ac_online        = (uint8_t)ac;
     }
+#else
+    /* arm64: no AMD SMN thermal / battery path yet — report unavailable
+     * (cpu_temp_c = -1, not the memset 0, so the widget hides it). */
+    hw.cpu_temp_c     = -1;
+    hw.cpu_temp_max_c = -1;
+#endif
 
     if (!user_ptr_valid(ubuf, sizeof(hw)))
         return SYS_ERR(EFAULT);
