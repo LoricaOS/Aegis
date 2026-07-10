@@ -289,6 +289,7 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 294: return sys_inotify_init1(arg1);
     case 254: return sys_inotify_add_watch(arg1, arg2, arg3);
     case  17: return sys_pread64(arg1, arg2, arg3, arg4);
+    case  18: return sys_pwrite64(arg1, arg2, arg3, arg4);
     case 324: return 0;                       /* membarrier — no-op (UP-ish) */
     default:
         return SYS_ERR(ENOSYS);

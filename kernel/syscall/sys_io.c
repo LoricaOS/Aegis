@@ -365,6 +365,43 @@ sys_pread64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t off)
     return (uint64_t)got;   /* pread does NOT advance f->offset */
 }
 
+/* sys_pwrite64 — syscall 18: write at an explicit offset without changing the
+ * fd's file offset (SQLite writes DB pages via pwrite; the whole "disk I/O
+ * error" class needs this). The write op is offset-less (it uses the driver's
+ * internal cursor), so seek that cursor to `off`, write, then re-sync it to the
+ * fd's logical offset. f->offset is untouched (POSIX: pwrite leaves it alone).
+ * ponytail: a program mixing lseek-less sequential write() with pwrite() on one
+ * fd could be surprised by the cursor re-sync — SQLite uses pread/pwrite
+ * exclusively (re-seeks every op), so this is correct where it matters. */
+uint64_t
+sys_pwrite64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t off)
+{
+    aegis_process_t *proc = current_proc();
+    if (cap_check(proc->caps, CAP_TABLE_SIZE,
+                  CAP_KIND_VFS_WRITE, CAP_RIGHTS_WRITE) != 0)
+        return SYS_ERR(ENOCAP);
+    if (fd >= PROC_MAX_FDS) return SYS_ERR(EBADF);
+    vfs_file_t *f = &proc->fd_table->fds[fd];
+    if (!f->ops || !f->ops->write) return SYS_ERR(EBADF);
+    if ((f->flags & VFS_O_ACCMODE) == VFS_O_RDONLY)
+        return SYS_ERR(EBADF);           /* fd not opened for writing */
+    if (!f->ops->seek)
+        return SYS_ERR(ESPIPE);          /* not positionable → can't pwrite */
+    if (!user_ptr_valid(buf, count)) return SYS_ERR(EFAULT);
+    char kbuf[4096];
+    uint64_t page_off = buf & 0xFFFULL;
+    uint64_t to_end   = 0x1000ULL - page_off;
+    uint64_t n = count;
+    if (n > 4096) n = 4096;
+    if (n > to_end) n = to_end;
+    copy_from_user(kbuf, (const void *)(uintptr_t)buf, n);
+    f->ops->seek(f->priv, off);
+    int64_t wrote = (int64_t)f->ops->write(f->priv, kbuf, n);
+    f->ops->seek(f->priv, f->offset);    /* restore driver cursor to fd offset */
+    if (wrote < 0) return (uint64_t)wrote;
+    return (uint64_t)wrote;              /* pwrite does NOT advance f->offset */
+}
+
 /*
  * sys_close — syscall 3
  *

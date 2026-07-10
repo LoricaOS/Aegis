@@ -631,8 +631,11 @@ sys_fcntl(uint64_t arg1, uint64_t arg2, uint64_t arg3)
      * writers ever contend on one file. */
     case 6:   /* F_SETLK  — pretend the lock was acquired */
     case 7:   /* F_SETLKW */
+    case 37:  /* F_OFD_SETLK  — open-file-description lock (SQLite WAL); same no-op */
+    case 38:  /* F_OFD_SETLKW */
         return 0;
-    case 5: { /* F_GETLK  — report no conflicting lock (l_type = F_UNLCK) */
+    case 5:   /* F_GETLK  — report no conflicting lock (l_type = F_UNLCK) */
+    case 36: { /* F_OFD_GETLK */
         short unlck = 2; /* F_UNLCK */
         if (arg3) {
             if (!user_ptr_valid(arg3, sizeof(unlck)))

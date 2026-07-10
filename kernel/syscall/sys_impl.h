@@ -155,6 +155,7 @@ uint64_t sys_prlimit64(uint64_t pid, uint64_t res, uint64_t newp, uint64_t oldp)
 uint64_t sys_inotify_init1(uint64_t flags);
 uint64_t sys_inotify_add_watch(uint64_t fd, uint64_t path, uint64_t mask);
 uint64_t sys_pread64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t off);
+uint64_t sys_pwrite64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t off);
 
 
 /* ── sys_adminconf.c ───────────────────────────────────────────────────── */
