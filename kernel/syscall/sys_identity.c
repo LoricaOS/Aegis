@@ -383,9 +383,11 @@ sys_reboot(uint64_t cmd)
                   CAP_KIND_POWER, CAP_RIGHTS_READ) != 0)
         return SYS_ERR(ENOCAP);
 
+#ifdef __x86_64__
     extern volatile uint32_t g_bc_kernel, g_bc_user, g_bc_full;
     printk("[TLBSTAT] broadcasts kernel=%u user=%u full=%u\n",
            (unsigned)g_bc_kernel, (unsigned)g_bc_user, (unsigned)g_bc_full);
+#endif
 
     if (cmd == 0) {
         /* Power off.  Flush fs + the drive's volatile write cache first —
