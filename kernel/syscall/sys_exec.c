@@ -139,6 +139,18 @@ sys_execve(syscall_frame_t *frame,
         abuf->env_ptrs[0] = (char *)0;
     }
 
+    /* Shebang re-exec state: a #! script is re-exec'd with its interpreter,
+     * looping back to the lookup below (bounded depth). Buffers live on the
+     * stack for the whole call. */
+    int  shebang_depth = 0;
+    char shebang_interp[256];
+    char shebang_arg[256];
+    char script_path[256];
+
+reload_binary:
+    /* On a shebang reload, free the previous image before re-looking-up. */
+    if (ext2_buf) { kva_free_pages(ext2_buf, ext2_pages); ext2_buf = (void *)0; ext2_pages = 0; }
+
     /* 3. Look up binary: initrd first, then VFS (ext2 on nvme0p1).
      *    Initrd binaries are always trusted (no permission check).
      *    ext2 binaries get an X_OK DAC check before loading. */
@@ -180,6 +192,49 @@ sys_execve(syscall_frame_t *frame,
             { ret = SYS_ERR(EIO); goto done; }   /* EIO */
         elf_data = (const uint8_t *)ext2_buf;
         elf_size = vf.size;
+    }
+
+    /* 3.5 Shebang: a "#!" script → re-exec with its interpreter. Done here,
+     * before the point-of-no-return below, so a malformed script returns an
+     * error instead of killing the caller. POSIX allows one optional arg after
+     * the interpreter path. New argv = [interp, (arg,) scriptpath, orig_argv[1..]];
+     * argv[0] of the original invocation is dropped. Nested shebangs bounded. */
+    if (elf_size >= 2 && elf_data[0] == '#' && elf_data[1] == '!') {
+        if (++shebang_depth > 4) { ret = SYS_ERR(ENOEXEC); goto done; }
+        uint64_t p = 2;
+        while (p < elf_size && (elf_data[p] == ' ' || elf_data[p] == '\t')) p++;
+        uint64_t is = 0;
+        while (p < elf_size && elf_data[p] != '\n' && elf_data[p] != ' ' &&
+               elf_data[p] != '\t' && is < sizeof(shebang_interp) - 1)
+            shebang_interp[is++] = (char)elf_data[p++];
+        shebang_interp[is] = '\0';
+        if (is == 0) { ret = SYS_ERR(ENOEXEC); goto done; }   /* "#!" with no interpreter */
+        while (p < elf_size && (elf_data[p] == ' ' || elf_data[p] == '\t')) p++;
+        uint64_t as = 0;
+        while (p < elf_size && elf_data[p] != '\n' && as < sizeof(shebang_arg) - 1)
+            shebang_arg[as++] = (char)elf_data[p++];
+        while (as > 0 && (shebang_arg[as-1] == ' ' || shebang_arg[as-1] == '\t' ||
+                          shebang_arg[as-1] == '\r')) as--;
+        shebang_arg[as] = '\0';
+        int has_arg = (as > 0);
+        /* Rebuild argv. Snapshot the original pointers first (they index into
+         * abuf->argv_strs, which stays valid) before overwriting the array. */
+        for (uint64_t i = 0; i < sizeof(path); i++) script_path[i] = path[i];
+        char *saved[EXECVE_MAX_ARGV];
+        int saved_n = argc2;
+        if (saved_n > EXECVE_MAX_ARGV) saved_n = EXECVE_MAX_ARGV;
+        for (int i = 0; i < saved_n; i++) saved[i] = abuf->argv_ptrs[i];
+        int na = 0;
+        abuf->argv_ptrs[na++] = shebang_interp;
+        if (has_arg) abuf->argv_ptrs[na++] = shebang_arg;
+        abuf->argv_ptrs[na++] = script_path;
+        for (int i = 1; i < saved_n && na < EXECVE_MAX_ARGV - 1; i++)
+            abuf->argv_ptrs[na++] = saved[i];
+        abuf->argv_ptrs[na] = (char *)0;
+        argc2 = na;
+        for (uint64_t i = 0; i < sizeof(shebang_interp) && i < sizeof(path); i++)
+            path[i] = shebang_interp[i];
+        goto reload_binary;
     }
 
     /* 4. Install a fresh address space for the new image.
