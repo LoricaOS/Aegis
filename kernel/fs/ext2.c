@@ -1032,6 +1032,14 @@ static int ext2_read_symlink_target_impl(uint32_t ino, char *buf, uint32_t bufsi
     if (!data)
         return -EIO;
 
+    /* Defensive: a slow symlink lives in ONE data block, so its target can't
+     * exceed the block size. Without this, a crafted inode with i_size and a
+     * caller bufsiz both > s_block_size would read past the 4096-byte cache
+     * slot. (Current callers clamp bufsiz to 256, so latent — but this is a
+     * public API.) */
+    if (tlen > s_block_size - 1)
+        tlen = s_block_size - 1;
+
     uint32_t i;
     for (i = 0; i < tlen; i++)
         buf[i] = (char)data[i];
@@ -1697,6 +1705,17 @@ uint32_t ext2_alloc_block(uint32_t preferred_group)
         uint32_t blocks_in_group = (grp == s_num_groups - 1)
             ? (s_sb.s_blocks_count - grp * s_sb.s_blocks_per_group)
             : s_sb.s_blocks_per_group;
+        /* s_num_groups is clamped to 32 at mount while s_blocks_count keeps its
+         * true (larger) value, so on a >32-group fs the "last group" formula
+         * yields a count FAR bigger than one bitmap block — driving bitmap[i/8]
+         * tens of KiB past the 4096-byte cache slot (OOB read+write). A group's
+         * block count can never exceed blocks_per_group (one bitmap's worth of
+         * bits), so clamp. (Blocks beyond group 31 stay unreachable — a
+         * pre-existing capacity limit — but never corrupt memory.) */
+        if (blocks_in_group > s_sb.s_blocks_per_group)
+            blocks_in_group = s_sb.s_blocks_per_group;
+        if (blocks_in_group > 8u * s_block_size)
+            blocks_in_group = 8u * s_block_size;   /* bitmap byte capacity */
         /* Resume from the per-group hint; wrap once to cover [0, hint) so a
          * freed low bit is still found (correctness) — amortized O(1) for the
          * common sequential-allocation case. */

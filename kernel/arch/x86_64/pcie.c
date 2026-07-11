@@ -161,8 +161,14 @@ static void enumerate_function(uint8_t bus, uint8_t dev, uint8_t fn)
 
     {
         int i;
-        for (i = 0; i < 6; )
-            d->bar[i] = decode_bar(bus, dev, fn, &i);
+        for (i = 0; i < 6; ) {
+            /* decode_bar advances *i (by 2 for a 64-bit BAR). Capture the slot
+             * index BEFORE the call: `d->bar[i] = decode_bar(..., &i)` reads and
+             * writes `i` with no sequence point (UB) — a 64-bit BAR at slot 5
+             * could even advance i to 7 and write d->bar[6] (array is [6]) OOB. */
+            int slot = i;
+            d->bar[slot] = decode_bar(bus, dev, fn, &i);
+        }
     }
 
     printk("[PCIE] found %x:%x class=%x at %x:%x.%x\n",

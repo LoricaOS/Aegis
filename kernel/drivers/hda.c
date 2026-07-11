@@ -294,14 +294,18 @@ static int
 codec_find_out(int want, int *pin_out, int *dac_out)
 {
     uint32_t sub = get_param(0, PARAM_SUBNODE_COUNT);
-    uint8_t fgs = (uint8_t)(sub >> 16), fgc = (uint8_t)sub;
-    for (uint8_t fg = fgs; fg < fgs + fgc; fg++) {
-        if ((get_param(fg, PARAM_FN_GROUP_TYPE) & 0xFFu) != 1u)
+    /* Node start+count come from the codec's SUBNODE_COUNT response. Use int
+     * loop bounds: a malicious/broken codec with start+count > 255 would wrap a
+     * uint8_t counter at 256 so the condition never fails → infinite verb loop
+     * (boot hang). */
+    unsigned fgs = (sub >> 16) & 0xFFu, fgc = sub & 0xFFu;
+    for (unsigned fg = fgs; fg < fgs + fgc; fg++) {
+        if ((get_param((int)fg, PARAM_FN_GROUP_TYPE) & 0xFFu) != 1u)
             continue;
-        uint32_t wsub = get_param(fg, PARAM_SUBNODE_COUNT);
-        uint8_t ws = (uint8_t)(wsub >> 16), wc = (uint8_t)wsub;
+        uint32_t wsub = get_param((int)fg, PARAM_SUBNODE_COUNT);
+        unsigned ws = (wsub >> 16) & 0xFFu, wc = wsub & 0xFFu;
         int pin = -1, any_dac = -1;
-        for (uint8_t w = ws; w < ws + wc; w++) {
+        for (unsigned w = ws; w < ws + wc; w++) {
             uint32_t cap  = get_param(w, PARAM_AUDIO_WIDGET_CAP);
             uint32_t type = (cap >> 20) & 0xFu;
             if (type == WIDGET_DAC) { if (any_dac < 0) any_dac = w; continue; }

@@ -2127,6 +2127,12 @@ probe_usb_ethernet(uint8_t slot_id, uint8_t port_num, uint8_t speed)
     s_eth.bulk_out_burst = bout_burst;
     s_eth.int_addr      = bint;
     s_eth.int_dci       = bint ? (uint8_t)(2u * (bint & 0x0Fu) + 1u) : 0u;
+    /* int_mps is the device-asserted interrupt-EP wMaxPacketSize (up to 0xFFFF)
+     * and is used verbatim as the interrupt-IN TRB transfer length over int_buf,
+     * a fixed 4096-byte page. A malicious/spoofed device declaring a huge value
+     * would DMA past the page (kernel heap overflow). A real interrupt EP is
+     * <=1024; clamp to the buffer size. */
+    if (bint_mps > 4096u) bint_mps = 4096u;
     s_eth.int_mps       = bint_mps;
 
     printk("[XHCI] slot %u ASIX AX88179 vid=%x pid=%x cfg=%u "

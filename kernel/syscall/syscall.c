@@ -42,7 +42,7 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case  66: num = 20;  break;  /* writev */
     case  73: num = 271; break;  /* ppoll (aarch64 has no poll; musl poll()→ppoll) */
     case  72: num = 270; break;  /* pselect6 (aarch64 has no select; musl select()→pselect6) */
-    case  36: num = 88; arg1 = arg2; arg2 = arg3; break;  /* symlinkat → symlink (skip dirfd) */
+    case  36: num = 88; arg2 = arg3; break;  /* symlinkat(target,dirfd,link) → symlink(target,link): dirfd is arg2, keep target=arg1 */
     case  37: num = 86; arg1 = arg2; arg2 = arg4; break;  /* linkat → link (skip dirfds) */
     case  78: num = 89; arg1 = arg2; arg2 = arg3; arg3 = arg4; break;  /* readlinkat → readlink (skip dirfd) */
     case  53: num = 90; arg1 = arg2; arg2 = arg3; break;  /* fchmodat → chmod (skip dirfd+flags) */

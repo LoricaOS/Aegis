@@ -281,6 +281,17 @@ sys_mmap(uint64_t arg1, uint64_t arg2, uint64_t arg3,
     if (file_backed && (off & 0xFFFUL))
         return SYS_ERR(EINVAL);   /* EINVAL — offset not page-aligned */
 
+    /* Re-validate AUTH on USE, exactly as sys_read/sys_pread64 do: mmap is a
+     * sibling read path onto the same fd. An fd opened past the AUTH gate
+     * (/etc/shadow, /etc/aegis/admin) carries VFS_KF_AUTH_GATED; if it reached a
+     * process lacking CAP_KIND_AUTH (inherited across exec, or dup'd), that
+     * process must not read the secret by mmap'ing it either. Without this,
+     * mmap was an AUTH-bypass hole the read-path defense didn't cover. */
+    if (file_backed && (uint32_t)fd < PROC_MAX_FDS &&
+        (proc->fd_table->fds[(uint32_t)fd].kflags & VFS_KF_AUTH_GATED) &&
+        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_AUTH, CAP_RIGHTS_READ) != 0)
+        return SYS_ERR(EACCES);
+
     /* Read-only MAP_SHARED of a regular (non-memfd) file: Aegis keeps no page
      * cache for ext2, so a *true* shared file mapping is memfd-only. But a
      * READ-ONLY shared mapping needs no write-back, so an eager private copy is
@@ -359,8 +370,16 @@ sys_mmap(uint64_t arg1, uint64_t arg2, uint64_t arg3,
         for (va = addr; va < addr + len; va += 4096UL) {
             uint64_t phys = vmm_phys_of_user_raw(proc->pml4_phys, va);
             if (phys) {
+                /* SECURITY: never free a VMM_FLAG_SHARED frame — it is
+                 * driver-owned RAM (e.g. the virtio-gpu framebuffer from
+                 * sys_fb_map) the process maps but does not own. Freeing it
+                 * returns live GPU/shared RAM to the allocator. Same guard
+                 * sys_munmap + the exit-teardown walks apply (H1); MAP_FIXED
+                 * replacement was missing it. Unmap only for shared frames. */
+                uint64_t pte = vmm_pte_of_user_raw(proc->pml4_phys, va);
                 vmm_unmap_user_page(proc->pml4_phys, va);
-                pmm_free_page(phys);
+                if (!(pte & VMM_FLAG_SHARED))
+                    pmm_free_page(phys);
             }
         }
         base = addr;
