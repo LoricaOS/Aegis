@@ -519,6 +519,24 @@ cap_apply_policy(cap_slot_t *caps, const char *path, int authenticated,
     if (pol) {
         for (ci = 0; ci < pol->count; ci++) {
             if (pol->caps[ci].tier == CAP_TIER_SERVICE) {
+                /* Defense in depth: INSTALL and DISK_ADMIN are the two kinds the
+                 * ADMIN-tier path gates behind a sudo-style admin_session (below).
+                 * The SERVICE tier grants unconditionally, so a policy line like
+                 * `service INSTALL` would launder that elevation away — the tier
+                 * word alone would forge the authority the admin_session gate
+                 * exists to require. Refuse them here so the tier field can never
+                 * be the escape hatch, no matter what a future caps.d ships. (No
+                 * shipped policy needs this: real INSTALL/DISK_ADMIN users declare
+                 * `admin`; the sole service-tier INSTALL, caps.d/vigil, is inert —
+                 * PID 1's caps come from proc.c, not policy.) Fail closed + WARN. */
+                if (pol->caps[ci].kind == CAP_KIND_INSTALL ||
+                    pol->caps[ci].kind == CAP_KIND_DISK_ADMIN) {
+                    printk("[CAP_POLICY] WARN: refusing service-tier %s for %s "
+                           "— admin-gated caps cannot be granted unconditionally\n",
+                           pol->caps[ci].kind == CAP_KIND_INSTALL
+                               ? "INSTALL" : "DISK_ADMIN", path);
+                    continue;
+                }
                 cap_grant(caps, CAP_TABLE_SIZE,
                           pol->caps[ci].kind, pol->caps[ci].rights);
             } else if (pol->caps[ci].tier == CAP_TIER_ADMIN) {

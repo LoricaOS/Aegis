@@ -199,7 +199,12 @@ void _start(void)
     /* 8. execve: fork a child that execs a SECOND binary (/bin/exectest).
      *    Validates the full exec path — ELF load of a new image + the EL0/
      *    ring-3 entry trampoline. exectest exits 42; execve only returns on
-     *    failure, in which case the child exits 99. */
+     *    failure, in which case the child exits 99.
+     *
+     *    exectest ALSO doubles as the service-tier privilege-laundering guard:
+     *    it ships `service DISK_ADMIN` policy and probes blkdev_list. The kernel
+     *    must refuse an admin-gated cap through the unconditional SERVICE tier,
+     *    so exectest exits 42 (refused, good) — NOT 43 (granted = privesc). */
     total++;
     {
         long pid = sys6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);
@@ -213,6 +218,7 @@ void _start(void)
         sys6(SYS_wait4, pid, (long)&status, 0, 0, 0, 0);
         int cs = (status >> 8) & 0xff;
         if (pid > 0 && cs == 42) { pass++; out("[KTEST] PASS exec\n"); }
+        else if (cs == 43) out("[KTEST] FAIL svc-tier-DISK_ADMIN-granted (privesc!)\n");
         else out("[KTEST] FAIL exec\n");
     }
 

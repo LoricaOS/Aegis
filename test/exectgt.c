@@ -25,14 +25,23 @@ static long sys3(long n, long a, long b, long c)
 }
 #endif
 
-#define SYS_write 1
-#define SYS_exit  60
+#define SYS_write        1
+#define SYS_exit         60
+#define SYS_blkdev_list  510   /* gated on CAP_KIND_DISK_ADMIN */
 
 void _start(void)
 {
     const char *m = "[KTEST] exec-target running\n";
     unsigned n = 0; while (m[n]) n++;
     sys3(SYS_write, 2, (long)m, n);
-    sys3(SYS_exit, 42, 0, 0);
+
+    /* Service-tier privilege-laundering guard: this binary ships a policy of
+     * `service DISK_ADMIN` (test rootfs /etc/aegis/caps.d/exectest). DISK_ADMIN
+     * is admin_session-gated, so the kernel must REFUSE to grant it through the
+     * unconditional SERVICE tier — otherwise the tier word forges elevation.
+     * blkdev_list needs DISK_ADMIN: refused (<0) = fix holds → exit 42; granted
+     * (>=0) = the laundering hole is open → exit 43 so the parent FAILs. */
+    long r = sys3(SYS_blkdev_list, 0, 0, 0);
+    sys3(SYS_exit, r < 0 ? 42 : 43, 0, 0);
     for (;;) { }
 }
