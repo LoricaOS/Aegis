@@ -269,6 +269,89 @@ ext2_ino_is_anchor(uint32_t ino)
     return 0;
 }
 
+/* Ancestor-guard set: the directory inodes on the path from "/" down to (but
+ * not including) each protected root / sensitive file — e.g. "/" and "/etc" for
+ * /etc/shadow; "/" for /bin.  Recorded at mount alongside the protected roots.
+ *
+ * WHY this exists (round-2 fix): the protected-tree and sensitive-file gates
+ * guard a FIXED set of inodes recorded at mount, and catch aliases *to* those
+ * inodes and paths *under* a protected root.  But nothing protected the ANCESTOR
+ * directories.  /etc's own inode is neither a protected root nor a sensitive
+ * file, so an unprivileged session could `rename("/etc","/realetc")` then
+ * `rename("/fakeetc","/etc")` — after which /etc/shadow, /etc/passwd,
+ * /etc/aegis/admin, … resolve to ATTACKER files with fresh inodes the gates
+ * never recorded, i.e. a wholesale shadow of the protected subtree (a full
+ * password-less admin-elevation chain).  Guarding the ancestor inodes makes the
+ * path from "/" to every protected/sensitive inode immutable to a session that
+ * lacks CAP_KIND_INSTALL. */
+#define EXT2_GUARD_MAX 32
+static uint32_t s_guard_ino[EXT2_GUARD_MAX];
+static int      s_guard_count = 0;
+
+static void
+ext2_guard_add(uint32_t ino)
+{
+    int j;
+    if (ino == 0)
+        return;
+    for (j = 0; j < s_guard_count; j++)
+        if (s_guard_ino[j] == ino)
+            return;
+    if (s_guard_count < EXT2_GUARD_MAX)
+        s_guard_ino[s_guard_count++] = ino;
+}
+
+/* Record every ANCESTOR directory of `path` (each proper prefix, plus root)
+ * into the guard set.  Called at mount under ext2_lock; ext2_walk takes the
+ * recursive lock so this is deadlock-free. */
+static void
+ext2_guard_record_ancestors(const char *path)
+{
+    uint32_t i, plen = 0;
+    while (path[plen] != '\0' && plen < 510)
+        plen++;
+    /* Root is an ancestor of every absolute path. */
+    ext2_guard_add(EXT2_ROOT_INODE);
+    /* Each internal '/' delimits a proper-prefix directory to guard. */
+    for (i = 1; i < plen; i++) {
+        if (path[i] == '/') {
+            char prefix[512];
+            uint32_t k;
+            for (k = 0; k < i; k++)
+                prefix[k] = path[k];
+            prefix[i] = '\0';
+            uint32_t ino = 0;
+            if (ext2_walk(prefix, &ino, 1, (int *)0) == 0)
+                ext2_guard_add(ino);
+        }
+    }
+}
+
+/* True if `ino` is a protected-tree root, a recorded sensitive file, an install
+ * anchor, or an ANCESTOR directory of any of those.  Removing or replacing any
+ * such inode (rename source, rename destination-overwrite, unlink/rmdir target)
+ * requires CAP_KIND_INSTALL — otherwise a session could rename an ancestor (e.g.
+ * /etc) aside and shadow the whole protected subtree with fresh attacker inodes. */
+static int
+ext2_ino_is_guarded(uint32_t ino)
+{
+    int j;
+    if (ino == 0)
+        return 0;
+    if (ino == s_apps_ino || ino == s_etc_aegis_ino ||
+        ino == s_bin_ino  || ino == s_sbin_ino)
+        return 1;
+    if (ino == s_shadow_ino || ino == s_admin_ino ||
+        ino == s_passwd_ino || ino == s_group_ino)
+        return 1;
+    if (ext2_ino_is_anchor(ino))
+        return 1;
+    for (j = 0; j < s_guard_count; j++)
+        if (s_guard_ino[j] == ino)
+            return 1;
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Filesystem clean/dirty state (superblock s_state)                   */
 /* ------------------------------------------------------------------ */
@@ -330,6 +413,9 @@ int ext2_mount(const char *devname)
 
     /* Drop any parsed inodes cached from a previous mount. */
     icache_clear();
+
+    /* Reset the ancestor-guard set for this mount (repopulated below). */
+    s_guard_count = 0;
 
     int ret = -1;
 
@@ -485,6 +571,19 @@ int ext2_mount(const char *devname)
          * post-mount by ext2_anchors_reload() — they require reading a file
          * (/etc/aegis/anchors), which can't be done under the mount lock. */
     }
+
+    /* Record the ANCESTOR directories of every protected/sensitive path into the
+     * guard set (round-2 fix), so an ancestor like /etc cannot be renamed aside
+     * to shadow the whole protected subtree.  Each call records "/" plus every
+     * proper-prefix directory of the path; duplicates are folded. */
+    ext2_guard_record_ancestors("/etc/shadow");
+    ext2_guard_record_ancestors("/etc/passwd");
+    ext2_guard_record_ancestors("/etc/group");
+    ext2_guard_record_ancestors("/etc/aegis/admin");
+    ext2_guard_record_ancestors("/etc/aegis");
+    ext2_guard_record_ancestors("/apps");
+    ext2_guard_record_ancestors("/bin");
+    ext2_guard_record_ancestors("/sbin");
 
     printk("[EXT2] OK: mounted %s, %u blocks, %u inodes\n",
            devname, s_sb.s_blocks_count, s_sb.s_inodes_count);
@@ -2110,6 +2209,13 @@ int ext2_unlink(const char *path, int has_install)
         return -1;
     }
 
+    /* Ancestor-guard (round-2): unlinking a protected root / sensitive file /
+     * install anchor / ancestor directory of any of those requires INSTALL. */
+    if (!has_install && ext2_ino_is_guarded(ino)) {
+        ext2_lock_release(fl);
+        return -EPERM;
+    }
+
     ext2_inode_t inode;
     if (ext2_read_inode(ino, &inode) != 0) {
         ext2_lock_release(fl);
@@ -2285,6 +2391,13 @@ int ext2_rmdir(const char *path, int has_install)
         return -1;
     }
 
+    /* Ancestor-guard (round-2): rmdir of a protected root / install anchor /
+     * ancestor directory of any protected/sensitive inode requires INSTALL. */
+    if (!has_install && ext2_ino_is_guarded(ino)) {
+        ext2_lock_release(fl);
+        return -EPERM;
+    }
+
     ext2_inode_t inode;
     if (ext2_read_inode(ino, &inode) != 0) {
         ext2_lock_release(fl);
@@ -2397,6 +2510,16 @@ int ext2_rename(const char *old_path, const char *new_path, int has_install)
         return -1;
     }
 
+    /* Ancestor-guard (round-2): renaming the SOURCE inode away is the ancestor-
+     * shadowing break — `rename("/etc","/realetc")` then `rename("/fakeetc",
+     * "/etc")` re-points /etc/{shadow,passwd,aegis/admin,…} at fresh attacker
+     * inodes.  If the source is a protected root / sensitive file / install
+     * anchor / ancestor directory of any of those, require INSTALL. */
+    if (!has_install && ext2_ino_is_guarded(ino)) {
+        ext2_lock_release(fl);
+        return -EPERM;
+    }
+
     uint32_t old_parent_ino;
     const char *old_basename;
     if (ext2_lookup_parent(old_path, &old_parent_ino, &old_basename) != 0) {
@@ -2425,6 +2548,13 @@ int ext2_rename(const char *old_path, const char *new_path, int has_install)
     uint32_t dst_ino = 0;
     if (ext2_walk_impl(new_path, &dst_ino, 0 /*don't follow final*/, 0) == 0 &&
         dst_ino != 0) {
+        /* Ancestor-guard (round-2): renaming something OVER a guarded inode
+         * (protected root / sensitive file / anchor / ancestor dir) requires
+         * INSTALL — belt-and-suspenders for the destination-overwrite case. */
+        if (!has_install && ext2_ino_is_guarded(dst_ino)) {
+            ext2_lock_release(fl);
+            return -EPERM;
+        }
         if (dst_ino == ino) {
             /* Source and destination resolve to the same inode (e.g. a no-op
              * rename, or hard-link aliases): nothing to move. */

@@ -325,6 +325,12 @@ sys_fchmod(uint64_t arg1, uint64_t arg2)
     if (f->ops->stat) {
         k_stat_t ks;
         if (f->ops->stat(f->priv, &ks) == 0) {
+            /* Sensitive-inode gate (parity with path-based sys_chmod): fchmod'ing
+             * an fd onto /etc/shadow, /etc/passwd, … needs the same authority a
+             * path chmod would — owner-uid-0 DAC is not it. Keyed on the fd's
+             * resolved inode, so it can't be bypassed via an fd opened O_RDONLY. */
+            int g = sensitive_write_gate((uint32_t)ks.st_ino);
+            if (g != 0) return (uint64_t)(int64_t)g;
             /* No uid=0 bypass (see sys_chmod): only the owner may fchmod/fchown. */
             if (proc->uid != ks.st_uid)
                 return SYS_ERR(EACCES);
@@ -409,6 +415,11 @@ sys_fchown(uint64_t arg1, uint64_t arg2, uint64_t arg3)
     if (f->ops->stat) {
         k_stat_t ks;
         if (f->ops->stat(f->priv, &ks) == 0) {
+            /* Sensitive-inode gate (parity with path-based sys_chown): fchown'ing
+             * an fd onto /etc/shadow, /etc/passwd, … needs the same authority a
+             * path chown would. Keyed on the fd's resolved inode. */
+            int g = sensitive_write_gate((uint32_t)ks.st_ino);
+            if (g != 0) return (uint64_t)(int64_t)g;
             /* No uid=0 bypass (see sys_chmod): only the owner may fchmod/fchown. */
             if (proc->uid != ks.st_uid)
                 return SYS_ERR(EACCES);
