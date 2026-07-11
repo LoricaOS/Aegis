@@ -278,15 +278,19 @@ pipe_read_close_fn(void *priv)
      * end is already at zero. refcount_read of write_refs under p->lock is
      * the other half of the free test. */
     int do_free = (last_reader_gone && refcount_read(&p->write_refs) == 0);
-    spin_unlock_irqrestore(&p->lock, fl);
 
-    /* A blocked writer's condition (count < SIZE || read_refs == 0) only
-     * changes via read_refs when it reaches 0, so wake the write-end waitq
-     * (blocked writers + write pollers) only then: they observe read_refs == 0
-     * and return EPIPE / see POLLERR.  Wake AFTER unlock and BEFORE the free
-     * (which invalidates p, including p->write_waiters). */
+    /* Wake the write-end waitq UNDER p->lock, not after unlock. pipe_t is
+     * kva-freed (unlike pty/unix/memfd's never-freed static pools), so a wake
+     * after unlock is a use-after-free: the OPPOSITE-end closer, seeing both
+     * refs zero, can kva_free_pages(p) in the window between our unlock and our
+     * wake — then waitq_wake_all touches a freed p->write_waiters. Waking under
+     * the lock is deadlock-safe (p->lock → sched_lock has no inverse: the
+     * scheduler never takes a pipe lock) and means only the sole freeing closer
+     * touches p after unlock. Blocked writers then observe read_refs == 0 and
+     * return EPIPE / see POLLERR. */
     if (last_reader_gone)
         waitq_wake_all(&p->write_waiters);
+    spin_unlock_irqrestore(&p->lock, fl);
     if (do_free)
         kva_free_pages(p, 1);
 }
@@ -306,15 +310,14 @@ pipe_write_close_fn(void *priv)
      * end is already at zero. refcount_read of read_refs under p->lock is
      * the other half of the free test. */
     int do_free = (last_writer_gone && refcount_read(&p->read_refs) == 0);
-    spin_unlock_irqrestore(&p->lock, fl);
 
-    /* A blocked reader's condition (count > 0 || write_refs == 0) only changes
-     * via write_refs when it reaches 0, so wake the read-end waitq (blocked
-     * readers + read pollers) only then: they observe write_refs == 0 with
-     * count == 0 and return 0 (EOF) / see POLLIN|POLLHUP.  Wake AFTER unlock
-     * and BEFORE the free (which invalidates p, including p->read_waiters). */
+    /* Wake under p->lock — see pipe_read_close_fn: pipe_t is kva-freed, so a
+     * post-unlock wake races the opposite-end closer's free (UAF on
+     * p->read_waiters). Blocked readers then observe write_refs == 0 with
+     * count == 0 and return 0 (EOF) / see POLLIN|POLLHUP. */
     if (last_writer_gone)
         waitq_wake_all(&p->read_waiters);
+    spin_unlock_irqrestore(&p->lock, fl);
     if (do_free)
         kva_free_pages(p, 1);
 }

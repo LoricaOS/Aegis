@@ -39,6 +39,10 @@ memfd_t *memfd_from_fd(int fd, void *proc);
 /* Set memfd size (allocates/frees physical pages). Returns 0 or -errno. */
 int memfd_truncate(uint32_t id, uint64_t size);
 
+/* Pin + fetch a memfd page frame for MAP_SHARED mmap (see memfd.c). Returns 0
+ * and a refcounted *phys_out (caller drops via pmm_free_page), or -1. */
+int memfd_get_page_ref(uint32_t id, uint32_t pi, uint64_t *phys_out);
+
 /* Open an fd backed by a memfd. Returns fd or -1. */
 int memfd_open_fd(uint32_t id, void *proc);
 

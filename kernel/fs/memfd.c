@@ -45,20 +45,25 @@ static int memfd_vfs_read(void *priv, void *buf, uint64_t off, uint64_t len)
         if (chunk > len - done) chunk = (uint32_t)(len - done);
 
         if (page_idx < mf->page_count && mf->phys_pages[page_idx]) {
-            /* Snapshot phys addr, release memfd_lock to avoid lock inversion
-             * with vmm_window_lock. Single-reader: safe because refcount > 0
-             * prevents page free. */
+            /* PIN the frame with a refcount before dropping memfd_lock: a
+             * concurrent ftruncate shrink (or close) pmm_free_page's the frame
+             * REGARDLESS of the memfd's own ref, so the old "refcount>0 prevents
+             * free" assumption was false — the frame could be freed + reused
+             * under our copy (info leak / torn read). The pin keeps it valid;
+             * we drop it after the copy. (pmm_free under memfd_lock is already
+             * the shrink path's pattern, so no new lock inversion.) */
             uint64_t phys = mf->phys_pages[page_idx];
+            pmm_ref_page(phys);
             spin_unlock_irqrestore(&memfd_lock, fl);
 
             /* Copy under vmm_window_lock — the window VA is a single global
              * shared slot; using vmm_window_map directly without the lock
              * races every other CPU's window use (fork copy, vmm_zero_page,
-             * page-table walks) and corrupts an unrelated physical frame.
-             * Latent under BSP-only scheduling; live once APs schedule. */
+             * page-table walks) and corrupts an unrelated physical frame. */
             vmm_copy_from_phys(dst + done, phys, page_off, chunk);
 
             fl = spin_lock_irqsave(&memfd_lock);
+            pmm_free_page(phys);   /* unpin */
             mf = memfd_get(id);
             if (!mf) { spin_unlock_irqrestore(&memfd_lock, fl); return (int)done; }
         } else {
@@ -269,6 +274,29 @@ int memfd_truncate(uint32_t id, uint64_t size)
     mf->page_count = new_pages;
     mf->size       = size;
     spin_unlock_irqrestore(&memfd_lock, fl);
+    return 0;
+}
+
+/* memfd_get_page_ref — for the MAP_SHARED mmap path (sys_memory.c). Under
+ * memfd_lock, validate page index `pi` is in range + backed, then PIN the frame
+ * with a refcount so a concurrent ftruncate shrink (which pmm_free_page's under
+ * memfd_lock) can't free it out from under the mapper — the prior code read
+ * phys_pages[pi] and pmm_ref_page'd it with NO lock, a genuine SMP UAF. The
+ * caller maps the returned frame and owns the reference (dropped by
+ * pmm_free_page on munmap / rollback). Returns 0 + *phys_out, or -1 if the page
+ * is out of range / was shrunk away. */
+int memfd_get_page_ref(uint32_t id, uint32_t pi, uint64_t *phys_out)
+{
+    irqflags_t fl = spin_lock_irqsave(&memfd_lock);
+    memfd_t *mf = memfd_get(id);
+    if (!mf || pi >= mf->page_count || !mf->phys_pages[pi]) {
+        spin_unlock_irqrestore(&memfd_lock, fl);
+        return -1;
+    }
+    uint64_t phys = mf->phys_pages[pi];
+    pmm_ref_page(phys);
+    spin_unlock_irqrestore(&memfd_lock, fl);
+    *phys_out = phys;
     return 0;
 }
 

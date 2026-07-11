@@ -511,10 +511,16 @@ sys_mmap(uint64_t arg1, uint64_t arg2, uint64_t arg3,
         uint64_t va;
         for (va = base; va < base + len; va += 4096UL) {
             uint32_t pi = (uint32_t)((va - base) / 4096);
-            if (pi >= mf->page_count || !mf->phys_pages[pi]) {
-                /* Unmap+unref the pages mapped so far this call, then drop the
-                 * reservation. (Defensive: the len<=mf_pages_bytes guard above
-                 * makes this branch unreachable for in-range pages.) */
+            /* Fetch + PIN the frame under memfd_lock (memfd_get_page_ref): the
+             * old code read mf->phys_pages[pi] and pmm_ref_page'd it with NO
+             * lock, so a concurrent ftruncate could free the frame between the
+             * read and the ref → SMP use-after-free of a reused frame mapped
+             * writable into user space. The returned frame is pinned; the
+             * mapping owns that reference (dropped by munmap/rollback). */
+            uint64_t phys;
+            if (memfd_get_page_ref(mid, pi, &phys) != 0) {
+                /* Out of range or shrunk under us — unmap+unref pages mapped so
+                 * far this call (their pins), then drop the reservation. */
                 uint64_t v2;
                 for (v2 = base; v2 < va; v2 += 4096UL) {
                     uint64_t p = vmm_phys_of_user_raw(proc->pml4_phys, v2);
@@ -526,13 +532,11 @@ sys_mmap(uint64_t arg1, uint64_t arg2, uint64_t arg3,
             /* Tag memfd MAP_SHARED pages VMM_FLAG_SHARED_OWNED so fork inherits
              * them shared+writable (no COW-break onto a private copy) while
              * still refcounting the frame — see the flag's comment in vmm.h. */
-            vmm_map_user_page(proc->pml4_phys, va, mf->phys_pages[pi],
+            vmm_map_user_page(proc->pml4_phys, va, phys,
                               map_flags | VMM_FLAG_SHARED_OWNED);
-            /* This mapping now holds its own reference on the memfd frame.
-             * Invariant: total refs = 1 (memfd) + live MAP_SHARED mappings.
-             * Without this, munmap/exit would free a frame still owned by
-             * the memfd and any other mapping (UAF). */
-            pmm_ref_page(mf->phys_pages[pi]);
+            /* The reference is already held (taken by memfd_get_page_ref under
+             * memfd_lock). Invariant: total refs = 1 (memfd) + live MAP_SHARED
+             * mappings; munmap/exit drops this mapping's ref. */
         }
         (void)num_pages;
 
