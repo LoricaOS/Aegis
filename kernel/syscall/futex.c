@@ -1,6 +1,7 @@
 /* kernel/syscall/futex.c — futex WAIT/WAKE implementation */
 #include "futex.h"
 #include "sched.h"
+#include "proc.h"      /* current_proc()->pml4_phys — the futex address-space key */
 #include "syscall_util.h"
 #include "uaccess.h"
 #include "spinlock.h"
@@ -14,6 +15,13 @@
 typedef struct {
     aegis_task_t *task;
     uint64_t      addr;
+    uint64_t      mm;      /* address-space key (process pml4_phys): a futex VA is
+                            * per-address-space, so two processes' private futexes
+                            * at the SAME user VA (e.g. libc's fixed-VA malloc/stdio
+                            * locks) are DIFFERENT futexes. Matching addr alone made
+                            * one process's FUTEX_WAKE wake another's waiter, which
+                            * re-blocked → the intended waiter hung. Threads of one
+                            * process share pml4_phys, so they still match. */
     uint8_t       in_use;
     uint8_t       woken;   /* set by the waker; cleared ONLY by the owning waiter */
 } futex_waiter_t;
@@ -22,7 +30,7 @@ static futex_waiter_t s_pool[FUTEX_MAX_WAIT];
 
 static spinlock_t futex_lock = SPINLOCK_INIT;
 
-int futex_wake_addr(uint64_t addr, uint32_t count)
+int futex_wake_addr(uint64_t addr, uint32_t count, uint64_t mm)
 {
     irqflags_t fl = spin_lock_irqsave(&futex_lock);
     int woken = 0;
@@ -35,7 +43,8 @@ int futex_wake_addr(uint64_t addr, uint32_t count)
          * (slot-recycle lost-wakeup — reproduced via condvar broadcast under
          * smp_sched).  Only the owning waiter clears its slot, so it can never
          * be recycled out from under it.  Skip already-woken slots. */
-        if (s_pool[i].in_use && !s_pool[i].woken && s_pool[i].addr == addr) {
+        if (s_pool[i].in_use && !s_pool[i].woken &&
+            s_pool[i].addr == addr && s_pool[i].mm == mm) {
             s_pool[i].woken = 1;
             sched_wake(s_pool[i].task);
             woken++;
@@ -59,20 +68,22 @@ int futex_wake_addr(uint64_t addr, uint32_t count)
  * futexstress under smp_sched.)  Returns woken+requeued (musl only checks
  * != -ENOSYS). */
 static int futex_requeue(uint64_t addr, uint64_t addr2,
-                         uint32_t wake_n, uint32_t requeue_n)
+                         uint32_t wake_n, uint32_t requeue_n, uint64_t mm)
 {
     irqflags_t fl = spin_lock_irqsave(&futex_lock);
     int woken = 0, requeued = 0;
     uint32_t i;
     for (i = 0; i < FUTEX_MAX_WAIT && (uint32_t)woken < wake_n; i++) {
-        if (s_pool[i].in_use && !s_pool[i].woken && s_pool[i].addr == addr) {
+        if (s_pool[i].in_use && !s_pool[i].woken &&
+            s_pool[i].addr == addr && s_pool[i].mm == mm) {
             s_pool[i].woken = 1;
             sched_wake(s_pool[i].task);
             woken++;
         }
     }
     for (i = 0; i < FUTEX_MAX_WAIT && (uint32_t)requeued < requeue_n; i++) {
-        if (s_pool[i].in_use && !s_pool[i].woken && s_pool[i].addr == addr) {
+        if (s_pool[i].in_use && !s_pool[i].woken &&
+            s_pool[i].addr == addr && s_pool[i].mm == mm) {
             s_pool[i].addr = addr2;   /* now waits on addr2; woken via FUTEX_WAKE(addr2) */
             requeued++;
         }
@@ -124,6 +135,7 @@ uint64_t sys_futex(uint64_t addr, uint64_t op, uint64_t val,
         w->woken  = 0;
         w->task = sched_current();
         w->addr = addr;
+        w->mm   = current_proc()->pml4_phys;   /* address-space key (see struct) */
         spin_unlock_irqrestore(&futex_lock, fl);
 
         /* Re-load *uaddr AFTER registering.  If it no longer matches val, a
@@ -181,7 +193,8 @@ uint64_t sys_futex(uint64_t addr, uint64_t op, uint64_t val,
     }
 
     if (cmd == FUTEX_WAKE)
-        return (uint64_t)futex_wake_addr(addr, (uint32_t)val);
+        return (uint64_t)futex_wake_addr(addr, (uint32_t)val,
+                                         current_proc()->pml4_phys);
 
     /* FUTEX_REQUEUE / FUTEX_CMP_REQUEUE: wake `val` waiters on addr, requeue up
      * to `timeout` (the val2 arg) of the rest to addr2.  Required by musl's
@@ -198,7 +211,8 @@ uint64_t sys_futex(uint64_t addr, uint64_t op, uint64_t val,
                 return SYS_ERR(EAGAIN);
         }
         return (uint64_t)futex_requeue(addr, addr2, (uint32_t)val,
-                                       (uint32_t)timeout);
+                                       (uint32_t)timeout,
+                                       current_proc()->pml4_phys);
     }
 
     return SYS_ERR(ENOSYS);

@@ -108,7 +108,7 @@ sys_exit(uint64_t arg1)
                 vmm_write_user_bytes(proc->pml4_phys,
                                      sched_current()->clear_child_tid,
                                      &zero, sizeof(zero));
-            futex_wake_addr(sched_current()->clear_child_tid, 1);
+            futex_wake_addr(sched_current()->clear_child_tid, 1, proc->pml4_phys);
         }
 
         /* Session leader exit: SIGHUP + SIGCONT to foreground group */
@@ -201,7 +201,7 @@ uint64_t sys_exit_group(uint64_t arg1)
             if (user_ptr_valid(tid_clears[k].ctid, sizeof(zero)))
                 vmm_write_user_bytes(tid_clears[k].pml4, tid_clears[k].ctid,
                                      &zero, sizeof(zero));
-            futex_wake_addr(tid_clears[k].ctid, 1);
+            futex_wake_addr(tid_clears[k].ctid, 1, tid_clears[k].pml4);
         }
 
         /* Session leader exit: SIGHUP + SIGCONT to foreground group */

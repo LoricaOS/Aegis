@@ -14,6 +14,8 @@ uint64_t sys_futex(uint64_t addr, uint64_t op, uint64_t val,
                    uint64_t timeout, uint64_t addr2, uint64_t val3);
 
 /* Wake waiters on addr — called from thread exit for clear_child_tid */
-int futex_wake_addr(uint64_t addr, uint32_t count);
+/* mm = the address-space key (waker's process pml4_phys); only waiters in the
+ * same address space at `addr` are woken (see the mm field in futex.c). */
+int futex_wake_addr(uint64_t addr, uint32_t count, uint64_t mm);
 
 #endif
