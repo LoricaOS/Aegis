@@ -148,22 +148,24 @@ sys_open(uint64_t arg1, uint64_t arg2, uint64_t arg3)
         }
     }
 
-    /* Install-tree mutation gate: a ring-3 process that creates or writes a
-     * file under /apps or /etc/aegis must hold CAP_KIND_INSTALL. Read-only
-     * opens are exempt. (Syscall handlers run only in user context; boot-time
-     * fs work goes through vfs_open directly, not this path.) */
+    /* Install-tree mutation gate. Read-only opens are exempt. The CREATE case
+     * (O_CREAT of a new file under a protected tree) is enforced ATOMICALLY
+     * inside ext2_create via vfs_open_ex below — closing the symlink-swap
+     * TOCTOU the old separate check had. This pre-check still covers opening an
+     * EXISTING protected file for write, which doesn't route through a mutator;
+     * that narrower open-existing race is a documented residual. */
+    int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
+                                 CAP_RIGHTS_READ) == 0);
     {
         int mutating = (arg2 & 1) /* O_WRONLY */ || (arg2 & 2) /* O_RDWR */ ||
                        (arg2 & VFS_O_CREAT) || (arg2 & VFS_O_TRUNC) ||
                        (arg2 & VFS_O_APPEND);
-        if (mutating && cap_path_is_protected(kpath) &&
-            cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
-                      CAP_RIGHTS_READ) != 0)
-            return SYS_ERR(EPERM); /* EPERM — installing into the system tree needs CAP_KIND_INSTALL */
+        if (mutating && !has_install && cap_path_is_protected(kpath))
+            return SYS_ERR(EPERM); /* installing into the system tree needs CAP_KIND_INSTALL */
     }
 
-    int r = vfs_open(kpath, (int)arg2, (uint16_t)(arg3 & 0xFFF),
-                     &proc->fd_table->fds[fd]);
+    int r = vfs_open_ex(kpath, (int)arg2, (uint16_t)(arg3 & 0xFFF),
+                        &proc->fd_table->fds[fd], has_install);
     if (r < 0)
         return (uint64_t)(int64_t)r;
     /* Mark an AUTH-gated fd so SCM_RIGHTS can't launder secret-read authority

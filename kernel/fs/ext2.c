@@ -1336,11 +1336,16 @@ int ext2_open(const char *path, uint32_t *inode_out)
 /* ext2_symlink — create a symbolic link                               */
 /* ------------------------------------------------------------------ */
 
-int ext2_symlink(const char *linkpath, const char *target)
+int ext2_symlink(const char *linkpath, const char *target, int has_install)
 {
     if (!s_mounted)
         return -1;
     irqflags_t fl = ext2_lock_acquire();
+
+    if (!has_install && ext2_path_under_protected(linkpath)) {
+        ext2_lock_release(fl);
+        return -EPERM;
+    }
 
     uint32_t parent_ino;
     const char *basename;
@@ -1424,11 +1429,17 @@ int ext2_symlink(const char *linkpath, const char *target)
 /* unlink path already only frees the inode when links_count hits 0.    */
 /* ------------------------------------------------------------------ */
 
-int ext2_link(const char *oldpath, const char *newpath)
+int ext2_link(const char *oldpath, const char *newpath, int has_install)
 {
     if (!s_mounted)
         return -1;
     irqflags_t fl = ext2_lock_acquire();
+
+    if (!has_install && (ext2_path_under_protected(oldpath) ||
+                         ext2_path_under_protected(newpath))) {
+        ext2_lock_release(fl);
+        return -EPERM;
+    }
 
     uint32_t old_ino;
     if (ext2_open_ex(oldpath, &old_ino, 1) != 0) {
@@ -1498,11 +1509,16 @@ int ext2_readlink(const char *path, char *buf, uint32_t bufsiz)
 /* ext2_chmod — change permission bits                                 */
 /* ------------------------------------------------------------------ */
 
-int ext2_chmod(const char *path, uint16_t mode)
+int ext2_chmod(const char *path, uint16_t mode, int has_install)
 {
     if (!s_mounted)
         return -1;
     irqflags_t fl = ext2_lock_acquire();
+
+    if (!has_install && ext2_path_under_protected(path)) {
+        ext2_lock_release(fl);
+        return -EPERM;
+    }
 
     uint32_t ino;
     if (ext2_open_ex(path, &ino, 1) != 0) {
@@ -1527,11 +1543,16 @@ int ext2_chmod(const char *path, uint16_t mode)
 /* ext2_chown — change owner and/or group                              */
 /* ------------------------------------------------------------------ */
 
-int ext2_chown(const char *path, uint16_t uid, uint16_t gid, int follow)
+int ext2_chown(const char *path, uint16_t uid, uint16_t gid, int follow, int has_install)
 {
     if (!s_mounted)
         return -1;
     irqflags_t fl = ext2_lock_acquire();
+
+    if (!has_install && ext2_path_under_protected(path)) {
+        ext2_lock_release(fl);
+        return -EPERM;
+    }
 
     uint32_t ino;
     if (ext2_open_ex(path, &ino, follow) != 0) {
@@ -1558,11 +1579,16 @@ int ext2_chown(const char *path, uint16_t uid, uint16_t gid, int follow)
 /* ctime is always bumped to now (the inode metadata just changed).     */
 /* ------------------------------------------------------------------ */
 
-int ext2_utimes(const char *path, uint32_t atime, uint32_t mtime, int follow)
+int ext2_utimes(const char *path, uint32_t atime, uint32_t mtime, int follow, int has_install)
 {
     if (!s_mounted)
         return -1;
     irqflags_t fl = ext2_lock_acquire();
+
+    if (!has_install && ext2_path_under_protected(path)) {
+        ext2_lock_release(fl);
+        return -EPERM;
+    }
 
     uint32_t ino;
     if (ext2_open_ex(path, &ino, follow) != 0) {
@@ -1970,11 +1996,19 @@ int ext2_truncate(uint32_t inode_num)
     return 0;
 }
 
-int ext2_create(const char *path, uint16_t mode)
+int ext2_create(const char *path, uint16_t mode, int has_install)
 {
     if (!s_mounted)
         return -1;
     irqflags_t fl = ext2_lock_acquire();
+
+    /* Install-tree TOCTOU gate: check protection under the SAME lock we hold
+     * across the create, so a concurrent symlink swap can't move the target
+     * under a protected tree between the check and the mutation. */
+    if (!has_install && ext2_path_under_protected(path)) {
+        ext2_lock_release(fl);
+        return -EPERM;
+    }
 
     uint32_t parent_ino;
     const char *basename;
@@ -2008,11 +2042,16 @@ int ext2_create(const char *path, uint16_t mode)
     return r;
 }
 
-int ext2_unlink(const char *path)
+int ext2_unlink(const char *path, int has_install)
 {
     if (!s_mounted)
         return -1;
     irqflags_t fl = ext2_lock_acquire();
+
+    if (!has_install && ext2_path_under_protected(path)) {
+        ext2_lock_release(fl);
+        return -EPERM;
+    }
 
     uint32_t parent_ino;
     const char *basename;
@@ -2071,11 +2110,16 @@ int ext2_unlink(const char *path)
     return r;
 }
 
-int ext2_mkdir(const char *path, uint16_t mode)
+int ext2_mkdir(const char *path, uint16_t mode, int has_install)
 {
     if (!s_mounted)
         return -1;
     irqflags_t fl = ext2_lock_acquire();
+
+    if (!has_install && ext2_path_under_protected(path)) {
+        ext2_lock_release(fl);
+        return -EPERM;
+    }
 
     uint32_t parent_ino;
     const char *basename;
@@ -2171,13 +2215,18 @@ int ext2_mkdir(const char *path, uint16_t mode)
  * Returns 0 on success, -20 (ENOTDIR) if path is not a directory,
  * -39 (ENOTEMPTY) if it holds anything besides "." and "..",
  * -1 on other failures. */
-int ext2_rmdir(const char *path)
+int ext2_rmdir(const char *path, int has_install)
 {
     if (!s_mounted)
         return -1;
     if (path[0] == '/' && path[1] == '\0')
         return -1; /* never the root */
     irqflags_t fl = ext2_lock_acquire();
+
+    if (!has_install && ext2_path_under_protected(path)) {
+        ext2_lock_release(fl);
+        return -EPERM;
+    }
 
     uint32_t parent_ino;
     const char *basename;
@@ -2286,11 +2335,17 @@ int ext2_rmdir(const char *path)
     return r;
 }
 
-int ext2_rename(const char *old_path, const char *new_path)
+int ext2_rename(const char *old_path, const char *new_path, int has_install)
 {
     if (!s_mounted)
         return -1;
     irqflags_t fl = ext2_lock_acquire();
+
+    if (!has_install && (ext2_path_under_protected(old_path) ||
+                         ext2_path_under_protected(new_path))) {
+        ext2_lock_release(fl);
+        return -EPERM;
+    }
 
     uint32_t ino;
     if (ext2_open(old_path, &ino) != 0) {
@@ -2348,7 +2403,10 @@ int ext2_rename(const char *old_path, const char *new_path)
          * Reuse ext2_rmdir for correctness (emptiness check, link counts, block
          * free); on failure (ENOTEMPTY) abort the rename without side effects. */
         if (dst_is_dir) {
-            int rr = ext2_rmdir(new_path);
+            /* Internal to an already-authorized rename (has_install checked at
+             * entry); pass it through so a legit protected-tree rename isn't
+             * self-blocked when replacing an existing dir. */
+            int rr = ext2_rmdir(new_path, has_install);
             if (rr != 0) {
                 ext2_lock_release(fl);
                 return rr;

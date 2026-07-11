@@ -200,8 +200,8 @@ void ext2_perfbench(void)
         buf[i] = (uint8_t)(i * 7 + 1);
 
     /* Fresh file. */
-    ext2_unlink(PERFBENCH_PATH);
-    if (ext2_create(PERFBENCH_PATH, 0644) != 0) {
+    ext2_unlink(PERFBENCH_PATH, 1);
+    if (ext2_create(PERFBENCH_PATH, 0644, 1) != 0) {
         printk("[PERFBENCH] FAIL: create %s\n", PERFBENCH_PATH);
         kva_free_pages(buf, PERFBENCH_CHUNK / 4096);
         return;
@@ -300,6 +300,6 @@ void ext2_perfbench(void)
     if (ok && verify_ok)
         printk("[PERFBENCH] OK\n");
 
-    ext2_unlink(PERFBENCH_PATH);
+    ext2_unlink(PERFBENCH_PATH, 1);
     kva_free_pages(buf, PERFBENCH_CHUNK / 4096);
 }

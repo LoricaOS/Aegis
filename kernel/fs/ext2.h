@@ -148,11 +148,20 @@ int ext2_write(uint32_t inode_num, const void *buf, uint32_t offset, uint32_t le
  * (direct + indirect trees + pointer blocks).  Used by the O_TRUNC open path,
  * which previously zeroed only i_size and leaked every block. Returns 0 / -1. */
 int ext2_truncate(uint32_t inode_num);
-int ext2_create(const char *path, uint16_t mode);
-int ext2_unlink(const char *path);
-int ext2_mkdir(const char *path, uint16_t mode);
-int ext2_rmdir(const char *path);
-int ext2_rename(const char *old_path, const char *new_path);
+/* Path-mutating operations take has_install: 1 if the caller holds
+ * CAP_KIND_INSTALL (or is trusted kernel/boot context), 0 otherwise. Each
+ * checks — atomically, under the single ext2_lock it already holds across
+ * resolve+mutate — whether the target resolves under an install-protected tree
+ * and, if so, refuses with -EPERM unless has_install. Doing the check inside
+ * the lock (not in the syscall layer, which released the lock between check and
+ * mutate) closes the symlink-swap TOCTOU: a concurrent rename/symlink cannot
+ * change what the path resolves to between the protection check and the
+ * mutation. */
+int ext2_create(const char *path, uint16_t mode, int has_install);
+int ext2_unlink(const char *path, int has_install);
+int ext2_mkdir(const char *path, uint16_t mode, int has_install);
+int ext2_rmdir(const char *path, int has_install);
+int ext2_rename(const char *old_path, const char *new_path, int has_install);
 int ext2_file_size(uint32_t inode_num);
 
 /* ext2_perfbench — block-cache throughput micro-benchmark.  Writes a large
@@ -173,23 +182,23 @@ int ext2_readdir(uint32_t dir_inode, uint64_t index,
 int ext2_is_dir(uint32_t ino);
 
 /* Symlink operations */
-int ext2_symlink(const char *linkpath, const char *target);
+int ext2_symlink(const char *linkpath, const char *target, int has_install);
 int ext2_readlink(const char *path, char *buf, uint32_t bufsiz);
 int ext2_read_symlink_target(uint32_t ino, char *buf, uint32_t bufsiz);
 
 /* Permission check — POSIX DAC (no root bypass) */
 int ext2_check_perm(uint32_t ino, uint16_t proc_uid, uint16_t proc_gid, int want);
 
-/* Metadata modification */
-int ext2_chmod(const char *path, uint16_t mode);
-int ext2_chown(const char *path, uint16_t uid, uint16_t gid, int follow);
+/* Metadata modification (has_install: see the mutating-ops note above) */
+int ext2_chmod(const char *path, uint16_t mode, int has_install);
+int ext2_chown(const char *path, uint16_t uid, uint16_t gid, int follow, int has_install);
 
 /* utimensat: leave a timestamp field unchanged (UTIME_OMIT) */
 #define EXT2_UTIME_KEEP 0xFFFFFFFFu
-int ext2_utimes(const char *path, uint32_t atime, uint32_t mtime, int follow);
+int ext2_utimes(const char *path, uint32_t atime, uint32_t mtime, int follow, int has_install);
 
 /* Hard link: newpath becomes another name for oldpath's inode. */
-int ext2_link(const char *oldpath, const char *newpath);
+int ext2_link(const char *oldpath, const char *newpath, int has_install);
 
 /* Path walk with symlink following control.
  * follow_final: 1 = follow symlinks on final component, 0 = no-follow (lstat). */

@@ -26,8 +26,11 @@ static int
 kfile_write(const char *path, const char *data, uint32_t len)
 {
     vfs_file_t f;
-    /* O_WRONLY(1) | O_CREAT | O_TRUNC — create or overwrite. */
-    int rc = vfs_open(path, 1 | VFS_O_CREAT | VFS_O_TRUNC, 0644, &f);
+    /* O_WRONLY(1) | O_CREAT | O_TRUNC — create or overwrite. has_install=1: the
+     * caller reached sys_adminconf only past the POWER admin gate, and this
+     * writes deliberately into the protected /etc/aegis tree (that's its whole
+     * purpose), so the ext2 create's install-tree check must let it through. */
+    int rc = vfs_open_ex(path, 1 | VFS_O_CREAT | VFS_O_TRUNC, 0644, &f, 1);
     if (rc != 0)
         return rc;
 

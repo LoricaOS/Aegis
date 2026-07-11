@@ -112,8 +112,20 @@ vfs_ramfs_rename(const char *oldp, const char *newp, int *out_rc)
     return 1;
 }
 
+/* vfs_open — read-only / non-authorized wrapper. Callers that don't create
+ * under install-protected trees use this (has_install=0 is safe because a
+ * non-O_CREAT open never reaches the ext2 create path). Create-with-authority
+ * callers (sys_open with the caller's INSTALL cap, sys_adminconf which is
+ * POWER-authorized) use vfs_open_ex directly. */
 int
 vfs_open(const char *path, int flags, uint16_t create_mode, vfs_file_t *out)
+{
+    return vfs_open_ex(path, flags, create_mode, out, 0);
+}
+
+int
+vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
+            int has_install)
 {
     /* Default: not protected. Non-ext2 backends below don't touch kflags, so
      * this prevents a stale VFS_KF_PROTECTED bit leaking from a reused slot. */
@@ -232,7 +244,7 @@ vfs_open(const char *path, int flags, uint16_t create_mode, vfs_file_t *out)
                 if (pperm != 0)
                     return -EACCES;
             }
-            if (ext2_create(path, create_mode ? create_mode : 0644) == 0) {
+            if (ext2_create(path, create_mode ? create_mode : 0644, has_install) == 0) {
                 if (ext2_open(path, &ino) >= 0) {
                     ext2_fd_priv_t *p = ext2_pool_alloc(ino);
                     if (!p) return -ENOMEM;

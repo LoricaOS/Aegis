@@ -77,12 +77,11 @@ sys_mkdir(uint64_t arg1, uint64_t arg2)
     (void)arg2; /* mode ignored for now */
     if (copy_path_resolved(kpath, arg1, sizeof(kpath)) != 0)
         return SYS_ERR(EFAULT);
-    /* Install-tree mutation gate: a ring-3 process mutating /apps or
-     * /etc/aegis must hold CAP_KIND_INSTALL. Boot-time (is_user == 0) exempt. */
-    if (cap_path_is_protected(kpath) &&
-        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
-                  CAP_RIGHTS_READ) != 0)
-        return SYS_ERR(EPERM); /* EPERM — installing into the system tree needs CAP_KIND_INSTALL */
+    /* Install-tree mutation gate is enforced ATOMICALLY inside ext2_mkdir now
+     * (closing the symlink-swap TOCTOU); we just compute the caller's authority.
+     * ramfs paths (below) never reach ext2_mkdir. */
+    int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
+                                 CAP_RIGHTS_READ) == 0);
     /* Route ramfs (/tmp, /run) paths — these are not in ext2, so ext2_mkdir
      * would wrongly return EPERM. ramfs is a flat namespace; mkdir creates a
      * directory marker entry (needed by software that mkdir's cache/runtime
@@ -115,7 +114,7 @@ sys_mkdir(uint64_t arg1, uint64_t arg2)
                 return SYS_ERR(EACCES);
         }
     }
-    int r = ext2_mkdir(kpath, 0755);
+    int r = ext2_mkdir(kpath, 0755, has_install);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }
 
@@ -148,7 +147,9 @@ sys_rmdir(uint64_t arg1)
                 return SYS_ERR(EACCES);
         }
     }
-    int r = ext2_rmdir(kpath);
+    int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
+                                 CAP_RIGHTS_READ) == 0);
+    int r = ext2_rmdir(kpath, has_install);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }
 
@@ -169,12 +170,9 @@ sys_unlink(uint64_t arg1)
     char kpath[256];
     if (copy_path_resolved(kpath, arg1, sizeof(kpath)) != 0)
         return SYS_ERR(EFAULT);
-    /* Install-tree mutation gate: a ring-3 process mutating /apps or
-     * /etc/aegis must hold CAP_KIND_INSTALL. Boot-time (is_user == 0) exempt. */
-    if (cap_path_is_protected(kpath) &&
-        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
-                  CAP_RIGHTS_READ) != 0)
-        return SYS_ERR(EPERM); /* EPERM — installing into the system tree needs CAP_KIND_INSTALL */
+    /* Install-tree gate enforced atomically inside ext2_unlink now. */
+    int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
+                                 CAP_RIGHTS_READ) == 0);
     /* Route ramfs (/tmp, /run) paths — these are not in ext2, so calling
      * ext2_unlink would wrongly return EPERM. */
     {
@@ -193,7 +191,7 @@ sys_unlink(uint64_t arg1)
                 return SYS_ERR(EACCES);
         }
     }
-    int r = ext2_unlink(kpath);
+    int r = ext2_unlink(kpath, has_install);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }
 
@@ -217,13 +215,9 @@ sys_rename(uint64_t arg1, uint64_t arg2)
         return SYS_ERR(EFAULT);
     if (copy_path_resolved(knew, arg2, sizeof(knew)) != 0)
         return SYS_ERR(EFAULT);
-    /* Install-tree mutation gate: a ring-3 process mutating /apps or
-     * /etc/aegis must hold CAP_KIND_INSTALL. Guard if EITHER the source or
-     * destination is protected. Boot-time (is_user == 0) exempt. */
-    if ((cap_path_is_protected(kold) || cap_path_is_protected(knew)) &&
-        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
-                  CAP_RIGHTS_READ) != 0)
-        return SYS_ERR(EPERM); /* EPERM — installing into the system tree needs CAP_KIND_INSTALL */
+    /* Install-tree gate enforced atomically inside ext2_rename (both paths). */
+    int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
+                                 CAP_RIGHTS_READ) == 0);
     /* Route ramfs (/tmp, /run) renames before the ext2 path. */
     {
         int rc;
@@ -247,6 +241,6 @@ sys_rename(uint64_t arg1, uint64_t arg2)
                 return SYS_ERR(EACCES);
         }
     }
-    int r = ext2_rename(kold, knew);
+    int r = ext2_rename(kold, knew, has_install);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }

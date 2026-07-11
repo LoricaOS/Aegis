@@ -79,14 +79,13 @@ sys_symlink(uint64_t arg1, uint64_t arg2)
     if (resolve_path(linkpath, proc->cwd, resolved, sizeof(resolved)) != 0)
         return SYS_ERR(ENAMETOOLONG);
 
-    /* Install-tree gate: creating a symlink AT a protected path (which could
-     * alias a system binary/policy file) requires CAP_KIND_INSTALL. */
-    if (cap_path_is_protected(resolved) &&
-        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
-                  CAP_RIGHTS_READ) != 0)
-        return SYS_ERR(EPERM);
-
-    int r = ext2_symlink(resolved, target);
+    /* Install-tree gate is now enforced ATOMICALLY inside ext2_symlink (under
+     * the fs lock it holds across resolve+create), closing the symlink-swap
+     * TOCTOU the old separate cap_path_is_protected check had. We just tell it
+     * whether this caller is INSTALL-authorized. */
+    int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
+                                 CAP_RIGHTS_READ) == 0);
+    int r = ext2_symlink(resolved, target, has_install);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }
 
@@ -113,14 +112,10 @@ sys_link(uint64_t arg1, uint64_t arg2)
         resolve_path(newp, proc->cwd, rnew, sizeof(rnew)) != 0)
         return SYS_ERR(ENAMETOOLONG);
 
-    /* Linking a system binary/policy file into a new name (or creating the new
-     * name under a protected tree) requires CAP_KIND_INSTALL. */
-    if ((cap_path_is_protected(rold) || cap_path_is_protected(rnew)) &&
-        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
-                  CAP_RIGHTS_READ) != 0)
-        return SYS_ERR(EPERM);
-
-    int r = ext2_link(rold, rnew);
+    /* Install-tree gate enforced atomically inside ext2_link (both paths). */
+    int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
+                                 CAP_RIGHTS_READ) == 0);
+    int r = ext2_link(rold, rnew, has_install);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }
 
@@ -197,12 +192,9 @@ sys_chmod(uint64_t arg1, uint64_t arg2)
     if (resolve_path(path, proc->cwd, resolved, sizeof(resolved)) != 0)
         return SYS_ERR(ENAMETOOLONG);
 
-    /* Install-tree mutation gate: a process mutating /apps or /etc/aegis must
-     * hold CAP_KIND_INSTALL. (Syscall handlers run only in user context.) */
-    if (cap_path_is_protected(resolved) &&
-        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
-                  CAP_RIGHTS_READ) != 0)
-        return SYS_ERR(EPERM); /* EPERM — installing into the system tree needs CAP_KIND_INSTALL */
+    /* Install-tree mutation gate enforced atomically inside ext2_chmod. */
+    int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
+                                 CAP_RIGHTS_READ) == 0);
 
     /* Ownership check: only file owner (or uid 0) may chmod */
     {
@@ -219,7 +211,7 @@ sys_chmod(uint64_t arg1, uint64_t arg2)
         }
     }
 
-    int r = ext2_chmod(resolved, (uint16_t)arg2);
+    int r = ext2_chmod(resolved, (uint16_t)arg2, has_install);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }
 
@@ -296,7 +288,9 @@ sys_chown(uint64_t arg1, uint64_t arg2, uint64_t arg3)
         }
     }
 
-    int r = ext2_chown(resolved, (uint16_t)arg2, (uint16_t)arg3, 1);
+    int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
+                                 CAP_RIGHTS_READ) == 0);
+    int r = ext2_chown(resolved, (uint16_t)arg2, (uint16_t)arg3, 1, has_install);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }
 
@@ -365,10 +359,9 @@ sys_utimensat(uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4)
     if (resolve_path(path, proc->cwd, resolved, sizeof(resolved)) != 0)
         return SYS_ERR(ENAMETOOLONG);
 
-    if (cap_path_is_protected(resolved) &&
-        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
-                  CAP_RIGHTS_READ) != 0)
-        return SYS_ERR(EPERM);
+    /* Install-tree gate enforced atomically inside ext2_utimes. */
+    int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
+                                 CAP_RIGHTS_READ) == 0);
 
     /* Ownership check: only the file owner may set times. */
     {
@@ -402,7 +395,8 @@ sys_utimensat(uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4)
     }
 
     int follow = (arg4 & 0x100) ? 0 : 1;  /* AT_SYMLINK_NOFOLLOW */
-    int r = ext2_utimes(resolved, atime, mtime, follow);
+    int r = ext2_utimes(resolved, atime, mtime, follow, has_install);
+    if (r == -EPERM) return SYS_ERR(EPERM);   /* protected-tree without INSTALL */
     return (r < 0) ? SYS_ERR(ENOENT) : 0;
 }
 
@@ -440,6 +434,8 @@ sys_lchown(uint64_t arg1, uint64_t arg2, uint64_t arg3)
         }
     }
 
-    int r = ext2_chown(resolved, (uint16_t)arg2, (uint16_t)arg3, 0);
+    int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
+                                 CAP_RIGHTS_READ) == 0);
+    int r = ext2_chown(resolved, (uint16_t)arg2, (uint16_t)arg3, 0, has_install);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }
