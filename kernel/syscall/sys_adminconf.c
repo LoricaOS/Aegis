@@ -6,12 +6,19 @@
  * (Settings) can't write there directly — that requires CAP_KIND_INSTALL,
  * which is intentionally narrow. Instead these narrow syscalls perform the
  * write in kernel context (which is trusted and bypasses the syscall-layer
- * INSTALL/DAC checks), gated on the caller being an authenticated root admin.
+ * INSTALL/DAC checks), so the gate here is the ONLY thing standing between an
+ * unprivileged caller and a forged /etc/aegis config file. It must therefore
+ * match the authority that a direct INSTALL write demands.
  *
- * v1 policy: caller must hold CAP_KIND_POWER (admin-tier, already implies
- * proc->authenticated) AND be bound to root (auth_uid == 0). A dedicated
- * administrative-session password gate is planned for v2 and will layer on
- * top of this same entry point without changing the storage format.
+ * Policy: caller must hold a live sudo-style ADMIN SESSION (proc->admin_session)
+ * — the same gate CAP_KIND_INSTALL / sys_install_commit enforce, granted only by
+ * sys_admin_session after /bin/login verifies a SEPARATE admin credential. Mere
+ * login (`authenticated`) or an admin-tier CAP_KIND_POWER cap is NOT enough:
+ * POWER is authenticated-tier (even service-tier binaries such as /bin/reboot
+ * carry it) and the cosmetic uid-0 `live` session already satisfies auth_uid==0,
+ * so gating on POWER+auth_uid==0 would let any logged-in user drive a confused
+ * deputy (e.g. /bin/aegisctl, which policy hands POWER) into writing here with
+ * no admin password. Requiring the admin session closes that. Fail closed.
  */
 #include "sys_impl.h"
 #include "sched.h"
@@ -46,14 +53,20 @@ kfile_write(const char *path, const char *data, uint32_t len)
     return ret;
 }
 
-/* True if the caller is an authenticated root admin (the v1 gate). */
+/*
+ * True if the caller holds a live admin session — the SAME authority
+ * CAP_KIND_INSTALL / sys_install_commit require (see admin_session_active in
+ * sys_cap.c, the single install-authority chokepoint). proc->admin_session is
+ * granted ONLY by sys_admin_session after /bin/login checks a separate admin
+ * credential; it is not implied by login or by any capability. Gating the
+ * kernel-context /etc/aegis writes on this — rather than on POWER + auth_uid==0,
+ * both of which an ordinary logged-in `live` session already satisfies —
+ * prevents a confused-deputy escalation. Fail closed: no session, no write.
+ */
 static int
 admin_root(aegis_process_t *proc)
 {
-    if (cap_check(proc->caps, CAP_TABLE_SIZE,
-                  CAP_KIND_POWER, CAP_RIGHTS_READ) != 0)
-        return 0;
-    return proc->auth_uid == 0;
+    return proc->admin_session != 0;
 }
 
 /*

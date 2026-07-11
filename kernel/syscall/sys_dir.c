@@ -191,6 +191,15 @@ sys_unlink(uint64_t arg1)
                 return SYS_ERR(EACCES);
         }
     }
+    /* Sensitive-inode gate: unlinking /etc/shadow (→ recreate with attacker
+     * hashes) or the account DB needs the mutation authority, not owner-uid-0. */
+    {
+        uint32_t sino;
+        if (ext2_open(kpath, &sino) == 0) {
+            int g = sensitive_write_gate(sino);
+            if (g != 0) return (uint64_t)(int64_t)g;
+        }
+    }
     int r = ext2_unlink(kpath, has_install);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }
@@ -239,6 +248,21 @@ sys_rename(uint64_t arg1, uint64_t arg2)
                 (uint16_t)proc->uid, (uint16_t)proc->gid, 2 | 1);
             if (pperm != 0)
                 return SYS_ERR(EACCES);
+        }
+    }
+    /* Sensitive-inode mutation gate on BOTH source and target: renaming a
+     * crafted file OVER /etc/shadow (target) — the reported break — needs
+     * CAP_KIND_AUTH; renaming the account DB away (source) needs an admin
+     * session.  Keyed on the resolved inode so symlink/".." cannot bypass. */
+    {
+        uint32_t sino;
+        if (ext2_open(kold, &sino) == 0) {
+            int g = sensitive_write_gate(sino);
+            if (g != 0) return (uint64_t)(int64_t)g;
+        }
+        if (ext2_open(knew, &sino) == 0) {
+            int g = sensitive_write_gate(sino);
+            if (g != 0) return (uint64_t)(int64_t)g;
         }
     }
     int r = ext2_rename(kold, knew, has_install);

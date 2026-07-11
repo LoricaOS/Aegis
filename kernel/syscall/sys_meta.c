@@ -32,6 +32,58 @@ resolve_path(const char *kpath, const char *cwd, char *out, uint32_t outsz)
     return 0;
 }
 
+/* ── Sensitive-inode mutation gate ──────────────────────────────────────
+ *
+ * The kernel protects a handful of security-critical files by INODE (recorded
+ * at ext2 mount), so symlink / ".." aliases cannot bypass the check:
+ *
+ *   /etc/shadow, /etc/aegis/admin  — the login + admin-elevation credentials.
+ *       READ is already AUTH-gated in vfs_open/sys_open.  But the ext2 MUTATORS
+ *       (rename/unlink/link/chmod/chown/…) enforced only baseline VFS_WRITE +
+ *       the install-protected-tree check — and /etc/shadow is under neither, so
+ *       an unprivileged `rename()` could clobber it with attacker hashes (no
+ *       CAP_KIND_AUTH).  Gate every mutator on CAP_KIND_AUTH, mirroring the read
+ *       gate, so the write side is as strong as the read side.
+ *
+ *   /etc/passwd, /etc/group  — the account/group identity DB.  World-readable
+ *       but admin-managed; the live user is cosmetic uid 0 and OWNS these uid-0
+ *       files, so ext2 DAC alone grants owner-write.  Gate mutation on an
+ *       admin_session (the same authority useradd/adminpw hold), so a baseline
+ *       session cannot append a uid-0 account or clobber the DB.
+ *
+ * Fail-closed: unknown/zero inode → allowed (nothing sensitive resolved); a
+ * sensitive inode without the required authority → negative errno.  Only user
+ * processes are gated (kernel-internal fs setup passes through). */
+int
+sensitive_write_gate(uint32_t ino)
+{
+    if (ino == 0)
+        return 0;
+    if (!sched_current()->is_user)
+        return 0;
+
+    aegis_process_t *proc = current_proc();
+
+    uint32_t shadow_ino = ext2_get_shadow_ino();
+    uint32_t admin_ino  = ext2_get_admin_ino();
+    if ((shadow_ino != 0 && ino == shadow_ino) ||
+        (admin_ino  != 0 && ino == admin_ino)) {
+        if (cap_check(proc->caps, CAP_TABLE_SIZE,
+                      CAP_KIND_AUTH, CAP_RIGHTS_READ) != 0)
+            return -EACCES;
+    }
+
+    uint32_t passwd_ino = ext2_get_passwd_ino();
+    uint32_t group_ino  = ext2_get_group_ino();
+    if ((passwd_ino != 0 && ino == passwd_ino) ||
+        (group_ino  != 0 && ino == group_ino)) {
+        if (proc->admin_session == 0)
+            return -EPERM;
+    }
+
+    return 0;
+}
+
 /*
  * sys_lstat — syscall 6
  * Like sys_stat but does not follow symlinks on the final component.
@@ -85,6 +137,15 @@ sys_symlink(uint64_t arg1, uint64_t arg2)
      * whether this caller is INSTALL-authorized. */
     int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
                                  CAP_RIGHTS_READ) == 0);
+    /* Sensitive-inode mutation gate (shadow/admin → AUTH, passwd/group → admin
+     * session). Keyed on the resolved inode so a symlink alias cannot bypass. */
+    {
+        uint32_t sino;
+        if (ext2_open(resolved, &sino) == 0) {
+            int g = sensitive_write_gate(sino);
+            if (g != 0) return (uint64_t)(int64_t)g;
+        }
+    }
     int r = ext2_symlink(resolved, target, has_install);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }
@@ -115,6 +176,19 @@ sys_link(uint64_t arg1, uint64_t arg2)
     /* Install-tree gate enforced atomically inside ext2_link (both paths). */
     int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
                                  CAP_RIGHTS_READ) == 0);
+    /* Sensitive-inode gate on BOTH ends: hard-linking /etc/shadow to an alias
+     * (source) or clobbering a sensitive target both require the authority. */
+    {
+        uint32_t sino;
+        if (ext2_open(rold, &sino) == 0) {
+            int g = sensitive_write_gate(sino);
+            if (g != 0) return (uint64_t)(int64_t)g;
+        }
+        if (ext2_open(rnew, &sino) == 0) {
+            int g = sensitive_write_gate(sino);
+            if (g != 0) return (uint64_t)(int64_t)g;
+        }
+    }
     int r = ext2_link(rold, rnew, has_install);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }
@@ -211,6 +285,15 @@ sys_chmod(uint64_t arg1, uint64_t arg2)
         }
     }
 
+    /* Sensitive-inode gate: chmod'ing /etc/shadow or the account DB needs the
+     * same authority as any other mutation of it (owner-uid-0 DAC is not it). */
+    {
+        uint32_t sino;
+        if (ext2_open(resolved, &sino) == 0) {
+            int g = sensitive_write_gate(sino);
+            if (g != 0) return (uint64_t)(int64_t)g;
+        }
+    }
     int r = ext2_chmod(resolved, (uint16_t)arg2, has_install);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }
@@ -290,6 +373,13 @@ sys_chown(uint64_t arg1, uint64_t arg2, uint64_t arg3)
 
     int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
                                  CAP_RIGHTS_READ) == 0);
+    {
+        uint32_t sino;
+        if (ext2_open(resolved, &sino) == 0) {
+            int g = sensitive_write_gate(sino);
+            if (g != 0) return (uint64_t)(int64_t)g;
+        }
+    }
     int r = ext2_chown(resolved, (uint16_t)arg2, (uint16_t)arg3, 1, has_install);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }
@@ -394,6 +484,14 @@ sys_utimensat(uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4)
               :                          (uint32_t)ts[2];
     }
 
+    {
+        uint32_t sino;
+        if (ext2_open(resolved, &sino) == 0) {
+            int g = sensitive_write_gate(sino);
+            if (g != 0) return (uint64_t)(int64_t)g;
+        }
+    }
+
     int follow = (arg4 & 0x100) ? 0 : 1;  /* AT_SYMLINK_NOFOLLOW */
     int r = ext2_utimes(resolved, atime, mtime, follow, has_install);
     if (r == -EPERM) return SYS_ERR(EPERM);   /* protected-tree without INSTALL */
@@ -436,6 +534,13 @@ sys_lchown(uint64_t arg1, uint64_t arg2, uint64_t arg3)
 
     int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
                                  CAP_RIGHTS_READ) == 0);
+    {
+        uint32_t sino;
+        if (ext2_open(resolved, &sino) == 0) {
+            int g = sensitive_write_gate(sino);
+            if (g != 0) return (uint64_t)(int64_t)g;
+        }
+    }
     int r = ext2_chown(resolved, (uint16_t)arg2, (uint16_t)arg3, 0, has_install);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }

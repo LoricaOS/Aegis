@@ -105,6 +105,17 @@ int copy_path_from_user(char *kpath, uint64_t user_ptr, uint32_t bufsz);
 int copy_path_resolved(char *kpath, uint64_t user_ptr, uint32_t bufsz);
 int stat_copy_path(uint64_t user_ptr, char *out, uint32_t bufsz);
 
+/* sensitive_write_gate (sys_meta.c) — fail-closed authority check for mutating a
+ * security-sensitive inode, keyed on the RESOLVED inode number so symlink/".."
+ * aliases cannot bypass it.  `ino` is the resolved source/target inode of a
+ * mutator (rename/unlink/link/symlink/chmod/chown/utimes/…); pass 0 for "no such
+ * inode" (unresolved) — that is allowed.  Returns 0 if permitted, else a negative
+ * errno:
+ *   - /etc/shadow, /etc/aegis/admin  → require CAP_KIND_AUTH   (mirrors vfs_open)
+ *   - /etc/passwd, /etc/group        → require an admin_session (account DB)
+ * Only user processes are gated; kernel-internal callers pass through. */
+int sensitive_write_gate(uint32_t ino);
+
 /* ── sys_io.c ───────────────────────────────────────────────────────────── */
 uint64_t sys_write(uint64_t a1, uint64_t a2, uint64_t a3);
 uint64_t sys_writev(uint64_t a1, uint64_t a2, uint64_t a3);

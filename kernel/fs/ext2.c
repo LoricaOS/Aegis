@@ -214,6 +214,22 @@ static uint32_t s_admin_ino = 0;
 
 uint32_t ext2_get_admin_ino(void) { return s_admin_ino; }
 
+/* Inodes of /etc/passwd and /etc/group — the account/group identity database.
+ * Unlike shadow/admin these are legitimately world-READABLE (login, id, ls -l
+ * all read them), so they are NOT read-gated. But they must not be MUTATED by an
+ * unprivileged session: the live user is cosmetic uid 0 and owns these uid-0
+ * files, so ext2 DAC alone grants owner-write — letting a baseline process append
+ * a uid-0 account or clobber the DB. They are admin-managed, so every mutation
+ * (write-open, append, truncate, rename-over, unlink, chmod, chown, …) is gated
+ * on an admin_session (the same gate the install/useradd path holds). Recorded
+ * at mount; compared against the resolved inode so symlink/".." aliases cannot
+ * bypass the gate. 0 = not present on this volume. */
+static uint32_t s_passwd_ino = 0;
+static uint32_t s_group_ino  = 0;
+
+uint32_t ext2_get_passwd_ino(void) { return s_passwd_ino; }
+uint32_t ext2_get_group_ino(void)  { return s_group_ino; }
+
 /* Inodes of the install-protected trees, recorded at mount. Mutations under
  * these (resolved through symlinks / "..") require CAP_KIND_INSTALL. 0 = the
  * tree is absent on this volume (no protection to enforce).
@@ -439,6 +455,15 @@ int ext2_mount(const char *devname)
         uint32_t admin_ino = 0;
         if (ext2_open_ex("/etc/aegis/admin", &admin_ino, 1) == 0)
             s_admin_ino = admin_ino;
+        /* /etc/passwd + /etc/group: mutation-gated on an admin_session (see the
+         * s_passwd_ino comment).  Same registration pattern as shadow/admin so
+         * the gate keys on the resolved inode, not a spoofable path string. */
+        uint32_t passwd_ino = 0;
+        if (ext2_open_ex("/etc/passwd", &passwd_ino, 1) == 0)
+            s_passwd_ino = passwd_ino;
+        uint32_t group_ino = 0;
+        if (ext2_open_ex("/etc/group", &group_ino, 1) == 0)
+            s_group_ino = group_ino;
     }
 
     /* Record the install-protected tree inodes (same rationale as shadow:

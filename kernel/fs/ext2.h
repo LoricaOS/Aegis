@@ -225,6 +225,13 @@ uint32_t ext2_get_shadow_ino(void);
  * post-symlink-resolution CAP_KIND_AUTH read enforcement as /etc/shadow. */
 uint32_t ext2_get_admin_ino(void);
 
+/* Return the inodes of /etc/passwd and /etc/group on the mounted volume (0 if
+ * absent).  Used by the sensitive-inode mutation gate (vfs_open write path +
+ * the sys_dir/sys_meta mutators) to require an admin_session before the account
+ * identity DB can be modified — these are world-readable but admin-managed. */
+uint32_t ext2_get_passwd_ino(void);
+uint32_t ext2_get_group_ino(void);
+
 /* Returns 1 if mutating `path` would touch the install-protected trees
  * (/apps or /etc/aegis), resolved through symlinks and "." / ".." — set even
  * when the final component does not exist (so O_CREAT targets are caught).

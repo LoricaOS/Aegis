@@ -209,6 +209,29 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
                         return -EACCES;
                 }
             }
+            /* Account-DB write gate: /etc/passwd and /etc/group are world-
+             * readable (login/id/ls -l read them) but admin-managed.  The live
+             * user is cosmetic uid 0 and OWNS these uid-0 files, so ext2 DAC
+             * alone would grant owner-write — letting a baseline session append
+             * a uid-0 account or clobber the DB.  Require an admin_session for
+             * any WRITE-intent open (O_WRONLY/O_RDWR/O_TRUNC/O_APPEND); reads are
+             * untouched.  Keyed on the resolved inode (post symlink/".."), so a
+             * symlink alias cannot bypass it.  Mirrors the shadow/admin gate
+             * above; the same inodes are also gated in the sys_dir/sys_meta
+             * mutators (rename-over/unlink/chmod/…). */
+            {
+                uint32_t passwd_ino = ext2_get_passwd_ino();
+                uint32_t group_ino  = ext2_get_group_ino();
+                if (sched_current()->is_user &&
+                    ((passwd_ino != 0 && ino == passwd_ino) ||
+                     (group_ino  != 0 && ino == group_ino))) {
+                    int wr = (flags & 1) || (flags & 2) ||
+                             (flags & (int)VFS_O_TRUNC) ||
+                             (flags & (int)VFS_O_APPEND);
+                    if (wr && current_proc()->admin_session == 0)
+                        return -EACCES;
+                }
+            }
             /* O_TRUNC: drop to length 0 AND free the data blocks.  Setting
              * i_size = 0 alone (the old behaviour) leaked every data/indirect
              * block of the file on each truncate. */
