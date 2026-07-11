@@ -285,6 +285,15 @@ sys_read(uint64_t arg1, uint64_t arg2, uint64_t arg3)
         return SYS_ERR(EISDIR);  /* directory fd, not readable */
     if ((f->flags & VFS_O_ACCMODE) == VFS_O_WRONLY)
         return SYS_ERR(EBADF);   /* fd not opened for reading */
+    /* Re-validate authority on USE, not just at open: an fd onto /etc/shadow or
+     * /etc/aegis/admin carries VFS_KF_AUTH_GATED. If it reached a process that
+     * lacks CAP_KIND_AUTH — inherited across exec, or dup'd to a capless child —
+     * that process must not read the secret through it. (SCM_RIGHTS passing of
+     * such an fd is separately refused at the sender.) No ambient authority:
+     * holding the fd is not holding the cap. */
+    if ((f->kflags & VFS_KF_AUTH_GATED) &&
+        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_AUTH, CAP_RIGHTS_READ) != 0)
+        return SYS_ERR(EACCES);
     if (!user_ptr_valid(arg2, arg3))
         return SYS_ERR(EFAULT);
 
@@ -346,6 +355,11 @@ sys_pread64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t off)
     if (!f->ops->read) return SYS_ERR(EISDIR);
     if ((f->flags & VFS_O_ACCMODE) == VFS_O_WRONLY)
         return SYS_ERR(EBADF);   /* fd not opened for reading */
+    /* AUTH-gated secret (see sys_read): re-check the caller holds AUTH so a
+     * laundered /etc/shadow fd can't be pread by a capless process. */
+    if ((f->kflags & VFS_KF_AUTH_GATED) &&
+        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_AUTH, CAP_RIGHTS_READ) != 0)
+        return SYS_ERR(EACCES);
     if (!user_ptr_valid(buf, count)) return SYS_ERR(EFAULT);
     char kbuf[4096];
     uint64_t page_off = buf & 0xFFFULL;
@@ -420,8 +434,12 @@ sys_close(uint64_t arg1)
         return SYS_ERR(EBADF);
     const vfs_ops_t *ops = f->ops;
     void *priv = f->priv;
-    f->ops  = (const vfs_ops_t *)0;
-    f->priv = (void *)0;
+    f->ops    = (const vfs_ops_t *)0;
+    f->priv   = (void *)0;
+    f->kflags = 0;   /* clear authority markers (VFS_KF_*) so a REUSED slot can't
+                      * inherit a stale AUTH_GATED/PROTECTED bit — invariant: a
+                      * free slot (ops==NULL) has kflags==0. Creation paths that
+                      * don't set kflags (memfd/pipe/socket) then stay clean. */
     ops->close(priv);
     return 0;
 }

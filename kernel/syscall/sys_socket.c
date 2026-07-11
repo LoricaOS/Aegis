@@ -16,6 +16,27 @@
 #include "unix_socket.h"
 #include "fd_waitq.h"
 #include "signal.h"
+#include "memfd.h"
+#include "pipe.h"
+
+/* scm_fd_passable — may this fd cross a process boundary via SCM_RIGHTS?
+ *
+ * Only no-authority IPC / shared-memory primitives may. A filesystem fd (ext2)
+ * carries its open-time authority — AUTH for /etc/shadow and /etc/aegis/admin,
+ * INSTALL for the write-protected trees, plus ext2 DAC — and a device fd
+ * (console/pty/fb) carries device access; the RECEIVER may hold none of those
+ * caps, so passing such an fd would launder the authority to a capless process
+ * (a confused-deputy privesc). The receiver must open the object itself and
+ * pass the gate. memfd (shared RAM), pipes and unix sockets carry no such
+ * authority. Allowlist + fail closed: anything not listed here cannot be
+ * passed. (Today only lumen's window-surface memfd is ever legitimately sent.) */
+static int
+scm_fd_passable(const vfs_ops_t *ops)
+{
+    return ops == &g_memfd_ops ||
+           ops == &g_pipe_read_ops || ops == &g_pipe_write_ops ||
+           ops == &g_unix_sock_ops;
+}
 
 /* ── Constants ─────────────────────────────────────────────────────────── */
 
@@ -867,6 +888,15 @@ uint64_t sys_sendmsg(uint64_t fd, uint64_t msg_ptr, uint64_t flags)
                     if (sfd < 0 || sfd >= PROC_MAX_FDS) continue;
                     vfs_file_t *f = &proc->fd_table->fds[sfd];
                     if (!f->ops) continue;
+                    /* Authority-laundering guard: refuse to pass an fd that
+                     * carries filesystem/device authority (see scm_fd_passable).
+                     * Unwind the refs already dup'd this message, then EPERM. */
+                    if (!scm_fd_passable(f->ops)) {
+                        for (uint8_t k = 0; k < count; k++)
+                            if (staged[k].ops && staged[k].ops->close)
+                                staged[k].ops->close(staged[k].priv);
+                        return SYS_ERR(EPERM);
+                    }
                     if (f->ops->dup) f->ops->dup(f->priv);
                     staged[count].ops   = f->ops;
                     staged[count].priv  = f->priv;

@@ -896,6 +896,11 @@ int unix_sock_recv_fds(uint32_t id, int *fd_out, int max_fds)
         proc->fd_table->fds[free_fd].priv   = us->passed_fds[i].priv;
         proc->fd_table->fds[free_fd].offset = 0;
         proc->fd_table->fds[free_fd].size   = 0;
+        /* Received fds carry no filesystem/device authority (sys_sendmsg's
+         * scm_fd_passable allowlist permits only memfd/pipe/unix-socket), so
+         * the receiver's fd holds no authority marker. Set kflags explicitly
+         * rather than trust the reused slot to have been left clean. */
+        proc->fd_table->fds[free_fd].kflags = 0;
         /* Inherit the sender's file *status* flags (O_NONBLOCK etc., which
          * belong to the shared open file description) but NOT FD_CLOEXEC,
          * which is a per-fd-table property the receiver owns. Linux clears

@@ -17,8 +17,11 @@ fd_table_alloc(void)
     fd_table_t *t = (fd_table_t *)kva_alloc_pages(FD_TABLE_PAGES);
     if (!t) return (fd_table_t *)0;
     uint32_t i;
-    for (i = 0; i < PROC_MAX_FDS; i++)
-        t->fds[i].ops = (const vfs_ops_t *)0;
+    for (i = 0; i < PROC_MAX_FDS; i++) {
+        t->fds[i].ops    = (const vfs_ops_t *)0;
+        t->fds[i].kflags = 0;   /* kva pages aren't guaranteed zeroed; keep the
+                                 * "free slot ⇒ kflags==0" invariant from birth */
+    }
     t->refcount = 1;
     return t;
 }

@@ -129,6 +129,7 @@ sys_open(uint64_t arg1, uint64_t arg2, uint64_t arg3)
      * (caps.d/, anchors) stays readable.  This pre-resolution check catches
      * direct path access and normalized traversals (../etc/shadow); symlink
      * bypasses are caught by the post-resolution inode check in vfs_open. */
+    int auth_gated = 0;
     {
         static const char shadow_path[] = "/etc/shadow";
         static const char admin_path[]  = "/etc/aegis/admin";
@@ -143,6 +144,7 @@ sys_open(uint64_t arg1, uint64_t arg2, uint64_t arg3)
             if (cap_check(proc->caps, CAP_TABLE_SIZE,
                           CAP_KIND_AUTH, CAP_RIGHTS_READ) != 0)
                 return SYS_ERR(EACCES);
+            auth_gated = 1;   /* mark the resulting fd (see VFS_KF_AUTH_GATED) */
         }
     }
 
@@ -164,6 +166,10 @@ sys_open(uint64_t arg1, uint64_t arg2, uint64_t arg3)
                      &proc->fd_table->fds[fd]);
     if (r < 0)
         return (uint64_t)(int64_t)r;
+    /* Mark an AUTH-gated fd so SCM_RIGHTS can't launder secret-read authority
+     * (vfs_open set kflags to PROTECTED-or-0; OR our bit in, don't clobber). */
+    if (auth_gated)
+        proc->fd_table->fds[fd].kflags |= VFS_KF_AUTH_GATED;
     /* Store open flags in the fd slot for F_GETFL */
     proc->fd_table->fds[fd].flags = (uint32_t)arg2;
     /* Propagate O_CLOEXEC from open flags to fd flags */
