@@ -447,13 +447,17 @@ void tcp_rx(netdev_t *dev, ip4_addr_t src_ip, ip4_addr_t dst_ip,
                 tcp_send_segment(dev, &s_rst_conn, TCP_RST | TCP_ACK, NULL, 0);
                 goto out;
             }
-            /* Drop the SYN if too many half-open connections are pending
-             * (SYN-flood guard). The peer's SYN retransmit recovers once the
-             * backlog drains. tcp_lock is held here, so the count is stable. */
+            /* Drop the SYN if this LISTENER already has too many half-open
+             * connections pending (SYN-flood guard). Counting per-listener, not
+             * globally: a global count let an off-box attacker starve every
+             * service (incl. :22) with 32 half-opens to any one port. The peer's
+             * SYN retransmit recovers once the backlog drains. tcp_lock is held
+             * here, so the count is stable. */
             {
                 uint32_t half_open = 0;
                 for (uint32_t hi = 0; hi < TCP_MAX_CONNS; hi++)
-                    if (s_tcp[hi].state == TCP_SYN_RCVD) half_open++;
+                    if (s_tcp[hi].state == TCP_SYN_RCVD &&
+                        s_tcp[hi].listener_id == listener->sock_id) half_open++;
                 if (half_open >= TCP_SYN_BACKLOG_MAX) goto out;
             }
             conn = tcp_alloc();
@@ -469,6 +473,12 @@ void tcp_rx(netdev_t *dev, ip4_addr_t src_ip, ip4_addr_t dst_ip,
             conn->snd_una     = conn->snd_nxt;
             conn->snd_wnd     = ntohs(seg->window);   /* SYN window: unscaled */
             conn->listener_id = listener->sock_id;
+            /* Not accepted yet: no socket owns this half-open conn. Leave it
+             * SOCK_NONE (not the 0 that tcp_claim_slot zeroes it to) so the
+             * `sock_id != SOCK_NONE` wake guards don't fire a spurious
+             * sock_wake(0)/epoll_notify(0) on slot 0. accept() assigns the
+             * real id via tcp_conn_set_sock. */
+            conn->sock_id     = SOCK_NONE;
             /* RFC 7323: enable window scaling on this connection only if the
              * incoming SYN carried a Window Scale option.  If so, record the
              * peer's shift (applied to its future windows) and arm our own
