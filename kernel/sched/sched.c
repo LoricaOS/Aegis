@@ -147,24 +147,78 @@ run_list_remove_locked(aegis_task_t *task)
 /* vfork freeze: while a process vforks, its OTHER threads must not run — they
  * share the address space with the suspended main thread AND the vfork child
  * until the child execs.  Letting them run races the child in the shared VM
- * (Ladybird's transport threads vs the posix_spawn child).  Set to the vforking
- * tgid; the run picker skips every task in that thread group.  Cleared by the
+ * (Ladybird's transport threads vs the posix_spawn child).  The run picker skips
+ * every task whose tgid is in this frozen SET.  Entries are cleared by the
  * child's execve (before it wakes the parent) or by sched_exit if the child dies
- * first.  ponytail: single global => one concurrent vfork (fine: the parent
- * blocks; single-core test bed).  SMP would want this under sched_lock + a stack. */
-uint32_t s_vfork_frozen_tgid = 0;
+ * first.
+ *
+ * A SET, not a single global: with SMP two thread groups can vfork concurrently
+ * on different cores, and a single global let the second vfork overwrite (thaw)
+ * the first parent's freeze mid-window — its siblings then ran in the address
+ * space the first vfork child still shared (the exact corruption the freeze
+ * prevents).  All access is under sched_lock (task_pickable reads it there).
+ * Bounded by CPU count in practice; on the never-hit overflow we simply skip
+ * freezing that vfork (best-effort, never a corrupt set). */
+#define VFORK_FROZEN_MAX 16
+static uint32_t s_vfork_frozen[VFORK_FROZEN_MAX];
+static uint32_t s_vfork_frozen_count = 0;
+
+/* *_locked variants: caller already holds sched_lock (the sched_exit path).
+ * tgid 0 is the empty-slot sentinel; user tgids are >= 1 so it never collides. */
+static void vfork_freeze_add_locked(uint32_t tgid)
+{
+    int free_slot = -1;
+    for (int i = 0; i < VFORK_FROZEN_MAX; i++) {
+        if (s_vfork_frozen[i] == tgid) return;   /* already frozen */
+        if (s_vfork_frozen[i] == 0 && free_slot < 0) free_slot = i;
+    }
+    if (free_slot >= 0) { s_vfork_frozen[free_slot] = tgid; s_vfork_frozen_count++; }
+    /* else: set full (>16 concurrent vforks) — skip; best-effort, never corrupt. */
+}
+
+void vfork_freeze_remove_locked(uint32_t tgid)
+{
+    if (tgid == 0) return;
+    for (int i = 0; i < VFORK_FROZEN_MAX; i++)
+        if (s_vfork_frozen[i] == tgid) { s_vfork_frozen[i] = 0; s_vfork_frozen_count--; }
+}
+
+/* Public, self-locking wrappers for the syscall paths (vfork / execve) that do
+ * NOT already hold sched_lock. sched_lock is non-recursive, so callers that DO
+ * hold it must use the _locked forms above instead. */
+void vfork_freeze_add(uint32_t tgid)
+{
+    irqflags_t fl = spin_lock_irqsave(&sched_lock);
+    vfork_freeze_add_locked(tgid);
+    spin_unlock_irqrestore(&sched_lock, fl);
+}
+
+void vfork_freeze_remove(uint32_t tgid)
+{
+    irqflags_t fl = spin_lock_irqsave(&sched_lock);
+    vfork_freeze_remove_locked(tgid);
+    spin_unlock_irqrestore(&sched_lock, fl);
+}
 
 /* task_pickable — true if `t` is a real, runnable task this CPU may switch to:
  * not the sentinel, not already live on another core (on_cpu >= 0 && != me,
  * which would run its single kernel stack on two CPUs = corruption), and not
- * frozen by an in-flight vfork in its thread group. */
+ * frozen by an in-flight vfork in its thread group. Caller holds sched_lock. */
+static inline int
+vfork_is_frozen(uint32_t tgid)
+{
+    if (s_vfork_frozen_count == 0) return 0;   /* fast path: no vfork in flight */
+    for (int i = 0; i < VFORK_FROZEN_MAX; i++)
+        if (s_vfork_frozen[i] == tgid) return 1;
+    return 0;
+}
+
 static inline int
 task_pickable(aegis_task_t *t, int me)
 {
     return t != &s_run_sentinel &&
            (t->on_cpu < 0 || t->on_cpu == me) &&
-           !(s_vfork_frozen_tgid && t->is_user &&
-             ((aegis_process_t *)t)->tgid == s_vfork_frozen_tgid);
+           !(t->is_user && vfork_is_frozen(((aegis_process_t *)t)->tgid));
 }
 
 static aegis_task_t *
@@ -515,8 +569,10 @@ sched_exit(void)
         /* vfork child dying BEFORE exec: thaw the parent's frozen threads so the
          * parent (woken by SIGCHLD below) can run.  Without this the parent stays
          * frozen and the whole tgid deadlocks. */
-        if (s_cur->is_user && ((aegis_process_t *)s_cur)->vfork_parent)
-            s_vfork_frozen_tgid = 0;
+        if (s_cur->is_user && ((aegis_process_t *)s_cur)->vfork_parent) {
+            aegis_task_t *vp = ((aegis_process_t *)s_cur)->vfork_parent;
+            vfork_freeze_remove_locked(((aegis_process_t *)vp)->tgid);  /* sched_lock held */
+        }
 
         /* Notify parent of child exit via SIGCHLD.
          * signal_send_pid_locked sets SIGCHLD pending on the parent and

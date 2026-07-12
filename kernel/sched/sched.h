@@ -282,7 +282,11 @@ sched_current(void)
  * Unlinks current from the run queue; switches to the next RUNNING task,
  * or to the idle task when the run queue is empty.
  * REQUIRES: sched_spawn_idle has run (true for any post-boot caller). */
-extern uint32_t s_vfork_frozen_tgid;
+/* vfork thread-group freeze set (see sched.c). Both require the caller to hold
+ * sched_lock. add() freezes a tgid's non-vforking threads for the vfork window;
+ * remove() thaws it (on the child's execve or death). */
+void vfork_freeze_add(uint32_t tgid);
+void vfork_freeze_remove(uint32_t tgid);
 void sched_block(void);
 
 /* sched_block_locked — block the current task when the caller ALREADY holds

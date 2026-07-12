@@ -93,6 +93,12 @@ sock_t *sock_get_nolock(uint32_t sock_id);
 /* sock_free: mark slot free. Called on close. */
 void sock_free(uint32_t sock_id);
 
+/* sock_ref/sock_unref: pin a socket across a blocking syscall (send/recv/accept/
+ * connect) so a concurrent close of the same fd can't free the slot under a
+ * parked waiter. sock_unref tears down at the last reference. */
+void sock_ref(uint32_t sock_id);
+void sock_unref(uint32_t sock_id);
+
 /* sock_wake: wake everything blocked on this socket (blocking accept/connect/
  * recv + poll/epoll waiters) by waking its poll_waiters queue. Thin wrapper
  * around waitq_wake_all; do NOT call under tcp_lock/sock_lock. */

@@ -510,8 +510,15 @@ cap_apply_policy(cap_slot_t *caps, const char *path, int authenticated,
     cap_grant(caps, CAP_TABLE_SIZE, CAP_KIND_VFS_WRITE,     CAP_RIGHTS_WRITE);
     cap_grant(caps, CAP_TABLE_SIZE, CAP_KIND_VFS_READ,      CAP_RIGHTS_READ);
     cap_grant(caps, CAP_TABLE_SIZE, CAP_KIND_IPC,           CAP_RIGHTS_READ);
-    cap_grant(caps, CAP_TABLE_SIZE, CAP_KIND_PROC_READ,     CAP_RIGHTS_READ);
     cap_grant(caps, CAP_TABLE_SIZE, CAP_KIND_THREAD_CREATE, CAP_RIGHTS_READ);
+    /* NOTE: CAP_KIND_PROC_READ is deliberately NOT baseline. procfs_check_access
+     * always permits reading your OWN /proc/[pid]; reading ANOTHER process's
+     * /proc/[pid]/{maps,cmdline,status,fd} (ASLR layout, argv secrets, open fds)
+     * requires an explicit `PROC_READ` grant via caps.d — otherwise the model's
+     * "no ambient authority" is violated (any process could snoop every other).
+     * Process-monitoring tools (shutdown, contresume, the admin shell) carry the
+     * grant in their policy; sys_kill/sys_setfg need PROC_READ with WRITE rights,
+     * which was never baseline, so signalling stays fail-closed too. */
 
     /* Policy: SERVICE-tier caps unconditionally; ADMIN-tier only for an
      * authenticated session. Trusted-path-anchored (see cap_policy_lookup). */

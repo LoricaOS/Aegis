@@ -298,6 +298,13 @@ sys_accept(uint64_t fd, uint64_t addr, uint64_t addrlen)
     if (err) return err;
     if (ls->state != SOCK_LISTENING) return SYS_ERR(EINVAL);
 
+    /* Pin the listener across the accept: the loop blocks on ls->poll_waiters
+     * and re-dereferences `ls` after waking. Without the pin, a sibling thread
+     * closing the listening fd (CLONE_FILES) while we are parked would free the
+     * slot and re-init the waitq under us — a use-after-free. Every return below
+     * drops the pin via the comma operator. See sock_vfs_read. */
+    sock_ref(lsid);
+
     aegis_process_t *proc = current_proc();
 
     for (;;) {
@@ -308,7 +315,7 @@ sys_accept(uint64_t fd, uint64_t addr, uint64_t addrlen)
 
             /* Allocate a new sock_t for this connected peer */
             int new_sid = sock_alloc(SOCK_TYPE_STREAM);
-            if (new_sid < 0) return SYS_ERR(ENOMEM);
+            if (new_sid < 0) return (sock_unref(lsid), SYS_ERR(ENOMEM));
             sock_t *ns = sock_get((uint32_t)new_sid);
             ns->state       = SOCK_CONNECTED;
             ns->tcp_conn_id = conn_id;
@@ -322,8 +329,10 @@ sys_accept(uint64_t fd, uint64_t addr, uint64_t addrlen)
 
             /* Fill caller's addr struct */
             if (addr && addrlen) {
-                if (!user_ptr_valid(addr, sizeof(k_sockaddr_in_t))) return SYS_ERR(EFAULT);
-                if (!user_ptr_valid(addrlen, sizeof(uint32_t))) return SYS_ERR(EFAULT);
+                if (!user_ptr_valid(addr, sizeof(k_sockaddr_in_t)))
+                    return (sock_unref(lsid), SYS_ERR(EFAULT));
+                if (!user_ptr_valid(addrlen, sizeof(uint32_t)))
+                    return (sock_unref(lsid), SYS_ERR(EFAULT));
                 k_sockaddr_in_t sa;
                 sa.sin_family = AF_INET;
                 sa.sin_port   = htons(ns->remote_port);
@@ -335,12 +344,15 @@ sys_accept(uint64_t fd, uint64_t addr, uint64_t addrlen)
             }
 
             int new_fd = sock_open_fd((uint32_t)new_sid, proc);
-            if (new_fd < 0) { sock_free((uint32_t)new_sid); return SYS_ERR(ENOMEM); }
-            return (uint64_t)new_fd;
+            if (new_fd < 0) {
+                sock_free((uint32_t)new_sid);
+                return (sock_unref(lsid), SYS_ERR(ENOMEM));
+            }
+            return (sock_unref(lsid), (uint64_t)new_fd);
         }
 
         if (ls->nonblocking)
-            return SYS_ERR(EAGAIN);
+            return (sock_unref(lsid), SYS_ERR(EAGAIN));
 
         /* Block until a connection is queued.  Interruptible (Ctrl-C aborts).
          * wait_event registers on poll_waiters BEFORE re-checking the queue, so
@@ -350,7 +362,7 @@ sys_accept(uint64_t fd, uint64_t addr, uint64_t addrlen)
         wait_event_interruptible(&ls->poll_waiters,
             ls->accept_head != ls->accept_tail, rc);
         if (rc == BLOCK_EINTR)
-            return SYS_ERR(EINTR);
+            return (sock_unref(lsid), SYS_ERR(EINTR));
     }
 }
 
@@ -460,10 +472,14 @@ sys_connect(uint64_t fd, uint64_t addr, uint64_t addrlen)
      * returns immediately and a wake landing in the gap is not lost.
      * Interruptible: a pending signal aborts with EINTR. */
     int rc;
+    /* Pin across the handshake block so a sibling close of this fd can't free
+     * the slot / re-init s->poll_waiters under our parked connect (see
+     * sock_vfs_read). */
+    sock_ref(sid);
     wait_event_interruptible(&s->poll_waiters, s->state != SOCK_CONNECTING, rc);
-    if (rc == BLOCK_EINTR)
-        return SYS_ERR(EINTR);
-    if (s->state != SOCK_CONNECTED) return SYS_ERR(ECONNREFUSED);
+    if (rc == BLOCK_EINTR) { sock_unref(sid); return SYS_ERR(EINTR); }
+    if (s->state != SOCK_CONNECTED) { sock_unref(sid); return SYS_ERR(ECONNREFUSED); }
+    sock_unref(sid);
     return 0;
 }
 
@@ -549,9 +565,14 @@ sys_sendto(uint64_t fd, uint64_t buf, uint64_t len,
     if (err) return err;
 
     if (s->type == SOCK_TYPE_STREAM) {
-        /* TCP send — blocking, segments large writes (shared helper). */
+        /* TCP send — blocking, segments large writes (shared helper). Pin the
+         * socket across the block so a sibling thread closing this fd can't free
+         * the slot / re-init s->poll_waiters under our parked sender (see
+         * sock_vfs_read). */
         if (s->state != SOCK_CONNECTED) return SYS_ERR(ENOTCONN);
+        sock_ref(sid);
         int64_t r = sock_stream_send(s, buf, len);
+        sock_unref(sid);
         return (uint64_t)r;  /* bytes (>=0), or -errno == SYS_ERR(errno) form */
     }
 
@@ -628,6 +649,15 @@ sys_recvfrom(uint64_t fd, uint64_t buf, uint64_t len,
     uint64_t err = get_proc_sock(fd, &s, &sid);
     if (err) return err;
 
+    /* Pin the socket for the whole recv: both the TCP and UDP loops below block
+     * on s->poll_waiters and re-dereference `s` after waking. Without the pin, a
+     * sibling thread closing this same fd (CLONE_FILES) while we are parked would
+     * drop the last ref, free the slot, and re-init the waitq under our still-
+     * linked waiter — a use-after-free. Every return past this point drops the
+     * pin (via the comma operator) so teardown defers to the last putter. See
+     * sock_vfs_read. */
+    sock_ref(sid);
+
     /* MSG_DONTWAIT forces this single call to be nonblocking regardless of the
      * socket's O_NONBLOCK flag (Linux semantics). musl/curl pass it on their
      * "drain whatever is ready" reads; without honoring it a blocking socket
@@ -672,16 +702,16 @@ sys_recvfrom(uint64_t fd, uint64_t buf, uint64_t len,
                     n = tcp_conn_recv(s->tcp_conn_id, (void *)0, 0);  /* re-peek */
                 }
                 if (total > 0)
-                    return (uint64_t)total;
+                    return (sock_unref(sid), (uint64_t)total);
                 /* total==0: nothing actually consumed (lost a race to another
                  * reader) — fall through to the block/EOF/EAGAIN logic. */
                 n = tcp_conn_recv(s->tcp_conn_id, (void *)0, 0);
             }
-            if (n == 0) return 0;  /* EOF / FIN */
+            if (n == 0) return (sock_unref(sid), 0);  /* EOF / FIN */
             /* n < 0: -11 (alive, empty → block) or -1 (dead conn). */
-            if (nonblock) return SYS_ERR(EAGAIN);
+            if (nonblock) return (sock_unref(sid), SYS_ERR(EAGAIN));
             if (has_timeout && (uint32_t)arch_get_ticks() >= deadline)
-                return SYS_ERR(ETIMEDOUT);
+                return (sock_unref(sid), SYS_ERR(ETIMEDOUT));
             /* Block until data arrives or the connection closes (peek >= 0),
              * interruptible, with an optional SO_RCVTIMEO deadline.  The
              * authoritative peek + EOF/timeout decision re-runs at the top of
@@ -694,7 +724,7 @@ sys_recvfrom(uint64_t fd, uint64_t buf, uint64_t len,
             else
                 wait_event_interruptible(&s->poll_waiters,
                     tcp_conn_recv(s->tcp_conn_id, (void *)0, 0) >= 0, rc);
-            if (rc == BLOCK_EINTR) return SYS_ERR(EINTR);
+            if (rc == BLOCK_EINTR) return (sock_unref(sid), SYS_ERR(EINTR));
         }
     }
 
@@ -718,11 +748,11 @@ sys_recvfrom(uint64_t fd, uint64_t buf, uint64_t len,
                 copy_to_user((void *)(uintptr_t)addr, &sa, sizeof(sa));
             }
             slot->in_use = 0;
-            return (uint64_t)copy_len;
+            return (sock_unref(sid), (uint64_t)copy_len);
         }
-        if (nonblock) return SYS_ERR(EAGAIN);
+        if (nonblock) return (sock_unref(sid), SYS_ERR(EAGAIN));
         if (has_timeout && (uint32_t)arch_get_ticks() >= deadline)
-            return SYS_ERR(ETIMEDOUT);
+            return (sock_unref(sid), SYS_ERR(ETIMEDOUT));
         /* Block until a datagram is queued, interruptible, with an optional
          * SO_RCVTIMEO deadline.  The authoritative dequeue + timeout decision
          * re-runs at the top of the loop after the wait returns. */
@@ -733,7 +763,7 @@ sys_recvfrom(uint64_t fd, uint64_t buf, uint64_t len,
         else
             wait_event_interruptible(&s->poll_waiters,
                 s->udp_rx_head != s->udp_rx_tail, rc);
-        if (rc == BLOCK_EINTR) return SYS_ERR(EINTR);
+        if (rc == BLOCK_EINTR) return (sock_unref(sid), SYS_ERR(EINTR));
     }
 }
 
@@ -1818,8 +1848,12 @@ sys_netcfg(uint64_t op, uint64_t arg1, uint64_t arg2, uint64_t arg3)
                       CAP_KIND_NET_ADMIN, CAP_RIGHTS_WRITE) != 0)
             return SYS_ERR(ENOCAP);
         if (!iwl_wifi_present()) return SYS_ERR(ENODEV);
-        if (!user_ptr_valid(arg1, 1)) return SYS_ERR(EFAULT);
         char ssid[33];
+        /* Validate the FULL range we copy, not just 1 byte — the exception-table
+         * copy_from_user faults gracefully on the shipped arches, but the
+         * validated and copied lengths must agree (and the generic memcpy
+         * fallback would over-read). */
+        if (!user_ptr_valid(arg1, sizeof(ssid) - 1)) return SYS_ERR(EFAULT);
         __builtin_memset(ssid, 0, sizeof(ssid));
         if (copy_from_user(ssid, (const void *)(uintptr_t)arg1, sizeof(ssid) - 1) != 0)
             return SYS_ERR(EFAULT);

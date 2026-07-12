@@ -642,6 +642,15 @@ int unix_sock_read(uint32_t id, void *buf, uint32_t len, int force_nb)
         return us ? -EPIPE : -EBADF;
     }
 
+    /* Pin this socket for the whole (possibly blocking) read. We hold unix_lock
+     * and have validated `us` in_use, so the inc is race-free. Without it, a
+     * sibling thread (CLONE_FILES shares the fd table) closing this same fd while
+     * we are parked on s_unix[id].poll_waiters would drop the last ref, free the
+     * slot, and unix_sock_alloc could re-init the waitq under our still-linked
+     * waiter — a use-after-free. The matching unix_sock_free at every exit below
+     * defers the real teardown to whichever putter is last. */
+    refcount_inc(&us->refcount);
+
     uint32_t peer = us->peer_id;
 
     for (;;) {
@@ -654,6 +663,7 @@ int unix_sock_read(uint32_t id, void *buf, uint32_t len, int force_nb)
         if (!p || !p->in_use || !p->ring) {
             /* Never connected / fully released — EOF */
             spin_unlock_irqrestore(&unix_lock, fl);
+            unix_sock_free(id);   /* drop the read pin */
             return 0;
         }
 
@@ -680,12 +690,14 @@ int unix_sock_read(uint32_t id, void *buf, uint32_t len, int force_nb)
             waitq_t *peer_wq = &p->poll_waiters;
             spin_unlock_irqrestore(&unix_lock, fl);
             waitq_wake_all(peer_wq);
+            unix_sock_free(id);   /* drop the read pin */
             return (int)len;
         }
 
         /* Empty — if peer closed (lingering), that's EOF: drained. */
         if (p->state == UNIX_CLOSED) {
             spin_unlock_irqrestore(&unix_lock, fl);
+            unix_sock_free(id);   /* drop the read pin */
             return 0;  /* EOF */
         }
         /* Empty — block (unless the socket is O_NONBLOCK, or this call passed
@@ -693,6 +705,7 @@ int unix_sock_read(uint32_t id, void *buf, uint32_t len, int force_nb)
          * relies on MSG_DONTWAIT returning EAGAIN to terminate). */
         if (us->nonblocking || force_nb) {
             spin_unlock_irqrestore(&unix_lock, fl);
+            unix_sock_free(id);   /* drop the read pin */
             return -EAGAIN;
         }
         /* Block on OUR poll_waiters until the peer writes data or closes — the
@@ -708,12 +721,15 @@ int unix_sock_read(uint32_t id, void *buf, uint32_t len, int force_nb)
         int rc;
         wait_event_interruptible(&s_unix[id].poll_waiters,
             unix_read_ready(peer), rc);
-        if (rc == BLOCK_EINTR)
+        if (rc == BLOCK_EINTR) {
+            unix_sock_free(id);   /* drop the read pin (lock already released) */
             return -EINTR;
+        }
         fl = spin_lock_irqsave(&unix_lock);
         us = unix_sock_get(id);
         if (!us || us->state != UNIX_CONNECTED) {
             spin_unlock_irqrestore(&unix_lock, fl);
+            unix_sock_free(id);   /* drop the read pin */
             return 0;  /* EOF */
         }
         peer = us->peer_id;

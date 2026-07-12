@@ -374,6 +374,29 @@ static tcp_conn_t *tcp_alloc(void)
     return NULL;
 }
 
+/* tcp_conn_abort — RST the peer and free the conn slot. Used when a handshake
+ * has completed but the connection can never be delivered to accept() (the
+ * listener's backlog is full or the listener vanished). Leaving such a conn
+ * ESTABLISHED leaks its s_tcp[] slot forever: an ESTABLISHED conn with no
+ * queued data arms no retransmit timer, so nothing ever reaps it, and the table
+ * is shared with every outbound connect() — a peer completing many handshakes
+ * to a slow/non-accepting listener would exhaust it (remote DoS). Acquires
+ * tcp_lock; must be called OUTSIDE it (respects sock_lock > tcp_lock: callers
+ * invoke it after sock_get has released sock_lock). */
+static void tcp_conn_abort(uint32_t conn_id)
+{
+    irqflags_t fl = spin_lock_irqsave(&tcp_lock);
+    if (conn_id < TCP_MAX_CONNS) {
+        tcp_conn_t *c = &s_tcp[conn_id];
+        if (c->state != TCP_CLOSED) {
+            if (c->dev)
+                tcp_send_segment(c->dev, c, TCP_RST | TCP_ACK, NULL, 0);
+            c->state = TCP_CLOSED;   /* slot reclaimable by tcp_alloc */
+        }
+    }
+    spin_unlock_irqrestore(&tcp_lock, fl);
+}
+
 /* wake_poll_waiters — wake any sys_poll / sys_epoll_wait registered on
  * sock_id's embedded poll_waiters waitq. Safe to call with NONE / freed
  * sids; sock_get returns NULL.  Must be called OUTSIDE tcp_lock to
@@ -919,13 +942,20 @@ out:
     /* Accept queue push for SYN_RCVD → ESTABLISHED. */
     if (accept_listener_id != SOCK_NONE) {
         sock_t *ls = sock_get(accept_listener_id);
+        int queued = 0;
         if (ls) {
             uint8_t next_tail = (uint8_t)((ls->accept_tail + 1) & 7);
             if (next_tail != ls->accept_head) {
                 ls->accept_queue[ls->accept_tail] = accept_conn_id;
                 ls->accept_tail = next_tail;
+                queued = 1;
             }
         }
+        /* Backlog full or listener gone: abort instead of leaking an ESTABLISHED
+         * slot nobody will ever accept (see tcp_conn_abort). sock_get has already
+         * released sock_lock, so taking tcp_lock here honors sock_lock > tcp_lock. */
+        if (!queued)
+            tcp_conn_abort(accept_conn_id);
     }
 
     {

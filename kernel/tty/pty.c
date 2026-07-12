@@ -284,6 +284,15 @@ master_read_fn(void *priv, void *buf, uint64_t off, uint64_t len)
 	if (len == 0)
 		return 0;
 
+	/* Pin the master end across the (possibly blocking) read. ptmx_open reuses a
+	 * freed pool slot with memset + waitq_init; without this pin, a sibling
+	 * closing this same master fd (CLONE_FILES) while we are parked on
+	 * master_waiters lets the slot go idle (in_use=0) and a new ptmx_open re-init
+	 * the waitq under our still-linked waiter — corruption. master_close_fn at
+	 * each exit tears the slot down only if we are the last ref. See
+	 * sock_vfs_read. */
+	master_dup_fn(priv);
+
 	/*
 	 * Blocking read.  The authoritative data/EOF/EAGAIN/signal checks and
 	 * all copy-out run under pair->lock at the top of the loop (so the ring
@@ -306,24 +315,24 @@ master_read_fn(void *priv, void *buf, uint64_t off, uint64_t len)
 				((char *)buf)[n] = (char)ringbuf_pull(
 				    pair->output_buf, &pair->output_tail, PTY_BUF_SIZE);
 			spin_unlock_irqrestore(&pair->lock, fl);
-			return (int)n;
+			return (master_close_fn(priv), (int)n);
 		}
 		/* Slave closed and buffer empty -- EOF */
 		if (!pair->slave_open) {
 			spin_unlock_irqrestore(&pair->lock, fl);
-			return 0;
+			return (master_close_fn(priv), 0);
 		}
 		/* O_NONBLOCK: return -EAGAIN instead of blocking.
 		 * Use per-task flag (safe under preemption) rather than
 		 * the global vfs_read_nonblock which can be clobbered. */
 		if (sched_current()->read_nonblock) {
 			spin_unlock_irqrestore(&pair->lock, fl);
-			return -11; /* EAGAIN */
+			return (master_close_fn(priv), -11); /* EAGAIN */
 		}
 		/* Check for pending signals */
 		if (signal_check_pending()) {
 			spin_unlock_irqrestore(&pair->lock, fl);
-			return -4; /* EINTR */
+			return (master_close_fn(priv), -4); /* EINTR */
 		}
 		/* Block until the slave writes data or closes.  Drop the lock
 		 * first; wait_event re-validates lockless and the loop re-checks
@@ -335,7 +344,7 @@ master_read_fn(void *priv, void *buf, uint64_t off, uint64_t len)
 		    ringbuf_count(pair->output_head, pair->output_tail, PTY_BUF_SIZE) > 0
 		    || !pair->slave_open, rc);
 		if (rc == -4)
-			return -4; /* EINTR */
+			return (master_close_fn(priv), -4); /* EINTR */
 		/* Resumes here; loop re-checks authoritatively under lock. */
 	}
 }
@@ -472,7 +481,14 @@ slave_read_fn(void *priv, void *buf, uint64_t off, uint64_t len)
 	(void)off;
 	if (len == 0)
 		return 0;
-	return tty_read(&pair->tty, (char *)buf, (uint32_t)len);
+	/* Pin the slave end across the blocking tty_read (which parks on
+	 * slave_waiters inside pty_slave_read_raw). Without it, a sibling closing
+	 * this slave fd while we are parked lets ptmx_open reuse the pool slot and
+	 * re-init the waitq under us — corruption. See master_read_fn / sock_vfs_read. */
+	slave_dup_fn(priv);
+	int r = tty_read(&pair->tty, (char *)buf, (uint32_t)len);
+	slave_close_fn(priv);
+	return r;
 }
 
 /*

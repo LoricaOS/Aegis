@@ -134,6 +134,10 @@ int ext2_write_inode(uint32_t ino, const ext2_inode_t *inode);
 
 /* File operations for VFS integration */
 int ext2_open(const char *path, uint32_t *inode_out);
+/* Resolve + classify-as-protected atomically (one ext2_lock hold). *protected
+ * is set only when the return value is >= 0. Closes the sys_open check-then-open
+ * TOCTOU on trusted-binary write-opens. */
+int ext2_open_protected(const char *path, uint32_t *inode_out, int *is_protected);
 int ext2_read(uint32_t inode_num, void *buf, uint64_t offset, uint32_t len);
 
 /* secfix M2 — lazy file mmap inode-recycle defense.

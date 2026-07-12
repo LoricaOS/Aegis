@@ -176,7 +176,12 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
     /* ext2 primary — writable root filesystem */
     {
         uint32_t ino = 0;
-        if (ext2_open(path, &ino) >= 0) {
+        int is_protected = 0;
+        /* Resolve and classify-as-protected under ONE ext2_lock hold so an SMP
+         * symlink-swap can't substitute a different target between the two — see
+         * ext2_open_protected. This is the authoritative, atomic replacement for
+         * sys_open's racy cap_path_is_protected() pre-check. */
+        if (ext2_open_protected(path, &ino, &is_protected) >= 0) {
             /* O_CREAT|O_EXCL on an existing file: fail EEXIST (atomic create). */
             if ((flags & (int)VFS_O_CREAT) && (flags & (int)VFS_O_EXCL))
                 return -EEXIST;
@@ -232,6 +237,28 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
                         return -EACCES;
                 }
             }
+            /* Install-protected write gate: overwriting an EXISTING trusted
+             * binary (anything under /bin, /sbin, /apps, /etc/aegis, or a
+             * registered anchor) needs CAP_KIND_INSTALL, exactly like creating
+             * one does (sys_open's create path + ext2_create's has_install arg).
+             * The live session is cosmetic uid 0 and OWNS these uid-0 files, so
+             * ext2 DAC alone would grant owner-write — letting a baseline
+             * process open("/bin/login", O_WRONLY) and swap init/login/aegisctl
+             * for a trojan (full privesc). `is_protected` was resolved under the
+             * same ext2_lock hold as the inode (ext2_open_protected), so unlike
+             * the old sys_open pre-check this cannot be raced by an SMP
+             * symlink-swap. Runs only for user opens; kernel-internal writers
+             * (!is_user) and INSTALL-holders (installer/herald) are unaffected.
+             * Mirrors the shadow/admin (CAP_AUTH) and passwd/group
+             * (admin_session) gates above. */
+            {
+                int wr = (flags & 1) || (flags & 2) ||
+                         (flags & (int)VFS_O_TRUNC) ||
+                         (flags & (int)VFS_O_APPEND);
+                if (sched_current()->is_user && is_protected && wr &&
+                    !has_install)
+                    return -EACCES;
+            }
             /* O_TRUNC: drop to length 0 AND free the data blocks.  Setting
              * i_size = 0 alone (the old behaviour) leaked every data/indirect
              * block of the file on each truncate. */
@@ -251,8 +278,10 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
             out->flags  = 0;
             /* Tag fds onto install-protected files so fd-based fchmod/fchown/
              * ftruncate can't bypass the path-based install gate (the inode is
-             * resolved, so symlinks/".."/read-only opens are all covered). */
-            out->kflags = cap_path_is_protected(path) ? VFS_KF_PROTECTED : 0;
+             * resolved, so symlinks/".."/read-only opens are all covered).
+             * Reuses the atomically-resolved is_protected (same value
+             * cap_path_is_protected would return, minus a redundant walk). */
+            out->kflags = is_protected ? VFS_KF_PROTECTED : 0;
             return 0;
         }
         /* ext2 ENOENT + O_CREAT → check W+X on parent, then create */

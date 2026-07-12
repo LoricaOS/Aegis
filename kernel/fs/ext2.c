@@ -1259,7 +1259,12 @@ restart_walk:
                 if (!data)
                     return -1;
                 uint32_t block_pos = pos % s_block_size;
-                while (block_pos < s_block_size) {
+                /* +8 <= : the dirent header (inode/rec_len/name_len/file_type)
+                 * is 8 bytes; a tail of <8 bytes must not be dereferenced or
+                 * reading de->rec_len/name_len runs past the 4096-byte cache
+                 * slot into adjacent kernel memory on a crafted/corrupt image.
+                 * Matches the guard in ext2_readdir (this walk path missed it). */
+                while (block_pos + 8 <= s_block_size) {
                     ext2_dirent_t *de =
                         (ext2_dirent_t *)(data + block_pos);
                     if (de->rec_len < 8 || block_pos + de->rec_len > s_block_size)
@@ -1462,6 +1467,25 @@ ext2_anchors_reload(void)
 int ext2_open(const char *path, uint32_t *inode_out)
 {
     return ext2_open_ex(path, inode_out, 1);
+}
+
+/* ext2_open_protected — resolve `path` and, atomically with the resolve, report
+ * whether it lands under an install-protected tree (/bin, /sbin, /apps,
+ * /etc/aegis, or a registered anchor). Both the walk that resolves the inode and
+ * the walk that classifies the tree run under ONE continuous ext2_lock hold, so
+ * an SMP symlink-swap between "is it protected?" and "open it for write" cannot
+ * substitute a different target — every mutator (rename/unlink/create/symlink)
+ * takes ext2_lock, so it blocks for the duration. This is the atomic replacement
+ * for the old check-then-open split (sys_open's cap_path_is_protected pre-check
+ * plus a separate vfs_open_ex resolve), which was a genuine TOCTOU on SMP.
+ * Returns ext2_open's rc; *protected is set to 0/1 only when rc >= 0. */
+int ext2_open_protected(const char *path, uint32_t *inode_out, int *is_protected)
+{
+    irqflags_t fl = ext2_lock_acquire();
+    int rc = ext2_open(path, inode_out);
+    *is_protected = (rc >= 0) ? ext2_path_under_protected(path) : 0;
+    ext2_lock_release(fl);
+    return rc;
 }
 
 /* ------------------------------------------------------------------ */
