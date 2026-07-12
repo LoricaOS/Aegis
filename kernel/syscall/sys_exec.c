@@ -271,8 +271,9 @@ reload_binary:
         vma_init(proc);   /* fresh, independent table for the new image */
         aegis_task_t *vp = proc->vfork_parent;
         proc->vfork_parent = (void *)0;
-        s_vfork_frozen_tgid = 0;  /* vfork window over: thaw the parent's threads
-                                   * BEFORE waking it (a frozen parent can't run) */
+        /* vfork window over: thaw the parent's thread group BEFORE waking it (a
+         * frozen parent can't run). Self-locking (takes sched_lock internally). */
+        vfork_freeze_remove(((aegis_process_t *)vp)->tgid);
         sched_wake(vp);   /* parent resumes: it no longer shares our VM */
     } else {
         vmm_free_user_pages(proc->pml4_phys);

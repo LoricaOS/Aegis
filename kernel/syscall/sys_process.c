@@ -557,8 +557,9 @@ sys_clone(syscall_frame_t *frame, uint64_t flags, uint64_t child_stack,
         /* Freeze this thread group's OTHER threads for the vfork window so none
          * of them races the child in the shared address space (the child shares
          * our PML4 until it execs).  Cleared by the child's execve (before it
-         * wakes us) or by sched_exit if the child dies first. */
-        s_vfork_frozen_tgid = parent->tgid;
+         * wakes us) or by sched_exit if the child dies first.  vfork_freeze_add
+         * is self-locking (takes sched_lock); we do not hold it here. */
+        vfork_freeze_add(parent->tgid);
         /* Block via sched_block_locked so the condition recheck and the
          * transition to TASK_BLOCKED are ONE critical section under sched_lock,
          * closing the same lost-wakeup window fixed in sys_waitpid: a child that
@@ -579,7 +580,7 @@ sys_clone(syscall_frame_t *frame, uint64_t flags, uint64_t child_stack,
             }
             sched_block_locked(vfl);   /* releases sched_lock; returns unlocked */
         }
-        s_vfork_frozen_tgid = 0;  /* belt-and-suspenders thaw */
+        vfork_freeze_remove(parent->tgid);  /* belt-and-suspenders thaw (self-locking) */
         parent_task->waiting_for = 0;
     }
 

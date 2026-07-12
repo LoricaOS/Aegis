@@ -56,6 +56,16 @@ static int sock_vfs_read(void *priv, void *buf, uint64_t off, uint64_t len)
     sock_t *s = sock_get(sock_id);
     if (!s) return -EBADF;
 
+    /* Pin this socket across the (possibly blocking) recv. Without it, a sibling
+     * thread (CLONE_FILES shares the fd table) closing this same fd while we are
+     * parked on s->poll_waiters would drop the last ref, free the slot, and a
+     * later sock_alloc could re-init the waitq under our still-linked waiter — a
+     * use-after-free. sock_vfs_dup is refcount_inc (the fd we were dispatched
+     * through still holds a ref, so the object is live); each exit calls
+     * sock_vfs_close, which defers teardown to the last putter. Mirrors
+     * unix_sock_read. */
+    sock_vfs_dup(priv);
+
     if (s->type == SOCK_TYPE_STREAM) {
         /* TCP: blocking recv.  Returns byte count, 0=EOF, -EPIPE on close.
          *
@@ -69,17 +79,23 @@ static int sock_vfs_read(void *priv, void *buf, uint64_t off, uint64_t len)
             if (avail > 0) {
                 uint32_t want = (uint32_t)len < (uint32_t)avail ? (uint32_t)len : (uint32_t)avail;
                 if (want > 8192) want = 8192;
-                return tcp_conn_recv(s->tcp_conn_id, buf, (uint16_t)want);
+                int r = tcp_conn_recv(s->tcp_conn_id, buf, (uint16_t)want);
+                sock_vfs_close(priv);   /* drop the recv pin */
+                return r;
             }
             /* avail <= 0.  tcp_conn_recv peek returns -11 ONLY while the
              * connection is alive but empty (the one case we block on); 0
              * (FIN/closed + empty) or -1 (dead conn_id) mean no more data will
              * ever arrive — both are EOF, matching the old explicit state check
              * (CLOSE_WAIT/CLOSED/TIME_WAIT or !tc). */
-            if (avail != -11)
+            if (avail != -11) {
+                sock_vfs_close(priv);   /* drop the recv pin */
                 return 0;  /* EOF */
-            if (s->nonblocking)
+            }
+            if (s->nonblocking) {
+                sock_vfs_close(priv);   /* drop the recv pin */
                 return -EAGAIN;
+            }
             /* Block until data arrives or the connection closes (peek != -11),
              * interruptible so Ctrl-C against a parked recv delivers.  The
              * authoritative peek + EOF/data decision is re-run at the top of
@@ -87,11 +103,14 @@ static int sock_vfs_read(void *priv, void *buf, uint64_t off, uint64_t len)
             int rc;
             wait_event_interruptible(&s->poll_waiters,
                 tcp_conn_recv(s->tcp_conn_id, (void *)0, 0) != -11, rc);
-            if (rc == BLOCK_EINTR)
+            if (rc == BLOCK_EINTR) {
+                sock_vfs_close(priv);   /* drop the recv pin */
                 return -EINTR;
+            }
         }
     }
     /* UDP: peek from ring buffer — kernel buf already filled via recvfrom */
+    sock_vfs_close(priv);   /* drop the recv pin (STREAM branch didn't return) */
     return -ENOSYS;  /* UDP via read() — use recvfrom */
 }
 
@@ -134,7 +153,13 @@ static int sock_vfs_write(void *priv, const void *buf, uint64_t len)
 
     if (s->type == SOCK_TYPE_STREAM) {
         if (s->state != SOCK_CONNECTED) return -ENOTCONN;
-        return (int)sock_stream_send(s, (uint64_t)(uintptr_t)buf, len);
+        /* Pin across the (possibly blocking) send so a sibling close of this fd
+         * can't free the slot / re-init s->poll_waiters while we're parked in
+         * sock_stream_send. See sock_vfs_read. */
+        sock_vfs_dup(priv);
+        int r = (int)sock_stream_send(s, (uint64_t)(uintptr_t)buf, len);
+        sock_vfs_close(priv);
+        return r;
     }
     return -ENOSYS;  /* UDP via write() — use sendto */
 }
@@ -200,6 +225,15 @@ static void sock_vfs_dup(void *priv)
         refcount_inc(&s_socks[sock_id].refcount);
     spin_unlock_irqrestore(&sock_lock, fl);
 }
+
+/* Public pin/unpin for the socket syscalls that block (sys_send/sys_recv/
+ * sys_accept/sys_connect). A syscall parked on a socket's poll_waiters must hold
+ * a reference so a sibling thread closing the same fd (CLONE_FILES shares the fd
+ * table) can't free the slot and re-init its waitq under the parked waiter — a
+ * use-after-free. sock_ref is the refcount inc; sock_unref is the teardown-put
+ * that frees only at the last reference. */
+void sock_ref(uint32_t sock_id)   { sock_vfs_dup((void *)(uintptr_t)sock_id); }
+void sock_unref(uint32_t sock_id) { sock_vfs_close((void *)(uintptr_t)sock_id); }
 
 static int sock_vfs_stat(void *priv, k_stat_t *st)
 {

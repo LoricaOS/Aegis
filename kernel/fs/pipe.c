@@ -107,6 +107,14 @@ pipe_read_fn(void *priv, void *buf, uint64_t off, uint64_t len)
     pipe_t *p = (pipe_t *)priv;
     (void)off;
 
+    /* Pin the read end across the (possibly blocking) read. pipe_t is kva-freed
+     * when both ends hit zero refs; without this pin, a sibling thread closing
+     * this same read fd (CLONE_FILES) while we are parked drops read_refs to 0,
+     * and the writer's subsequent close then frees p and wakes us onto freed
+     * memory — a use-after-free. The matching pipe_read_close_fn at each exit
+     * performs the conjunctive free if we are the last ref. Mirrors sock_vfs_read. */
+    pipe_dup_read_fn(priv);
+
     for (;;) {
         irqflags_t fl = spin_lock_irqsave(&p->lock);
 
@@ -122,7 +130,7 @@ pipe_read_fn(void *priv, void *buf, uint64_t off, uint64_t len)
 
         if (p->count == 0 && refcount_read(&p->write_refs) == 0) {
             spin_unlock_irqrestore(&p->lock, fl);
-            return 0;   /* EOF: all writers gone */
+            return (pipe_read_close_fn(priv), 0);   /* EOF: all writers gone */
         }
         if (p->count == 0) {
             /* Empty, writers still around. O_NONBLOCK (per-task read_nonblock,
@@ -130,7 +138,7 @@ pipe_read_fn(void *priv, void *buf, uint64_t off, uint64_t len)
              * blocking — without this an O_NONBLOCK pipe read hangs forever. */
             if (sched_current()->read_nonblock) {
                 spin_unlock_irqrestore(&p->lock, fl);
-                return -EAGAIN;
+                return (pipe_read_close_fn(priv), -EAGAIN);
             }
             /* Block until a writer deposits data or closes the write end. Drop
              * the lock first — wait_event's condition is a lockless hint,
@@ -162,7 +170,7 @@ pipe_read_fn(void *priv, void *buf, uint64_t off, uint64_t len)
          */
         waitq_wake_all(&p->write_waiters);
 
-        return (int)n;
+        return (pipe_read_close_fn(priv), (int)n);
     }
 }
 
@@ -184,6 +192,12 @@ pipe_write_fn(void *priv, const void *buf, uint64_t len)
 {
     pipe_t *p = (pipe_t *)priv;
     char staging[PIPE_BUF_SIZE];
+
+    /* Pin the write end across the (possibly blocking) write — see pipe_read_fn.
+     * A sibling closing this same write fd while we are parked would drop
+     * write_refs to 0, and the reader's close would then free p and wake us onto
+     * freed memory. pipe_write_close_fn at each exit does the conjunctive free. */
+    pipe_dup_write_fn(priv);
 
     for (;;) {
         irqflags_t fl = spin_lock_irqsave(&p->lock);
@@ -208,7 +222,7 @@ pipe_write_fn(void *priv, const void *buf, uint64_t len)
                 aegis_process_t *p_cur = (aegis_process_t *)t;
                 signal_send_pid(p_cur->pid, SIGPIPE);
             }
-            return -EPIPE;   /* all readers gone */
+            return (pipe_write_close_fn(priv), -EPIPE);   /* all readers gone */
         }
         if (p->count == PIPE_BUF_SIZE) {
             /* Full. O_NONBLOCK (per-task write_nonblock, set by sys_write from
@@ -219,7 +233,7 @@ pipe_write_fn(void *priv, const void *buf, uint64_t len)
              * total and suppresses the EAGAIN if total>0, per POSIX.) */
             if (sched_current()->write_nonblock) {
                 spin_unlock_irqrestore(&p->lock, fl);
-                return -EAGAIN;
+                return (pipe_write_close_fn(priv), -EAGAIN);
             }
             /* Block until a reader drains space or closes the read end. Drop
              * the lock; wait_event re-validates under p->lock at the top of the
@@ -259,7 +273,7 @@ pipe_write_fn(void *priv, const void *buf, uint64_t len)
          */
         waitq_wake_all(&p->read_waiters);
 
-        return (int)n;   /* partial write; caller must loop if n < len */
+        return (pipe_write_close_fn(priv), (int)n);   /* partial write; caller loops if n<len */
     }
 }
 
