@@ -65,8 +65,9 @@ static char *append_str(char *dst, const char *src)
  *      bitmap's own backing pages), frees the high RAM, and switches over.
  *
  * The active bitmap is reached through s_bitmap (a pointer), so all the code
- * below is oblivious to which phase is current. The sparse refcount table is
- * RAM-independent and stays static.
+ * below is oblivious to which phase is current. The dense per-frame refcount
+ * array (below) mirrors this: absent during early boot, allocated full-size
+ * from KVA in pmm_init_late.
  * -------------------------------------------------------------------------- */
 #define PMM_BOOT_GB     4ULL
 #define PMM_BOOT_PAGES  (PMM_BOOT_GB * 1024 * 1024 * 1024 / PAGE_SIZE)
@@ -85,48 +86,42 @@ static uint8_t *s_bitmap       = pmm_boot_bitmap;
 static uint64_t s_bitmap_pages = PMM_BOOT_PAGES;
 
 /* --------------------------------------------------------------------------
- * Sparse per-page refcount (COW fork + memfd MAP_SHARED)
+ * Dense per-frame refcount (COW fork + memfd MAP_SHARED)
  *
- * A full byte-per-page refcount array would be 1 MB per 4 GB of RAM (4 MB at
- * 16 GB, 8 MB at 32 GB) — far over the BSS budget. But refcounts are only ever
- * > 1 for the small, transient set of pages that are actively COW-shared after
- * a fork or mapped MAP_SHARED from a memfd. So we store refcounts ONLY for
- * those pages, in a fixed-size open-addressing hash table, and treat any
- * allocated-but-absent page as having the implicit refcount 1. This decouples
- * refcount storage from total RAM size.
+ * A DENSE uint16_t array indexed directly by physical frame number (page index
+ * = addr / PAGE_SIZE), sized to the machine's full usable-RAM extent. Lookup
+ * and update are O(1) — a single array index — so the COW fork walk that calls
+ * pmm_ref_page() for every present user page is O(n) and bounded, no matter how
+ * many pages a process maps. It CANNOT saturate: there is exactly one slot per
+ * frame, so there is no probe chain to fill and no "table full" condition, and
+ * thus no userspace-reachable panic. (This replaced a fixed 65536-slot
+ * open-addressed hash whose linear-probe insertion degraded to O(n^2) and
+ * finally panic_halt'd once >65536 frames were simultaneously shared — an
+ * unprivileged mmap(>256 MiB)+fork froze the whole kernel with IRQs off, then
+ * would panic. Crash-Agent-B, secfix vpmm.)
  *
- * Semantics: refcount(pg) for an allocated page = (in table ? stored : 1).
- * We remove a page from the table the moment its count drops back to 1, so the
- * table only ever holds pages with refcount >= 2.
+ * Cost: 2 bytes per 4 KB page = ~0.05% of RAM (1 MB per 2 GB, 16 MB at 32 GB) —
+ * negligible at any scale. It is allocated from KVA in pmm_init_late (mirroring
+ * the full allocation bitmap), NOT from BSS, so it scales with real RAM.
  *
- * Tombstone deletion (SLOT_TOMB) keeps lookups correct after removal; inserts
- * reuse tombstones so the table stays healthy under the churn of fork/exec.
- * 64K slots × 9 bytes = 576 KB, independent of RAM — room for 64K
- * simultaneously-shared pages (256 MB of COW/memfd-shared memory, comfortably
- * more than the GUI's window buffers + fork churn).
+ * Semantics — the stored value is the frame's FULL refcount, with 0 meaning
+ * "implicit single owner" (identical to the old table's absent-page rule):
+ *   0        → allocated-and-singly-owned, or unallocated (implicit count 1)
+ *   >= 2     → COW/memfd shared by that many owners
+ * The value is never left at 1: a share bumps 0→2, and a drop back to a single
+ * owner resets it to 0. pmm_page_refcount() reports 0-as-1 to callers. This
+ * keeps the fresh-allocation fast path write-free (a new frame's slot is
+ * already 0 = implicit 1) exactly as before.
  *
- * The page-index KEY is uint64, matching the allocation bitmap's uint64 page
- * indices, so COW refcounting is EXACT for any physical page the bitmap can
- * track — there is no aliasing ceiling. (Earlier this key was uint32, which
- * silently truncated page indices >= 2^32: two distinct pages 2^32 apart, or a
- * page that happened to land on index 0xFFFFFFFF/0xFFFFFFFE, would collide with
- * each other or with the empty/tombstone sentinels, corrupting refcounts above
- * 16 TB of RAM. The 64-bit key removes that class of bug at the root: the
- * sentinels 2^64-1 / 2^64-2 correspond to page indices that are physically
- * unreachable, 2^76 bytes.)
+ * Indexed by uint64 frame number, matching the allocation bitmap — refcounting
+ * is EXACT for any physical page the bitmap can track, with no aliasing ceiling.
  * -------------------------------------------------------------------------- */
-#define PMM_REFHASH_SIZE  65536u             /* 64K slots */
-/* Page-KEY sentinels stored in s_ref_page[] (a uint64 page index, or one of
- * these). They sit at 2^64-1 / 2^64-2 — page indices for 2^76-byte physical
- * addresses, i.e. physically unreachable, so a real page can never alias them. */
-#define SLOT_EMPTY        0xFFFFFFFFFFFFFFFFull
-#define SLOT_TOMB         0xFFFFFFFFFFFFFFFEull
-/* A SLOT-INDEX "none" sentinel (distinct from the page-key sentinels above).
- * Valid slot indices are 0..PMM_REFHASH_SIZE-1, so PMM_REFHASH_SIZE is an
- * unused, type-correct marker for "no slot chosen yet". */
-#define SLOT_NONE         PMM_REFHASH_SIZE
-static uint64_t s_ref_page[PMM_REFHASH_SIZE];   /* page index, or SLOT_EMPTY/TOMB */
-static uint16_t s_ref_count[PMM_REFHASH_SIZE];  /* refcount (>= 2) for a live slot */
+/* Dense refcount array: NULL until pmm_init_late() allocates it from KVA. All
+ * COW/fork/memfd sharing happens after init, so early boot needs no array (the
+ * accessors treat NULL / out-of-range as implicit refcount 1). Reached through
+ * a pointer, like s_bitmap, so every code path uses the active array. */
+static uint16_t *s_refcount;         /* dense per-frame count; 0 = implicit 1  */
+static uint64_t  s_refcount_pages;   /* number of slots (= full RAM extent)    */
 
 static uint64_t s_total_usable_bytes;   /* raw usable RAM from the memory map */
 /* Pages the PMM actually manages: usable RAM within the bitmap's coverage.
@@ -154,74 +149,28 @@ static spinlock_t pmm_lock = SPINLOCK_INIT;
 extern char _kernel_end[];
 
 /* --------------------------------------------------------------------------
- * Sparse refcount hash — all helpers run under pmm_lock
+ * Dense refcount array — all accessors run under pmm_lock
+ *
+ * O(1) index into s_refcount[]. NULL/out-of-range is treated as the implicit
+ * refcount 0 (== single owner): early boot (pre-array) and MMIO/beyond-RAM
+ * frames both read as unshared, and a set on such a frame is a safe no-op
+ * (those frames are never COW-shared).
  * -------------------------------------------------------------------------- */
 
-static uint32_t refhash_home(uint64_t pg)
+/* Return the stored refcount for frame pg, or 0 (→ implicit 1) if absent. */
+static uint16_t refcount_get(uint64_t pg)
 {
-    /* Fibonacci hash, then fold to table size. */
-    return (uint32_t)((pg * 2654435761ull) % PMM_REFHASH_SIZE);
+    if (!s_refcount || pg >= s_refcount_pages)
+        return 0;
+    return s_refcount[pg];
 }
 
-/* Return the stored refcount for pg, or 0 if not present (→ implicit 1). */
-static uint16_t refhash_get(uint64_t pg)
+/* Store count for frame pg (0 → implicit single owner, or >= 2 for shared). */
+static void refcount_set(uint64_t pg, uint16_t count)
 {
-    uint32_t h = refhash_home(pg);
-    for (uint32_t n = 0; n < PMM_REFHASH_SIZE; n++) {
-        uint32_t j = (h + n) % PMM_REFHASH_SIZE;
-        if (s_ref_page[j] == SLOT_EMPTY)
-            return 0;                         /* end of probe chain — absent */
-        if (s_ref_page[j] == pg)
-            return s_ref_count[j];
-        /* SLOT_TOMB or other key — keep probing */
-    }
-    return 0;
-}
-
-/* Insert or update pg → count (count >= 2). Reuses tombstones. */
-static void refhash_set(uint64_t pg, uint16_t count)
-{
-    uint32_t h = refhash_home(pg);
-    uint32_t first_tomb = SLOT_NONE;
-    for (uint32_t n = 0; n < PMM_REFHASH_SIZE; n++) {
-        uint32_t j = (h + n) % PMM_REFHASH_SIZE;
-        if (s_ref_page[j] == pg) {            /* update in place */
-            s_ref_count[j] = count;
-            return;
-        }
-        if (s_ref_page[j] == SLOT_TOMB) {
-            if (first_tomb == SLOT_NONE) first_tomb = j;
-            continue;
-        }
-        if (s_ref_page[j] == SLOT_EMPTY) {
-            uint32_t slot = (first_tomb != SLOT_NONE) ? first_tomb : j;
-            s_ref_page[slot]  = pg;
-            s_ref_count[slot] = count;
-            return;
-        }
-    }
-    if (first_tomb != SLOT_NONE) {            /* no empty, but a tombstone */
-        s_ref_page[first_tomb]  = pg;
-        s_ref_count[first_tomb] = count;
+    if (!s_refcount || pg >= s_refcount_pages)
         return;
-    }
-    panic_halt("[PMM] FAIL: refcount hash full (too many shared pages)");
-}
-
-/* Remove pg from the table (mark its slot a tombstone). */
-static void refhash_remove(uint64_t pg)
-{
-    uint32_t h = refhash_home(pg);
-    for (uint32_t n = 0; n < PMM_REFHASH_SIZE; n++) {
-        uint32_t j = (h + n) % PMM_REFHASH_SIZE;
-        if (s_ref_page[j] == SLOT_EMPTY)
-            return;                           /* absent */
-        if (s_ref_page[j] == pg) {
-            s_ref_page[j]  = SLOT_TOMB;
-            s_ref_count[j] = 0;
-            return;
-        }
-    }
+    s_refcount[pg] = count;
 }
 
 /* --------------------------------------------------------------------------
@@ -282,11 +231,10 @@ static void pmm_reserve_region(uint64_t base, uint64_t len)
 void pmm_init(void)
 {
     lockrank_register(&pmm_lock, LOCK_RANK_PMM);   /* debug lock-order check */
-    /* Step 0: empty the refcount table (every page starts at implicit 1). */
-    for (uint32_t i = 0; i < PMM_REFHASH_SIZE; i++) {
-        s_ref_page[i]  = SLOT_EMPTY;
-        s_ref_count[i] = 0;
-    }
+    /* The dense per-frame refcount array is allocated later (pmm_init_late,
+     * once KVA is up) — it is RAM-sized, not BSS. Until then s_refcount is NULL
+     * and every frame reads as the implicit refcount 1; no COW/fork/memfd
+     * sharing occurs before init. */
 
     /* Step 1: start with everything reserved (safe default) */
     for (uint64_t i = 0; i < s_bitmap_pages / 8; i++)
@@ -366,6 +314,36 @@ void pmm_init(void)
  * -------------------------------------------------------------------------- */
 void pmm_init_late(void)
 {
+    /* Allocate the dense per-frame refcount array first — it is needed on EVERY
+     * machine (the bitmap swap below only runs on >4 GB boxes), sized to the
+     * full usable-RAM extent so every frame the allocator can hand out has a
+     * slot. 2 bytes/page from KVA (higher-half, no image-window cap); the
+     * backing frames are marked used in the currently-active bitmap, so on a
+     * >4 GB box the copy below carries that "used" state into the full bitmap.
+     * Must run before userland: COW/fork/memfd sharing has no other refcount
+     * store, so a NULL array at that point would be a use-after-free waiting to
+     * happen. This is a one-time, boot-only allocation that cannot be triggered
+     * by userspace, so failing closed with a panic here is not a DoS surface. */
+    if (!s_refcount && s_ram_max_pages > 0) {
+        uint64_t slots    = s_ram_max_pages;
+        uint64_t rc_bytes = slots * sizeof(uint16_t);
+        uint64_t rc_need  = (rc_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+        uint16_t *rc = (uint16_t *)kva_alloc_pages(rc_need);
+        if (!rc)
+            panic_halt("[PMM] FAIL: per-frame refcount array alloc failed");
+        /* Zero the whole allocation: every frame starts at implicit refcount 1
+         * (0 == single owner). Word-wise; the tail beyond rc_bytes is padding. */
+        uint64_t *z      = (uint64_t *)rc;
+        uint64_t  zwords = (rc_need * PAGE_SIZE) / 8;
+        for (uint64_t i = 0; i < zwords; i++)
+            z[i] = 0;
+
+        irqflags_t fl = spin_lock_irqsave(&pmm_lock);
+        s_refcount       = rc;
+        s_refcount_pages = slots;
+        spin_unlock_irqrestore(&pmm_lock, fl);
+    }
+
     if (s_ram_max_pages <= s_bitmap_pages)
         return;   /* <= 4 GB: bootstrap bitmap already covers all RAM */
 
@@ -509,14 +487,16 @@ int pmm_acct_enabled(void)
 
 void pmm_acct_dump(const char *tag)
 {
-    /* Sum (count-1) over the sparse refcount table = outstanding shared refs.
-     * Take pmm_lock so the 64K-slot walk sees a consistent table snapshot. */
+    /* Sum (count-1) over the dense refcount array = outstanding shared refs.
+     * Take pmm_lock so the walk sees a consistent snapshot. This is an opt-in
+     * diagnostic (OFF by default), so the O(managed-pages) sweep is acceptable
+     * here — it runs only at teardown when `pmm_acct` is set. */
     irqflags_t fl = spin_lock_irqsave(&pmm_lock);
     uint64_t shared_extra = 0;
-    for (uint32_t i = 0; i < PMM_REFHASH_SIZE; i++) {
-        uint64_t k = s_ref_page[i];
-        if (k != SLOT_EMPTY && k != SLOT_TOMB && s_ref_count[i] >= 1)
-            shared_extra += (uint64_t)s_ref_count[i] - 1u;
+    for (uint64_t i = 0; i < s_refcount_pages; i++) {
+        uint16_t c = s_refcount[i];
+        if (c >= 2)
+            shared_extra += (uint64_t)c - 1u;
     }
     uint64_t allocs = s_acct_allocs, frees = s_acct_frees;
     uint64_t refs   = s_acct_refs,   unrefs = s_acct_unrefs;
@@ -674,13 +654,13 @@ void pmm_ref_page(uint64_t addr)
         spin_unlock_irqrestore(&pmm_lock, fl);
         panic_halt("[PMM] FAIL: pmm_ref_page on unallocated page");
     }
-    uint16_t cur = refhash_get(idx);
+    uint16_t cur = refcount_get(idx);
     if (cur == 0) cur = 1;                      /* implicit single owner */
     if (cur == 0xFFFF) {
         spin_unlock_irqrestore(&pmm_lock, fl);
         panic_halt("[PMM] FAIL: pmm_ref_page refcount overflow");
     }
-    refhash_set(idx, (uint16_t)(cur + 1));      /* now >= 2 → stored */
+    refcount_set(idx, (uint16_t)(cur + 1));     /* now >= 2 → stored */
     if (s_pmm_acct) s_acct_refs++;              /* T1 accounting (pmm_lock held) */
     spin_unlock_irqrestore(&pmm_lock, fl);
 }
@@ -702,9 +682,9 @@ uint16_t pmm_page_refcount(uint64_t addr)
     if (idx >= s_scan_max_pages)
         return 0;                       /* MMIO / outside managed RAM */
     irqflags_t fl  = spin_lock_irqsave(&pmm_lock);
-    uint16_t   cur = refhash_get(idx);
+    uint16_t   cur = refcount_get(idx);
     spin_unlock_irqrestore(&pmm_lock, fl);
-    return cur == 0 ? 1 : cur;          /* absent from table → implicit 1 */
+    return cur == 0 ? 1 : cur;          /* 0 slot → implicit single owner */
 }
 
 void pmm_free_page(uint64_t addr)
@@ -751,19 +731,19 @@ void pmm_free_page(uint64_t addr)
      * absent from the table has the implicit refcount 1, so this is the common
      * 1→free path; shared pages (count >= 2) just decrement, and drop out of
      * the table when they return to a single owner. */
-    uint16_t cur = refhash_get(idx);
+    uint16_t cur = refcount_get(idx);
     if (cur <= 1) {
         /* Single (or implicit single) owner → free the page. */
         if (cur == 1)
-            refhash_remove(idx);               /* shouldn't be stored, defensive */
+            refcount_set(idx, 0);              /* shouldn't be stored, defensive */
         s_bitmap[idx / 8] &= (uint8_t)~bit;
         if (s_pmm_acct) s_acct_frees++;        /* T1 accounting (pmm_lock held) */
     } else {
         uint16_t nv = (uint16_t)(cur - 1);
         if (nv == 1)
-            refhash_remove(idx);               /* back to implicit single owner */
+            refcount_set(idx, 0);              /* back to implicit single owner */
         else
-            refhash_set(idx, nv);
+            refcount_set(idx, nv);
         if (s_pmm_acct) s_acct_unrefs++;       /* T1 accounting (pmm_lock held) */
     }
     /* A free below the hint creates a free page the next-fit scan would skip;
@@ -810,7 +790,7 @@ uint64_t pmm_unreserve_region(uint64_t base, uint64_t len)
         uint8_t bit = (uint8_t)(1U << (idx % 8));
         if (!(s_bitmap[idx / 8] & bit))
             continue;   /* already free — never double-free */
-        if (refhash_get(idx) != 0)
+        if (refcount_get(idx) != 0)
             continue;   /* defensively skip anything that is COW/memfd shared */
         s_bitmap[idx / 8] &= (uint8_t)~bit;
         if (idx / 8 < s_alloc_hint_byte)
