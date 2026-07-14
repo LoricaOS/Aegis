@@ -107,6 +107,12 @@ ensure_table(uint64_t table_phys, uint64_t idx)
         if (child == 0)
             return 0;
         t[idx] = child | A64_TABLE;
+        /* This table is already live (root_phys may be s_ttbr1_phys, in use
+         * by other cores/paths) — without this, a table walk started right
+         * after we return can race the write and see a stale invalid entry.
+         * TCG's in-order model never exposed this; real hardware (HVF, and
+         * Cortex cores on target boards) does. */
+        __asm__ volatile("dsb ishst" ::: "memory");
         return child;
     }
     if (!(e & 2UL))
@@ -159,6 +165,11 @@ map_page_in(uint64_t root_phys, uint64_t va, uint64_t phys,
         panic_halt("[VMM] FAIL: vmm map double-map");
     }
     l3[i] = phys | arch_pte_from_flags(flags | VMM_FLAG_PRESENT);
+    /* Same reasoning as ensure_table: this leaf may be used (by this core
+     * or another) the instant we return, so the write must be ordered
+     * before any subsequent access through it — a fresh valid entry needs
+     * no TLBI (nothing stale to invalidate), just this store barrier. */
+    __asm__ volatile("dsb ishst" ::: "memory");
     return 0;
 }
 
