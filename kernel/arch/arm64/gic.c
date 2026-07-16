@@ -1,12 +1,25 @@
 /*
- * gic.c — GICv3 (QEMU virt: distributor @ 0x08000000, redistributor
- * frames @ 0x080A0000), system-register CPU interface, BSP only.
+ * gic.c — GIC dispatcher + GICv3 backend.
+ *
+ * GICv3 (QEMU virt default, and `-machine virt,gic-version=3`): distributor
+ * @ 0x08000000, redistributor frames @ 0x080A0000, system-register CPU
+ * interface. BSP-bring-up path only; APs call gic_cpu_init() themselves.
+ *
+ * GICv2 (GIC-400: Raspberry Pi 5/BCM2712, and
+ * `-machine virt,gic-version=2`) lives in gic_v2.c — genuinely different
+ * hardware (memory-mapped CPU interface, no redistributors, 10-bit INTID in
+ * IAR/EOIR vs. v3's 24-bit field), not a register-offset variant of this
+ * file. gic_init() reads the DTB's interrupt-controller "compatible" string
+ * once and every public entry point below dispatches on that.
  */
 
 #include "arch.h"
 #include "printk.h"
 #include "fdt.h"
+#include "gic_v2.h"
 #include <stdint.h>
+
+static int s_is_v2;
 
 /* QEMU-virt defaults; overridden from the DTB's arm,gic-v3 node at init
  * (Apple Virtualization.framework puts these at 0x1000_0000/0x1001_0000). */
@@ -36,8 +49,6 @@ static volatile uint8_t *s_gicr;
 static inline uint32_t d32(uint32_t off)             { return *(volatile uint32_t *)(s_gicd + off); }
 static inline void     dw32(uint32_t off, uint32_t v){ *(volatile uint32_t *)(s_gicd + off) = v; }
 static inline void     dw64(uint32_t off, uint64_t v){ *(volatile uint64_t *)(s_gicd + off) = v; }
-static inline uint32_t r32(uint32_t off)             { return *(volatile uint32_t *)(s_gicr + off); }
-static inline void     rw32(uint32_t off, uint32_t v){ *(volatile uint32_t *)(s_gicr + off) = v; }
 
 /* Redistributor frame for a given CPU. QEMU virt lays the GICv3
  * redistributors out as consecutive 128 KiB (0x20000) frames in CPU-index
@@ -49,13 +60,19 @@ gicr_for(uint32_t cpu)
     return (volatile uint8_t *)arch_dmap(s_gicr_phys + (uint64_t)cpu * GICR_STRIDE);
 }
 
-/* gic_cpu_init — per-CPU GICv3 bring-up: wake THIS core's redistributor,
- * make its SGIs/PPIs group-1 at a permissive priority, enable the virtual
- * timer PPI (27), and enable the system-register CPU interface. Called on
- * the BSP by gic_init and on each AP by its ap_c_entry (with its own index). */
+/* gic_cpu_init — per-CPU bring-up: dispatches to gicv2_cpu_init() on GIC-400,
+ * else the GICv3 path below (wake THIS core's redistributor, make its
+ * SGIs/PPIs group-1 at a permissive priority, enable the virtual timer PPI
+ * (27), and enable the system-register CPU interface). Called on the BSP by
+ * gic_init and on each AP by its ap_c_entry (with its own index). */
 void
 gic_cpu_init(uint32_t cpu)
 {
+    if (s_is_v2) {
+        gicv2_cpu_init(cpu);
+        return;
+    }
+
     volatile uint8_t *rd = gicr_for(cpu);
 
     *(volatile uint32_t *)(rd + GICR_WAKER) &= ~(1u << 1);   /* ProcessorSleep=0 */
@@ -80,6 +97,39 @@ gic_cpu_init(uint32_t cpu)
 void
 gic_init(void)
 {
+    /* Real GIC-400 silicon (Raspberry Pi 5/BCM2712) reports itself as
+     * "arm,gic-400" in its DTB (confirmed via a live dump off real Pi 5
+     * hardware). QEMU's `virt,gic-version=2` machine is a DIFFERENT GICv2
+     * implementation string, "arm,cortex-a15-gic" (confirmed via
+     * `-machine dumpdtb` + dtc) — same v2 register model this driver
+     * already implements (memory-mapped CPU interface, no redistributors),
+     * just a different compatible string. Checking only "arm,gic-400"
+     * meant QEMU's v2 machine fell through to the GICv3 branch below and
+     * tried to bring up a redistributor that doesn't exist on this
+     * hardware — an external abort at the very first GICR_WAKER access,
+     * discovered testing this driver against QEMU before ever touching
+     * real Pi 5 silicon. */
+    const char *v2_compat = 0;
+    if (fdt_compat_exists("arm,gic-400"))
+        v2_compat = "arm,gic-400";
+    else if (fdt_compat_exists("arm,cortex-a15-gic"))
+        v2_compat = "arm,cortex-a15-gic";
+
+    if (v2_compat) {
+        s_is_v2 = 1;
+        uint64_t gicd, gicc, sz;
+        int from_dtb = fdt_reg_by_compat(v2_compat, 0, &gicd, &sz) &&
+                       fdt_reg_by_compat(v2_compat, 1, &gicc, &sz);
+        if (!from_dtb) {
+            /* QEMU virt,gic-version=2 fallback (matches the GICv3 pattern
+             * below: builtin constants if a DTB somehow lacks reg data). */
+            gicd = 0x08000000UL;
+            gicc = 0x08010000UL;
+        }
+        gicv2_init(gicd, gicc);
+        return;
+    }
+
     /* Prefer the DTB's arm,gic-v3 node (reg[0]=distributor, reg[1]=first
      * redistributor frame); fall back to the QEMU-virt constants. */
     uint64_t d, r, sz;
@@ -106,6 +156,10 @@ gic_init(void)
 void
 gic_enable_ppi(uint32_t intid)
 {
+    if (s_is_v2) {
+        gicv2_enable_ppi(intid);
+        return;
+    }
     *(volatile uint32_t *)(s_gicr + GICR_SGI_OFF + GICR_ISENABLER0) = 1u << intid;
 }
 
@@ -113,6 +167,10 @@ gic_enable_ppi(uint32_t intid)
 void
 gic_enable_spi(uint32_t intid)
 {
+    if (s_is_v2) {
+        gicv2_enable_spi(intid);
+        return;
+    }
     dw32(GICD_IGROUPR + 4 * (intid / 32),
          d32(GICD_IGROUPR + 4 * (intid / 32)) | (1u << (intid % 32)));
     *(volatile uint8_t *)(s_gicd + GICD_IPRIORITYR + intid) = 0xA0;
@@ -123,6 +181,9 @@ gic_enable_spi(uint32_t intid)
 uint32_t
 gic_ack(void)
 {
+    if (s_is_v2)
+        return gicv2_ack();
+
     uint64_t iar;
     __asm__ volatile("mrs %0, S3_0_C12_C12_0" : "=r"(iar));       /* ICC_IAR1_EL1 */
     return (uint32_t)iar & 0xFFFFFFu;
@@ -131,6 +192,10 @@ gic_ack(void)
 void
 gic_eoi(uint32_t intid)
 {
+    if (s_is_v2) {
+        gicv2_eoi(intid);
+        return;
+    }
     __asm__ volatile("msr S3_0_C12_C12_1, %0" : : "r"((uint64_t)intid)); /* ICC_EOIR1_EL1 */
     __asm__ volatile("isb");
 }
