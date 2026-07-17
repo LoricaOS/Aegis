@@ -40,6 +40,7 @@
 void poll_test(void);
 void arm64_map_early_uart(void);
 void uaccess_selftest(void);
+void pcie_brcmstb_init(void);
 
 /* (g_cow_fork / g_lazyfile / g_perfbench_mm are defined in
  * sys_process.c / sys_memory.c — shared, default-ON like x86.) */
@@ -159,6 +160,17 @@ kernel_main_arm64(void)
     gic_enable_spi(33);       /* UART0 interrupt                        */
     random_init();
     pcie_init();              /* ECAM enumerate — [PCIE] OK or skip     */
+#ifdef AEGIS_BOOT_NATIVE
+    pcie_brcmstb_init();      /* real Pi 5: Broadcom RC bring-up (pcie1) */
+#if defined(AEGIS_NATIVE_TEST_STOP) && AEGIS_NATIVE_TEST_STOP <= 6
+    /* TEMPORARY (native-boot bring-up): isolate the brand-new Broadcom
+     * PCIe root-complex driver (first real hardware use, first PCIe owner
+     * on this board) from virtio/vfs/ext2/net init below -- one thing per
+     * flash, same discipline as every prior milestone this session. */
+    printk("[NATIVE] test-stop 6: pcie_brcmstb_init done\n");
+    for (;;) { __asm__ volatile("wfi"); }
+#endif
+#endif
     virtio_blk_init();        /* virtio-blk disk → vblk0 (poll mode)    */
     virtio_input_init();      /* virtio keyboard + mouse (desktop input) */
     virtio_gpu_init();        /* virtio-gpu scanout → compositor fb      */

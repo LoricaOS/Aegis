@@ -29,6 +29,17 @@ int fdt_reg_by_compat(const char *compat, int index,
 /* 1 if any node advertises `compat` in its "compatible" list. */
 int fdt_compat_exists(const char *compat);
 
+/* Like fdt_reg_by_compat, but for compat strings shared by more than one
+ * node (e.g. BCM2712's three "brcm,bcm2712-pcie" root complexes at
+ * different reg bases) -- node_index selects which MATCHING NODE (0 = the
+ * first node in the tree with this compatible string, 1 = the second,
+ * ...), and reads that node's reg[0]. Ignores "status" -- callers that
+ * care which node is enabled must already know which node_index they
+ * want (this session's rpi5-pcie-driver-research memory: pcie1 is
+ * node_index 1, the board's NVMe M.2 slot). */
+int fdt_reg_by_compat_nth(const char *compat, int node_index,
+                          uint64_t *addr_out, uint64_t *size_out);
+
 /* Collect every <addr,size> reg pair from every node whose "device_type"
  * is "memory" (the standard Devicetree convention for RAM -- these nodes
  * normally have no "compatible" property at all, so fdt_reg_by_compat

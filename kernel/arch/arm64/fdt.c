@@ -247,6 +247,95 @@ fdt_compat_exists(const char *compat)
     return walk(compat, 0, 0, NULL, NULL);
 }
 
+/* Same node-walking shape as walk() above, but counts NODE matches instead
+ * of returning on the first one -- needed for BCM2712's three identically-
+ * compatible PCIe root complexes (pcie0/pcie1/pcie2), which walk() cannot
+ * tell apart. */
+int
+fdt_reg_by_compat_nth(const char *compat, int node_index,
+                      uint64_t *addr_out, uint64_t *size_out)
+{
+    if (!s_ok || node_index < 0)
+        return 0;
+
+    uint32_t ac[FDT_MAX_DEPTH], sc[FDT_MAX_DEPTH];
+    int depth = 0;
+    ac[0] = 2; sc[0] = 1;
+
+    int      matched = 0, reg_seen = 0;
+    uint32_t reg_val = 0, reg_len = 0;
+    int      seen_nodes = 0;
+
+    uint32_t off = s_struct_off;
+    while (off + 4 <= s_struct_end) {
+        uint32_t tok = be32(s_buf + off);
+        off += 4;
+
+        if (tok == FDT_BEGIN_NODE) {
+            uint32_t n = off;
+            while (n < s_struct_end && s_buf[n]) n++;
+            off = (n + 4) & ~3u;
+            if (depth + 1 >= FDT_MAX_DEPTH)
+                return 0;
+            depth++;
+            ac[depth] = 2; sc[depth] = 1;
+            matched = 0; reg_seen = 0;
+        } else if (tok == FDT_END_NODE) {
+            if (depth == 0) break;
+            depth--;
+            matched = 0; reg_seen = 0;
+        } else if (tok == FDT_PROP) {
+            if (off + 8 > s_struct_end) break;
+            uint32_t len     = be32(s_buf + off);
+            uint32_t nameoff = be32(s_buf + off + 4);
+            uint32_t val     = off + 8;
+            off = (val + len + 3) & ~3u;
+            if (val + len > s_struct_end)
+                break;
+
+            if (str_at_is(nameoff, "#address-cells") && len >= 4)
+                ac[depth] = be32(s_buf + val);
+            else if (str_at_is(nameoff, "#size-cells") && len >= 4)
+                sc[depth] = be32(s_buf + val);
+            else if (str_at_is(nameoff, "compatible")) {
+                if (compat_list_has(s_buf + val, len, compat))
+                    matched = 1;
+            } else if (str_at_is(nameoff, "reg")) {
+                reg_seen = 1; reg_val = val; reg_len = len;
+            }
+
+            if (matched && reg_seen) {
+                if (seen_nodes != node_index) {
+                    seen_nodes++;
+                    matched = 0; reg_seen = 0;   /* keep walking past this node */
+                    continue;
+                }
+                uint32_t pac = ac[depth - 1], psc = sc[depth - 1];
+                if (pac == 0 || pac > 2 || psc > 2)
+                    return 0;
+                uint32_t stride = (pac + psc) * 4;
+                if (stride > reg_len)
+                    return 0;
+                uint64_t a = 0, s = 0;
+                for (uint32_t c = 0; c < pac; c++)
+                    a = (a << 32) | be32(s_buf + reg_val + c * 4);
+                for (uint32_t c = 0; c < psc; c++)
+                    s = (s << 32) | be32(s_buf + reg_val + (pac + c) * 4);
+                if (addr_out) *addr_out = a;
+                if (size_out) *size_out = s;
+                return 1;
+            }
+        } else if (tok == FDT_NOP) {
+            /* nothing */
+        } else if (tok == FDT_END) {
+            break;
+        } else {
+            return 0;
+        }
+    }
+    return 0;
+}
+
 /* "memory" nodes are identified by device_type, not compatible -- a
  * separate walk from the compat-matching one above. Also different from
  * walk()'s single-match/single-reg-index contract: collects every reg

@@ -75,6 +75,7 @@ ARCH_SRCS = \
     kernel/arch/arm64/uart_pl011.c \
     kernel/arch/arm64/poll_sources.c \
     kernel/arch/arm64/pcie.c \
+    kernel/arch/arm64/pcie_brcmstb.c \
     kernel/arch/arm64/fdt.c \
     kernel/arch/arm64/smp.c \
     kernel/arch/arm64/stubs.c
@@ -161,7 +162,7 @@ $(BUILD)/pi5-kernel.img: $(BUILD)/pi5-kernel.elf tools/gen-pi5-image.py
 sdcard: kernel
 	@mkdir -p $(BUILD)/sdcard
 	cp $(BUILD)/pi5-kernel.img $(BUILD)/sdcard/kernel_2712.img
-	printf 'kernel=kernel_2712.img\nkernel_address=0x80000\nenable_uart=1\nos_check=0\npciex4_reset=0\nusb_max_current_enable=1\n' > $(BUILD)/sdcard/config.txt
+	printf 'kernel=kernel_2712.img\nkernel_address=0x80000\nenable_uart=1\nos_check=0\npciex4_reset=0\nusb_max_current_enable=1\ndtparam=pciex1\n' > $(BUILD)/sdcard/config.txt
 	@echo "staged: $(BUILD)/sdcard/{kernel_2712.img,config.txt}"
 	@echo "copy both to the root of a FAT32-formatted SD card, alongside a"
 	@echo "board-matching bcm2712-rpi-5-b.dtb (needed -- without one, firmware"
