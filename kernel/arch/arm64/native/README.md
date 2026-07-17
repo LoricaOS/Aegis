@@ -33,6 +33,20 @@ recognized boot chain. This is out of scope for a single-session driver
 fix; see [[rpi5-pcie-driver-research]]'s dated entries for the full
 register-by-register evidence trail.
 
+## Cheapest untested lead (try this first before U-Boot work)
+
+Aegis has only ever been boot-tested from the **USB** drive; the real-Linux
+register baseline was captured booting *from NVMe*. RPi's own docs describe
+`pciex4_reset=0` (RP1's link only) as letting bare-metal code "inherit the
+PCIe configuration setup from the bootloader" — no equivalent exists for
+the NVMe slot, but it suggests the EEPROM may only fully commit PCIe
+bring-up for whichever device it actually boots from, tearing the link
+back down for anything merely probed-but-not-selected. Cheap, reversible
+test not yet run: temporarily swap this kernel onto the NVMe drive's boot
+partition (back up Debian's boot files first), boot with USB disconnected,
+recheck the `[PCIE-BRCM]` diagnostics. See [[rpi5-uboot-research]] for
+the full writeup.
+
 ## Decision (2026-07-17): pivot to an existing bootloader
 
 Rather than keep guessing at undocumented Broadcom firmware behavior, the
