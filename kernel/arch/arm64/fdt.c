@@ -246,3 +246,92 @@ fdt_compat_exists(const char *compat)
 {
     return walk(compat, 0, 0, NULL, NULL);
 }
+
+/* "memory" nodes are identified by device_type, not compatible -- a
+ * separate walk from the compat-matching one above. Also different from
+ * walk()'s single-match/single-reg-index contract: collects every reg
+ * pair from every matching node (a node's own reg property emits all its
+ * pairs at FDT_END_NODE, once #address-cells/#size-cells for that node
+ * are known). */
+int
+fdt_memory_regions(uint64_t *addr_out, uint64_t *size_out, int max)
+{
+    if (!s_ok)
+        return 0;
+
+    uint32_t ac[FDT_MAX_DEPTH], sc[FDT_MAX_DEPTH];
+    int depth = 0;
+    ac[0] = 2; sc[0] = 1;
+
+    int      is_memory = 0, reg_seen = 0;
+    uint32_t reg_val = 0, reg_len = 0;
+    int      n = 0;
+
+    uint32_t off = s_struct_off;
+    while (off + 4 <= s_struct_end) {
+        uint32_t tok = be32(s_buf + off);
+        off += 4;
+
+        if (tok == FDT_BEGIN_NODE) {
+            uint32_t p = off;
+            while (p < s_struct_end && s_buf[p]) p++;
+            off = (p + 4) & ~3u;
+            if (depth + 1 >= FDT_MAX_DEPTH)
+                return n;
+            depth++;
+            ac[depth] = 2; sc[depth] = 1;
+            is_memory = 0; reg_seen = 0;
+        } else if (tok == FDT_END_NODE) {
+            if (depth == 0) break;
+            if (is_memory && reg_seen && n < max) {
+                uint32_t pac = ac[depth - 1], psc = sc[depth - 1];
+                if (pac >= 1 && pac <= 2 && psc <= 2) {
+                    uint32_t stride = (pac + psc) * 4;
+                    uint32_t count = stride ? reg_len / stride : 0;
+                    for (uint32_t k = 0; k < count && n < max; k++) {
+                        uint32_t base = k * stride;
+                        uint64_t a = 0, s = 0;
+                        for (uint32_t c = 0; c < pac; c++)
+                            a = (a << 32) | be32(s_buf + reg_val + base + c * 4);
+                        for (uint32_t c = 0; c < psc; c++)
+                            s = (s << 32) | be32(s_buf + reg_val + base + (pac + c) * 4);
+                        addr_out[n] = a;
+                        size_out[n] = s;
+                        n++;
+                    }
+                }
+            }
+            depth--;
+            is_memory = 0; reg_seen = 0;
+        } else if (tok == FDT_PROP) {
+            if (off + 8 > s_struct_end) break;
+            uint32_t len     = be32(s_buf + off);
+            uint32_t nameoff = be32(s_buf + off + 4);
+            uint32_t val     = off + 8;
+            off = (val + len + 3) & ~3u;
+            if (val + len > s_struct_end)
+                break;
+
+            if (str_at_is(nameoff, "#address-cells") && len >= 4)
+                ac[depth] = be32(s_buf + val);
+            else if (str_at_is(nameoff, "#size-cells") && len >= 4)
+                sc[depth] = be32(s_buf + val);
+            else if (str_at_is(nameoff, "device_type")) {
+                static const char want[] = "memory";
+                int eq = (len >= sizeof(want));
+                for (uint32_t k = 0; eq && k < sizeof(want) - 1; k++)
+                    if (s_buf[val + k] != want[k]) eq = 0;
+                if (eq) is_memory = 1;
+            } else if (str_at_is(nameoff, "reg")) {
+                reg_seen = 1; reg_val = val; reg_len = len;
+            }
+        } else if (tok == FDT_NOP) {
+            /* nothing */
+        } else if (tok == FDT_END) {
+            break;
+        } else {
+            return n;                           /* corrupt stream */
+        }
+    }
+    return n;
+}

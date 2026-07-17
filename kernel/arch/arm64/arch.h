@@ -77,6 +77,25 @@ uint64_t arch_kern_phys_slide(void);
 uint64_t arch_early_pv_off(void);
 uint64_t arch_get_dtb_phys(void);
 
+/* Native (non-Limine) boot path -- kernel/arch/arm64/native_entry.c.
+ * arch_mm_init_native() plays the same role arch_mm_ingest() does for
+ * Limine (sets dtb_phys/slide/pv_off/cmdline), but there is no
+ * aegis_bootinfo_t: no memory map is handed to us at entry, no HHDM
+ * exists (the native path runs off boot_probe.S's own identity map).
+ * arch_mm_populate_regions_from_dtb() fills regions[] from the DTB's
+ * memory nodes afterward -- must be called after fdt_init() has
+ * captured the tree, and is a no-op if Limine already gave us regions. */
+void arch_mm_init_native(uint64_t dtb_phys);
+void arch_mm_populate_regions_from_dtb(void);
+
+/* Platform UART physical base, for code that needs it after vmm_init has
+ * replaced the early identity map (vmm.c's DMAP device window, main.c's
+ * post-vmm_init serial_set_base call). Defaults to QEMU virt's PL011
+ * (0x09000000); arch_mm_init_native() overrides it for real Pi 5
+ * hardware (0x107D001000 -- confirmed this address on real hardware
+ * during the native-boot bring-up, see rpi5-port-research memory). */
+uint64_t arch_mm_get_uart_phys(void);
+
 /* Highest canonical user-space virtual address (48-bit VA, TTBR0 half). */
 #define USER_ADDR_MAX 0x0000FFFFFFFFFFFFUL
 

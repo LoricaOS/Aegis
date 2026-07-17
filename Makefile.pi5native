@@ -1,0 +1,172 @@
+# Makefile.pi5native — native (non-Limine, non-UEFI) Raspberry Pi 5 boot
+# path. Separate from Makefile.arm64 on purpose: the reference arm64 build
+# boots exclusively via Limine/UEFI (see Makefile.arm64's header comment);
+# this one targets stock, unmodified Pi 5 firmware directly, no aftermarket
+# UEFI firmware involved.
+#
+# Milestones 1-3b (DONE, verified on real Pi 5 hardware 2026-07-16/17): a
+# standalone boot stub (kernel/arch/arm64/native/boot_probe.S) proved image-
+# header parsing, entry, EL2->EL1 drop, page tables + MMU enable + jump to
+# a high-VA section, a real AAPCS64 call into compiled C with a stack, and
+# real .bss zeroing -- all on stock BCM2712 firmware, no bisection needed
+# by the end. See rpi5-port-research memory for the full history.
+#
+# This build (in progress): the REAL kernel, linked with boot_probe.S as
+# entry instead of Limine's entry.S -- same source tree as Makefile.arm64,
+# minus start.c (Limine-only: arm64_early_entry/arm64_map_early_uart, not
+# used or called on this path) plus native_entry.c (kernel_main_native(),
+# the native-path counterpart of kernel_main_limine() in main.c).
+#
+# Usage:
+#   make -f Makefile.pi5native kernel        # build/pi5native/pi5-kernel.img
+#   make -f Makefile.pi5native sdcard        # stage an SD card image tree
+#
+# NATIVE_TEST_STOP=1|2|3 (optional, e.g. `make ... kernel NATIVE_TEST_STOP=2`):
+# one-subsystem-per-flash bring-up gate in kernel_main_arm64 (main.c) --
+# 1 = stop after fdt_init, 2 = after pmm_init, 3 = after vmm_init. Omit (or
+# any other value) for the full, ungated boot.
+
+CC      = aarch64-linux-gnu-gcc
+LD      = aarch64-linux-gnu-ld
+NM      = aarch64-linux-gnu-nm
+OBJCOPY = aarch64-linux-gnu-objcopy
+PYTHON ?= python3
+
+AEGIS_VERSION := $(shell cat VERSION 2>/dev/null || echo 0.0.0)
+
+BUILD = build/pi5native
+
+GCC_INCLUDE := $(shell $(CC) -print-file-name=include)
+CFLAGS = \
+    -ffreestanding -nostdlib -nostdinc \
+    -isystem $(GCC_INCLUDE) \
+    -march=armv8-a \
+    -mgeneral-regs-only \
+    -mno-outline-atomics \
+    -fno-pie -fno-pic \
+    -fno-stack-protector \
+    -fno-omit-frame-pointer \
+    -O2 -fno-strict-aliasing \
+    -g \
+    -Wall -Wextra -Werror \
+    -DAEGIS_VERSION=\"$(AEGIS_VERSION)\" \
+    -DAEGIS_BOOT_NATIVE \
+    -Ikernel/arch/arm64 -Ikernel/core -Ikernel/cap -Ikernel/mm \
+    -Ikernel/sched -Ikernel/proc -Ikernel/syscall -Ikernel/fs \
+    -Ikernel/tty -Ikernel/signal -Ikernel/drivers -Ikernel/net
+ifneq ($(NATIVE_TEST_STOP),)
+CFLAGS += -DAEGIS_NATIVE_TEST_STOP=$(NATIVE_TEST_STOP)
+endif
+
+LDFLAGS = -T kernel/arch/arm64/native/linker-pi5-native.ld -nostdlib
+
+# ── Sources ──────────────────────────────────────────────────────────────────
+# Same as Makefile.arm64's ARCH_SRCS, minus start.c (Limine-only) plus
+# native_entry.c (this path's kernel_main_native()).
+ARCH_SRCS = \
+    kernel/arch/arm64/native_entry.c \
+    kernel/arch/arm64/arch.c \
+    kernel/arch/arm64/arch_mm.c \
+    kernel/arch/arm64/vmm.c \
+    kernel/arch/arm64/traps.c \
+    kernel/arch/arm64/gic.c \
+    kernel/arch/arm64/timer.c \
+    kernel/arch/arm64/uart_pl011.c \
+    kernel/arch/arm64/poll_sources.c \
+    kernel/arch/arm64/pcie.c \
+    kernel/arch/arm64/fdt.c \
+    kernel/arch/arm64/smp.c \
+    kernel/arch/arm64/stubs.c
+
+# entry.S excluded (boot_probe.S is this path's entry); everything else
+# (vectors/ctx-switch/proc-enter/uaccess/ap-boot) is boot-path-agnostic.
+ARCH_ASMS = \
+    kernel/arch/arm64/native/boot_probe.S \
+    kernel/arch/arm64/vectors.S \
+    kernel/arch/arm64/ctx_switch.S \
+    kernel/arch/arm64/proc_enter.S \
+    kernel/arch/arm64/uaccess.S \
+    kernel/arch/arm64/ap_boot.S
+
+# Same as Makefile.arm64's SHARED_SRCS, minus kernel/core/limine.c --
+# limine_boot_entry() is only ever called from start.c (Limine's
+# arm64_early_entry), which this build excludes; nothing else references
+# it, so it'd otherwise be dead code that still fails to link (it in turn
+# calls kernel_main_limine(), guarded out of main.c by AEGIS_BOOT_NATIVE).
+SHARED_SRCS = \
+    kernel/core/printk.c kernel/core/random.c \
+    kernel/core/poll.c kernel/core/ksym.c kernel/core/trace.c \
+    kernel/core/lockrank.c kernel/cap/cap.c kernel/cap/cap_policy.c \
+    kernel/mm/pmm.c kernel/mm/kva.c kernel/mm/vma.c \
+    kernel/lib/va_freelist.c kernel/lib/string.c \
+    kernel/sched/sched.c kernel/sched/waitq.c \
+    kernel/signal/signal.c \
+    kernel/tty/tty.c kernel/tty/pty.c \
+    kernel/fs/fd_table.c kernel/fs/vfs.c kernel/fs/initrd.c \
+    kernel/fs/console.c kernel/fs/kbd_vfs.c kernel/fs/pipe.c \
+    kernel/fs/blkdev.c kernel/fs/gpt.c \
+    kernel/fs/ext2.c kernel/fs/ext2_cache.c kernel/fs/ext2_dir.c \
+    kernel/fs/ext2_vfs.c kernel/fs/ramfs.c kernel/fs/procfs.c \
+    kernel/fs/memfd.c kernel/fs/eventfd.c kernel/fs/poll_test.c \
+    kernel/drivers/fb.c kernel/drivers/ramdisk.c \
+    kernel/drivers/virtio_pci.c kernel/drivers/virtqueue.c \
+    kernel/drivers/virtio_blk.c kernel/drivers/virtio_input.c \
+    kernel/drivers/virtio_gpu.c kernel/drivers/virtio_net.c \
+    kernel/drivers/usb_mouse.c \
+    kernel/net/netdev.c kernel/net/eth.c kernel/net/ip.c \
+    kernel/net/udp.c kernel/net/tcp.c kernel/net/socket.c \
+    kernel/net/unix_socket.c kernel/net/epoll.c \
+    kernel/syscall/syscall.c kernel/syscall/sys_io.c \
+    kernel/syscall/sys_memory.c kernel/syscall/sys_process.c \
+    kernel/syscall/sys_exec.c kernel/syscall/sys_identity.c \
+    kernel/syscall/sys_hostname.c kernel/syscall/sys_adminconf.c \
+    kernel/syscall/sys_cap.c kernel/syscall/sys_time.c \
+    kernel/syscall/sys_file.c kernel/syscall/sys_dir.c \
+    kernel/syscall/sys_meta.c kernel/syscall/sys_signal.c \
+    kernel/syscall/sys_socket.c kernel/syscall/sys_random.c \
+    kernel/syscall/sys_disk.c kernel/syscall/futex.c \
+    kernel/syscall/fd_waitq.c kernel/syscall/uaccess_check.c \
+    kernel/proc/proc.c kernel/proc/elf.c \
+    kernel/arch/arm64/main.c
+
+C_OBJS   = $(patsubst kernel/%.c,$(BUILD)/%.o,$(ARCH_SRCS) $(SHARED_SRCS))
+ASM_OBJS = $(patsubst kernel/%.S,$(BUILD)/%.o,$(ARCH_ASMS))
+ALL_OBJS = $(ASM_OBJS) $(C_OBJS)
+
+.PHONY: kernel sdcard clean
+
+-include $(C_OBJS:.o=.d)
+
+$(BUILD)/%.o: kernel/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD)/%.o: kernel/%.S
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Two-pass link to embed the in-kernel symbol table (same as x86/arm64-Limine).
+$(BUILD)/pi5-kernel.elf: $(ALL_OBJS) tools/gen-ksyms.sh kernel/core/ksym.h
+	$(LD) $(LDFLAGS) -o $@.tmp $(ALL_OBJS)
+	NM=$(NM) sh tools/gen-ksyms.sh $@.tmp > $(BUILD)/ksyms.c
+	$(CC) $(CFLAGS) -c $(BUILD)/ksyms.c -o $(BUILD)/ksyms.o
+	$(LD) $(LDFLAGS) -o $@ $(ALL_OBJS) $(BUILD)/ksyms.o
+	@rm -f $@.tmp
+
+kernel: $(BUILD)/pi5-kernel.img
+$(BUILD)/pi5-kernel.img: $(BUILD)/pi5-kernel.elf tools/gen-pi5-image.py
+	$(PYTHON) tools/gen-pi5-image.py $(BUILD)/pi5-kernel.elf $@
+
+sdcard: kernel
+	@mkdir -p $(BUILD)/sdcard
+	cp $(BUILD)/pi5-kernel.img $(BUILD)/sdcard/kernel_2712.img
+	printf 'kernel=kernel_2712.img\nkernel_address=0x80000\nenable_uart=1\nos_check=0\npciex4_reset=0\nusb_max_current_enable=1\n' > $(BUILD)/sdcard/config.txt
+	@echo "staged: $(BUILD)/sdcard/{kernel_2712.img,config.txt}"
+	@echo "copy both to the root of a FAT32-formatted SD card, alongside a"
+	@echo "board-matching bcm2712-rpi-5-b.dtb (needed -- without one, firmware"
+	@echo "logs a dterror and the boot still proceeds but is untested that way)."
+	@echo "Pi 5 does NOT need bootcode.bin/start*.elf/fixup*.dat -- that's the"
+	@echo "Pi3/legacy VideoCore-boot scheme; Pi 5's own EEPROM handles that stage."
+
+clean:
+	rm -rf $(BUILD)

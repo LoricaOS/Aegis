@@ -29,4 +29,13 @@ int fdt_reg_by_compat(const char *compat, int index,
 /* 1 if any node advertises `compat` in its "compatible" list. */
 int fdt_compat_exists(const char *compat);
 
+/* Collect every <addr,size> reg pair from every node whose "device_type"
+ * is "memory" (the standard Devicetree convention for RAM -- these nodes
+ * normally have no "compatible" property at all, so fdt_reg_by_compat
+ * can't see them). A single node's "reg" property may itself carry
+ * multiple pairs (real hardware can be a small handful of nodes each with
+ * several ranges, or one node with many -- both are handled). Writes up
+ * to `max` pairs into addr_out/size_out; returns the number written. */
+int fdt_memory_regions(uint64_t *addr_out, uint64_t *size_out, int max);
+
 #endif /* AEGIS_ARM64_FDT_H */

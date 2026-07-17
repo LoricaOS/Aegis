@@ -52,14 +52,23 @@ task_idle(void)
         arch_wait_for_irq();
 }
 
+/* kernel_main_arm64 — shared continuation for every arm64 boot path.
+ * Reached two ways:
+ *   - Limine: kernel_main_limine(bi) below does arch_mm_ingest(bi) +
+ *     arm64_map_early_uart() + serial_init() first (Limine's HHDM doesn't
+ *     map device MMIO, so a temporary TTBR0 idmap is needed), then calls
+ *     here.
+ *   - Native (non-Limine, non-UEFI; kernel/arch/arm64/native_entry.c):
+ *     kernel_main_native(dtb_phys) does arch_mm_init_native(dtb_phys) +
+ *     serial_init() (no separate idmap needed — boot_probe.S's own TTBR0
+ *     already covers the real UART, see that file's page-table comment),
+ *     then calls here. Mirrors the x86 kernel_main(mb_magic,mb_info) /
+ *     kernel_main_limine(bi) split (kernel/core/main.c) — same pattern,
+ *     "don't build a fake bootinfo_t for the non-Limine path" (see
+ *     kernel/core/bootinfo.h). */
 void
-kernel_main_limine(const aegis_bootinfo_t *bi)
+kernel_main_arm64(void)
 {
-    arch_mm_ingest(bi);
-    arm64_map_early_uart();   /* TTBR0 device idmap → PL011 reachable */
-    serial_init();
-    printk("[SERIAL] OK: PL011 UART initialized\n");
-
     smp_percpu_init_bsp();    /* TPIDR_EL1 — before any sched_current() */
     idt_init();               /* VBAR_EL1 — catch faults from here on   */
 
@@ -72,10 +81,47 @@ kernel_main_limine(const aegis_bootinfo_t *bi)
     }
 
     fdt_init();               /* capture DTB now — HHDM dies at vmm_init */
+    arch_mm_populate_regions_from_dtb();  /* no-op if Limine gave us usable[] already */
+
+#if defined(AEGIS_BOOT_NATIVE) && defined(AEGIS_NATIVE_TEST_STOP) && AEGIS_NATIVE_TEST_STOP <= 1
+    /* TEMPORARY (native-boot bring-up, one-subsystem-per-flash discipline
+     * -- see rpi5-port-research memory): park here so a hang further
+     * down can't be confused with a bug in fdt_init/arch_mm_populate_
+     * regions_from_dtb, both genuinely new-to-this-hardware code. Bump
+     * AEGIS_NATIVE_TEST_STOP (Makefile.pi5native) and re-flash to advance
+     * past the next subsystem; remove once the whole chain is proven. */
+    printk("[NATIVE] test-stop 1: fdt_init + region parse done, region_count=%u\n",
+           (unsigned)arch_mm_region_count());
+    for (;;) { __asm__ volatile("wfi"); }
+#endif
 
     pmm_init();
+
+#if defined(AEGIS_BOOT_NATIVE) && defined(AEGIS_NATIVE_TEST_STOP) && AEGIS_NATIVE_TEST_STOP <= 2
+    /* DIAGNOSTIC (temporary): vmm_init's first pmm_alloc_page() reported
+     * OOM despite pmm_init's own "8188MB usable" line -- dump the raw
+     * region list + bootstrap-bitmap free count to discriminate "nothing
+     * freed in the <4GB bootstrap window" from "alloc/free/reserve logic
+     * bug" before touching any pmm/vmm code (see rpi5-port-research memory). */
+    {
+        uint32_t                  nr = arch_mm_region_count();
+        const aegis_mem_region_t *rg = arch_mm_get_regions();
+        for (uint32_t i = 0; i < nr; i++)
+            printk("[NATIVE]   region[%u] base=0x%lx len=0x%lx (end=0x%lx)\n",
+                   (unsigned)i, rg[i].base, rg[i].len, rg[i].base + rg[i].len);
+        printk("[NATIVE]   pmm_free_pages()=%lu\n", pmm_free_pages());
+    }
+    printk("[NATIVE] test-stop 2: pmm_init done\n");
+    for (;;) { __asm__ volatile("wfi"); }
+#endif
+
     vmm_init();               /* TTBR1 kernel tables + DMAP go live     */
-    serial_set_base(arch_dmap(0x09000000UL));  /* off the early idmap   */
+    serial_set_base(arch_dmap(arch_mm_get_uart_phys()));  /* off the early idmap */
+
+#if defined(AEGIS_BOOT_NATIVE) && defined(AEGIS_NATIVE_TEST_STOP) && AEGIS_NATIVE_TEST_STOP <= 3
+    printk("[NATIVE] test-stop 3: vmm_init done, UART re-based, still alive\n");
+    for (;;) { __asm__ volatile("wfi"); }
+#endif
     kva_init();
     pmm_init_late();
     pmm_set_alloc_high_pref(1);
@@ -150,3 +196,21 @@ kernel_main_limine(const aegis_bootinfo_t *bi)
     sched_start();
     __builtin_unreachable();
 }
+
+#ifndef AEGIS_BOOT_NATIVE
+/* Limine boot protocol continuation (kernel/core/limine.c). Not compiled
+ * for the native build (Makefile.pi5native defines AEGIS_BOOT_NATIVE) --
+ * arm64_map_early_uart() lives in start.c, which the native build doesn't
+ * link (its own entry, kernel/arch/arm64/native/boot_probe.S, does the
+ * EL2->EL1 drop + MMU enable + identity map itself; see
+ * kernel/arch/arm64/native_entry.c for that path's own thin wrapper). */
+void
+kernel_main_limine(const aegis_bootinfo_t *bi)
+{
+    arch_mm_ingest(bi);
+    arm64_map_early_uart();   /* TTBR0 device idmap → PL011 reachable */
+    serial_init();
+    printk("[SERIAL] OK: PL011 UART initialized\n");
+    kernel_main_arm64();
+}
+#endif

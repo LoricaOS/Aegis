@@ -8,6 +8,7 @@
 #include "fb.h"
 #include "printk.h"
 #include "bootinfo.h"
+#include "fdt.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -23,6 +24,7 @@ static arch_fb_info_t     s_fb_info;
 static uint64_t           s_module_phys, s_module_size;
 static uint64_t           s_module2_phys, s_module2_size;
 static char               s_cmdline[256];
+static uint64_t           s_uart_phys = 0x09000000UL;   /* QEMU virt PL011 default */
 
 /* Reserved: module ranges (reserved at pmm_init, reclaimed by main.c
  * after the ramdisk copy — same lifecycle as x86). Slots filled by
@@ -139,4 +141,73 @@ arch_get_module2(uint64_t *phys_out, uint64_t *size_out)
     *phys_out = s_module2_phys;
     *size_out = s_module2_size;
     return 1;
+}
+
+uint64_t arch_mm_get_uart_phys(void) { return s_uart_phys; }
+
+/* Native (non-Limine) boot path -- see arch.h. Mirrors arch_mm_ingest()'s
+ * role but with no aegis_bootinfo_t to read: no bootloader memory map, no
+ * HHDM. Real hardware address confirmed via this session's own
+ * native-boot bring-up (see rpi5-port-research memory) -- not yet DTB-
+ * derived (would need fdt_reg_by_compat("arm,pl011", ...) called after
+ * fdt_init(), same chicken-and-egg as the memory regions below; hardcoded
+ * for now since this is the only board this path targets). */
+void
+arch_mm_init_native(uint64_t dtb_phys)
+{
+    s_kern_phys_slide = 0;              /* fixed load address, see linker script */
+    s_early_pv_off    = 0;              /* identity-mapped (VA==PA), no HHDM     */
+    s_rsdp_phys       = 0;              /* no ACPI on arm64                      */
+    s_dtb_phys        = dtb_phys;
+    s_cmdline[0]      = '\0';           /* no cmdline source on this path yet    */
+    s_uart_phys       = 0x107D001000UL; /* real Pi 5 PL011 (block index 65)      */
+}
+
+/* Called after fdt_init() has captured the tree. No-op if Limine already
+ * populated regions[] at ingest time (region_count > 0) -- this is purely
+ * the native path's memory-map source, since it gets no bootinfo usable[]
+ * list. Real Pi 5 RAM is "highly fragmented multi-region" per prior DTB
+ * research -- MAX_REGIONS (32) comfortably covers what was seen there.
+ *
+ * Excludes PA[0, ARCH_KERNEL_PHYS_BASE) from whatever the DTB reports as
+ * usable. Two independent reasons, found together during this session's
+ * native-boot bring-up (see rpi5-port-research memory):
+ *   1. This SoC's real DTB has a /reserved-memory/atf@0 node covering
+ *      PA[0, 0x80000) (TF-A's own live memory, `no-map`) that this
+ *      simple device_type="memory"-only walk doesn't know to exclude --
+ *      allocating into it would corrupt running secure firmware.
+ *   2. pmm_alloc_page() treats a returned physical address of exactly 0
+ *      as its OOM sentinel ("always reserved" on Limine/x86, where page 0
+ *      genuinely is pre-reserved by convention) -- on this path nothing
+ *      reserved it, so the very first allocation legitimately returned
+ *      PA 0 and was misread as out-of-memory. Excluding this range keeps
+ *      page 0 unavailable here too, restoring that invariant, without
+ *      touching pmm.c's shared sentinel convention.
+ * A real /reserved-memory walk (there are other, smaller entries: cma,
+ * nvram@0/1) is a good follow-up but not required to fix either of the
+ * above -- both are inside this one excluded range. */
+void
+arch_mm_populate_regions_from_dtb(void)
+{
+    if (region_count > 0)
+        return;
+
+    uint64_t addrs[MAX_REGIONS], sizes[MAX_REGIONS];
+    int n = fdt_memory_regions(addrs, sizes, MAX_REGIONS);
+    for (int i = 0; i < n && region_count < MAX_REGIONS; i++) {
+        uint64_t base = addrs[i];
+        uint64_t size = sizes[i];
+        if (base < ARCH_KERNEL_PHYS_BASE) {
+            uint64_t cut = ARCH_KERNEL_PHYS_BASE - base;
+            if (cut >= size)
+                continue;               /* entirely within the excluded range */
+            base = ARCH_KERNEL_PHYS_BASE;
+            size -= cut;
+        }
+        if (size == 0)
+            continue;
+        regions[region_count].base = base;
+        regions[region_count].len  = size;
+        region_count++;
+    }
 }
