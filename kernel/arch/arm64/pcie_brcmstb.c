@@ -128,6 +128,8 @@
 #define BCM_RESET_SET            0x00UL
 #define BCM_RESET_CLEAR          0x04UL
 #define PCIE1_BRIDGE_RESET_ID    43
+#define PCIE0_BRIDGE_RESET_ID    42   /* unused slot, but shares rescal below */
+#define PCIE2_BRIDGE_RESET_ID    44   /* RP1 (x4) -- shares rescal below */
 
 /* pcie_rescal (brcm,bcm7216-pcie-sata-rescal): single shared "kick and
  * poll" reset, id-less (#reset-cells = 0) -- confirmed via the real DTB
@@ -215,13 +217,19 @@ rescal_deassert(void)
 }
 
 static void
-bridge_reset_set(int assert)
+bridge_reset_set_id(uint32_t reset_id, int assert)
 {
-    uint32_t bank = PCIE1_BRIDGE_RESET_ID >> 5;
-    uint32_t bit  = 1UL << (PCIE1_BRIDGE_RESET_ID & 0x1f);
+    uint32_t bank = reset_id >> 5;
+    uint32_t bit  = 1UL << (reset_id & 0x1f);
     uint32_t off  = (uint32_t)(bank * BCM_RESET_BANK_SIZE) +
                     (assert ? BCM_RESET_SET : BCM_RESET_CLEAR);
     *(volatile uint32_t *)(s_bcm_reset + off) = bit;
+}
+
+static void
+bridge_reset_set(int assert)
+{
+    bridge_reset_set_id(PCIE1_BRIDGE_RESET_ID, assert);
 }
 
 static void
@@ -402,18 +410,87 @@ pcie_brcmstb_init(void)
                freq, (unsigned)r32(0x00));
     }
 
+    /* DIAGNOSTIC (temporary): every rescal/reset-ordering variant tried
+     * this session has produced byte-identical "garbage" at both
+     * pcie1[0x0] (vendor/device ID) and rescal STATUS, including after a
+     * full bridge reset pulse -- but a vendor/device ID is a fixed silicon
+     * constant with zero dependence on rescal/PERST#/link training, so no
+     * amount of reset reordering could ever fix a bad vendor-ID read. That
+     * means the RC's own register block may simply not be answering yet on
+     * THIS boot path (Aegis boots from USB; the real-Linux ground truth was
+     * captured booting *from* pcie1/NVMe itself, where firmware necessarily
+     * brings the RC fully up -- Aegis's boot path may inherit a half-
+     * initialized block Linux never has to deal with). Dump every register
+     * we have a real-Linux devmem baseline for, wait 2s with zero writes,
+     * then dump the identical set again: if everything is still garbage
+     * after just waiting, the block is genuinely inaccessible from this
+     * boot path (a firmware-init gap, not a sequencing bug in this driver);
+     * if the vendor ID (or anything else) flips to the expected value on
+     * its own, this is a settling-time issue and needs a readiness poll
+     * instead of more reset-ordering guesses. */
+    printk("[PCIE-BRCM] diag: pre-wait  vendorid=0x%x misc_ctrl=0x%x "
+           "hard_debug=0x%x pcie_ctrl=0x%x pcie_status=0x%x\n",
+           (unsigned)r32(0x00), (unsigned)r32(PCIE_MISC_MISC_CTRL),
+           (unsigned)r32(PCIE_MISC_HARD_DEBUG), (unsigned)r32(PCIE_MISC_PCIE_CTRL),
+           (unsigned)r32(PCIE_MISC_PCIE_STATUS));
+    busy_wait_us(2000000);
+    printk("[PCIE-BRCM] diag: post-wait vendorid=0x%x misc_ctrl=0x%x "
+           "hard_debug=0x%x pcie_ctrl=0x%x pcie_status=0x%x\n",
+           (unsigned)r32(0x00), (unsigned)r32(PCIE_MISC_MISC_CTRL),
+           (unsigned)r32(PCIE_MISC_HARD_DEBUG), (unsigned)r32(PCIE_MISC_PCIE_CTRL),
+           (unsigned)r32(PCIE_MISC_PCIE_STATUS));
+
+    /* DIAGNOSTIC (temporary): a real Linux boot on this exact board reads
+     * pcie1[0x0]=0x271214e4 (BCM2712 vendor/device ID) and rescal
+     * START=0x0/STATUS=0x73 at these same physical addresses via devmem --
+     * our own captures instead showed pcie1[0x0]=0xf3a8d9e8 and rescal
+     * values with no resemblance to a real control/status register, on the
+     * very first read after mapping, before any writes. That points at the
+     * KVA->phys translation itself rather than sequencing. Independently
+     * ask the VMM what physical address it thinks s_base/s_rescal resolve
+     * to -- if this printed phys doesn't match base_phys/RESCAL_PHYS
+     * exactly, the PTE is wrong and that's the bug; if it matches, the
+     * mapping is fine and the fault is downstream (hardware enable
+     * sequencing, or a wrong assumption about what's at this offset). */
+    printk("[PCIE-BRCM] diag: kva_page_phys(s_base)=0x%lx (want 0x%lx) "
+           "kva_page_phys(s_rescal)=0x%lx (want 0x%lx)\n",
+           kva_page_phys((void *)((uint64_t)(uintptr_t)s_base & ~0xFFFUL)),
+           base_phys,
+           kva_page_phys((void *)((uint64_t)(uintptr_t)s_rescal & ~0xFFFUL)),
+           RESCAL_PHYS & ~0xFFFUL);
+
     /* 0. Deassert the bridge reset FIRST, before ever touching rescal --
      * matches Linux's real probe() order exactly (clk_enable ->
      * brcm_pcie_bridge_sw_init_set(pcie, 0) -> reset_control_reset(rescal)
      * -> brcm_phy_start (no-op on BCM2712) -> brcm_pcie_setup(), which
-     * itself does its OWN separate assert->deassert pulse below). Missing
-     * this exact ordering was this driver's real bug: rescal's STATUS bit
-     * read completely static across every previous flash (200ms+ polls,
-     * both with and without a real NVMe module connected) while START
-     * correctly reflected our writes -- consistent with rescal's
-     * calibration state machine itself being frozen because the bridge
-     * was still held in its power-on reset state the whole time. */
+     * itself does its OWN separate assert->deassert pulse below). NOTE:
+     * tested on real hardware -- this produced byte-identical rescal/link
+     * diagnostics to the build without it, so it did NOT turn out to be
+     * the fix (leaving the ordering in place since it still matches
+     * upstream, but the earlier claim that this was "the real bug" was
+     * wrong -- see the post-reset vendor-ID re-read below instead). */
     bridge_reset_set(0);
+
+    /* 0b. NEW: the real Linux driver's own header comment (linux-pcie-
+     * brcmstb.c) warns that "the RESCAL block is tied to PCIe controller #1,
+     * regardless of the number of controllers, and turning off PCIe
+     * controller #1 prevents access to the RESCAL register blocks ...
+     * depending upon the bus fabric we may get a timeout, or a hang" --
+     * CFG_QUIRK_AVOID_BRIDGE_SHUTDOWN exists in that driver specifically to
+     * never assert a bridge that would break rescal for every controller.
+     * All three of this SoC's pcie nodes share ONE rescal block (pcie0 ->
+     * bcm_reset 42, pcie1 (us, NVMe) -> 43, pcie2/RP1 (x4) -> 44) -- we've
+     * only ever deasserted our own bit 43. If rescal is actually gated by
+     * pcie0's or pcie2's bridge instead (RP1/pcie2 is the far more likely
+     * candidate: it's the SoC's always-on south-bridge, needed for basically
+     * every board peripheral, so real firmware/Linux always has it live
+     * long before pcie1 probes rescal -- our from-scratch native boot never
+     * touches it at all), that would explain byte-identical rescal
+     * START/STATUS values across every pcie1-only reset ordering we've
+     * tried this session. Deassert both siblings' bridges too -- harmless
+     * (we never assert them, and don't rely on their own link training). */
+    bridge_reset_set_id(PCIE0_BRIDGE_RESET_ID, 0);
+    bridge_reset_set_id(PCIE2_BRIDGE_RESET_ID, 0);
 
     /* 1. rescal must be running before the bridge's OWN reset pulse below. */
     if (rescal_deassert() != 0) {
@@ -426,6 +503,21 @@ pcie_brcmstb_init(void)
     bridge_reset_set(1);
     busy_wait_us(100); /* precludes the reset looking like a glitch */
     bridge_reset_set(0);
+
+    /* DIAGNOSTIC (temporary): the vendor-ID garbage read earlier (before
+     * step 0) happened while the bridge was still cold-reset -- an
+     * unclocked/held-in-reset APB register block returning undefined bus
+     * data would look exactly like that, and wouldn't indicate a
+     * translation bug. Re-read the SAME register now that the bridge has
+     * been through its full reset pulse (steps 0-2) and rescal has run --
+     * if this now reads 0x271214e4 (matches a real Linux boot's devmem
+     * readback of this exact address), the RC is genuinely alive and the
+     * remaining bug is downstream (rescal completion / PERST# / link
+     * training); if it's still garbage, the reset sequence itself isn't
+     * reaching hardware and that's the next place to look. */
+    printk("[PCIE-BRCM] diag: post-reset pcie1[0x0]=0x%x rescal STATUS=0x%x\n",
+           (unsigned)r32(0x00),
+           (unsigned)(*(volatile uint32_t *)(s_rescal + RESCAL_STATUS)));
 
     /* 3. Clear SerDes IDDQ (power-down) now that the bridge is out of reset. */
     w32(PCIE_MISC_HARD_DEBUG, r32(PCIE_MISC_HARD_DEBUG) & ~HARD_DEBUG_SERDES_IDDQ_MASK);
