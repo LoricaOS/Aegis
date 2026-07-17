@@ -70,6 +70,7 @@ ARCH_SRCS = \
     kernel/arch/arm64/vmm.c \
     kernel/arch/arm64/traps.c \
     kernel/arch/arm64/gic.c \
+    kernel/arch/arm64/gic_v2.c \
     kernel/arch/arm64/timer.c \
     kernel/arch/arm64/uart_pl011.c \
     kernel/arch/arm64/poll_sources.c \

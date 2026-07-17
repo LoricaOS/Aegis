@@ -128,10 +128,32 @@ kernel_main_arm64(void)
     arch_set_master_pml4(vmm_get_master_pml4());
     uaccess_selftest();       /* [UACCESS] OK: EL1 fault fixup             */
 
+#if defined(AEGIS_BOOT_NATIVE) && defined(AEGIS_NATIVE_TEST_STOP) && AEGIS_NATIVE_TEST_STOP <= 4
+    /* TEMPORARY (native-boot bring-up): a prior red-team investigation
+     * (see the "dsb ishst" fix, kernel/arch/arm64/vmm.c ensure_table/
+     * map_page_in) flagged kva_alloc_pages()-backed refcount-array
+     * allocation right in this span as a still-open early-boot crash
+     * risk on real Cortex-A cores -- stop here to isolate it from
+     * anything gic/timer/pcie touch next. */
+    printk("[NATIVE] test-stop 4: kva_init+pmm_init_late+uaccess_selftest done\n");
+    for (;;) { __asm__ volatile("wfi"); }
+#endif
+
     fb_init();                /* silent when Limine gave no framebuffer */
     cap_init();
     gic_init();
     timer_init();
+
+#if defined(AEGIS_BOOT_NATIVE) && defined(AEGIS_NATIVE_TEST_STOP) && AEGIS_NATIVE_TEST_STOP <= 5
+    /* TEMPORARY (native-boot bring-up): gic_init/timer_init are genuinely
+     * new to this hardware (GICv2/GIC-400 dispatch, see gic.c) -- stop
+     * here before pcie_init, which is a known landmine on real Pi 5 (its
+     * DTB-lookup fallback assumes a QEMU-only ECAM address; see task list
+     * "Guard pcie_init() against non-ECAM hardware"). */
+    printk("[NATIVE] test-stop 5: gic_init+timer_init done\n");
+    for (;;) { __asm__ volatile("wfi"); }
+#endif
+
     poll_sources_init();
     kbd_init();               /* PL011 RX console input                 */
     gic_enable_spi(33);       /* UART0 interrupt                        */
