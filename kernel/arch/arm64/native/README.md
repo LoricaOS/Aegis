@@ -1,68 +1,59 @@
-# Native (non-Limine, non-UEFI) RPi5 boot — PARKED 2026-07-17
+# Native (non-Limine, non-UEFI) RPi5 boot
 
 This directory holds Aegis's from-scratch boot path for stock, unmodified
 Raspberry Pi 5 firmware — no Limine, no UEFI, no U-Boot. Entry is
 `boot_probe.S` (image-header parsing → EL2→EL1 drop → page tables/MMU →
 jump into C), landing in `native_entry.c`'s `kernel_main_native()`.
 
-**Status: parked, not deleted.** Phase A (a real native boot reaching a
-clean "no init found" panic on stock Pi 5 EEPROM firmware) is done and
-works — see [[rpi5-port-research]]. Phase B (real NVMe storage via a
-from-scratch Broadcom PCIe root-complex driver, `pcie_brcmstb.c`) hit a
-hardware wall that isn't fixable from software alone; see
-[[rpi5-pcie-driver-research]] for the full investigation.
+**Status: working through PCIe/NVMe enumeration.** Phase A (native boot to a
+clean "no init found" panic on stock Pi 5 EEPROM firmware) works. Phase B
+(real NVMe storage via a from-scratch Broadcom PCIe root-complex driver,
+`pcie_brcmstb.c`) reached a milestone on 2026-07-17: the PCIe link trains and
+the NVMe SSD enumerates on real hardware:
 
-## Why this is parked, in one paragraph
+```
+[PCIE-BRCM] OK: link up @ phys 0x1000110000
+[PCIE-BRCM] found 14e4:2712 class=6 at bus 0 dev 0    (the root complex)
+[PCIE-BRCM] found 15b7:5041 class=1 at bus 1 dev 0    (the NVMe SSD)
+```
 
-`pcie_brcmstb.c` implements pcie1 (the NVMe M.2 slot) bring-up ported from
-Linux/U-Boot/Zephyr reference drivers. On real hardware, with a genuine
-NVMe module installed, the PCIe root complex's own register block (vendor/
-device ID, MISC_CTRL, HARD_DEBUG, PCIE_CTRL, PCIE_STATUS, and the shared
-`rescal` calibration block) reads a **fixed, non-real pattern that never
-changes** — not across six independently-tested hypotheses (KVA→phys
-translation, three different reset/bridge orderings including the
-verified real U-Boot sequence, sibling-controller `rescal`-sharing bridge
-gating, and a 2-second settling wait with zero writes). The translation
-was independently proven correct via `kva_page_phys()`. A vendor/device ID
-is a fixed silicon constant with zero dependence on reset state, so no
-amount of driver-side reordering could ever fix a bad read there. The
-conclusion: some firmware/EEPROM-level init step this driver has no way to
-discover or replicate from a from-scratch boot is missing — likely
-something the stock EEPROM/bootloader only performs when handing off to a
-recognized boot chain. This is out of scope for a single-session driver
-fix; see [[rpi5-pcie-driver-research]]'s dated entries for the full
-register-by-register evidence trail.
+## The multi-session "PCIe wall" was never a PCIe bug
 
-## Cheapest untested lead (try this first before U-Boot work)
+For a long stretch this looked like a Broadcom PCIe bring-up problem: every
+MMIO register read (rescal STATUS, RC vendor/device ID, MISC_CTRL, …) came
+back as a fixed garbage value, and the link never trained. Six
+register-sequencing hypotheses and a U-Boot-chainload research detour all
+came up empty.
 
-Aegis has only ever been boot-tested from the **USB** drive; the real-Linux
-register baseline was captured booting *from NVMe*. RPi's own docs describe
-`pciex4_reset=0` (RP1's link only) as letting bare-metal code "inherit the
-PCIe configuration setup from the bootloader" — no equivalent exists for
-the NVMe slot, but it suggests the EEPROM may only fully commit PCIe
-bring-up for whichever device it actually boots from, tearing the link
-back down for anything merely probed-but-not-selected. Cheap, reversible
-test not yet run: temporarily swap this kernel onto the NVMe drive's boot
-partition (back up Debian's boot files first), boot with USB disconnected,
-recheck the `[PCIE-BRCM]` diagnostics. See [[rpi5-uboot-research]] for
-the full writeup.
+The actual root cause was in `../vmm.c`'s `map_page_in()`: it installed a
+fresh leaf PTE with only `dsb ishst` and **no `TLBI` + `ISB`**. That's fine
+for a genuine first-ever mapping, but not when a VA previously held a live
+translation torn down without its own TLBI (early-boot idmaps, VA reuse via
+the kva freelist), and it never synchronized the walker for the caller's
+next load. So every `kva_map_mmio()`'d MMIO page was read through a stale
+cached translation — a bit-perfect-correct PTE still returned garbage. The
+native RPi5 path was simply the first code in the tree to heavily use
+`kva_map_mmio()`, so the latent bug surfaced here first. Fixed in commit
+`d88ba23` with the full `STR → DSB ISHST → TLBI VAAE1IS → DSB ISH → ISB`
+sequence. See [[rpi5-pcie-driver-research]] for the full story.
 
-## Decision (2026-07-17): pivot to an existing bootloader
+## Known-open secondary issue (not blocking)
 
-Rather than keep guessing at undocumented Broadcom firmware behavior, the
-plan is to put this native path on the backburner and boot via an existing,
-proven bootloader (U-Boot is the leading candidate — it already has a
-**working** `pcie_brcmstb` driver for this exact SoC, see
-`~/Developer/rpi5-pcie-ref/uboot-pcie-brcmstb.c`) instead of stock EEPROM
-directly loading `kernel_2712.img`. See [[rpi5-uboot-research]] for
-whatever comes out of that research.
+`GICD_IIDR` at phys `0x7fff9008` reads `0xffffffff` (real-Linux devmem:
+`0xEB010042`), through both `arch_dmap` and `kva_map_mmio`, even though the
+GIC works for interrupts. Leading theory: `vmm_init()`'s "map all reported
+RAM as Normal-cacheable" pass sweeps the GIC's device page into a cacheable
+alias because the DTB `memory` node doesn't strictly exclude MMIO holes.
+Fix would be to build the cacheable-RAM map from DRAM banks only and treat
+all `0x10_xxxx_xxxx` SoC/AXI ranges as Device. Does not currently block
+anything.
 
-## How to resume this path later
+## Next feature step
 
-Everything native-boot-specific lives in this one directory plus one
-top-level file, and is **not** referenced by the default `make`/`make
-iso`/`make dist` targets — it cannot regress the shipped x86-64/Limine-
-arm64 build by existing:
+Wire up the existing NVMe block driver (from the x86 port) on top of the
+now-working PCIe RC to actually read/write the disk.
+
+## Files
 
 - `Makefile.pi5native` (repo root) — `make -f Makefile.pi5native kernel`
   builds `build/pi5native/pi5-kernel.img`; `NATIVE_TEST_STOP=N` gates
@@ -71,16 +62,17 @@ arm64 build by existing:
 - `boot_probe.S` / `linker-pi5-native.ld` — the entry stub + linker script.
 - `native_entry.c` — `kernel_main_native()`, this path's thin wrapper
   around the shared `kernel_main_arm64()` in `../main.c`.
-- `pcie_brcmstb.c` — the parked PCIe driver. Its diagnostics (register
-  dumps, `kva_page_phys` self-check) are left in place deliberately, not
-  stripped — they're exactly what the next attempt needs to pick up from,
-  whether that's a fresh from-scratch attempt or comparing against
-  whatever U-Boot leaves initialized when Aegis boots after it.
+- `pcie_brcmstb.c` — the Broadcom PCIe root-complex driver. Still carries
+  temporary `[PCIE-BRCM]` diagnostics + a `vmm_debug_raw_kernel_pte()`
+  helper (in `../vmm.c`) from the bring-up investigation, pending a cleanup
+  pass.
 
-To rebuild and smoke-test on real hardware exactly as this session did:
+None of this is referenced by the default `make`/`make iso`/`make dist`
+targets, so it cannot regress the shipped x86-64/Limine-arm64 build.
+
+To rebuild and test on real hardware exactly as this session did:
 `make -f Makefile.pi5native kernel NATIVE_TEST_STOP=6`, flash
-`build/pi5native/pi5-kernel.img` as `kernel_2712.img` on the boot
-partition alongside the existing `config.txt`
-(`dtparam=pciex1` is required for pcie1 to even be enabled), boot, and
-read the `[PCIE-BRCM]` diagnostic lines over serial (115200 8N1,
-`/dev/ttyACM0` via the Pi 5's USB-C debug port).
+`build/pi5native/pi5-kernel.img` as `kernel_2712.img` on the boot partition
+alongside `config.txt` (`dtparam=pciex1` is required for pcie1 to be
+enabled), boot, and read the `[PCIE-BRCM]` diagnostic lines over serial
+(115200 8N1, `/dev/ttyACM0` via the Pi 5's USB-C debug port).
