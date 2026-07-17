@@ -12,9 +12,12 @@
  *
  * The ECAM base is read from the DTB's pci-host-ecam-generic node at init
  * (Apple Virtualization.framework puts it at 0x4000_0000, QEMU virt at
- * 0x40_1000_0000); ECAM_BASE below is the QEMU-virt fallback. Only bus 0
- * is scanned/mapped (both platforms put every device, virtio included, on
- * bus 0; there are no PCI-PCI bridges by default).
+ * 0x40_1000_0000). Only bus 0 is scanned/mapped (both platforms put every
+ * device, virtio included, on bus 0; there are no PCI-PCI bridges by
+ * default). Boards with no such DTB node (real Pi 5/BCM2712: a proprietary
+ * Broadcom PCIe root complex, not ECAM) are skipped entirely rather than
+ * falling back to a hardcoded QEMU-only address -- undecoded MMIO on that
+ * SoC stalls the bus forever with no exception, confirmed on real hardware.
  */
 #include "pcie.h"
 #include "printk.h"
@@ -23,7 +26,6 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define ECAM_BASE   0x4010000000UL
 #define ECAM_BUSES  1u                  /* map + scan bus 0 only */
 
 static volatile uint8_t *s_ecam_base;   /* KVA of the mapped ECAM (bus 0) */
@@ -101,17 +103,27 @@ enumerate_function(uint8_t bus, uint8_t dev, uint8_t fn)
 void
 pcie_init(void)
 {
-    uint64_t ecam = ECAM_BASE, sz;
+    uint64_t ecam, sz;
     int from_dtb = fdt_reg_by_compat("pci-host-ecam-generic", 0, &ecam, &sz);
-    if (!from_dtb)
-        ecam = ECAM_BASE;
+    if (!from_dtb) {
+        /* No generic-ECAM PCIe host in this board's DTB (real Pi 5/BCM2712:
+         * its PCIe root complex is a proprietary Broadcom controller, not
+         * ECAM at all) -- do NOT fall back to a hardcoded QEMU-only ECAM
+         * address here. Reading undecoded MMIO on this SoC stalls the bus
+         * forever with no exception (confirmed during this session's
+         * native-boot bring-up), so a blind fallback read would hang the
+         * whole kernel instead of failing loudly. Skip cleanly instead;
+         * real PCIe support on this board needs its own driver. */
+        printk("[PCIE] skip: no pci-host-ecam-generic in DTB\n");
+        return;
+    }
 
     s_ecam_base = (volatile uint8_t *)kva_map_mmio(ecam, ECAM_BUSES * 256u);
     if (!s_ecam_base) {
         printk("[PCIE] WARN: ECAM map failed\n");
         return;
     }
-    printk("[PCIE] ECAM@%lx (%s)\n", ecam, from_dtb ? "DTB" : "builtin");
+    printk("[PCIE] ECAM@%lx (DTB)\n", ecam);
     for (uint8_t dev = 0; dev < 32; dev++) {
         if (pcie_read16(0, dev, 0, 0x00) == 0xFFFF)
             continue;
