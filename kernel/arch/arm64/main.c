@@ -59,7 +59,7 @@ task_idle(void)
  *     arm64_map_early_uart() + serial_init() first (Limine's HHDM doesn't
  *     map device MMIO, so a temporary TTBR0 idmap is needed), then calls
  *     here.
- *   - Native (non-Limine, non-UEFI; kernel/arch/arm64/native_entry.c):
+ *   - Native (non-Limine, non-UEFI; kernel/arch/arm64/native/native_entry.c):
  *     kernel_main_native(dtb_phys) does arch_mm_init_native(dtb_phys) +
  *     serial_init() (no separate idmap needed — boot_probe.S's own TTBR0
  *     already covers the real UART, see that file's page-table comment),
@@ -237,7 +237,7 @@ kernel_main_arm64(void)
  * arm64_map_early_uart() lives in start.c, which the native build doesn't
  * link (its own entry, kernel/arch/arm64/native/boot_probe.S, does the
  * EL2->EL1 drop + MMU enable + identity map itself; see
- * kernel/arch/arm64/native_entry.c for that path's own thin wrapper). */
+ * kernel/arch/arm64/native/native_entry.c for that path's own thin wrapper). */
 void
 kernel_main_limine(const aegis_bootinfo_t *bi)
 {

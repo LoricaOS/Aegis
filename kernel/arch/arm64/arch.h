@@ -77,7 +77,7 @@ uint64_t arch_kern_phys_slide(void);
 uint64_t arch_early_pv_off(void);
 uint64_t arch_get_dtb_phys(void);
 
-/* Native (non-Limine) boot path -- kernel/arch/arm64/native_entry.c.
+/* Native (non-Limine) boot path -- kernel/arch/arm64/native/native_entry.c.
  * arch_mm_init_native() plays the same role arch_mm_ingest() does for
  * Limine (sets dtb_phys/slide/pv_off/cmdline), but there is no
  * aegis_bootinfo_t: no memory map is handed to us at entry, no HHDM

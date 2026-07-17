@@ -459,47 +459,35 @@ pcie_brcmstb_init(void)
            kva_page_phys((void *)((uint64_t)(uintptr_t)s_rescal & ~0xFFFUL)),
            RESCAL_PHYS & ~0xFFFUL);
 
-    /* 0. Deassert the bridge reset FIRST, before ever touching rescal --
-     * matches Linux's real probe() order exactly (clk_enable ->
-     * brcm_pcie_bridge_sw_init_set(pcie, 0) -> reset_control_reset(rescal)
-     * -> brcm_phy_start (no-op on BCM2712) -> brcm_pcie_setup(), which
-     * itself does its OWN separate assert->deassert pulse below). NOTE:
-     * tested on real hardware -- this produced byte-identical rescal/link
-     * diagnostics to the build without it, so it did NOT turn out to be
-     * the fix (leaving the ordering in place since it still matches
-     * upstream, but the earlier claim that this was "the real bug" was
-     * wrong -- see the post-reset vendor-ID re-read below instead). */
-    bridge_reset_set(0);
-
-    /* 0b. NEW: the real Linux driver's own header comment (linux-pcie-
-     * brcmstb.c) warns that "the RESCAL block is tied to PCIe controller #1,
-     * regardless of the number of controllers, and turning off PCIe
-     * controller #1 prevents access to the RESCAL register blocks ...
-     * depending upon the bus fabric we may get a timeout, or a hang" --
-     * CFG_QUIRK_AVOID_BRIDGE_SHUTDOWN exists in that driver specifically to
-     * never assert a bridge that would break rescal for every controller.
-     * All three of this SoC's pcie nodes share ONE rescal block (pcie0 ->
-     * bcm_reset 42, pcie1 (us, NVMe) -> 43, pcie2/RP1 (x4) -> 44) -- we've
-     * only ever deasserted our own bit 43. If rescal is actually gated by
-     * pcie0's or pcie2's bridge instead (RP1/pcie2 is the far more likely
-     * candidate: it's the SoC's always-on south-bridge, needed for basically
-     * every board peripheral, so real firmware/Linux always has it live
-     * long before pcie1 probes rescal -- our from-scratch native boot never
-     * touches it at all), that would explain byte-identical rescal
-     * START/STATUS values across every pcie1-only reset ordering we've
-     * tried this session. Deassert both siblings' bridges too -- harmless
-     * (we never assert them, and don't rely on their own link training). */
+    /* 0. Deassert the OTHER two controllers' bridges first -- harmless
+     * (we never assert them, don't rely on their own link training), and
+     * covers the real Linux driver's own documented quirk: "the RESCAL
+     * block is tied to PCIe controller #1, regardless of the number of
+     * controllers, and turning off PCIe controller #1 prevents access to
+     * the RESCAL register blocks ... depending upon the bus fabric we may
+     * get a timeout, or a hang." All three pcie nodes share ONE rescal
+     * block (pcie0->bcm_reset 42, pcie1(us)->43, pcie2/RP1->44). Tested in
+     * isolation on real hardware already (byte-identical result either
+     * way) but kept since it's cheap and still matches upstream intent. */
     bridge_reset_set_id(PCIE0_BRIDGE_RESET_ID, 0);
     bridge_reset_set_id(PCIE2_BRIDGE_RESET_ID, 0);
 
-    /* 1. rescal must be running before the bridge's OWN reset pulse below. */
+    /* 1. rescal FIRST, before our OWN bridge is touched at all -- this is
+     * U-Boot's actual real order (uboot-pcie-brcmstb.c brcm_pcie_probe()):
+     * "Ensure rescal reset for BCM2712 is really disabled" is the literal
+     * FIRST hardware action, called with the bridge still in whatever
+     * state it naturally powers up in. Our own bridge's assert->deassert
+     * pulse happens ONLY afterward (step 2). This directly reverses the
+     * order we had before (deassert-then-rescal, based on a since-
+     * unverifiable recollection of Linux's probe() order) -- that ordering
+     * was tested on real hardware and produced no change, so trying the
+     * ground-truth U-Boot order instead, not another guess. */
     if (rescal_deassert() != 0) {
         printk("[PCIE-BRCM] WARN: rescal reset timed out (continuing anyway)\n");
     }
 
-    /* 2. Assert then release the bridge (bcm_reset bit 43) -- this is
-     * brcm_pcie_setup()'s own separate reset pulse, distinct from the
-     * unconditional pre-rescal deassert in step 0 above. */
+    /* 2. Assert then release our own bridge (bcm_reset bit 43) -- U-Boot's
+     * single reset pulse, run only after rescal above, not before. */
     bridge_reset_set(1);
     busy_wait_us(100); /* precludes the reset looking like a glitch */
     bridge_reset_set(0);

@@ -64,7 +64,8 @@ LDFLAGS = -T kernel/arch/arm64/native/linker-pi5-native.ld -nostdlib
 # Same as Makefile.arm64's ARCH_SRCS, minus start.c (Limine-only) plus
 # native_entry.c (this path's kernel_main_native()).
 ARCH_SRCS = \
-    kernel/arch/arm64/native_entry.c \
+    kernel/arch/arm64/native/native_entry.c \
+    kernel/arch/arm64/native/pcie_brcmstb.c \
     kernel/arch/arm64/arch.c \
     kernel/arch/arm64/arch_mm.c \
     kernel/arch/arm64/vmm.c \
@@ -75,7 +76,6 @@ ARCH_SRCS = \
     kernel/arch/arm64/uart_pl011.c \
     kernel/arch/arm64/poll_sources.c \
     kernel/arch/arm64/pcie.c \
-    kernel/arch/arm64/pcie_brcmstb.c \
     kernel/arch/arm64/fdt.c \
     kernel/arch/arm64/smp.c \
     kernel/arch/arm64/stubs.c
