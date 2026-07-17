@@ -165,11 +165,27 @@ map_page_in(uint64_t root_phys, uint64_t va, uint64_t phys,
         panic_halt("[VMM] FAIL: vmm map double-map");
     }
     l3[i] = phys | arch_pte_from_flags(flags | VMM_FLAG_PRESENT);
-    /* Same reasoning as ensure_table: this leaf may be used (by this core
-     * or another) the instant we return, so the write must be ordered
-     * before any subsequent access through it — a fresh valid entry needs
-     * no TLBI (nothing stale to invalidate), just this store barrier. */
-    __asm__ volatile("dsb ishst" ::: "memory");
+    /* Full runtime PTE-install discipline (the canonical ARM sequence:
+     * STR -> DSB ISHST -> TLBI -> DSB ISH -> ISB). The old code did only
+     * the DSB ISHST, on the "fresh invalid->valid transitions need no
+     * TLBI" architecture rule -- but that rule only covers entries the TLB
+     * was never PERMITTED to cache; it does not help if this VA ever had a
+     * previous live translation that was torn down without its own TLBI
+     * (early-boot idmaps, VA reuse via the kva freelist), and it does not
+     * order the walker's view for the caller's very next load through the
+     * new mapping. Found on real RPi5 hardware: a kva_map_mmio()'d MMIO
+     * page whose leaf PTE decoded bit-perfect (correct PA/attrs) returned
+     * garbage on the first read while an arch_dmap block mapping of the
+     * SAME physical byte read correctly -- the signature of the load being
+     * satisfied by a stale cached translation, not the new entry. The
+     * conservative per-map cost (one TLBI+ISB) is noise next to that
+     * failure mode. */
+    __asm__ volatile(
+        "dsb ishst\n\t"
+        "tlbi vaae1is, %0\n\t"
+        "dsb ish\n\t"
+        "isb"
+        : : "r"(va >> 12) : "memory");
     return 0;
 }
 
@@ -486,6 +502,20 @@ vmm_pte_of_user_raw(uint64_t pml4_phys, uint64_t virt)
     /* Boundary contract: return the ABSTRACT form (callers test
      * VMM_FLAG_SHARED etc. against this). */
     return hw ? arch_pte_to_flags(hw) : 0;
+}
+
+/* DIAGNOSTIC (temporary, RPi5 native-boot kva_map_mmio investigation):
+ * the literal hardware leaf PTE for a KERNEL (TTBR1) mapping, no
+ * abstract-flag translation -- lets a caller directly inspect AttrIdx/SH/
+ * AF/output-address bits rather than trust a derived value. */
+uint64_t
+vmm_debug_raw_kernel_pte(uint64_t virt)
+{
+    irqflags_t fl = spin_lock_irqsave(&vmm_lock);
+    uint64_t *pte = walk_to_pte(s_ttbr1_phys, virt);
+    uint64_t hw = pte ? *pte : 0;
+    spin_unlock_irqrestore(&vmm_lock, fl);
+    return hw;
 }
 
 void

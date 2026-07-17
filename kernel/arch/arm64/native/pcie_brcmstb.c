@@ -45,8 +45,14 @@
 #include "printk.h"
 #include "kva.h"
 #include "fdt.h"
+#include "arch.h"
 #include <stdint.h>
 #include <stddef.h>
+
+/* DIAGNOSTIC (temporary): raw kernel-mapping PTE readback, added directly
+ * to kernel/arch/arm64/vmm.c for this investigation -- not yet promoted to
+ * a shared header since it's debug-only. */
+extern uint64_t vmm_debug_raw_kernel_pte(uint64_t virt);
 
 /* This board's three brcm,bcm2712-pcie nodes, in DTB order (confirmed via
  * the real upstream bcm2712.dtsi/bcm2712-rpi-5-b.dts, not guessed):
@@ -408,6 +414,59 @@ pcie_brcmstb_init(void)
         __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
         printk("[PCIE-BRCM] diag: cntfrq_el0=%lu pcie1[0x0]=0x%x\n",
                freq, (unsigned)r32(0x00));
+    }
+
+    /* DECISIVE TEST (temporary), round 2 -- airtight version. Round 1
+     * (kept in history) proved s_bcm_reset and a fresh kva_map_mmio of the
+     * UART both read garbage -- but that UART test used a HARDCODED phys
+     * addr, not arch_mm_get_uart_phys() (the value the WORKING static
+     * printk path actually uses), leaving a hole: if those two differ by
+     * even a page, it proves nothing about the mapping mechanism. Close
+     * that hole by reading the SAME physical register through both paths:
+     * arch_dmap() (the mechanism the working printk path uses all
+     * session) vs kva_map_mmio() (what pcie_brcmstb.c uses everywhere).
+     * Also add a sub-4GB witness (the GIC distributor, real phys
+     * 0x7fff9000 per this board's own boot log, known-working via
+     * arch_dmap in gicv2_init -- but NEVER before exercised via
+     * kva_map_mmio at all, sub-4GB or not, on this arch: grepping the
+     * whole arm64 tree, kva_map_mmio is called ONLY by pcie.c's generic-
+     * ECAM path (skipped: "no pci-host-ecam-generic in DTB") and this
+     * file -- so kva_map_mmio itself may simply have never been proven to
+     * work on this boot path at ALL, any address, until now). Finally,
+     * dump the raw hardware leaf PTE kva_map_mmio installed, to read the
+     * actual AttrIdx/SH/AF bits directly rather than trust a derived
+     * value (kva_page_phys/vmm_phys_of only report the output-address
+     * field, which a syntactically-fine-but-functionally-dead PTE could
+     * still get right). */
+    {
+        uint64_t uart_phys = arch_mm_get_uart_phys();
+        uint32_t via_dmap = *(volatile uint32_t *)
+            ((volatile uint8_t *)arch_dmap(uart_phys) + 0xFE0);
+        volatile uint8_t *uart_kva =
+            (volatile uint8_t *)kva_map_mmio(uart_phys & ~0xFFFUL, 1)
+            + (uart_phys & 0xFFFUL);
+        uint32_t via_kva = *(volatile uint32_t *)(uart_kva + 0xFE0);
+        printk("[PCIE-BRCM] diag: UART PeriphID0 via arch_dmap=0x%x "
+               "via kva_map_mmio=0x%x (both should read 0x11, same phys 0x%lx)\n",
+               via_dmap, via_kva, uart_phys);
+
+        uint64_t gicd_phys = 0x7fff9000UL;
+        uint32_t gicd_dmap = *(volatile uint32_t *)
+            ((volatile uint8_t *)arch_dmap(gicd_phys) + 0x8);
+        volatile uint8_t *gicd_kva =
+            (volatile uint8_t *)kva_map_mmio(gicd_phys & ~0xFFFUL, 1)
+            + (gicd_phys & 0xFFFUL);
+        uint32_t gicd_kva_val = *(volatile uint32_t *)(gicd_kva + 0x8);
+        printk("[PCIE-BRCM] diag: GICD_IIDR (sub-4GB) via arch_dmap=0x%x "
+               "via kva_map_mmio=0x%x (should match each other)\n",
+               gicd_dmap, gicd_kva_val);
+
+        uint64_t raw_pte = vmm_debug_raw_kernel_pte((uint64_t)(uintptr_t)uart_kva & ~0xFFFUL);
+        printk("[PCIE-BRCM] diag: raw kernel PTE for uart_kva mapping = 0x%lx\n", raw_pte);
+
+        uint32_t reset_val = *(volatile uint32_t *)s_bcm_reset;
+        printk("[PCIE-BRCM] diag: s_bcm_reset[0x0]=0x%x (want 0x0, real-Linux "
+               "devmem baseline at phys 0x%lx)\n", reset_val, BCM_RESET_PHYS);
     }
 
     /* DIAGNOSTIC (temporary): every rescal/reset-ordering variant tried
