@@ -349,10 +349,23 @@ pcie_brcmstb_init(void)
                freq, (unsigned)r32(0x00));
     }
 
-    /* 1. rescal must be running before the bridge comes out of reset. */
+    /* 1. rescal must be running before the bridge comes out of reset.
+     *
+     * DIAGNOSTIC (temporary): this has timed out on every real-hardware
+     * flash so far, with STATUS reading completely static regardless of
+     * timeout length -- and neither pcie1 nor pcie_rescal reference a
+     * clocks/power-domains property in the real DTB, so this SoC's PCIe
+     * power/clock gating likely isn't modeled via standard phandles here
+     * (probably a proprietary firmware-mailbox path this kernel doesn't
+     * implement). Rather than keep gating everything on an unverified
+     * assumption ("rescal must complete before link-up is possible"),
+     * make this non-fatal and continue into the rest of the sequence --
+     * if link-up succeeds anyway, rescal was a red herring for this
+     * milestone; if it also stalls, that's real evidence of a shared
+     * upstream cause (the same clock/power gap) rather than a rescal-
+     * specific bug. */
     if (rescal_deassert() != 0) {
-        printk("[PCIE-BRCM] WARN: rescal reset timed out\n");
-        return;
+        printk("[PCIE-BRCM] WARN: rescal reset timed out (continuing anyway)\n");
     }
 
     /* 2. Assert then release the bridge (bcm_reset bit 43). */
