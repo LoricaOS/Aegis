@@ -79,8 +79,14 @@
 #define  MISC_CTRL_SCB_ACCESS_EN_MASK           0x1000UL
 #define  MISC_CTRL_CFG_READ_UR_MODE_MASK        0x2000UL
 #define PCIE_MISC_RC_BAR1_CONFIG_LO              0x402c
+#define PCIE_MISC_RC_BAR1_CONFIG_HI              0x4030
 #define  RC_BAR_CONFIG_LO_SIZE_MASK              0x1f
 #define PCIE_MISC_RC_BAR3_CONFIG_LO              0x403c
+#define PCIE_MISC_UBUS_BAR1_CONFIG_REMAP         0x40ac
+#define PCIE_MISC_UBUS_BAR1_CONFIG_REMAP_HI      0x40b0
+#define  UBUS_BAR_CONFIG_REMAP_ENABLE_MASK        0x1UL
+#define  UBUS_BAR_CONFIG_REMAP_LO_MASK             0xfffff000UL
+#define  UBUS_BAR_CONFIG_REMAP_HI_MASK              0xffUL
 #define PCIE_MISC_PCIE_CTRL                      0x4064
 #define  PCIE_CTRL_PCIE_PERSTB_MASK               0x4UL
 #define PCIE_MISC_PCIE_STATUS                    0x4068
@@ -260,6 +266,53 @@ rc_mode(void)
     return (r32(PCIE_MISC_PCIE_STATUS) & STATUS_PCIE_PORT_MASK) != 0;
 }
 
+/* PCIE_MISC_RC_BARx_CONFIG_LO's SIZE field is a non-linear encoding, not a
+ * raw byte count -- ported from brcm_pcie_encode_ibar_size (all 3
+ * reference drivers agree on this table). size must be a power of two. */
+static uint32_t
+encode_ibar_size(uint64_t size)
+{
+    uint32_t log2 = 63 - __builtin_clzll(size);
+    if (log2 >= 12 && log2 <= 15)
+        return (log2 - 12) + 0x1c;     /* 4KB..32KB */
+    if (log2 >= 16 && log2 <= 36)
+        return log2 - 15;              /* 64KB..64GB */
+    return 0;
+}
+
+/* Inbound DMA window (RC_BAR1 + its UBUS remap pair): lets a downstream
+ * device's DMA reach system RAM. This is NOT optional/DMA-only setup as
+ * first assumed -- Linux and U-Boot both program this BEFORE PERST# is
+ * ever deasserted, as part of basic bring-up, and skipping it was this
+ * driver's real bug (confirmed by a real-hardware A/B: identical "link
+ * down" with a physical NVMe module connected, matching real Linux
+ * exactly minus this step -- see rpi5-pcie-driver-research memory).
+ * BCM2712-specific encoding (confirmed against U-Boot's `is_2712` branch):
+ * the BAR holds the RAW PCIe-bus address; a separate UBUS remap register
+ * pair supplies the CPU-side physical address translation -- pre-2712
+ * chips instead store an offset in the BAR itself and have no UBUS remap
+ * step at all. Values are pcie1's own dma-ranges (real DTB): PCI bus addr
+ * 0x10_00000000, CPU addr 0x0, size 64GB (the tiny 4KB MIP1 MSI window in
+ * the same dma-ranges property is skipped -- not needed without MSI). */
+static void
+set_inbound_window(void)
+{
+    const uint64_t bar_pci  = 0x1000000000UL;
+    const uint64_t bar_cpu  = 0x0UL;
+    const uint64_t bar_size = 0x1000000000UL; /* 64GB */
+
+    uint32_t tmp = (uint32_t)(bar_pci & 0xFFFFFFFFUL);
+    tmp &= ~RC_BAR_CONFIG_LO_SIZE_MASK;
+    tmp |= encode_ibar_size(bar_size) & RC_BAR_CONFIG_LO_SIZE_MASK;
+    w32(PCIE_MISC_RC_BAR1_CONFIG_LO, tmp);
+    w32(PCIE_MISC_RC_BAR1_CONFIG_HI, (uint32_t)(bar_pci >> 32));
+
+    tmp = (uint32_t)(bar_cpu & 0xFFFFFFFFUL) & UBUS_BAR_CONFIG_REMAP_LO_MASK;
+    tmp |= UBUS_BAR_CONFIG_REMAP_ENABLE_MASK;
+    w32(PCIE_MISC_UBUS_BAR1_CONFIG_REMAP, tmp);
+    w32(PCIE_MISC_UBUS_BAR1_CONFIG_REMAP_HI, (uint32_t)(bar_cpu >> 32) & UBUS_BAR_CONFIG_REMAP_HI_MASK);
+}
+
 /* --- Config space: bus 0 is the RC's own bridge function, reachable
  * directly at s_base+offset. Bus 1 (the single downstream device this
  * root complex's x1 link can ever carry) goes through the indirect
@@ -349,26 +402,27 @@ pcie_brcmstb_init(void)
                freq, (unsigned)r32(0x00));
     }
 
-    /* 1. rescal must be running before the bridge comes out of reset.
-     *
-     * DIAGNOSTIC (temporary): this has timed out on every real-hardware
-     * flash so far, with STATUS reading completely static regardless of
-     * timeout length -- and neither pcie1 nor pcie_rescal reference a
-     * clocks/power-domains property in the real DTB, so this SoC's PCIe
-     * power/clock gating likely isn't modeled via standard phandles here
-     * (probably a proprietary firmware-mailbox path this kernel doesn't
-     * implement). Rather than keep gating everything on an unverified
-     * assumption ("rescal must complete before link-up is possible"),
-     * make this non-fatal and continue into the rest of the sequence --
-     * if link-up succeeds anyway, rescal was a red herring for this
-     * milestone; if it also stalls, that's real evidence of a shared
-     * upstream cause (the same clock/power gap) rather than a rescal-
-     * specific bug. */
+    /* 0. Deassert the bridge reset FIRST, before ever touching rescal --
+     * matches Linux's real probe() order exactly (clk_enable ->
+     * brcm_pcie_bridge_sw_init_set(pcie, 0) -> reset_control_reset(rescal)
+     * -> brcm_phy_start (no-op on BCM2712) -> brcm_pcie_setup(), which
+     * itself does its OWN separate assert->deassert pulse below). Missing
+     * this exact ordering was this driver's real bug: rescal's STATUS bit
+     * read completely static across every previous flash (200ms+ polls,
+     * both with and without a real NVMe module connected) while START
+     * correctly reflected our writes -- consistent with rescal's
+     * calibration state machine itself being frozen because the bridge
+     * was still held in its power-on reset state the whole time. */
+    bridge_reset_set(0);
+
+    /* 1. rescal must be running before the bridge's OWN reset pulse below. */
     if (rescal_deassert() != 0) {
         printk("[PCIE-BRCM] WARN: rescal reset timed out (continuing anyway)\n");
     }
 
-    /* 2. Assert then release the bridge (bcm_reset bit 43). */
+    /* 2. Assert then release the bridge (bcm_reset bit 43) -- this is
+     * brcm_pcie_setup()'s own separate reset pulse, distinct from the
+     * unconditional pre-rescal deassert in step 0 above. */
     bridge_reset_set(1);
     busy_wait_us(100); /* precludes the reset looking like a glitch */
     bridge_reset_set(0);
@@ -413,10 +467,20 @@ pcie_brcmstb_init(void)
     w32(PCIE_MISC_UBUS_TIMEOUT, 0xB2D0000UL);          /* ~250ms @ 750MHz */
     w32(PCIE_MISC_RC_CONFIG_RETRY_TIMEOUT, 0xABA0000UL); /* ~240ms @ 750MHz */
 
-    /* 7. Disable the PCIe->GISB/SCB inbound windows (BAR1/BAR3) -- nothing
-     * has programmed them yet, don't leave stale/undefined content live. */
+    /* 7. Disable the PCIe->GISB/SCB inbound windows (BAR1/BAR3) as a clean
+     * baseline -- BAR1 gets overwritten with the real inbound DMA window
+     * below (step 7b); BAR3 stays disabled (no second DMA region needed). */
     w32(PCIE_MISC_RC_BAR1_CONFIG_LO, r32(PCIE_MISC_RC_BAR1_CONFIG_LO) & ~(uint32_t)RC_BAR_CONFIG_LO_SIZE_MASK);
     w32(PCIE_MISC_RC_BAR3_CONFIG_LO, r32(PCIE_MISC_RC_BAR3_CONFIG_LO) & ~(uint32_t)RC_BAR_CONFIG_LO_SIZE_MASK);
+
+    /* 7b. Inbound DMA window -- MUST run before PERST# deassert (step 9),
+     * matching Linux/U-Boot's own ordering. This was missing entirely on
+     * the previous flash (wrongly assumed to be DMA-only, needed only
+     * after enumeration) -- that flash reproduced "link down" even with a
+     * real NVMe module physically connected, proving something in the
+     * pre-link-training sequence was incomplete. See set_inbound_window's
+     * own comment + rpi5-pcie-driver-research memory for the full trail. */
+    set_inbound_window();
 
     /* 8. RC's own class code (bridge, 0x060400) + BAR2 endian mode. Both
      * reference drivers set these unconditionally on BCM2712. */
