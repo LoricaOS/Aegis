@@ -199,3 +199,39 @@ pi5_fb_init(void)
 
     arch_native_set_fb(fb_phys, w, h, pitch);
 }
+
+/* vc_get_mac — fetch the board's Ethernet MAC via the property mailbox
+ * (GET_BOARD_MAC_ADDRESS 0x00010003; the Pi 5 EEPROM implements it). Returns 0
+ * on success with mac[0..5] filled, -1 otherwise. Used by the RP1 GEM driver. */
+#define TAG_GET_MAC   0x00010003u
+
+int
+vc_get_mac(uint8_t mac[6])
+{
+    uint32_t *buf = (uint32_t *)kva_alloc_pages_low_nc(1);
+    if (!buf)
+        return -1;
+    uint64_t bp = kva_page_phys(buf);
+    if (bp == 0 || (bp >> 32) != 0)
+        return -1;
+
+    uint32_t i = 0;
+    buf[i++] = 0;              /* total size (filled below) */
+    buf[i++] = 0;              /* request */
+    buf[i++] = TAG_GET_MAC;
+    buf[i++] = 8;              /* value buffer size (6 bytes, rounded to 8) */
+    buf[i++] = 0;              /* req/resp */
+    uint32_t vi = i;
+    buf[i++] = 0; buf[i++] = 0; /* MAC response slots */
+    buf[i++] = 0;              /* end tag */
+    buf[0] = i * 4;
+
+    if (!mbox_call((uint32_t)bp, MBOX_CHAN_PROP) || buf[1] != REQ_OK)
+        return -1;
+
+    uint32_t lo = buf[vi], hi = buf[vi + 1];
+    mac[0] = lo & 0xff;        mac[1] = (lo >> 8) & 0xff;
+    mac[2] = (lo >> 16) & 0xff; mac[3] = (lo >> 24) & 0xff;
+    mac[4] = hi & 0xff;        mac[5] = (hi >> 8) & 0xff;
+    return 0;
+}

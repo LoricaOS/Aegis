@@ -24,6 +24,7 @@
 #include "arch.h"
 #include "printk.h"
 #include "kva.h"
+#include "netdev.h"
 #include <stdint.h>
 
 #define RP1_BAR1_PHYS      0x1f00000000UL
@@ -35,6 +36,7 @@
 #define RP1_CHIP_ID_B0     0x10001927u
 
 int pcie_rp1_map_window(void);            /* native/pcie_brcmstb.c — domain-2 outbound win */
+int vc_get_mac(uint8_t mac[6]);           /* native/vc_mailbox_fb.c — board MAC via mailbox */
 
 static volatile uint8_t *s_rp1;           /* KVA base of the BAR1 window, or NULL */
 
@@ -161,63 +163,122 @@ gem_mdio_write(uint8_t phy, uint8_t reg, uint16_t val)
  * buffers are Normal-NC (uncached, so no cache maintenance vs the GEM's writes);
  * every address handed to the GEM carries the +0x10_00000000 inbound offset and
  * uses 64-bit addressing (ADDR64) since that puts it past 32 bits. */
+/* ── GEM as a netdev: persistent RX/TX rings + registration ────────────── */
+
+#define GEM_TBQP     0x01c
+#define GEM_TBQPH    0x4C8
+#define GEM_SA1B     0x098
+#define GEM_SA1T     0x09C
+#define NCR_TSTART   (1u << 9)
+
+static struct {
+    volatile uint32_t *rx_ring;   /* RX_DESCS * 16B (Normal-NC) */
+    uint8_t           *rx_bufs;   /* RX_DESCS pages, one buffer each */
+    uint32_t           rx_head;
+    volatile uint32_t *tx_ring;   /* 1 descriptor */
+    uint8_t           *tx_buf;
+    netdev_t           dev;
+} s_gem;
+
+/* gem_poll — deliver received frames to the stack + re-arm descriptors. Called
+ * from the PIT tick (100 Hz). Rings are Normal-NC, so no cache maintenance. */
 static void
-rp1_eth_rx_test(void)
+gem_poll(netdev_t *dev)
 {
-    /* Firmware netbooted over this GEM — dump the addressing scheme it left in
-     * the DMA registers (known-good): tells us the real offset + whether it used
-     * ADDR64, so we match it instead of guessing. */
-    printk("[RP1] eth-fw: DMACFG=0x%x RBQP=0x%x/0x%x TBQP=0x%x/0x%x NCR=0x%x\n",
-           rp1_r(RP1_ETH_BASE + GEM_DMACFG),
-           rp1_r(RP1_ETH_BASE + GEM_RBQPH), rp1_r(RP1_ETH_BASE + MACB_RBQP),
-           rp1_r(RP1_ETH_BASE + 0x4C8),     rp1_r(RP1_ETH_BASE + 0x01c),
-           rp1_r(RP1_ETH_BASE + GEM_NCR));
+    (void)dev;
+    for (int n = 0; n < RX_DESCS; n++) {
+        uint32_t i = s_gem.rx_head;
+        if (!(s_gem.rx_ring[i*4] & 0x1u))          /* USED not set → no frame */
+            break;
+        uint16_t len = (uint16_t)(s_gem.rx_ring[i*4 + 1] & 0x1FFFu);
+        uint8_t *buf = s_gem.rx_bufs + (uint64_t)i * RX_BUFSZ;
+        if (len >= 14 && len <= RX_BUFSZ)
+            netdev_rx_deliver(&s_gem.dev, buf, len);
+        uint64_t bd = kva_page_phys(buf) + RP1_DMA_OFFSET;
+        s_gem.rx_ring[i*4] = (uint32_t)bd | (i == RX_DESCS - 1 ? 0x2u : 0u); /* USED=0 */
+        s_gem.rx_head = (i + 1) % RX_DESCS;
+    }
+}
 
-    volatile uint32_t *ring = (volatile uint32_t *)kva_alloc_pages_low_nc(1);
-    uint8_t *bufs = (uint8_t *)kva_alloc_pages_low_nc(RX_DESCS);   /* 8 pages, 1 buf each */
-    if (!ring || !bufs) { printk("[RP1] eth: RX alloc failed\n"); return; }
+/* gem_send — transmit one Ethernet frame. Waits (bounded) for the previous TX
+ * to complete, then hands the frame to the GEM and rings TSTART. Returns 0. */
+static int
+gem_send(netdev_t *dev, const void *pkt, uint16_t len)
+{
+    (void)dev;
+    if (len < 14 || len > RX_BUFSZ) return -1;
+    for (int t = 0; t < 200000; t++)               /* prev TX done (USED set)? */
+        if (s_gem.tx_ring[1] & (1u << 31)) break;
+    __builtin_memcpy(s_gem.tx_buf, pkt, len);
+    uint64_t bd = kva_page_phys(s_gem.tx_buf) + RP1_DMA_OFFSET;
+    s_gem.tx_ring[0] = (uint32_t)bd;
+    s_gem.tx_ring[2] = (uint32_t)(bd >> 32);
+    s_gem.tx_ring[3] = 0;
+    s_gem.tx_ring[1] = (uint32_t)len | (1u << 15) | (1u << 30);  /* len|LAST|WRAP, USED=0 */
+    __asm__ volatile("dsb sy" ::: "memory");
+    rp1_w(RP1_ETH_BASE + GEM_NCR, rp1_r(RP1_ETH_BASE + GEM_NCR) | NCR_TSTART);
+    return 0;
+}
 
-    uint64_t ring_dma = kva_page_phys((void *)ring) + RP1_DMA_OFFSET;
+/* gem_setup — allocate persistent RX/TX rings, program the GEM, register a
+ * netdev. Called once after the PHY link is up. */
+static void
+gem_setup(void)
+{
+    s_gem.rx_ring = (volatile uint32_t *)kva_alloc_pages_low_nc(1);
+    s_gem.rx_bufs = (uint8_t *)kva_alloc_pages_low_nc(RX_DESCS);
+    s_gem.tx_ring = (volatile uint32_t *)kva_alloc_pages_low_nc(1);
+    s_gem.tx_buf  = (uint8_t *)kva_alloc_pages_low_nc(1);
+    if (!s_gem.rx_ring || !s_gem.rx_bufs || !s_gem.tx_ring || !s_gem.tx_buf) {
+        printk("[RP1] eth: netdev alloc failed\n"); return;
+    }
+    s_gem.rx_head = 0;
+
     for (int i = 0; i < RX_DESCS; i++) {
-        uint64_t bd = kva_page_phys(bufs + (uint64_t)i * RX_BUFSZ) + RP1_DMA_OFFSET;
-        ring[i*4 + 0] = (uint32_t)bd | (i == RX_DESCS - 1 ? 0x2u : 0u); /* USED=0, WRAP last */
-        ring[i*4 + 1] = 0;                                             /* status */
-        ring[i*4 + 2] = (uint32_t)(bd >> 32);                          /* addr high */
-        ring[i*4 + 3] = 0;
+        uint64_t bd = kva_page_phys(s_gem.rx_bufs + (uint64_t)i * RX_BUFSZ) + RP1_DMA_OFFSET;
+        s_gem.rx_ring[i*4 + 0] = (uint32_t)bd | (i == RX_DESCS - 1 ? 0x2u : 0u);
+        s_gem.rx_ring[i*4 + 1] = 0;
+        s_gem.rx_ring[i*4 + 2] = (uint32_t)(bd >> 32);
+        s_gem.rx_ring[i*4 + 3] = 0;
     }
-    arch_dcache_civac_range((void *)ring, RX_DESCS * 16);  /* push ring to DRAM */
-    __asm__ volatile("dsb sy" ::: "memory");   /* ring writes visible before RX on */
-    rp1_w(RP1_ETH_BASE + 0x020, 0xF);          /* clear stale RSR (firmware netboot) */
+    /* TX ring: 1 descriptor, start USED=1 (SW owns) + WRAP so the GEM idles. */
+    uint64_t tb = kva_page_phys(s_gem.tx_buf) + RP1_DMA_OFFSET;
+    s_gem.tx_ring[0] = (uint32_t)tb;
+    s_gem.tx_ring[1] = (1u << 31) | (1u << 30);   /* USED | WRAP */
+    s_gem.tx_ring[2] = (uint32_t)(tb >> 32);
+    s_gem.tx_ring[3] = 0;
+    __asm__ volatile("dsb sy" ::: "memory");
 
-    /* Adopt firmware's exact known-good DMACFG (ADDR64 + RXBS 0x20 + its burst/
-     * pkt-buffer bits). Buffers are still 4KB-spaced (correct per-buffer phys);
-     * RXBS=2048 just caps stored bytes per buffer, fine for <1500B frames. */
+    uint64_t rd = kva_page_phys((void *)s_gem.rx_ring) + RP1_DMA_OFFSET;
+    uint64_t td = kva_page_phys((void *)s_gem.tx_ring) + RP1_DMA_OFFSET;
+    rp1_w(RP1_ETH_BASE + 0x020, 0xF);             /* clear stale RSR */
     rp1_w(RP1_ETH_BASE + GEM_DMACFG, 0x4020071fu);
-    rp1_w(RP1_ETH_BASE + MACB_RBQP, (uint32_t)ring_dma);
-    rp1_w(RP1_ETH_BASE + GEM_RBQPH, (uint32_t)(ring_dma >> 32));
-    /* Promiscuous (CAF bit4) so we catch everything; enable RX+TX+MPE. */
-    rp1_w(RP1_ETH_BASE + GEM_NCFGR, rp1_r(RP1_ETH_BASE + GEM_NCFGR) | (1u << 4));
-    rp1_w(RP1_ETH_BASE + GEM_NCR,
-          rp1_r(RP1_ETH_BASE + GEM_NCR) | (1u << 2) | (1u << 3) | (1u << 4));
+    rp1_w(RP1_ETH_BASE + MACB_RBQP, (uint32_t)rd);
+    rp1_w(RP1_ETH_BASE + GEM_RBQPH, (uint32_t)(rd >> 32));
+    rp1_w(RP1_ETH_BASE + GEM_TBQP, (uint32_t)td);
+    rp1_w(RP1_ETH_BASE + GEM_TBQPH, (uint32_t)(td >> 32));
 
-    int got = -1; uint32_t len = 0;
-    for (int t = 0; t < 200 && got < 0; t++) {
-        /* Invalidate our cached view so we see the GEM's USED writeback (in case
-         * the ring memory isn't truly non-cacheable). */
-        arch_dcache_civac_range((void *)ring, RX_DESCS * 16);
-        for (int i = 0; i < RX_DESCS; i++)
-            if (ring[i*4 + 0] & 0x1u) { got = i; len = ring[i*4 + 1] & 0x1FFFu; break; }
-        rp1_delay_ms(10);
-    }
-    if (got >= 0)
-        printk("[RP1] eth: RX OK! frame in desc%d len=%u — GEM DMA works!\n", got, len);
-    else
-        printk("[RP1] eth: no RX (RSR=0x%x RBQP=0x%x/0x%x d0=%x,%x,%x ring_dma=0x%lx)\n",
-               rp1_r(RP1_ETH_BASE + 0x020),
-               rp1_r(RP1_ETH_BASE + GEM_RBQPH), rp1_r(RP1_ETH_BASE + MACB_RBQP),
-               ring[0], ring[1], ring[2], ring_dma);
-    /* Clear RSR sticky bits for a clean read next cycle. */
-    rp1_w(RP1_ETH_BASE + 0x020, 0xF);
+    /* MAC via the VideoCore mailbox (firmware clears the GEM address filter). */
+    if (vc_get_mac(s_gem.dev.mac) != 0)
+        printk("[RP1] eth: mailbox MAC fetch failed\n");
+    uint32_t sab = s_gem.dev.mac[0] | ((uint32_t)s_gem.dev.mac[1] << 8) |
+                   ((uint32_t)s_gem.dev.mac[2] << 16) | ((uint32_t)s_gem.dev.mac[3] << 24);
+    uint32_t sat = s_gem.dev.mac[4] | ((uint32_t)s_gem.dev.mac[5] << 8);
+    rp1_w(RP1_ETH_BASE + GEM_SA1B, sab);     /* program our unicast filter */
+    rp1_w(RP1_ETH_BASE + GEM_SA1T, sat);     /* (writing SA1T activates it)  */
+    rp1_w(RP1_ETH_BASE + GEM_NCFGR, rp1_r(RP1_ETH_BASE + GEM_NCFGR) | (1u << 4)); /* CAF */
+    rp1_w(RP1_ETH_BASE + GEM_NCR,
+          rp1_r(RP1_ETH_BASE + GEM_NCR) | (1u << 2) | (1u << 3) | (1u << 4)); /* RE|TE|MPE */
+
+    s_gem.dev.name[0]='e'; s_gem.dev.name[1]='t'; s_gem.dev.name[2]='h';
+    s_gem.dev.name[3]='0'; s_gem.dev.name[4]='\0';
+    s_gem.dev.mtu  = 1500;
+    s_gem.dev.send = gem_send;
+    s_gem.dev.poll = gem_poll;
+    netdev_register(&s_gem.dev);
+    printk("[RP1] eth0: up, MAC %x:%x:%x:%x:%x:%x — registered as netdev\n",
+           s_gem.dev.mac[0], s_gem.dev.mac[1], s_gem.dev.mac[2],
+           s_gem.dev.mac[3], s_gem.dev.mac[4], s_gem.dev.mac[5]);
 }
 
 /* rp1_eth_probe — step-0 for Ethernet: enable the GEM's clock gates (unlike USB,
@@ -242,8 +303,8 @@ rp1_eth_probe(void)
     uint16_t bmsr = gem_mdio_read(ETH_PHY_ADDR, 1);
     printk("[RP1] eth: PHY@%u id=0x%x%x BMSR=0x%x link=%u autoneg_done=%u\n",
            ETH_PHY_ADDR, id1, id2, bmsr, (bmsr >> 2) & 1u, (bmsr >> 5) & 1u);
-    if (bmsr & (1u << 2))              /* link up → try to receive a frame */
-        rp1_eth_rx_test();
+    if (bmsr & (1u << 2))              /* link up → bring up the netdev */
+        gem_setup();
 }
 
 /* rp1_init — map the BAR1 window and verify the chip is reachable. Leaves
