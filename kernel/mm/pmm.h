@@ -79,6 +79,13 @@ uint16_t pmm_page_refcount(uint64_t addr);
  * Returns the number of pages released. */
 uint64_t pmm_unreserve_region(uint64_t base, uint64_t len);
 
+/* pmm_reserve_region — mark a physical range as used so the allocator never
+ * hands it out. Callable after pmm_init (idempotent bitmap set) — used by the
+ * native VideoCore framebuffer path, whose FB address is only known post-init
+ * (from the mailbox) and would otherwise sit in the free pool and collide with
+ * userland allocations. */
+void pmm_reserve_region(uint64_t base, uint64_t len);
+
 /* pmm_set_debug — enable/disable the double-free sentinel (off by default).
  * When on, pmm_free_page logs a symbolized backtrace at any free of a
  * managed-RAM page whose bitmap bit is already clear (a double-free, or a free

@@ -25,6 +25,7 @@
 #include "arch.h"
 #include "printk.h"
 #include "kva.h"
+#include "pmm.h"
 #include <stdint.h>
 
 /* Mailbox registers (offsets from the 0x...3880 base; classic bcm2835 layout). */
@@ -190,5 +191,11 @@ pi5_fb_init(void)
         printk("[VCFB] FAIL: implausible base/pitch\n");
         return;
     }
+    /* The firmware allocated this FB out of RAM our PMM already claimed as free
+     * (pmm_init ran before we knew the address). Reserve it now, or PMM hands
+     * the region to a userland page that then fights the live scanout ->
+     * intermittent corruption/SIGILL. Reserve the full pitch*height extent. */
+    pmm_reserve_region(fb_phys, (uint64_t)pitch * h);
+
     arch_native_set_fb(fb_phys, w, h, pitch);
 }
