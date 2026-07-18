@@ -217,6 +217,41 @@ kernel_main_arm64(void)
     nvme_set_dma_noncoherent(1);
     nvme_init();              /* bind NVMe on the Broadcom RC → blkdev */
 #if defined(AEGIS_NATIVE_TEST_STOP) && AEGIS_NATIVE_TEST_STOP <= 7
+    /* DIAGNOSTIC (temporary): prove real block I/O + GPT parsing on nvme0.
+     * Read LBA0 (protective MBR: 0x55AA at 0x1FE) and LBA1 (GPT header:
+     * "EFI PART"), then gpt_scan() to register partitions and list them. */
+    {
+        blkdev_t *d = blkdev_get("nvme0");
+        if (!d) {
+            printk("[NATIVE] no nvme0 blkdev — skipping I/O test\n");
+        } else {
+            static uint8_t s0[512], s1[512];
+            int r0 = d->read(d, 0, 1, s0);
+            int r1 = d->read(d, 1, 1, s1);
+            printk("[NATIVE] nvme0 LBA0 read=%d sig=%x%x (want 55aa) | "
+                   "LBA1 read=%d hdr=%c%c%c%c%c%c%c%c (want EFI PART)\n",
+                   r0, (unsigned)s0[0x1FE], (unsigned)s0[0x1FF], r1,
+                   s1[0], s1[1], s1[2], s1[3], s1[4], s1[5], s1[6], s1[7]);
+            /* Dump the 4 MBR partition entries (LBA0 +0x1BE, 16B each) —
+             * confirms the read returns real data + shows this disk is MBR
+             * (Debian/raspios), which is why gpt_scan finds nothing. */
+            for (int e = 0; e < 4; e++) {
+                uint8_t *pe = &s0[0x1BE + e * 16];
+                uint32_t start = pe[8] | (pe[9]<<8) | (pe[10]<<16) | ((uint32_t)pe[11]<<24);
+                uint32_t nsec  = pe[12] | (pe[13]<<8) | (pe[14]<<16) | ((uint32_t)pe[15]<<24);
+                if (pe[4]) printk("[NATIVE]   MBR part%d type=%x start=%u sectors=%u\n",
+                                  e, (unsigned)pe[4], start, nsec);
+            }
+            int np = gpt_scan("nvme0");
+            printk("[NATIVE] gpt_scan(nvme0) registered %d partition(s):\n", np);
+            for (int i = 0; i < blkdev_count(); i++) {
+                blkdev_t *p = blkdev_get_index(i);
+                if (p) printk("[NATIVE]   blkdev '%s' %lu blocks x %u (lba_off %lu)\n",
+                              p->name, p->block_count, p->block_size, p->lba_offset);
+            }
+        }
+    }
+
     printk("[NATIVE] test-stop 7: nvme_init done\n");
     for (;;) { __asm__ volatile("wfi"); }   /* watchdog resets ~16s → netboot */
 #endif
