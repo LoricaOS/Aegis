@@ -416,6 +416,84 @@ set_outbound_window(uint32_t win, uint64_t phys, uint64_t pcie_addr, uint64_t si
     w32(PCIE_MEM_WIN0_LIMIT_HI(win), lh);
 }
 
+/* pcie_rp1_map_window — program a CPU->PCIe outbound window on the RP1's own
+ * controller (pcie2 / domain 2, brcm,bcm2712-pcie node index 2) so the RP1's
+ * BAR1 (PCIe address 0x0, per the DTB rp1 `ranges`) is reachable at CPU-phys
+ * 0x1f_00000000. With `pciex4_reset=0` the firmware already trained this link
+ * and enumerated the RP1, but left no usable outbound window for us -- a read
+ * at 0x1f_00000000 returns the RC's 0xdeaddead poison. We add ONLY the window;
+ * we deliberately do NOT reset/re-train the link (that would undo the firmware's
+ * RP1 init and force a full cold bring-up). Self-contained (its own RC mapping +
+ * register writes via the shared offset macros) so it can't disturb the pcie1/
+ * NVMe path. Returns 1 on success. */
+int
+pcie_rp1_map_window(void)
+{
+    uint64_t base_phys, base_sz;
+    if (!fdt_reg_by_compat_nth(PCIE_BRCMSTB_COMPAT, 2, &base_phys, &base_sz)) {
+        printk("[PCIE-BRCM] RP1: pcie2 node not found in DTB\n");
+        return 0;
+    }
+    volatile uint8_t *rc = (volatile uint8_t *)kva_map_mmio(base_phys, 16);
+    if (!rc) {
+        printk("[PCIE-BRCM] RP1: pcie2 RC map failed\n");
+        return 0;
+    }
+#define RCW(off, v) (*(volatile uint32_t *)(rc + (off)) = (uint32_t)(v))
+#define RCR(off)    (*(volatile uint32_t *)(rc + (off)))
+
+    uint32_t st = RCR(PCIE_MISC_PCIE_STATUS);
+    if (!((st & STATUS_PCIE_DL_ACTIVE_MASK) && (st & STATUS_PCIE_PHYLINKUP_MASK))) {
+        printk("[PCIE-BRCM] RP1: pcie2 link DOWN (status=0x%x) — firmware didn't "
+               "train it (pciex4_reset!=0?)\n", st);
+        return 0;
+    }
+
+    /* Diagnostic: dump the RP1's config space (bus 1, dev 0) to see where
+     * firmware assigned its BARs, and enable memory-space + bus-master decode
+     * (which firmware may have left off). EXT_CFG_INDEX selects bus/dev/fn once;
+     * then read/write EXT_CFG_DATA + reg-offset. */
+    RCW(PCIE_EXT_CFG_INDEX, (1u << 20));   /* bus 1, dev 0, fn 0 */
+    uint32_t vid  = RCR(PCIE_EXT_CFG_DATA + 0x00);
+    uint32_t cmd  = RCR(PCIE_EXT_CFG_DATA + 0x04);
+    uint32_t cls  = RCR(PCIE_EXT_CFG_DATA + 0x08);
+    uint32_t bar0 = RCR(PCIE_EXT_CFG_DATA + 0x10);
+    uint32_t bar1 = RCR(PCIE_EXT_CFG_DATA + 0x14);
+    uint32_t bar2 = RCR(PCIE_EXT_CFG_DATA + 0x18);
+    uint32_t bar3 = RCR(PCIE_EXT_CFG_DATA + 0x1c);
+    printk("[PCIE-BRCM] RP1: cfg id=0x%x cmd=0x%x class=0x%x\n", vid, cmd, cls);
+    printk("[PCIE-BRCM] RP1: BAR0=0x%x BAR1=0x%x BAR2=0x%x BAR3=0x%x\n",
+           bar0, bar1, bar2, bar3);
+    RCW(PCIE_EXT_CFG_DATA + 0x04, cmd | 0x6);   /* MEM space + bus master enable */
+
+    /* Outbound window 0: CPU-phys 0x1f_00000000 -> PCIe 0x0, 4 MiB (RP1 BAR1).
+     * Same base/limit-in-MB encoding as set_outbound_window(). */
+    const uint64_t cpu = 0x1f00000000UL, pci = 0x0UL, size = 0x400000UL;
+    const uint32_t win = 0;
+    RCW(PCIE_MEM_WIN0_LO(win), pci & 0xFFFFFFFFUL);
+    RCW(PCIE_MEM_WIN0_HI(win), pci >> 32);
+    uint64_t base_mb = cpu / 0x100000UL, limit_mb = (cpu + size - 1) / 0x100000UL;
+    uint32_t bl = RCR(PCIE_MEM_WIN0_BASE_LIMIT(win));
+    bl &= ~(uint32_t)(MEM_WIN0_BASE_LIMIT_BASE_MASK | MEM_WIN0_BASE_LIMIT_LIMIT_MASK);
+    bl |= ((uint32_t)base_mb  << MEM_WIN0_BASE_LIMIT_BASE_LSB)  & MEM_WIN0_BASE_LIMIT_BASE_MASK;
+    bl |= ((uint32_t)limit_mb << MEM_WIN0_BASE_LIMIT_LIMIT_LSB) & MEM_WIN0_BASE_LIMIT_LIMIT_MASK;
+    RCW(PCIE_MEM_WIN0_BASE_LIMIT(win), bl);
+    uint32_t bh = RCR(PCIE_MEM_WIN0_BASE_HI(win));
+    bh = (bh & ~(uint32_t)MEM_WIN0_BASE_HI_BASE_MASK) |
+         ((uint32_t)(base_mb >> MEM_WIN0_HIGH_ADDR_SHIFT) & MEM_WIN0_BASE_HI_BASE_MASK);
+    RCW(PCIE_MEM_WIN0_BASE_HI(win), bh);
+    uint32_t lh = RCR(PCIE_MEM_WIN0_LIMIT_HI(win));
+    lh = (lh & ~(uint32_t)MEM_WIN0_LIMIT_HI_LIMIT_MASK) |
+         ((uint32_t)(limit_mb >> MEM_WIN0_HIGH_ADDR_SHIFT) & MEM_WIN0_LIMIT_HI_LIMIT_MASK);
+    RCW(PCIE_MEM_WIN0_LIMIT_HI(win), lh);
+
+    printk("[PCIE-BRCM] RP1: pcie2 link up (0x%x), outbound win0 CPU 0x%lx -> "
+           "PCIe 0x%lx (%lu MB)\n", st, cpu, pci, size / 0x100000UL);
+#undef RCW
+#undef RCR
+    return 1;
+}
+
 static void
 print_found(uint8_t bus, uint8_t dev)
 {

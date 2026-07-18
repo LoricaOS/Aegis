@@ -78,6 +78,7 @@ ARCH_SRCS = \
     kernel/arch/arm64/native/pcie_brcmstb.c \
     kernel/arch/arm64/native/vc_mailbox_fb.c \
     kernel/arch/arm64/native/pi5_thermal.c \
+    kernel/arch/arm64/native/rp1.c \
     kernel/arch/arm64/arch.c \
     kernel/arch/arm64/arch_mm.c \
     kernel/arch/arm64/vmm.c \

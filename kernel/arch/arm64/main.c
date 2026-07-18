@@ -45,6 +45,7 @@ void pcie_brcmstb_init(void);
 void nvme_init(void);
 void pi5_fb_init(void);        /* native/vc_mailbox_fb.c — VideoCore framebuffer */
 void pi5_thermal_report(void); /* native/pi5_thermal.c — SoC temp via AVS monitor */
+int  rp1_init(void);           /* native/rp1.c — RP1 southbridge (USB/eth/fan) */
 void nvme_set_dma_offset(uint64_t off);
 void nvme_set_dma_noncoherent(int nc);
 
@@ -201,6 +202,10 @@ kernel_main_arm64(void)
 #ifdef AEGIS_BOOT_NATIVE
     pi5_fb_init();            /* ask the VideoCore for a linear FB (real Pi 5) */
     pi5_thermal_report();     /* SoC temperature (AVS monitor) */
+    /* rp1_init() — WIP: needs full domain-2 PCIe enumeration (bridge bus setup
+     * + RP1 BAR discovery); firmware leaves the RC bridge unconfigured for us,
+     * so config reads return 0xffffffff. Disabled until that's built out. */
+    (void)rp1_init;
 #endif
     fb_init();                /* silent when no framebuffer provided */
     cap_init();
