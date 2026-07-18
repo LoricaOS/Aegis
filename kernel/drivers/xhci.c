@@ -213,9 +213,40 @@ static uint64_t s_cycles_per_ms = 0;
 static inline uint64_t
 xhci_rdtsc(void)
 {
+#if defined(__aarch64__)
+    uint64_t v;
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(v));   /* physical counter */
+    return v;
+#else
     uint32_t lo, hi;
     __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
     return ((uint64_t)hi << 32) | lo;
+#endif
+}
+
+/* Counter ticks per millisecond. arm64 has a real timebase (cntfrq_el0);
+ * x86 assumes >=1 GHz TSC as a safe floor (may wait longer, never shorter). */
+static inline uint64_t
+xhci_ticks_per_ms(void)
+{
+#if defined(__aarch64__)
+    uint64_t f;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
+    return f / 1000u;
+#else
+    return 1000000ULL;
+#endif
+}
+
+/* CPU relax hint inside a spin loop. */
+static inline void
+xhci_relax(void)
+{
+#if defined(__aarch64__)
+    __asm__ volatile("yield");
+#else
+    xhci_relax();
+#endif
 }
 
 static void
@@ -226,12 +257,12 @@ xhci_busy_wait_ms(uint32_t ms)
          * fixed-cycle loop and ASSUME at least 1 GHz; on a 4 GHz CPU
          * the actual wait will be 4x what we ask for, which is safe.
          * We use 1,000,000 cycles per ms as the floor (= 1 GHz). */
-        s_cycles_per_ms = 1000000ULL;
+        s_cycles_per_ms = xhci_ticks_per_ms();
     }
     uint64_t start = xhci_rdtsc();
     uint64_t deadline = start + (uint64_t)ms * s_cycles_per_ms;
     while (xhci_rdtsc() < deadline)
-        __asm__ volatile("pause");
+        xhci_relax();
 }
 
 /* op_spin_until_set — busy-wait until (op_reg_at_off & mask) != 0.
@@ -240,12 +271,12 @@ xhci_busy_wait_ms(uint32_t ms)
 static int
 op_spin_until_set_ms(uint32_t off, uint32_t mask, uint32_t ms_timeout)
 {
-    if (s_cycles_per_ms == 0) s_cycles_per_ms = 1000000ULL;
+    if (s_cycles_per_ms == 0) s_cycles_per_ms = xhci_ticks_per_ms();
     uint64_t deadline = xhci_rdtsc() + (uint64_t)ms_timeout * s_cycles_per_ms;
     while (xhci_rdtsc() < deadline) {
         if (op_read32(off) & mask)
             return 0;
-        __asm__ volatile("pause");
+        xhci_relax();
     }
     return -1;
 }
@@ -254,12 +285,12 @@ op_spin_until_set_ms(uint32_t off, uint32_t mask, uint32_t ms_timeout)
 static int
 op_spin_until_clear_ms(uint32_t off, uint32_t mask, uint32_t ms_timeout)
 {
-    if (s_cycles_per_ms == 0) s_cycles_per_ms = 1000000ULL;
+    if (s_cycles_per_ms == 0) s_cycles_per_ms = xhci_ticks_per_ms();
     uint64_t deadline = xhci_rdtsc() + (uint64_t)ms_timeout * s_cycles_per_ms;
     while (xhci_rdtsc() < deadline) {
         if (!(op_read32(off) & mask))
             return 0;
-        __asm__ volatile("pause");
+        xhci_relax();
     }
     return -1;
 }
@@ -276,12 +307,21 @@ op_spin_until_clear(uint32_t off, uint32_t mask)
  * Page allocator helper
  * ---------------------------------------------------------------------- */
 
+/* When set, all xHCI DMA memory is allocated Normal-NC (non-coherent) instead of
+ * cacheable. Needed for controllers behind a non-coherent bus (the RP1 dwc3 on
+ * Pi 5); x86 leaves it 0 (coherent). Set via xhci_set_dma_noncoherent(). */
+static int s_xhci_dma_nc = 0;
+void xhci_set_dma_noncoherent(int nc) { s_xhci_dma_nc = nc; }
+
 /* alloc_page — allocate one 4KB zeroed page, return VA; set *phys_out.
  * Follows the nvme.c alloc_queue_page() pattern exactly. */
 static void *
 alloc_page(uint64_t *phys_out)
 {
-    void *va = kva_alloc_pages(1);
+    /* Non-coherent path (RP1): Normal-NC <4GB page — the controller's DMA sees
+     * the writes without cache maintenance, and the RP1 inbound window is
+     * identity so kva_page_phys is the bus address directly. */
+    void *va = s_xhci_dma_nc ? kva_alloc_pages_low_nc(1) : kva_alloc_pages(1);
     /* SAFETY: kva_alloc_pages returns a kernel VA for a PMM-allocated page;
      * zeroing via __builtin_memset is safe. */
     __builtin_memset(va, 0, 4096);
@@ -359,12 +399,12 @@ xhci_bios_handoff(void)
         /* Set OS Owned bit, wait for BIOS Owned to clear (up to 1s).
          * Use rdtsc-based timing — runs in early boot, no PIT IRQs. */
         *legsup = val | XHCI_LEGSUP_OS_OWNED;
-        if (s_cycles_per_ms == 0) s_cycles_per_ms = 1000000ULL;
+        if (s_cycles_per_ms == 0) s_cycles_per_ms = xhci_ticks_per_ms();
         uint64_t deadline = xhci_rdtsc() + 1000ULL * s_cycles_per_ms;
         while (xhci_rdtsc() < deadline) {
             if (!((*legsup) & XHCI_LEGSUP_BIOS_OWNED))
                 break;
-            __asm__ volatile("pause");
+            xhci_relax();
         }
         if ((*legsup) & XHCI_LEGSUP_BIOS_OWNED) {
             /* BIOS never released — force ownership (workaround for
@@ -518,7 +558,7 @@ poll_cmd_completion(void)
      * jittery for a real SuperSpeed Address Device, which intermittently took
      * longer and "timed out" (cc=timeout) run-to-run. Matches the control-
      * transfer path's timeout discipline. */
-    if (s_cycles_per_ms == 0) s_cycles_per_ms = 1000000ULL;
+    if (s_cycles_per_ms == 0) s_cycles_per_ms = xhci_ticks_per_ms();
     uint64_t deadline = xhci_rdtsc() + 1000ULL * s_cycles_per_ms;
     while (xhci_rdtsc() < deadline) {
         volatile xhci_trb_t *trb = &s_evt_ring[s_evt_dequeue];
@@ -526,7 +566,7 @@ poll_cmd_completion(void)
          * volatile qualifier ensures each cycle-bit read goes to memory. */
         uint32_t ctrl = trb->control;
         if ((ctrl & 1u) != (uint32_t)s_evt_cycle) {
-            __asm__ volatile("pause");
+            xhci_relax();
             continue;   /* no new event yet */
         }
 
@@ -702,14 +742,19 @@ issue_configure_ep(uint8_t slot_id, uint8_t port_num, uint8_t speed)
     ((volatile uint32_t *)ictx)[0] = 0u;
     ((volatile uint32_t *)ictx)[1] = 0x9u;
 
-    /* Slot Context: ContextEntries=3 (highest DCI in use is 3 = EP1 IN).
-     * RootHubPortNumber goes in dword1[23:16], NOT dword2 (same fix as
-     * issue_address_device — see comment there). */
+    /* Slot Context: copy the CURRENT device slot context (set up by Address
+     * Device: device address, slot state, speed, port) and only bump Context
+     * Entries to 3 (highest DCI in use = EP1 IN). Building it from scratch left
+     * the address/state fields zero, which the strict Synopsys dwc3 (RP1)
+     * rejects with cc=17 (lenient x86 xHCIs accepted it). */
     {
         uint8_t *sc = ictx + XHCI_CTX_ENTRY_SIZE;
-        ((volatile uint32_t *)sc)[0] =
-            ((uint32_t)speed << 20) | (3u << 27);
-        ((volatile uint32_t *)sc)[1] = (uint32_t)port_num << 16;
+        (void)speed; (void)port_num;
+        __builtin_memcpy((void *)sc, (const void *)s_dev_ctx[slot_id],
+                         XHCI_CTX_ENTRY_SIZE);
+        uint32_t d0 = ((volatile uint32_t *)sc)[0];
+        d0 = (d0 & ~(0x1Fu << 27)) | (3u << 27);   /* Context Entries = 3 */
+        ((volatile uint32_t *)sc)[0] = d0;
     }
 
     /* EP1 IN Context at byte offset (DCI+1) * ctx_size = 4 * ctx_size.
@@ -726,19 +771,27 @@ issue_configure_ep(uint8_t slot_id, uint8_t port_num, uint8_t speed)
      * descriptor value. */
     {
         uint8_t *ep1in = ictx + 4u * XHCI_CTX_ENTRY_SIZE;
+        /* Low-Speed endpoints max out at 8-byte packets; the strict Synopsys
+         * dwc3 (RP1) rejects the x86 anti-Babble MaxPacketSize=64 for a LS
+         * device with cc=17. Size it to the port speed (boot keyboards send 8). */
+        uint32_t mps = (speed == XHCI_SPEED_LS) ? 8u : 64u;
         /* dword0: Interval[23:16] */
         ((volatile uint32_t *)ep1in)[0] = (0xAu << 16);
-        /* dword1: CErr=3, EPType=INT_IN(7), MaxPacketSize=64 */
+        /* dword1: CErr=3, EPType=INT_IN(7), MaxPacketSize */
         ((volatile uint32_t *)ep1in)[1] =
-            (3u << 1) | (XHCI_EP_TYPE_INT_IN << 3) | (64u << 16);
+            (3u << 1) | (XHCI_EP_TYPE_INT_IN << 3) | (mps << 16);
         /* dword2: TR Dequeue Pointer Lo [63:4] | DCS (dequeue cycle state) */
         ((volatile uint32_t *)ep1in)[2] =
             (uint32_t)(xfer_phys & 0xFFFFFFF0u) |
             (uint32_t)s_xfer_cycle[slot_id];
         /* dword3: TR Dequeue Pointer Hi */
         ((volatile uint32_t *)ep1in)[3] = (uint32_t)(xfer_phys >> 32);
-        /* dword4: Average TRB Length = 8 bytes */
-        ((volatile uint32_t *)ep1in)[4] = 8u;
+        /* dword4: Max ESIT Payload [31:16] | Average TRB Length [15:0].
+         * The Synopsys dwc3 (RP1) validates Max ESIT Payload and rejects a
+         * zero with cc=17 (Parameter Error); = MaxPacketSize * (burst+1) *
+         * (mult+1) = MaxPacketSize. (Lenient x86 xHCIs accept 0, which is why
+         * this was invisible until real Pi 5 hardware.) */
+        ((volatile uint32_t *)ep1in)[4] = (mps << 16) | 8u;
     }
 
     enqueue_cmd(ictx_phys, 0,
@@ -878,7 +931,7 @@ issue_control_transfer(uint8_t slot_id, uint64_t setup_pkt, int data_dir)
     while (xhci_rdtsc() < deadline) {
         evt = &s_evt_ring[s_evt_dequeue];
         if ((evt->control & 1u) != (uint32_t)s_evt_cycle) {
-            __asm__ volatile("pause");
+            xhci_relax();
             continue;
         }
 
@@ -1622,7 +1675,7 @@ usb_eth_send(netdev_t *dev, const void *pkt, uint16_t len)
         }
         s_eth.tx_inflight = 0;
     }
-    if (s_cycles_per_ms == 0) s_cycles_per_ms = 1000000ULL;
+    if (s_cycles_per_ms == 0) s_cycles_per_ms = xhci_ticks_per_ms();
     s_eth.tx_deadline = xhci_rdtsc() + 1000ULL * s_cycles_per_ms;  /* 1s */
 
     uint8_t *tb = s_eth.tx_buf;
@@ -1792,7 +1845,7 @@ msc_bulk_one(uint8_t dci, xhci_trb_t *ring,
     uint64_t deadline = xhci_rdtsc() + 1000ULL * s_cycles_per_ms;
     while (xhci_rdtsc() < deadline) {
         volatile xhci_trb_t *evt = &s_evt_ring[s_evt_dequeue];
-        if ((evt->control & 1u) != (uint32_t)s_evt_cycle) { __asm__ volatile("pause"); continue; }
+        if ((evt->control & 1u) != (uint32_t)s_evt_cycle) { xhci_relax(); continue; }
         uint32_t etype = (evt->control >> 10) & 0x3Fu;
         uint8_t  eslot = (uint8_t)((evt->control >> 24) & 0xFFu);
         uint8_t  cc    = (uint8_t)((evt->status >> 24) & 0xFFu);
@@ -2361,12 +2414,12 @@ enumerate_port(uint32_t port_num)
          * hardware can take 50-80ms. Use rdtsc-based timing because
          * xhci_init runs early in boot before PIT IRQs fire. */
         {
-            if (s_cycles_per_ms == 0) s_cycles_per_ms = 1000000ULL;
+            if (s_cycles_per_ms == 0) s_cycles_per_ms = xhci_ticks_per_ms();
             uint64_t deadline = xhci_rdtsc() + 100ULL * s_cycles_per_ms;
             while (xhci_rdtsc() < deadline) {
                 if (*portsc_reg & XHCI_PORTSC_PRC)
                     break;
-                __asm__ volatile("pause");
+                xhci_relax();
             }
         }
         if (!(*portsc_reg & XHCI_PORTSC_PRC)) {
@@ -2606,6 +2659,24 @@ xhci_init(void)
     printk("[XHCI] no xHCI controller had connected devices\n");
 }
 
+/* xhci_init_at — bring up an xHCI controller at an explicit MMIO base rather
+ * than a discoverable PCI function. For the RP1 dwc3 on Pi 5, whose xHCI
+ * registers are an MMIO block inside the RP1 BAR1 window. The caller must have
+ * put the dwc3 core in host mode and, for a non-coherent bus, called
+ * xhci_set_dma_noncoherent(1) first. Injects a synthetic pcie_device_t with
+ * bus==0xFF so xhci_init_one skips the PCI config-space step. */
+void
+xhci_init_at(uint64_t bar0_phys)
+{
+    pcie_device_t d;
+    __builtin_memset(&d, 0, sizeof(d));
+    d.bus = 0xFFu; d.dev = 0; d.fn = 0;
+    d.class_code = 0x0Cu; d.subclass = 0x03u; d.progif = 0x30u;
+    d.bar[0] = bar0_phys;
+    int rc = xhci_init_one(&d);
+    printk("[XHCI] init_at 0x%lx -> rc=%d\n", bar0_phys, rc);
+}
+
 /* The actual init body. Returns 1=success+ports, 0=success+empty, -1=fail. */
 static int
 xhci_init_one(const pcie_device_t *dev)
@@ -2620,8 +2691,10 @@ xhci_init_one(const pcie_device_t *dev)
      * with Bus Master disabled the controller cannot DMA completion TRBs into
      * the event ring, so no command/transfer ever completes and nothing
      * enumerates. QEMU pre-enables both, which is why this was invisible until
-     * bare metal. Mirrors rtl8169.c (pcie.h exposes only 32-bit cfg writes). */
-    {
+     * bare metal. Mirrors rtl8169.c (pcie.h exposes only 32-bit cfg writes).
+     * Skipped for an injected MMIO controller (bus==0xFF, e.g. the RP1 dwc3):
+     * it has no PCI config space, and firmware already enabled it. */
+    if (dev->bus != 0xFFu) {
         uint32_t cmd = pcie_read32(dev->bus, dev->dev, dev->fn, 0x04);
         cmd &= 0xFFFF0000u;     /* preserve the status word (upper 16 bits) */
         cmd |= 0x02u | 0x04u;   /* bit1 = Memory Space Enable, bit2 = Bus Master */

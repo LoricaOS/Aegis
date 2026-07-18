@@ -25,6 +25,7 @@
 #include "printk.h"
 #include "kva.h"
 #include "netdev.h"
+#include "xhci.h"
 #include <stdint.h>
 
 #define RP1_BAR1_PHYS      0x1f00000000UL
@@ -49,6 +50,8 @@ rp1_reg(uint32_t off)
 
 static inline void     rp1_w(uint32_t off, uint32_t v) { *rp1_reg(off) = v; }
 static inline uint32_t rp1_r(uint32_t off)             { return *rp1_reg(off); }
+
+static void rp1_delay_ms(uint32_t ms);    /* defined below (timer busy-wait) */
 
 /* RP1 GPIO/PAD/RIO for bank 2 (GPIOs 34-53). Per-pin CTRL @ bank+n*8+4
  * (FUNCSEL in bits[4:0]); pad @ pads+4+n*4 (OUT_DISABLE=bit7); RIO OUT@+0, OE@+4
@@ -84,13 +87,45 @@ rp1_fan_full(void)
 #define RP1_USB0        0x200000
 #define DWC3_GSNPSID    0xc120
 
+/* dwc3 global registers (within the controller, at +0xc100..). */
+#define DWC3_GCTL               0xc110
+#define DWC3_GUSB2PHYCFG0       0xc200
+#define DWC3_GUSB3PIPECTL0      0xc2c0
+#define DWC3_PHYSOFTRST         (1u << 31)
+#define DWC3_GCTL_CORESOFTRESET (1u << 11)
+#define DWC3_GCTL_PRTCAP_HOST   (1u << 12)   /* PRTCAPDIR bits[13:12]=01 */
+#define DWC3_GCTL_PRTCAP_MASK   (3u << 12)
+#define RP1_USB0_XHCI_PHYS      0x1f00200000ULL  /* CPU-phys of USB0 xHCI base */
+
+/* rp1_usb_init — put the RP1 dwc3 #0 core into host mode and hand its xHCI
+ * interface to our xhci.c (with Normal-NC DMA — RP1 is non-coherent, identity
+ * offset). Registers accessed via the RP1 window at offset 0x200000. */
 static void
-rp1_usb_probe(void)
+rp1_usb_init(void)
 {
     uint32_t snpsid = rp1_r(RP1_USB0 + DWC3_GSNPSID);
-    uint32_t cap    = rp1_r(RP1_USB0 + 0x00);         /* xHCI CAPLENGTH/HCIVERSION */
-    printk("[RP1] usb0: dwc3 GSNPSID=0x%x  xhci CAPLENGTH=0x%x HCIVERSION=0x%x\n",
-           snpsid, cap & 0xffu, (cap >> 16) & 0xffffu);
+    printk("[RP1] usb0: dwc3 GSNPSID=0x%x  xhci CAPLENGTH=0x%x\n",
+           snpsid, rp1_r(RP1_USB0 + 0x00) & 0xffu);
+
+    /* Core + USB2/USB3 PHY soft reset, then release. */
+    rp1_w(RP1_USB0 + DWC3_GCTL,          rp1_r(RP1_USB0 + DWC3_GCTL) | DWC3_GCTL_CORESOFTRESET);
+    rp1_w(RP1_USB0 + DWC3_GUSB3PIPECTL0, rp1_r(RP1_USB0 + DWC3_GUSB3PIPECTL0) | DWC3_PHYSOFTRST);
+    rp1_w(RP1_USB0 + DWC3_GUSB2PHYCFG0,  rp1_r(RP1_USB0 + DWC3_GUSB2PHYCFG0)  | DWC3_PHYSOFTRST);
+    rp1_delay_ms(100);
+    rp1_w(RP1_USB0 + DWC3_GUSB3PIPECTL0, rp1_r(RP1_USB0 + DWC3_GUSB3PIPECTL0) & ~DWC3_PHYSOFTRST);
+    rp1_w(RP1_USB0 + DWC3_GUSB2PHYCFG0,  rp1_r(RP1_USB0 + DWC3_GUSB2PHYCFG0)  & ~DWC3_PHYSOFTRST);
+    rp1_delay_ms(100);
+    rp1_w(RP1_USB0 + DWC3_GCTL,          rp1_r(RP1_USB0 + DWC3_GCTL) & ~DWC3_GCTL_CORESOFTRESET);
+
+    /* Port capability = HOST. */
+    uint32_t g = rp1_r(RP1_USB0 + DWC3_GCTL);
+    g = (g & ~DWC3_GCTL_PRTCAP_MASK) | DWC3_GCTL_PRTCAP_HOST;
+    rp1_w(RP1_USB0 + DWC3_GCTL, g);
+    printk("[RP1] usb0: dwc3 host mode (GCTL=0x%x) — starting xHCI\n",
+           rp1_r(RP1_USB0 + DWC3_GCTL));
+
+    xhci_set_dma_noncoherent(1);
+    xhci_init_at(RP1_USB0_XHCI_PHYS);
 }
 
 /* RP1 clocks bank (per-peripheral gates; PLLs already locked by firmware). */
@@ -342,8 +377,8 @@ rp1_init(void)
         printk("[RP1] OK: CHIP_ID 0x%x — reachable over PCIe (firmware-configured)\n",
                id);
         rp1_fan_full();       /* thermal relief now that the RP1 is reachable */
-        rp1_usb_probe();      /* step-0: is the dwc3 USB controller reachable? */
-        rp1_eth_probe();      /* step-0: is the Cadence GEM reachable + clocked? */
+        rp1_eth_probe();      /* Ethernet: GEM + PHY + link + netdev            */
+        rp1_usb_init();       /* USB: dwc3 host mode + xHCI keyboard             */
         return 1;
     }
 

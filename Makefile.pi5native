@@ -136,6 +136,7 @@ SHARED_SRCS = \
     kernel/drivers/virtio_blk.c kernel/drivers/virtio_input.c \
     kernel/drivers/virtio_gpu.c kernel/drivers/virtio_net.c \
     kernel/drivers/usb_mouse.c \
+    kernel/drivers/xhci.c kernel/drivers/usb_hid.c \
     kernel/net/netdev.c kernel/net/eth.c kernel/net/ip.c \
     kernel/net/udp.c kernel/net/tcp.c kernel/net/socket.c \
     kernel/net/unix_socket.c kernel/net/epoll.c \
