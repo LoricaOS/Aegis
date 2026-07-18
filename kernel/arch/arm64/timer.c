@@ -80,6 +80,10 @@ timer_ap_init(void)
     __asm__ volatile("msr " TMR_CTL_EL0 ", %0" : : "r"(1UL));
 }
 
+#ifdef AEGIS_BOOT_NATIVE
+void native_watchdog_tick(void);   /* kernel/arch/arm64/main.c — petted watchdog */
+#endif
+
 /* timer_irq — INTID 27 handler (called from arm64_irq AFTER gic_eoi:
  * sched_tick may context-switch away and not return promptly). */
 void
@@ -87,6 +91,9 @@ timer_irq(void)
 {
     rearm();
     s_ticks++;
+#ifdef AEGIS_BOOT_NATIVE
+    native_watchdog_tick();     /* pet the BCM2712 watchdog while petting window open */
+#endif
     random_add_interrupt_entropy();
     poll_sources_run();
     waitq_wake_all(&g_timer_waitq);
@@ -107,14 +114,21 @@ arch_request_shutdown(void)
     s_shutdown = 1;
 }
 
-/* PSCI SYSTEM_OFF via HVC (QEMU virt PSCI conduit). Powers the VM off —
- * the arm64 equivalent of the x86 isa-debug-exit device. */
+/* PSCI power control. value==1 => SYSTEM_RESET (reboot), else SYSTEM_OFF (power
+ * off). Conduit differs: QEMU virt's PSCI is at EL2 (HVC); the real Pi 5's is at
+ * EL3, reached via SMC — so the native build issues `smc` and shutdown/reboot
+ * actually cut/cycle power instead of hanging in a WFI halt. */
 void
 arch_debug_exit(unsigned char value)
 {
-    (void)value;
-    register uint64_t x0 __asm__("x0") = 0x84000008UL;   /* SYSTEM_OFF */
+    uint64_t fn = (value == 1) ? 0x84000009UL   /* PSCI SYSTEM_RESET */
+                               : 0x84000008UL;   /* PSCI SYSTEM_OFF   */
+    register uint64_t x0 __asm__("x0") = fn;
+#ifdef AEGIS_BOOT_NATIVE
+    __asm__ volatile("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
+#else
     __asm__ volatile("hvc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
+#endif
     for (;;)
         arch_halt();
 }

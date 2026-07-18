@@ -76,6 +76,23 @@ native_arm_watchdog(void)
         0x5a000000UL | (rstc & 0xffffffcfUL) | 0x00000020UL;         /* WRCFG_FULL_RESET */
 }
 
+/* Petted watchdog: the timer tick (native_watchdog_tick, from timer_irq) re-arms
+ * the ~16s watchdog while s_wdog_pet_ticks remain, keeping a healthy board up for
+ * ~5 min instead of ~16s. When the count runs out the pet stops and the watchdog
+ * fires — so the board still auto-recovers on a hang AND still cycles to pick up
+ * a freshly-staged kernel, just on a 5-min cadence (uptime for interactive
+ * testing while giving up the fast dev-loop). */
+static volatile int32_t s_wdog_pet_ticks = 0;
+
+void
+native_watchdog_tick(void)
+{
+    if (s_wdog_pet_ticks > 0) {
+        s_wdog_pet_ticks--;
+        native_arm_watchdog();
+    }
+}
+
 /* Disable the watchdog (clear PM_RSTC WRCFG so a timeout takes no action).
  * Called once we reach userland: the watchdog protects the (still flaky --
  * intermittent nvme_init hang) boot by resetting+retrying, but must not fire
@@ -91,6 +108,12 @@ native_disable_watchdog(void)
     *(volatile uint32_t *)(pm + 0x1c) = 0x5a000000UL | (rstc & 0xffffffcfUL);
 }
 #endif
+#endif
+
+#if defined(AEGIS_BOOT_NATIVE) && !(defined(AEGIS_NATIVE_TEST_STOP) || \
+    defined(AEGIS_NATIVE_REPRO) || defined(AEGIS_NATIVE_WATCHDOG))
+/* No watchdog compiled into this build — the timer's pet call is a no-op. */
+void native_watchdog_tick(void) { }
 #endif
 
 /* (g_cow_fork / g_lazyfile / g_perfbench_mm are defined in
@@ -177,7 +200,8 @@ kernel_main_arm64(void)
      * anywhere past here (driver bring-up especially) self-recovers into a
      * fresh netboot ~16s later without any human touch. */
     native_arm_watchdog();
-    printk("[NATIVE] watchdog armed (~16s) — hangs will auto-reset+netboot\n");
+    s_wdog_pet_ticks = 5 * 60 * 100;   /* pet for ~5 min (100 Hz tick) then let it fire */
+    printk("[NATIVE] watchdog armed, petted ~5min — hangs auto-reset+netboot\n");
 #endif
 
 #if defined(AEGIS_BOOT_NATIVE) && defined(AEGIS_NATIVE_TEST_STOP) && AEGIS_NATIVE_TEST_STOP <= 3
