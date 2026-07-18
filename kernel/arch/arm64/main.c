@@ -41,6 +41,35 @@ void poll_test(void);
 void arm64_map_early_uart(void);
 void uaccess_selftest(void);
 void pcie_brcmstb_init(void);
+void nvme_init(void);
+void nvme_set_dma_offset(uint64_t off);
+void nvme_set_dma_noncoherent(int nc);
+
+#if defined(AEGIS_BOOT_NATIVE) && defined(AEGIS_NATIVE_TEST_STOP)
+/* TEMPORARY (native-boot bring-up autonomy): arm the BCM2712 PM watchdog so
+ * ANY hang self-recovers into a fresh TFTP-netboot -- it fires independent of
+ * the (possibly wedged) CPU, unlike a PSCI self-reset. This is what makes the
+ * iteration loop hang-proof: run -> watchdog resets ~16s later -> netboot
+ * whatever kernel is staged, no human touch even when a build hangs.
+ *
+ * Address: watchdog@7d200000 (child) under soc@107c000000, whose ranges map
+ * child 0 -> CPU 0x10_00000000, so CPU-physical 0x10_7d200000 -- inside the
+ * UART's device block already mapped by vmm_init, hence reachable via
+ * arch_dmap with no extra mapping. Register layout is the classic bcm2835 PM
+ * watchdog (Debian's own dmesg shows the Pi 5 driven by the "Broadcom BCM2835
+ * Watchdog timer"): PM_WDOG=+0x24, PM_RSTC=+0x1c, password 0x5a000000,
+ * ~65536 ticks/s (0xfffff ~= 15.9s max). Only compiled into TEST_STOP debug
+ * builds -- a real full boot must not be watchdog-reset mid-run. */
+static void
+native_arm_watchdog(void)
+{
+    volatile uint8_t *pm = (volatile uint8_t *)arch_dmap(0x107d200000UL);
+    *(volatile uint32_t *)(pm + 0x24) = 0x5a000000UL | 0x000fffffUL; /* PM_WDOG max */
+    uint32_t rstc = *(volatile uint32_t *)(pm + 0x1c);
+    *(volatile uint32_t *)(pm + 0x1c) =
+        0x5a000000UL | (rstc & 0xffffffcfUL) | 0x00000020UL;         /* WRCFG_FULL_RESET */
+}
+#endif
 
 /* (g_cow_fork / g_lazyfile / g_perfbench_mm are defined in
  * sys_process.c / sys_memory.c — shared, default-ON like x86.) */
@@ -119,6 +148,14 @@ kernel_main_arm64(void)
     vmm_init();               /* TTBR1 kernel tables + DMAP go live     */
     serial_set_base(arch_dmap(arch_mm_get_uart_phys()));  /* off the early idmap */
 
+#if defined(AEGIS_BOOT_NATIVE) && defined(AEGIS_NATIVE_TEST_STOP)
+    /* Arm the hardware watchdog as early as the DMAP allows, so a hang
+     * anywhere past here (driver bring-up especially) self-recovers into a
+     * fresh netboot ~16s later without any human touch. */
+    native_arm_watchdog();
+    printk("[NATIVE] watchdog armed (~16s) — hangs will auto-reset+netboot\n");
+#endif
+
 #if defined(AEGIS_BOOT_NATIVE) && defined(AEGIS_NATIVE_TEST_STOP) && AEGIS_NATIVE_TEST_STOP <= 3
     printk("[NATIVE] test-stop 3: vmm_init done, UART re-based, still alive\n");
     for (;;) { __asm__ volatile("wfi"); }
@@ -162,13 +199,26 @@ kernel_main_arm64(void)
     pcie_init();              /* ECAM enumerate — [PCIE] OK or skip     */
 #ifdef AEGIS_BOOT_NATIVE
     pcie_brcmstb_init();      /* real Pi 5: Broadcom RC bring-up (pcie1) */
-#if defined(AEGIS_NATIVE_TEST_STOP) && AEGIS_NATIVE_TEST_STOP <= 6
+#if defined(AEGIS_NATIVE_TEST_STOP) && AEGIS_NATIVE_TEST_STOP == 6
     /* TEMPORARY (native-boot bring-up): isolate the brand-new Broadcom
      * PCIe root-complex driver (first real hardware use, first PCIe owner
      * on this board) from virtio/vfs/ext2/net init below -- one thing per
      * flash, same discipline as every prior milestone this session. */
     printk("[NATIVE] test-stop 6: pcie_brcmstb_init done\n");
-    for (;;) { __asm__ volatile("wfi"); }
+    for (;;) { __asm__ volatile("wfi"); }   /* watchdog resets ~16s → netboot */
+#endif
+    /* The Broadcom RC's inbound DMA window maps PCIe bus 0x10_00000000 ->
+     * CPU 0x0 (see set_inbound_window in pcie_brcmstb.c), so the NVMe
+     * controller must add this offset to every host DMA target. */
+    nvme_set_dma_offset(0x1000000000UL);
+    /* The RC has no `dma-coherent` in its DTB -> the controller does not
+     * snoop the CPU cache; NVMe DMA buffers must be non-cacheable (now truly
+     * Normal-NC after the native MAIR fix). */
+    nvme_set_dma_noncoherent(1);
+    nvme_init();              /* bind NVMe on the Broadcom RC → blkdev */
+#if defined(AEGIS_NATIVE_TEST_STOP) && AEGIS_NATIVE_TEST_STOP <= 7
+    printk("[NATIVE] test-stop 7: nvme_init done\n");
+    for (;;) { __asm__ volatile("wfi"); }   /* watchdog resets ~16s → netboot */
 #endif
 #endif
     virtio_blk_init();        /* virtio-blk disk → vblk0 (poll mode)    */

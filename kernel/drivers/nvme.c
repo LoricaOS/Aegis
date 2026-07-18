@@ -68,6 +68,31 @@ static uint32_t  s_max_xfer  = 4096u;     /* min(bounce bytes, MDTS); set in ini
 static uint32_t  s_mdts_max  = 0xFFFFFFFFu; /* controller MDTS in bytes (identify) */
 static spinlock_t nvme_lock = SPINLOCK_INIT;
 
+/* Bus/DMA offset: the value added to a CPU-physical address to get the PCIe
+ * bus address the controller must use to DMA to it. 0 on identity-mapped
+ * hosts (x86, QEMU). On the native RPi5 Broadcom RC the inbound DMA window
+ * maps PCIe bus 0x10_00000000 -> CPU 0x0, so every DMA target the controller
+ * is handed must carry a +0x10_00000000 offset (set via nvme_set_dma_offset
+ * before nvme_init). Applied at the two points where a CPU-phys becomes a
+ * device-visible bus address (alloc_queue_page + iobuf_alloc); those phys
+ * values are ONLY ever used as DMA addresses, never for CPU access. */
+static uint64_t  s_dma_offset = 0;
+void nvme_set_dma_offset(uint64_t off) { s_dma_offset = off; }
+
+/* Non-coherent DMA: when set, all DMA buffers are allocated non-cacheable so
+ * the controller (which does not snoop the CPU cache on this host) and the CPU
+ * see each other's writes. 0 on coherent hosts (x86, QEMU). Set for the RPi5
+ * Broadcom RC (no `dma-coherent` in its DTB) before nvme_init. */
+static int s_dma_nc = 0;
+void nvme_set_dma_noncoherent(int nc) { s_dma_nc = nc; }
+
+/* Allocate a <4GB DMA buffer, non-cacheable when the host is non-coherent. */
+static void *
+nvme_dma_alloc(uint64_t n)
+{
+    return s_dma_nc ? kva_alloc_pages_low_nc(n) : kva_alloc_pages_low(n);
+}
+
 /* iobuf_alloc — (re)allocate the bounce page set and rewrite the PRP list.
  * Falls back to a single page (s_max_xfer = 4096) if the low pool cannot
  * supply the full set.  Returns -1 only if not even one page is available.
@@ -77,10 +102,10 @@ static int
 iobuf_alloc(void)
 {
     uint32_t pages = NVME_BOUNCE_PAGES;
-    uint8_t *va = (uint8_t *)kva_alloc_pages_low(pages);
+    uint8_t *va = (uint8_t *)nvme_dma_alloc(pages);
     if (va == NULL) {
         pages = 1u;
-        va = (uint8_t *)kva_alloc_pages_low(1);
+        va = (uint8_t *)nvme_dma_alloc(1);
         if (va == NULL)
             return -1;
     }
@@ -90,7 +115,7 @@ iobuf_alloc(void)
             pages = 1u;               /* no PRP list page → single-page mode */
     }
     for (uint32_t i = 0; i < pages; i++)
-        s_iobuf_page_phys[i] = kva_page_phys(va + (uint64_t)i * 4096u);
+        s_iobuf_page_phys[i] = kva_page_phys(va + (uint64_t)i * 4096u) + s_dma_offset;
     for (uint32_t i = 1; i < pages; i++)
         s_prplist[i - 1u] = s_iobuf_page_phys[i];
     s_iobuf      = va;
@@ -152,13 +177,13 @@ doorbell(uint32_t qid, int is_head)
 static void *
 alloc_queue_page(uint64_t *phys_out)
 {
-    void *va = kva_alloc_pages_low(1);
+    void *va = nvme_dma_alloc(1);
     if (va == NULL)
         return NULL;
     /* SAFETY: kva_alloc_pages_low returns a kernel VA for a PMM-allocated,
      * mapped page; zeroing via __builtin_memset is safe here. */
     __builtin_memset(va, 0, 4096);
-    *phys_out = kva_page_phys(va);
+    *phys_out = kva_page_phys(va) + s_dma_offset;
     return va;
 }
 

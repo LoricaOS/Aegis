@@ -139,6 +139,22 @@ pcie_init(void)
 int pcie_device_count(void) { return s_device_count; }
 const pcie_device_t *pcie_get_devices(void) { return s_devices; }
 
+/* pcie_register_device — inject a device discovered by a non-ECAM host
+ * bridge (e.g. the native RPi5 Broadcom RC in pcie_brcmstb.c, which does its
+ * own config-space access and BAR assignment) into the shared table so
+ * pcie_find_device() works unchanged for drivers like nvme.c. Returns 0 on
+ * success, -1 if the table is full. bar[] must already hold clean, decoded
+ * CPU-physical base addresses (flag bits masked off), same as the ECAM
+ * enumerator stores. */
+int
+pcie_register_device(const pcie_device_t *dev)
+{
+    if (s_device_count >= PCIE_MAX_DEVICES)
+        return -1;
+    s_devices[s_device_count++] = *dev;
+    return 0;
+}
+
 const pcie_device_t *
 pcie_find_device(uint8_t class_code, uint8_t subclass, uint8_t progif)
 {

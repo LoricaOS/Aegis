@@ -113,8 +113,16 @@ kva_alloc_pages(uint64_t n)
     return (void *)base;
 }
 
-void *
-kva_alloc_pages_low(uint64_t n)
+/* Shared body for the two <4GB DMA-pool allocators. map_flags selects the
+ * cacheability: VMM_FLAG_WRITABLE = Normal-WB (coherent hosts), plus
+ * VMM_FLAG_WC = Normal-NC for non-coherent DMA (e.g. the RPi5 Broadcom PCIe
+ * RC, whose DTB has no `dma-coherent` — the controller does not snoop the CPU
+ * cache, so its DMA buffers must be uncached or the CPU and device see stale
+ * data past each other). NOTE: the frame is still direct-mapped Normal-WB via
+ * the DMAP; callers of the NC variant must only ever touch these frames
+ * through the returned (NC) VA, never the DMAP alias. */
+static void *
+kva_alloc_pages_low_flags(uint64_t n, uint64_t map_flags)
 {
     if (n == 0) return NULL;
 
@@ -155,9 +163,23 @@ kva_alloc_pages_low(uint64_t n)
             spin_unlock_irqrestore(&kva_lock, ufl);
             return NULL;
         }
-        vmm_map_page(base + i * 4096UL, phys, VMM_FLAG_WRITABLE);
+        vmm_map_page(base + i * 4096UL, phys, map_flags);
     }
     return (void *)base;
+}
+
+void *
+kva_alloc_pages_low(uint64_t n)
+{
+    return kva_alloc_pages_low_flags(n, VMM_FLAG_WRITABLE);
+}
+
+/* Non-cacheable <4GB DMA pages for non-coherent devices (see the flags note
+ * above). Same lifetime/free path as kva_alloc_pages_low. */
+void *
+kva_alloc_pages_low_nc(uint64_t n)
+{
+    return kva_alloc_pages_low_flags(n, VMM_FLAG_WRITABLE | VMM_FLAG_WC);
 }
 
 void *

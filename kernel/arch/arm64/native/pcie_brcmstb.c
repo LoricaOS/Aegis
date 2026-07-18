@@ -110,6 +110,22 @@ extern uint64_t vmm_debug_raw_kernel_pte(uint64_t virt);
 #define PCIE_EXT_CFG_DATA                        0x8000
 #define PCIE_EXT_CFG_INDEX                       0x9000
 
+/* Outbound (CPU -> PCIe) memory window registers (win 0 base; other wins
+ * strided per the macros below). Offsets/masks cross-checked identical
+ * across the Linux and Zephyr reference drivers. */
+#define PCIE_MEM_WIN0_LO(w)          (0x400c + (w) * 8)
+#define PCIE_MEM_WIN0_HI(w)          (0x4010 + (w) * 8)
+#define PCIE_MEM_WIN0_BASE_LIMIT(w)  (0x4070 + (w) * 4)
+#define  MEM_WIN0_BASE_LIMIT_BASE_MASK   0xfff0UL      /* base MB, bits 15:4  */
+#define  MEM_WIN0_BASE_LIMIT_BASE_LSB    4
+#define  MEM_WIN0_BASE_LIMIT_LIMIT_MASK  0xfff00000UL  /* limit MB, bits 31:20 */
+#define  MEM_WIN0_BASE_LIMIT_LIMIT_LSB   20
+#define PCIE_MEM_WIN0_BASE_HI(w)     (0x4080 + (w) * 8)
+#define  MEM_WIN0_BASE_HI_BASE_MASK      0xffUL
+#define PCIE_MEM_WIN0_LIMIT_HI(w)    (0x4084 + (w) * 8)
+#define  MEM_WIN0_LIMIT_HI_LIMIT_MASK    0xffUL
+#define  MEM_WIN0_HIGH_ADDR_SHIFT        12
+
 /* Both pcie_rescal and bcm_reset live under the real DTB's `soc@107c000000`
  * node (compatible "simple-bus"), whose `ranges = <0x0 0x10 0x0
  * 0x80000000>` maps child address 0 to real CPU-physical 0x10_00000000 --
@@ -347,11 +363,57 @@ cfg_read32(uint8_t bus, uint8_t dev, uint16_t off)
 }
 
 static void
+cfg_write32(uint8_t bus, uint8_t dev, uint16_t off, uint32_t val)
+{
+    if (bus == 0) {
+        w32(off, val);
+        return;
+    }
+    if (!link_up() || dev != 0)
+        return;
+    uint32_t idx = ((uint32_t)bus << 20) | ((uint32_t)dev << 15) | (0u << 12);
+    w32(PCIE_EXT_CFG_INDEX, idx);
+    w32(PCIE_EXT_CFG_DATA + off, val);
+}
+
+static void
 program_bridge_bus_numbers(uint8_t primary, uint8_t secondary, uint8_t subordinate)
 {
     uint32_t v = (uint32_t)primary | ((uint32_t)secondary << 8) |
                  ((uint32_t)subordinate << 16);
     w32(0x18, v); /* standard type-1 header: Primary/Secondary/Subordinate Bus # */
+}
+
+/* set_outbound_window — program CPU-physical [phys, phys+size) to translate
+ * to PCIe bus address [pcie_addr, ...) on outbound window `win`. Ported from
+ * brcm_pcie_set_outbound_win (Linux/Zephyr/U-Boot, identical logic): the
+ * base/limit are expressed in MB, split across a low BASE_LIMIT register and
+ * high BASE_HI/LIMIT_HI registers (the high halves are the MB value shifted
+ * right by HIGH_ADDR_SHIFT). */
+static void
+set_outbound_window(uint32_t win, uint64_t phys, uint64_t pcie_addr, uint64_t size)
+{
+    w32(PCIE_MEM_WIN0_LO(win), (uint32_t)(pcie_addr & 0xFFFFFFFFUL));
+    w32(PCIE_MEM_WIN0_HI(win), (uint32_t)(pcie_addr >> 32));
+
+    uint64_t base_mb  = phys / 0x100000UL;
+    uint64_t limit_mb = (phys + size - 1) / 0x100000UL;
+
+    uint32_t bl = r32(PCIE_MEM_WIN0_BASE_LIMIT(win));
+    bl &= ~(uint32_t)(MEM_WIN0_BASE_LIMIT_BASE_MASK | MEM_WIN0_BASE_LIMIT_LIMIT_MASK);
+    bl |= ((uint32_t)base_mb  << MEM_WIN0_BASE_LIMIT_BASE_LSB)  & MEM_WIN0_BASE_LIMIT_BASE_MASK;
+    bl |= ((uint32_t)limit_mb << MEM_WIN0_BASE_LIMIT_LIMIT_LSB) & MEM_WIN0_BASE_LIMIT_LIMIT_MASK;
+    w32(PCIE_MEM_WIN0_BASE_LIMIT(win), bl);
+
+    uint32_t base_hi = (uint32_t)(base_mb >> MEM_WIN0_HIGH_ADDR_SHIFT) & MEM_WIN0_BASE_HI_BASE_MASK;
+    uint32_t bh = r32(PCIE_MEM_WIN0_BASE_HI(win));
+    bh = (bh & ~(uint32_t)MEM_WIN0_BASE_HI_BASE_MASK) | base_hi;
+    w32(PCIE_MEM_WIN0_BASE_HI(win), bh);
+
+    uint32_t limit_hi = (uint32_t)(limit_mb >> MEM_WIN0_HIGH_ADDR_SHIFT) & MEM_WIN0_LIMIT_HI_LIMIT_MASK;
+    uint32_t lh = r32(PCIE_MEM_WIN0_LIMIT_HI(win));
+    lh = (lh & ~(uint32_t)MEM_WIN0_LIMIT_HI_LIMIT_MASK) | limit_hi;
+    w32(PCIE_MEM_WIN0_LIMIT_HI(win), lh);
 }
 
 static void
@@ -664,10 +726,111 @@ pcie_brcmstb_init(void)
     }
     printk("[PCIE-BRCM] OK: link up @ phys 0x%lx\n", base_phys);
 
+    /* Make the RC's own config header report the PCI-PCI-bridge class, so a
+     * config read of bus 0 dev 0 looks like a bridge (default is EP mode);
+     * matches all 3 reference drivers. */
+    {
+        uint32_t v = r32(PCIE_RC_CFG_PRIV1_ID_VAL3);
+        v = (v & ~(uint32_t)ID_VAL3_CLASS_CODE_MASK) | (uint32_t)BCM2712_CLASS_CODE;
+        w32(PCIE_RC_CFG_PRIV1_ID_VAL3, v);
+    }
+
     print_found(0, 0);
     /* Bus 1 has no device tree entry of its own to check against -- give
      * the RC its bridge bus numbers before trying bus 1, or it has no
      * idea that bus exists yet (standard PCI-PCI bridge behavior). */
     program_bridge_bus_numbers(0, 1, 1);
     print_found(1, 0);
+
+    /* --- Make the downstream device actually USABLE (not just visible) ---
+     * The device is enumerated but has no CPU-reachable BAR and no memory/
+     * bus-master enable yet. Program one outbound MMIO window from the DTB's
+     * `ranges` first entry (32-bit non-prefetchable):
+     *   <0x02000000 0x00 0x00000000  0x1b 0x00000000  0x00 0xfffffffc>
+     *   = PCIe bus 0x0..~4GB  <-  CPU-physical 0x1b_00000000..
+     * then assign the device's BAR0 to PCIe bus address 0x0 (window start),
+     * enable memory-space + bus-master, and register it so nvme.c's
+     * pcie_find_device() picks it up. The device's registers then decode at
+     * CPU-physical 0x1b_00000000. */
+    {
+        const uint64_t win_cpu  = 0x1b00000000UL;
+        const uint64_t win_pcie = 0x0UL;
+        const uint64_t win_size = 0x100000000UL; /* 4GB (DTB ~0xfffffffc) */
+        const uint64_t dev_bar_pcie = 0x0UL;      /* device BAR at window start */
+
+        set_outbound_window(0, win_cpu, win_pcie, win_size);
+
+        uint32_t idreg = cfg_read32(1, 0, 0x00);
+        uint16_t vendor = (uint16_t)(idreg & 0xFFFF);
+        if (vendor == 0xFFFF) {
+            printk("[PCIE-BRCM] no downstream device on bus 1; storage skipped\n");
+            return;
+        }
+        uint32_t clsreg = cfg_read32(1, 0, 0x08);
+
+        /* Assign BAR0 (and BAR1 if it's a 64-bit BAR) to the chosen PCIe bus
+         * address. Low 4 bits of a BAR are read-only type indicators; writing
+         * the address value leaves them intact. */
+        uint32_t bar0 = cfg_read32(1, 0, 0x10);
+        int bar_is_64 = ((bar0 & 0x6) == 0x4);   /* bits[2:1]=10 => 64-bit */
+        cfg_write32(1, 0, 0x10, (uint32_t)(dev_bar_pcie & 0xFFFFFFFFUL));
+        if (bar_is_64)
+            cfg_write32(1, 0, 0x14, (uint32_t)(dev_bar_pcie >> 32));
+
+        /* Command register (0x04): Memory Space Enable (bit1) + Bus Master
+         * Enable (bit2). */
+        uint32_t cmd = cfg_read32(1, 0, 0x04);
+        cfg_write32(1, 0, 0x04, cmd | 0x6);
+
+        /* Program the RC bridge's (bus 0) MEMORY-FORWARDING window so it
+         * actually forwards CPU->device memory transactions down to bus 1.
+         * The outbound window above only handles the CPU<->PCIe *address*
+         * translation; the internal PCI-PCI bridge still decides, via its
+         * Memory Base/Limit register (type-1 header offset 0x20, 1MB
+         * granularity: base=A[31:20] in bits[15:4], limit=A[31:20] in
+         * bits[31:20]), whether a PCIe memory transaction on bus 0 gets
+         * forwarded to its secondary bus. On real Linux/U-Boot the generic
+         * PCI core does this; from-scratch we must. Forward [0, 16MB) --
+         * comfortably covers a 16-64KB NVMe BAR sitting at PCIe bus 0x0,
+         * and stays well within the 4GB outbound window. */
+        cfg_write32(0, 0, 0x20, 0x00F00000UL); /* base MB=0, limit MB=15 */
+
+        /* And enable memory-space + bus-master forwarding on the bridge
+         * itself, or it won't pass the transaction through even with the
+         * window set. */
+        uint32_t bcmd = cfg_read32(0, 0, 0x04);
+        cfg_write32(0, 0, 0x04, bcmd | 0x6);
+
+        /* CPU-physical address the device's BAR0 now decodes at. */
+        uint64_t bar_cpu = win_cpu + (dev_bar_pcie - win_pcie);
+
+        /* DIAGNOSTIC (temporary): read the device's first MMIO register
+         * through the freshly-programmed outbound window. For an NVMe
+         * controller this is CAP[31:0], which must be non-zero and not the
+         * 0xffffffff "no responder" value if the window + BAR assignment
+         * worked. Uses kva_map_mmio -> now trustworthy after the TLB fix. */
+        {
+            volatile uint8_t *bar = (volatile uint8_t *)kva_map_mmio(bar_cpu & ~0xFFFUL, 4)
+                                    + (bar_cpu & 0xFFFUL);
+            uint32_t cap_lo = *(volatile uint32_t *)bar;
+            printk("[PCIE-BRCM] diag: device BAR0 @ cpu 0x%lx, first reg (NVMe CAP[31:0])=0x%x\n",
+                   bar_cpu, cap_lo);
+        }
+
+        /* Register into the shared PCIe device table so nvme_init()'s
+         * pcie_find_device(0x01,0x08,0x02) finds it, bar[0] = clean CPU-phys
+         * base (no flag bits), exactly as the ECAM enumerator would store. */
+        pcie_device_t d = {0};
+        d.vendor_id  = vendor;
+        d.device_id  = (uint16_t)(idreg >> 16);
+        d.class_code = (uint8_t)(clsreg >> 24);
+        d.subclass   = (uint8_t)(clsreg >> 16);
+        d.progif     = (uint8_t)(clsreg >> 8);
+        d.bus = 1; d.dev = 0; d.fn = 0;
+        d.bar[0] = bar_cpu;
+        if (pcie_register_device(&d) == 0)
+            printk("[PCIE-BRCM] registered %x:%x class=%x.%x.%x for driver bind\n",
+                   (unsigned)d.vendor_id, (unsigned)d.device_id,
+                   (unsigned)d.class_code, (unsigned)d.subclass, (unsigned)d.progif);
+    }
 }

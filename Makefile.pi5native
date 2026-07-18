@@ -110,7 +110,7 @@ SHARED_SRCS = \
     kernel/fs/ext2.c kernel/fs/ext2_cache.c kernel/fs/ext2_dir.c \
     kernel/fs/ext2_vfs.c kernel/fs/ramfs.c kernel/fs/procfs.c \
     kernel/fs/memfd.c kernel/fs/eventfd.c kernel/fs/poll_test.c \
-    kernel/drivers/fb.c kernel/drivers/ramdisk.c \
+    kernel/drivers/fb.c kernel/drivers/ramdisk.c kernel/drivers/nvme.c \
     kernel/drivers/virtio_pci.c kernel/drivers/virtqueue.c \
     kernel/drivers/virtio_blk.c kernel/drivers/virtio_input.c \
     kernel/drivers/virtio_gpu.c kernel/drivers/virtio_net.c \
