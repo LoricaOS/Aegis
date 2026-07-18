@@ -120,6 +120,19 @@ gic_init(void)
         uint64_t gicd, gicc, sz;
         int from_dtb = fdt_reg_by_compat(v2_compat, 0, &gicd, &sz) &&
                        fdt_reg_by_compat(v2_compat, 1, &gicc, &sz);
+#ifdef AEGIS_BOOT_NATIVE
+        /* The Pi 5 GIC node lives under soc@107c000000, whose `ranges` maps
+         * child address 0 -> CPU-physical 0x10_00000000. fdt_reg_by_compat
+         * returns the RAW child reg (0x7fff9000 / 0x7fffa000) without applying
+         * that translation, so add the bus base (identical simple-bus offset
+         * rescal/bcm_reset already use). Without this, every GIC access landed
+         * on low DRAM at 0x7fff9000 -- the GIC was never configured, no
+         * interrupt ever fired, and GICD_IIDR read RAM garbage. */
+        if (from_dtb) {
+            gicd += 0x1000000000UL;
+            gicc += 0x1000000000UL;
+        }
+#endif
         if (!from_dtb) {
             /* QEMU virt,gic-version=2 fallback (matches the GICv3 pattern
              * below: builtin constants if a DTB somehow lacks reg data). */

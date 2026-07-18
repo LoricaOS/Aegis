@@ -13,6 +13,7 @@
 
 #include "gic_v2.h"
 #include "arch.h"
+#include "kva.h"
 #include "printk.h"
 #include <stdint.h>
 
@@ -49,7 +50,11 @@ gicv2_cpu_init(uint32_t cpu)
     dw32(GICD_IGROUPR, 0xFFFFFFFFu);         /* SGI/PPI (banked) -> group 1 */
     for (int i = 0; i < 8; i++)
         dw32(GICD_IPRIORITYR + 4 * i, 0xA0A0A0A0u);
-    dw32(GICD_ISENABLER, 1u << 27);          /* generic virtual-timer PPI */
+#ifdef AEGIS_BOOT_NATIVE
+    dw32(GICD_ISENABLER, 1u << 30);          /* physical-timer PPI (real Pi5) */
+#else
+    dw32(GICD_ISENABLER, 1u << 27);          /* generic virtual-timer PPI (QEMU) */
+#endif
 
     cw32(GICC_PMR, 0xFFu);                   /* accept every priority */
     cw32(GICC_CTLR, (1u << 1) | (1u << 0));  /* EnableGrp1 | EnableGrp0 */
@@ -58,8 +63,21 @@ gicv2_cpu_init(uint32_t cpu)
 void
 gicv2_init(uint64_t gicd_phys, uint64_t gicc_phys)
 {
+#ifdef AEGIS_BOOT_NATIVE
+    /* Real Pi 5: the GIC MMIO MUST be mapped as Device memory. arch_dmap()
+     * returns the RAM direct-map, and vmm_init's "map all reported RAM as
+     * Normal-WB" sweep covers this address range (it doesn't carve out the
+     * GIC hole) -- so GIC reads/writes were hitting CACHED RAM, not the
+     * device. That is why no interrupt ever fired on this path and why
+     * GICD_IIDR read back garbage: every config write landed in RAM and
+     * every read echoed it. Map it uncached instead (GICD 4KB, GICC 8KB;
+     * both 4K-aligned so no sub-page offset). */
+    s_gicd = (volatile uint8_t *)kva_map_mmio(gicd_phys, 1);
+    s_gicc = (volatile uint8_t *)kva_map_mmio(gicc_phys, 2);
+#else
     s_gicd = (volatile uint8_t *)arch_dmap(gicd_phys);
     s_gicc = (volatile uint8_t *)arch_dmap(gicc_phys);
+#endif
 
     dw32(GICD_CTLR, (1u << 1) | (1u << 0));  /* EnableGrp1 | EnableGrp0 */
 

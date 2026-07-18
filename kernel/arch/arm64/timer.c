@@ -16,6 +16,23 @@
 
 #define TIMER_HZ 100
 
+/* Timer register + PPI selection. On real Pi 5 (entered at EL2, dropped to
+ * EL1) the VIRTUAL timer PPI (27) does not deliver — the scheduler tick never
+ * fires and no task past the idle loop runs. Use the PHYSICAL timer (cntp,
+ * PPI 30) there instead: boot_probe.S sets CNTHCTL_EL2.EL1PC{EN,TEN} so EL1
+ * may access it and zeros CNTVOFF. QEMU virt / Limine keep the virtual timer,
+ * which works at EL1 on that path. The PPI number is mirrored in gic_v2.c
+ * (enable) and traps.c (dispatch) under the same guard. */
+#ifdef AEGIS_BOOT_NATIVE
+#define TMR_CTL_EL0   "cntp_ctl_el0"
+#define TMR_CVAL_EL0  "cntp_cval_el0"
+#define TMR_CT_EL0    "cntpct_el0"
+#else
+#define TMR_CTL_EL0   "cntv_ctl_el0"
+#define TMR_CVAL_EL0  "cntv_cval_el0"
+#define TMR_CT_EL0    "cntvct_el0"
+#endif
+
 static uint64_t s_freq;             /* CNTFRQ_EL0 */
 static uint64_t s_ns_per_cnt_fp = 0;  /* (1e9 << 32) / cntfrq — ns/count Q32 */
 static uint64_t s_interval;
@@ -29,8 +46,8 @@ static inline void
 rearm(void)
 {
     uint64_t now;
-    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(now));
-    __asm__ volatile("msr cntv_cval_el0, %0" : : "r"(now + s_interval));
+    __asm__ volatile("mrs %0, " TMR_CT_EL0 : "=r"(now));
+    __asm__ volatile("msr " TMR_CVAL_EL0 ", %0" : : "r"(now + s_interval));
 }
 
 void
@@ -45,9 +62,13 @@ timer_init(void)
     s_ns_per_cnt_fp = (1000000000ULL << 32) / s_freq;
 
     rearm();
-    __asm__ volatile("msr cntv_ctl_el0, %0" : : "r"(1UL));  /* enable, unmasked */
-    /* The timer PPI (27) is enabled per-core in gic_cpu_init. */
-    printk("[PIT] OK: timer at 100 Hz\n");
+    __asm__ volatile("msr " TMR_CTL_EL0 ", %0" : : "r"(1UL));  /* enable, unmasked */
+    /* The timer PPI is enabled per-core in gic_cpu_init. */
+#ifdef AEGIS_BOOT_NATIVE
+    printk("[PIT] OK: timer at 100 Hz (physical, PPI 30)\n");
+#else
+    printk("[PIT] OK: timer at 100 Hz (virtual, PPI 27)\n");
+#endif
 }
 
 /* timer_ap_init — arm THIS AP's virtual timer (BSP timer_init already
@@ -56,7 +77,7 @@ void
 timer_ap_init(void)
 {
     rearm();
-    __asm__ volatile("msr cntv_ctl_el0, %0" : : "r"(1UL));
+    __asm__ volatile("msr " TMR_CTL_EL0 ", %0" : : "r"(1UL));
 }
 
 /* timer_irq — INTID 27 handler (called from arm64_irq AFTER gic_eoi:
@@ -121,7 +142,7 @@ arch_clock_mono_ns(void)
     if (!s_freq || !s_ns_per_cnt_fp)
         return s_ticks * (1000000000ULL / TIMER_HZ);
     uint64_t v;
-    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v));
+    __asm__ volatile("mrs %0, " TMR_CT_EL0 : "=r"(v));
     return (uint64_t)(((__uint128_t)v * s_ns_per_cnt_fp) >> 32);
 }
 

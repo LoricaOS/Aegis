@@ -189,7 +189,11 @@ arm64_irq(cpu_state_t *s)
         uint32_t intid = gic_ack();
         if (intid >= 1020 && intid <= 1023)
             break;                      /* spurious / no more pending */
-        if (intid == 27) {
+#ifdef AEGIS_BOOT_NATIVE
+        if (intid == 30) {              /* physical-timer PPI (real Pi5) */
+#else
+        if (intid == 27) {              /* virtual-timer PPI (QEMU) */
+#endif
             gic_eoi(intid);             /* EOI first: sched_tick may switch */
             timer_irq();
         } else if (intid == 33) {
