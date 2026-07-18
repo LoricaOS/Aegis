@@ -145,11 +145,11 @@ gem_mdio_write(uint8_t phy, uint8_t reg, uint16_t val)
     gem_mdio_wait();
 }
 
-/* RP1 GEM DMA offset: the firmware's own netboot GEM log showed rx_q_base
- * 0xfc3203c0 vs pointer 0x3c3205f0 — a 0xc0000000 delta — so the inbound window
- * firmware left up maps CPU X -> bus X+0xc0000000 (not the +0x10_00000000 the
- * NVMe RC uses). Tunable — this is the crux of the GEM RX addressing. */
-#define RP1_DMA_OFFSET    0xC0000000ULL
+/* RP1 GEM DMA offset: IDENTITY (0). Read from the firmware's own known-good GEM
+ * config after netboot — RBQP=0x3c320640, RBQPH=0 — a plain <4GB CPU-physical
+ * address used directly as the bus address. So the RP1 inbound window is 1:1 for
+ * the GEM (unlike the NVMe RC's +0x10_00000000). */
+#define RP1_DMA_OFFSET    0x0ULL
 #define GEM_DMACFG        0x010
 #define MACB_RBQP         0x018
 #define GEM_RBQPH         0x4D4
@@ -164,6 +164,15 @@ gem_mdio_write(uint8_t phy, uint8_t reg, uint16_t val)
 static void
 rp1_eth_rx_test(void)
 {
+    /* Firmware netbooted over this GEM — dump the addressing scheme it left in
+     * the DMA registers (known-good): tells us the real offset + whether it used
+     * ADDR64, so we match it instead of guessing. */
+    printk("[RP1] eth-fw: DMACFG=0x%x RBQP=0x%x/0x%x TBQP=0x%x/0x%x NCR=0x%x\n",
+           rp1_r(RP1_ETH_BASE + GEM_DMACFG),
+           rp1_r(RP1_ETH_BASE + GEM_RBQPH), rp1_r(RP1_ETH_BASE + MACB_RBQP),
+           rp1_r(RP1_ETH_BASE + 0x4C8),     rp1_r(RP1_ETH_BASE + 0x01c),
+           rp1_r(RP1_ETH_BASE + GEM_NCR));
+
     volatile uint32_t *ring = (volatile uint32_t *)kva_alloc_pages_low_nc(1);
     uint8_t *bufs = (uint8_t *)kva_alloc_pages_low_nc(RX_DESCS);   /* 8 pages, 1 buf each */
     if (!ring || !bufs) { printk("[RP1] eth: RX alloc failed\n"); return; }
@@ -180,9 +189,10 @@ rp1_eth_rx_test(void)
     __asm__ volatile("dsb sy" ::: "memory");   /* ring writes visible before RX on */
     rp1_w(RP1_ETH_BASE + 0x020, 0xF);          /* clear stale RSR (firmware netboot) */
 
-    /* burst16, RXBS=4096/64=0x40, full pkt buffers, ADDR64. */
-    rp1_w(RP1_ETH_BASE + GEM_DMACFG,
-          (1u << 30) | (0x40u << 16) | (3u << 11) | (1u << 10) | 0x10u);
+    /* Adopt firmware's exact known-good DMACFG (ADDR64 + RXBS 0x20 + its burst/
+     * pkt-buffer bits). Buffers are still 4KB-spaced (correct per-buffer phys);
+     * RXBS=2048 just caps stored bytes per buffer, fine for <1500B frames. */
+    rp1_w(RP1_ETH_BASE + GEM_DMACFG, 0x4020071fu);
     rp1_w(RP1_ETH_BASE + MACB_RBQP, (uint32_t)ring_dma);
     rp1_w(RP1_ETH_BASE + GEM_RBQPH, (uint32_t)(ring_dma >> 32));
     /* Promiscuous (CAF bit4) so we catch everything; enable RX+TX+MPE. */
