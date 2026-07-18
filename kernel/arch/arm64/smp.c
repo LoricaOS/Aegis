@@ -173,11 +173,22 @@ smp_start_aps(void)
                              img_phys(ap_trampoline),
                              img_phys(&s_ap_params[cpu]));
         if (r != 0) {
-            /* PSCI_INVALID_PARAMETERS (-2) = no such core → done probing. */
-            if (r == -2)
-                break;
-            printk("[SMP] WARN: CPU_ON cpu%u failed (%ld)\n", cpu, r);
-            continue;
+            /* Any failure ends the probe. On a flat MPIDR topology (QEMU
+             * virt and Pi 5, cpu index == Aff0) the first failure means no
+             * higher core exists. PSCI_INVALID_PARAMETERS (-2) is the clean
+             * "no such core". On the native Pi 5 path PSCI lives at EL3 and
+             * needs the SMC conduit, but this driver issues HVC (correct for
+             * QEMU); since we dropped past EL2, HVC is unhandled and returns
+             * the CPU_ON function id unchanged (0xc4000003) rather than a
+             * PSCI error. Without breaking here that "failure" repeats for
+             * ~1024 candidate cores, flooding the log and blowing the boot's
+             * time budget (the watchdog fired before init). Break on the
+             * first failure either way; real multi-core Pi 5 SMP is a
+             * follow-up (switch the conduit to SMC on this path). */
+            if (r != -2)
+                printk("[SMP] WARN: CPU_ON cpu%u failed (%ld) — stopping probe "
+                       "(1 core; SMC conduit needed for native Pi5 SMP)\n", cpu, r);
+            break;
         }
 
         /* Wait for the AP to signal online (~200ms budget). */
@@ -186,10 +197,16 @@ smp_start_aps(void)
             arch_pause();
             spin++;
         }
-        if (g_ap_online[cpu])
+        if (g_ap_online[cpu]) {
             online++;
-        else
-            printk("[SMP] WARN: cpu%u did not come online\n", cpu);
+        } else {
+            /* Also stop here (not just on a CPU_ON error): if the first AP
+             * never signals online, none will on this conduit, and the
+             * ~200ms-per-core wait × ~1024 candidates otherwise blows the
+             * boot time budget (watchdog before init). */
+            printk("[SMP] WARN: cpu%u did not come online — stopping probe\n", cpu);
+            break;
+        }
     }
 
     g_cpu_count = online;

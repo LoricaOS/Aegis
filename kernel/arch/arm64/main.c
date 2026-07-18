@@ -308,6 +308,9 @@ kernel_main_arm64(void)
     if (g_ap_sched_enabled)
         for (uint32_t c = 1; c < g_cpu_count; c++)
             sched_spawn_idle_for(c, task_idle);
+#if defined(AEGIS_BOOT_NATIVE) && defined(AEGIS_NATIVE_TEST_STOP)
+    native_arm_watchdog();    /* fresh ~16s so vigil has time to start   */
+#endif
     proc_spawn_init();        /* exec /bin/vigil from the rootfs        */
 
     vmm_teardown_identity();  /* oracle line; nothing to tear down      */

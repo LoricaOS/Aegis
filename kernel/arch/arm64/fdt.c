@@ -424,3 +424,77 @@ fdt_memory_regions(uint64_t *addr_out, uint64_t *size_out, int max)
     }
     return n;
 }
+
+/* fdt_initrd — read the firmware-provided initramfs range from /chosen
+ * (linux,initrd-start / linux,initrd-end, each u32 or u64). The Pi 5
+ * EEPROM firmware sets these when config.txt carries an `initramfs <file>`
+ * directive: it loads the file into RAM and records the range here. Returns
+ * 1 with [*start_out, *end_out) on success, 0 if absent/invalid. */
+int
+fdt_initrd(uint64_t *start_out, uint64_t *end_out)
+{
+    if (!s_ok)
+        return 0;
+
+    int      depth = 0;
+    int      in_chosen = 0;
+    uint64_t start = 0, end = 0;
+    int      got_start = 0, got_end = 0;
+
+    uint32_t off = s_struct_off;
+    while (off + 4 <= s_struct_end) {
+        uint32_t tok = be32(s_buf + off);
+        off += 4;
+
+        if (tok == FDT_BEGIN_NODE) {
+            const char *name = (const char *)(s_buf + off);
+            uint32_t n = off;
+            while (n < s_struct_end && s_buf[n]) n++;
+            off = (n + 4) & ~3u;
+            depth++;
+            /* /chosen is a direct child of the root node (depth 2 here:
+             * root opens at depth 1, its children at depth 2). */
+            if (depth == 2) {
+                const char *w = "chosen";
+                int eq = 1;
+                for (uint32_t k = 0; ; k++) {
+                    if (w[k] == '\0') { eq = (name[k] == '\0'); break; }
+                    if (name[k] != w[k]) { eq = 0; break; }
+                }
+                if (eq) in_chosen = 1;
+            }
+        } else if (tok == FDT_END_NODE) {
+            if (depth == 2) in_chosen = 0;
+            if (depth == 0) break;
+            depth--;
+        } else if (tok == FDT_PROP) {
+            if (off + 8 > s_struct_end) break;
+            uint32_t len     = be32(s_buf + off);
+            uint32_t nameoff = be32(s_buf + off + 4);
+            uint32_t val     = off + 8;
+            off = (val + len + 3) & ~3u;
+            if (val + len > s_struct_end)
+                break;
+            if (in_chosen && (len == 4 || len == 8)) {
+                uint64_t v = (len == 4)
+                    ? (uint64_t)be32(s_buf + val)
+                    : (((uint64_t)be32(s_buf + val) << 32) | be32(s_buf + val + 4));
+                if (str_at_is(nameoff, "linux,initrd-start")) { start = v; got_start = 1; }
+                else if (str_at_is(nameoff, "linux,initrd-end")) { end = v; got_end = 1; }
+            }
+        } else if (tok == FDT_NOP) {
+            /* nothing */
+        } else if (tok == FDT_END) {
+            break;
+        } else {
+            break;
+        }
+    }
+
+    if (got_start && got_end && end > start) {
+        *start_out = start;
+        *end_out   = end;
+        return 1;
+    }
+    return 0;
+}

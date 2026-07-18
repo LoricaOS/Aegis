@@ -49,4 +49,8 @@ int fdt_reg_by_compat_nth(const char *compat, int node_index,
  * to `max` pairs into addr_out/size_out; returns the number written. */
 int fdt_memory_regions(uint64_t *addr_out, uint64_t *size_out, int max);
 
+/* Read the firmware-provided initramfs range from /chosen
+ * (linux,initrd-start/end). Returns 1 with [*start,*end) on success. */
+int fdt_initrd(uint64_t *start_out, uint64_t *end_out);
+
 #endif /* AEGIS_ARM64_FDT_H */

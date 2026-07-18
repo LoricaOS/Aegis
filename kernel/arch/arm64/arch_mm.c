@@ -210,4 +210,25 @@ arch_mm_populate_regions_from_dtb(void)
         regions[region_count].len  = size;
         region_count++;
     }
+
+    /* Firmware-loaded initramfs (config.txt `initramfs <file> ...`): the Pi
+     * EEPROM records its RAM range in /chosen. Expose it as module[0] so the
+     * existing ramdisk0 root-mount path picks it up, and reserve its pages
+     * (they're inside the usable RAM regions above) so the PMM won't hand
+     * them out before ramdisk_init copies/claims them. Mirrors the Limine
+     * ingest's module[0] handling; main.c reclaims them via
+     * pmm_unreserve_region after ramdisk_init, same as the Limine path. */
+    {
+        uint64_t istart = 0, iend = 0;
+        if (fdt_initrd(&istart, &iend) && iend > istart) {
+            s_module_phys = istart;
+            s_module_size = iend - istart;
+            arm64_reserved[0].base = istart & ~0xFFFUL;
+            arm64_reserved[0].len  = ((iend + 0xFFF) & ~0xFFFUL) - arm64_reserved[0].base;
+            if (region_count < MAX_REGIONS) {
+                regions[region_count] = arm64_reserved[0];
+                region_count++;
+            }
+        }
+    }
 }
