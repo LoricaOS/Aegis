@@ -196,7 +196,11 @@ arm64_irq(cpu_state_t *s)
 #endif
             gic_eoi(intid);             /* EOI first: sched_tick may switch */
             timer_irq();
-        } else if (intid == 33) {
+#ifdef AEGIS_BOOT_NATIVE
+        } else if (intid == 153) {      /* Pi5 debug PL011 RX (DTB SPI 0x79) */
+#else
+        } else if (intid == 33) {       /* QEMU virt PL011 RX */
+#endif
             gic_eoi(intid);
             uart_rx_irq();
         } else {

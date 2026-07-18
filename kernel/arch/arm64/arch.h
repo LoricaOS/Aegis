@@ -271,4 +271,23 @@ static inline void arch_wait_for_irq(void)
 
 static inline int arch_early_key_held(void) { return 0; }
 
+/* arch_dcache_civac_range — clean+invalidate a data range to the Point of
+ * Coherency. Needed when consuming DRAM written by a NON-coherent agent (the
+ * Pi's VideoCore/VPU stages the netboot kernel + rootfs into RAM and does not
+ * snoop the A76 caches) through a cacheable mapping: without it the CPU may
+ * return speculatively-filled or stale cache lines instead of the producer's
+ * actual writes -- an intermittent, position-dependent corruption over any
+ * span larger than the cache. `civac` (clean AND invalidate) is the safe
+ * choice (harmless on a clean line, leaves nothing stale); 64 bytes is the
+ * A76 DminLine/CWG. */
+static inline void
+arch_dcache_civac_range(const void *addr, uint64_t len)
+{
+    uint64_t p   = (uint64_t)(uintptr_t)addr & ~63UL;
+    uint64_t end = (uint64_t)(uintptr_t)addr + len;
+    for (; p < end; p += 64)
+        __asm__ volatile("dc civac, %0" : : "r"(p) : "memory");
+    __asm__ volatile("dsb sy\n\tisb" ::: "memory");
+}
+
 #endif /* ARCH_H */

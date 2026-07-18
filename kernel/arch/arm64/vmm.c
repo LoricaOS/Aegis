@@ -325,11 +325,20 @@ vmm_init(void)
     /* 5. Go live: load TTBR1, nuke every stale entry. TTBR0 is left on
      * start.c's early device idmap — the PL011 printks below still go
      * through it (main.c repoints serial at the DMAP right after we
-     * return, and the first vmm_switch_to replaces TTBR0 for good). */
+     * return, and the first vmm_switch_to replaces TTBR0 for good).
+     *
+     * The leading `dsb ish` is REQUIRED (not the trailing one): all the block-
+     * PTE stores in steps 1-4 above (written via the direct pv() pointer, not
+     * ordered by anything yet) must be observable to the table walker BEFORE
+     * `msr ttbr1_el1` points the walker at `root` -- otherwise the walker may
+     * begin (possibly speculative) walks against not-yet-completed table
+     * memory. A trailing dsb does not retroactively close that window. Real
+     * defect on the A76: fits an intermittent hang right after "step 3 done". */
     s_ttbr1_phys = root;
     __asm__ volatile(
+        "dsb ish\n\t"               /* table stores observable before the switch */
         "msr ttbr1_el1, %0\n\t"
-        "dsb ish\n\t"
+        "isb\n\t"
         "tlbi vmalle1\n\t"
         "dsb ish\n\t"
         "isb"

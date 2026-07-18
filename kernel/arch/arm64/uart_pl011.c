@@ -88,10 +88,9 @@ static uint32_t s_head, s_tail;         /* head = write, tail = read */
 static uint32_t s_tty_pgrp;
 static uint32_t s_rx_count;             /* /proc/kbdstat serial counter */
 
-/* uart_rx_irq — drain the RX FIFO into the ring; called from arm64_irq
- * (INTID 33). Wakes console readers like the x86 kbd ISR does. */
-void
-uart_rx_irq(void)
+/* drain_fifo — move any bytes waiting in the PL011 RX FIFO into the ring. */
+static void
+drain_fifo(void)
 {
     while (!(rd(UART_FR) & FR_RXFE)) {
         char c = (char)rd(UART_DR);
@@ -104,6 +103,14 @@ uart_rx_irq(void)
         }
         s_rx_count++;
     }
+}
+
+/* uart_rx_irq — drain the RX FIFO into the ring; called from arm64_irq.
+ * Wakes console readers like the x86 kbd ISR does. */
+void
+uart_rx_irq(void)
+{
+    drain_fifo();
     wr(UART_ICR, 1u << 4);
     waitq_wake_all(&g_console_waiters);
 }
@@ -117,6 +124,13 @@ kbd_init(void)
 int
 kbd_poll(char *out)
 {
+    /* Also poll the FIFO directly, not just the IRQ-filled ring: the console
+     * read path spins on kbd_poll + arch_wait_for_irq (woken every timer
+     * tick), so draining here makes serial input work even if the RX
+     * interrupt isn't being delivered. ponytail: no IRQ-vs-poll lock -- the
+     * FIFO is tiny and this is the console; add one if the RX IRQ and a
+     * concurrent poll ever both run hot. */
+    drain_fifo();
     if (s_tail == s_head)
         return 0;
     *out = s_ring[s_tail];
@@ -127,6 +141,7 @@ kbd_poll(char *out)
 int
 kbd_has_data(void)
 {
+    drain_fifo();
     return s_tail != s_head;
 }
 

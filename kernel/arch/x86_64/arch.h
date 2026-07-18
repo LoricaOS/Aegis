@@ -483,4 +483,11 @@ static inline int arch_early_key_held(void)
     return 0;
 }
 
+/* x86 DMA is cache-coherent; no maintenance needed when consuming DRAM
+ * written by another agent. (arm64 counterpart does a dc civac sweep.) */
+static inline void arch_dcache_civac_range(const void *addr, uint64_t len)
+{
+    (void)addr; (void)len;
+}
+
 #endif

@@ -2,6 +2,7 @@
 #include "blkdev.h"
 #include "kva.h"
 #include "printk.h"
+#include "arch.h"
 #include <stdint.h>
 
 static uint8_t *s_base;   /* KVA pointer to mapped module */
@@ -79,6 +80,15 @@ ramdisk_init(uint64_t phys_base, uint64_t size)
         printk("[RAMDISK] FAIL: cannot map rootfs module\n");
         return;
     }
+    /* The rootfs image was written to DRAM by a non-coherent agent (the Pi's
+     * VideoCore stages it there over netboot/TFTP and does not snoop the A76
+     * caches). We are about to read it through a cacheable mapping, so
+     * clean+invalidate the whole source range to the PoC first -- otherwise
+     * the CPU can return speculatively-filled/stale lines instead of the
+     * staged bytes, intermittently corrupting the fs (silent hangs in the
+     * ext2 walk, or elsewhere once the corruption lands in reused pages).
+     * No-op on cache-coherent hosts (x86). */
+    arch_dcache_civac_range(src, size);
     /* Zero-extend to the ext2's true size. The ISO ships a TRUNCATED rootfs
      * image — trailing free/zero ext2 blocks are dropped at build time to shrink
      * the ISO (the fs is one block group with 4 KiB blocks, so it has no backup

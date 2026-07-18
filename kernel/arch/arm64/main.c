@@ -69,6 +69,18 @@ native_arm_watchdog(void)
     *(volatile uint32_t *)(pm + 0x1c) =
         0x5a000000UL | (rstc & 0xffffffcfUL) | 0x00000020UL;         /* WRCFG_FULL_RESET */
 }
+
+/* Disable the watchdog (clear PM_RSTC WRCFG so a timeout takes no action).
+ * Called once we reach userland: the watchdog protects the (still flaky --
+ * intermittent nvme_init hang) boot by resetting+retrying, but must not fire
+ * during an interactive login session. */
+static void
+native_disable_watchdog(void)
+{
+    volatile uint8_t *pm = (volatile uint8_t *)arch_dmap(0x107d200000UL);
+    uint32_t rstc = *(volatile uint32_t *)(pm + 0x1c);
+    *(volatile uint32_t *)(pm + 0x1c) = 0x5a000000UL | (rstc & 0xffffffcfUL);
+}
 #endif
 
 /* (g_cow_fork / g_lazyfile / g_perfbench_mm are defined in
@@ -194,10 +206,20 @@ kernel_main_arm64(void)
 
     poll_sources_init();
     kbd_init();               /* PL011 RX console input                 */
-    gic_enable_spi(33);       /* UART0 interrupt                        */
+#ifdef AEGIS_BOOT_NATIVE
+    gic_enable_spi(153);      /* Pi5 debug PL011 RX: DTB SPI 0x79 (+32) */
+#else
+    gic_enable_spi(33);       /* QEMU virt PL011 UART0 interrupt        */
+#endif
     random_init();
     pcie_init();              /* ECAM enumerate — [PCIE] OK or skip     */
 #ifdef AEGIS_BOOT_NATIVE
+    /* TEMP: the Pi 5 PCIe/NVMe bring-up still has an intermittent hang, and
+     * the rootfs comes from the initramfs (not nvme), so the clean interactive
+     * boot (no NATIVE_TEST_STOP) SKIPS storage to reach a reliable login.
+     * Storage still runs in the NATIVE_TEST_STOP debug builds where the flaky
+     * hang is being worked. Re-enable unconditionally once it's fixed. */
+#if defined(AEGIS_NATIVE_TEST_STOP)
     pcie_brcmstb_init();      /* real Pi 5: Broadcom RC bring-up (pcie1) */
 #if defined(AEGIS_NATIVE_TEST_STOP) && AEGIS_NATIVE_TEST_STOP == 6
     /* TEMPORARY (native-boot bring-up): isolate the brand-new Broadcom
@@ -216,6 +238,7 @@ kernel_main_arm64(void)
      * Normal-NC after the native MAIR fix). */
     nvme_set_dma_noncoherent(1);
     nvme_init();              /* bind NVMe on the Broadcom RC → blkdev */
+#endif /* storage gated on AEGIS_NATIVE_TEST_STOP (TEMP: flaky hang) */
 #if defined(AEGIS_NATIVE_TEST_STOP) && AEGIS_NATIVE_TEST_STOP <= 7
     /* DIAGNOSTIC (temporary): prove real block I/O + GPT parsing on nvme0.
      * Read LBA0 (protective MBR: 0x55AA at 0x1FE) and LBA1 (GPT header:
@@ -309,7 +332,9 @@ kernel_main_arm64(void)
         for (uint32_t c = 1; c < g_cpu_count; c++)
             sched_spawn_idle_for(c, task_idle);
 #if defined(AEGIS_BOOT_NATIVE) && defined(AEGIS_NATIVE_TEST_STOP)
-    native_arm_watchdog();    /* fresh ~16s so vigil has time to start   */
+    /* Reached userland: disable the boot watchdog so it can't fire during an
+     * interactive login (it did its job protecting the flaky nvme_init boot). */
+    native_disable_watchdog();
 #endif
     proc_spawn_init();        /* exec /bin/vigil from the rootfs        */
 
