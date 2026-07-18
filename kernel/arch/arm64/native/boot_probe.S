@@ -248,8 +248,15 @@ _kernel_entry:
     mov     x14, #(PTE_V | PTE_AF | PTE_SH)
     str     x14, [x13, #(510 * 8)]
 
-    /* MAIR: Attr0 = Normal WB, Attr1 = Device-nGnRnE */
-    ldr     x1, =0x00000000000000FF
+    /* MAIR: match the Limine path (start.c MAIR_VALUE) exactly, so the
+     * AttrIdx encodings in arch_vmm.h mean the same thing on both boot
+     * paths -- Attr0=0xFF Normal-WB (idx0), Attr1=0x04 Device-nGnRE (idx1),
+     * Attr2=0x44 Normal-NC (idx2). The old 0xFF value left idx1 as
+     * Device-nGnRnE and, critically, idx2 as Device instead of Normal-NC,
+     * so VMM_FLAG_WC mappings (kva_alloc_pages_low_nc for non-coherent DMA)
+     * came out Device -- which the NVMe driver's normal buffer accesses
+     * (memset/struct writes) hang on. */
+    ldr     x1, =0x00000000004404FF
     msr     mair_el1, x1
 
     /* TCR: T0SZ=16, T1SZ=16, 4K granule both, inner shareable, WB alloc,
