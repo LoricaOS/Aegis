@@ -27,7 +27,7 @@
 #include <stdint.h>
 
 #define RP1_BAR1_PHYS      0x1f00000000UL
-#define RP1_WINDOW_PAGES   0x100          /* 1 MiB — covers SYSINFO..PADS (0xf0000) */
+#define RP1_WINDOW_PAGES   0x400          /* 4 MiB — the full BAR1 (reaches dwc3 @ 0x200000) */
 
 #define RP1_SYSINFO_BASE   0x000000
 #define RP1_CHIP_ID_OFF    0x00
@@ -75,6 +75,22 @@ rp1_fan_full(void)
     printk("[RP1] fan: GPIO45 low (full speed, inverted line)\n");
 }
 
+/* dwc3 host controllers (RP1 offsets 0x200000/0x300000). xHCI regs at the
+ * controller base (+0), dwc3 globals at +0xc100 (GSNPSID @ +0xc120 reads the
+ * Synopsys core id 0x5533xxxx). Step-0 USB probe: confirm the dwc3 answers
+ * through the window before attempting host-mode bring-up. */
+#define RP1_USB0        0x200000
+#define DWC3_GSNPSID    0xc120
+
+static void
+rp1_usb_probe(void)
+{
+    uint32_t snpsid = rp1_r(RP1_USB0 + DWC3_GSNPSID);
+    uint32_t cap    = rp1_r(RP1_USB0 + 0x00);         /* xHCI CAPLENGTH/HCIVERSION */
+    printk("[RP1] usb0: dwc3 GSNPSID=0x%x  xhci CAPLENGTH=0x%x HCIVERSION=0x%x\n",
+           snpsid, cap & 0xffu, (cap >> 16) & 0xffffu);
+}
+
 /* rp1_init — map the BAR1 window and verify the chip is reachable. Leaves
  * s_rp1 set on success so later peripheral bring-up (fan/USB/eth) can reuse it.
  * Returns 1 if the RP1 answered with a known chip id, 0 otherwise. */
@@ -99,6 +115,7 @@ rp1_init(void)
         printk("[RP1] OK: CHIP_ID 0x%x — reachable over PCIe (firmware-configured)\n",
                id);
         rp1_fan_full();       /* thermal relief now that the RP1 is reachable */
+        rp1_usb_probe();      /* step-0: is the dwc3 USB controller reachable? */
         return 1;
     }
 
