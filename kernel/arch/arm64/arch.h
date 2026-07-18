@@ -67,6 +67,7 @@ typedef struct {
 } arch_fb_info_t;
 
 int arch_get_fb_info(arch_fb_info_t *out);
+void arch_native_set_fb(uint64_t addr, uint32_t w, uint32_t h, uint32_t pitch);
 int arch_get_module(uint64_t *phys_out, uint64_t *size_out);
 int arch_get_module2(uint64_t *phys_out, uint64_t *size_out);
 const char *arch_get_cmdline(void);

@@ -43,6 +43,8 @@ void arm64_map_early_uart(void);
 void uaccess_selftest(void);
 void pcie_brcmstb_init(void);
 void nvme_init(void);
+void pi5_fb_init(void);        /* native/vc_mailbox_fb.c — VideoCore framebuffer */
+void pi5_thermal_report(void); /* native/pi5_thermal.c — SoC temp via AVS monitor */
 void nvme_set_dma_offset(uint64_t off);
 void nvme_set_dma_noncoherent(int nc);
 
@@ -196,7 +198,11 @@ kernel_main_arm64(void)
     for (;;) { __asm__ volatile("wfi"); }
 #endif
 
-    fb_init();                /* silent when Limine gave no framebuffer */
+#ifdef AEGIS_BOOT_NATIVE
+    pi5_fb_init();            /* ask the VideoCore for a linear FB (real Pi 5) */
+    pi5_thermal_report();     /* SoC temperature (AVS monitor) */
+#endif
+    fb_init();                /* silent when no framebuffer provided */
     cap_init();
     gic_init();
     timer_init();

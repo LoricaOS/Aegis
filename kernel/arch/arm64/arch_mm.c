@@ -123,6 +123,25 @@ arch_get_fb_info(arch_fb_info_t *out)
     return 1;
 }
 
+/* arch_native_set_fb — publish a framebuffer discovered at runtime (the native
+ * VideoCore-mailbox path in vc_mailbox_fb.c; the Limine path fills s_fb_info in
+ * arch_mm_ingest). Same geometry validation as the ingest path — untrusted
+ * firmware reply, must not let pitch*height wrap or under-map the FB. */
+void
+arch_native_set_fb(uint64_t addr, uint32_t w, uint32_t h, uint32_t pitch)
+{
+    if (addr && w && w <= FB_MAX_WIDTH && h && h <= FB_MAX_HEIGHT &&
+        pitch && pitch <= FB_MAX_PITCH && pitch >= w * 4u &&
+        (uint64_t)pitch * h <= UINT64_MAX - addr) {
+        s_fb_info.addr   = addr;
+        s_fb_info.pitch  = pitch;
+        s_fb_info.width  = w;
+        s_fb_info.height = h;
+        s_fb_info.bpp    = 32;
+        s_fb_info.type   = 1;
+    }
+}
+
 int
 arch_get_module(uint64_t *phys_out, uint64_t *size_out)
 {
