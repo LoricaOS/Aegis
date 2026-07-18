@@ -46,7 +46,15 @@ _Static_assert(sizeof(aegis_process_t) <= 2 * 4096,
  * userland (Linux model). proc_spawn_init() reads /bin/vigil from the
  * already-mounted rootfs (ramdisk module → ext2, mounted in kernel_main
  * before this runs) and spawns it. See proc_spawn_init below. */
+#ifdef AEGIS_NATIVE_REPRO
+/* Auto-repro build (Makefile.pi5native NATIVE_REPRO=1): boot straight into a
+ * login shell instead of vigil, so main.c can drive the reported userland
+ * crash path (shell fork+execve of uname/cat/ls) via kbd_inject — no human at
+ * the console. Everything else (fd 0/1/2 = console, argv, auxv) is identical. */
+#define INIT_PATH "/bin/sh"
+#else
 #define INIT_PATH "/bin/vigil"
+#endif
 
 
 /* 16KB kernel stack for the user process (4 pages, matching sched task stacks).

@@ -12,6 +12,7 @@
  */
 
 #include "arch.h"
+#include "kbd.h"     /* kbd_inject — auto-repro console feed (NATIVE_REPRO) */
 #include "printk.h"
 #include "bootinfo.h"
 #include "cap.h"
@@ -45,7 +46,8 @@ void nvme_init(void);
 void nvme_set_dma_offset(uint64_t off);
 void nvme_set_dma_noncoherent(int nc);
 
-#if defined(AEGIS_BOOT_NATIVE) && defined(AEGIS_NATIVE_TEST_STOP)
+#if defined(AEGIS_BOOT_NATIVE) && \
+    (defined(AEGIS_NATIVE_TEST_STOP) || defined(AEGIS_NATIVE_REPRO))
 /* TEMPORARY (native-boot bring-up autonomy): arm the BCM2712 PM watchdog so
  * ANY hang self-recovers into a fresh TFTP-netboot -- it fires independent of
  * the (possibly wedged) CPU, unlike a PSCI self-reset. This is what makes the
@@ -73,7 +75,10 @@ native_arm_watchdog(void)
 /* Disable the watchdog (clear PM_RSTC WRCFG so a timeout takes no action).
  * Called once we reach userland: the watchdog protects the (still flaky --
  * intermittent nvme_init hang) boot by resetting+retrying, but must not fire
- * during an interactive login session. */
+ * during an interactive login session. Only the TEST_STOP path disables it;
+ * the REPRO path deliberately leaves it armed so the board self-resets after
+ * the repro output, closing the build->log->build loop with no power cycle. */
+#if defined(AEGIS_NATIVE_TEST_STOP)
 static void
 native_disable_watchdog(void)
 {
@@ -81,6 +86,7 @@ native_disable_watchdog(void)
     uint32_t rstc = *(volatile uint32_t *)(pm + 0x1c);
     *(volatile uint32_t *)(pm + 0x1c) = 0x5a000000UL | (rstc & 0xffffffcfUL);
 }
+#endif
 #endif
 
 /* (g_cow_fork / g_lazyfile / g_perfbench_mm are defined in
@@ -160,7 +166,8 @@ kernel_main_arm64(void)
     vmm_init();               /* TTBR1 kernel tables + DMAP go live     */
     serial_set_base(arch_dmap(arch_mm_get_uart_phys()));  /* off the early idmap */
 
-#if defined(AEGIS_BOOT_NATIVE) && defined(AEGIS_NATIVE_TEST_STOP)
+#if defined(AEGIS_BOOT_NATIVE) && \
+    (defined(AEGIS_NATIVE_TEST_STOP) || defined(AEGIS_NATIVE_REPRO))
     /* Arm the hardware watchdog as early as the DMAP allows, so a hang
      * anywhere past here (driver bring-up especially) self-recovers into a
      * fresh netboot ~16s later without any human touch. */
@@ -336,7 +343,27 @@ kernel_main_arm64(void)
      * interactive login (it did its job protecting the flaky nvme_init boot). */
     native_disable_watchdog();
 #endif
-    proc_spawn_init();        /* exec /bin/vigil from the rootfs        */
+    proc_spawn_init();        /* exec INIT_PATH (/bin/vigil, or /bin/sh on REPRO) */
+
+#if defined(AEGIS_BOOT_NATIVE) && defined(AEGIS_NATIVE_REPRO)
+    /* Auto-repro (NATIVE_REPRO=1): INIT_PATH is /bin/sh, spawned above with
+     * fd 0 = console. Pre-load the reported crash sequence into the PL011 RX
+     * ring so the shell forks+execve's uname/cat/ls exactly as a human at the
+     * login shell would — no keyboard, no power cycle. The bytes wait in the
+     * ring until sh drains stdin. Three unames back-to-back answer the open
+     * question: identical ELR/FAR each time = a real syscall/process-setup
+     * bug; addresses that move = residual rootfs cache corruption. cat/ls show
+     * whether the fault is uname-specific or hits every fork+execve'd binary.
+     * Watchdog stays armed (never disabled on this path) → self-reset ~16s
+     * after the output, closing the build→log→build loop hands-free. Keep the
+     * string < RX_RING (256B). */
+    {
+        static const char repro[] =
+            "uname\nuname\nuname\ncat /etc/issue\nls /\necho AEGIS_REPRO_END\n";
+        for (const char *c = repro; *c; c++)
+            kbd_inject(*c);
+    }
+#endif
 
     vmm_teardown_identity();  /* oracle line; nothing to tear down      */
 

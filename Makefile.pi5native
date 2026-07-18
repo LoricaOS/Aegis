@@ -57,6 +57,16 @@ CFLAGS = \
 ifneq ($(NATIVE_TEST_STOP),)
 CFLAGS += -DAEGIS_NATIVE_TEST_STOP=$(NATIVE_TEST_STOP)
 endif
+# NATIVE_REPRO=1 (optional): auto-repro build for the userland-crash hunt.
+# Boots straight into /bin/sh (not vigil) and feeds it "uname;uname;uname;
+# cat /etc/issue;ls /" via the kernel's console-inject, reproducing the
+# reported shell fork+execve crash with no human at the keyboard. Arms the
+# watchdog and never disables it, so the board self-resets ~16s later and
+# re-netboots — the build→read-log→build loop runs unattended. Skips storage
+# (does not set NATIVE_TEST_STOP), so the flaky nvme_init hang stays out.
+ifneq ($(NATIVE_REPRO),)
+CFLAGS += -DAEGIS_NATIVE_REPRO
+endif
 
 LDFLAGS = -T kernel/arch/arm64/native/linker-pi5-native.ld -nostdlib
 
