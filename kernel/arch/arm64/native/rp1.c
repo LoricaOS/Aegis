@@ -145,6 +145,71 @@ gem_mdio_write(uint8_t phy, uint8_t reg, uint16_t val)
     gem_mdio_wait();
 }
 
+/* RP1 GEM DMA offset: the firmware's own netboot GEM log showed rx_q_base
+ * 0xfc3203c0 vs pointer 0x3c3205f0 — a 0xc0000000 delta — so the inbound window
+ * firmware left up maps CPU X -> bus X+0xc0000000 (not the +0x10_00000000 the
+ * NVMe RC uses). Tunable — this is the crux of the GEM RX addressing. */
+#define RP1_DMA_OFFSET    0xC0000000ULL
+#define GEM_DMACFG        0x010
+#define MACB_RBQP         0x018
+#define GEM_RBQPH         0x4D4
+#define RX_DESCS          8
+#define RX_BUFSZ          4096             /* one buffer per page (kva_page_phys = page base) */
+
+/* rp1_eth_rx_test — bring up a minimal RX path and try to catch one frame off
+ * the LAN's broadcast traffic (proves the GEM's non-coherent DMA works). Ring +
+ * buffers are Normal-NC (uncached, so no cache maintenance vs the GEM's writes);
+ * every address handed to the GEM carries the +0x10_00000000 inbound offset and
+ * uses 64-bit addressing (ADDR64) since that puts it past 32 bits. */
+static void
+rp1_eth_rx_test(void)
+{
+    volatile uint32_t *ring = (volatile uint32_t *)kva_alloc_pages_low_nc(1);
+    uint8_t *bufs = (uint8_t *)kva_alloc_pages_low_nc(RX_DESCS);   /* 8 pages, 1 buf each */
+    if (!ring || !bufs) { printk("[RP1] eth: RX alloc failed\n"); return; }
+
+    uint64_t ring_dma = kva_page_phys((void *)ring) + RP1_DMA_OFFSET;
+    for (int i = 0; i < RX_DESCS; i++) {
+        uint64_t bd = kva_page_phys(bufs + (uint64_t)i * RX_BUFSZ) + RP1_DMA_OFFSET;
+        ring[i*4 + 0] = (uint32_t)bd | (i == RX_DESCS - 1 ? 0x2u : 0u); /* USED=0, WRAP last */
+        ring[i*4 + 1] = 0;                                             /* status */
+        ring[i*4 + 2] = (uint32_t)(bd >> 32);                          /* addr high */
+        ring[i*4 + 3] = 0;
+    }
+    arch_dcache_civac_range((void *)ring, RX_DESCS * 16);  /* push ring to DRAM */
+    __asm__ volatile("dsb sy" ::: "memory");   /* ring writes visible before RX on */
+    rp1_w(RP1_ETH_BASE + 0x020, 0xF);          /* clear stale RSR (firmware netboot) */
+
+    /* burst16, RXBS=4096/64=0x40, full pkt buffers, ADDR64. */
+    rp1_w(RP1_ETH_BASE + GEM_DMACFG,
+          (1u << 30) | (0x40u << 16) | (3u << 11) | (1u << 10) | 0x10u);
+    rp1_w(RP1_ETH_BASE + MACB_RBQP, (uint32_t)ring_dma);
+    rp1_w(RP1_ETH_BASE + GEM_RBQPH, (uint32_t)(ring_dma >> 32));
+    /* Promiscuous (CAF bit4) so we catch everything; enable RX+TX+MPE. */
+    rp1_w(RP1_ETH_BASE + GEM_NCFGR, rp1_r(RP1_ETH_BASE + GEM_NCFGR) | (1u << 4));
+    rp1_w(RP1_ETH_BASE + GEM_NCR,
+          rp1_r(RP1_ETH_BASE + GEM_NCR) | (1u << 2) | (1u << 3) | (1u << 4));
+
+    int got = -1; uint32_t len = 0;
+    for (int t = 0; t < 200 && got < 0; t++) {
+        /* Invalidate our cached view so we see the GEM's USED writeback (in case
+         * the ring memory isn't truly non-cacheable). */
+        arch_dcache_civac_range((void *)ring, RX_DESCS * 16);
+        for (int i = 0; i < RX_DESCS; i++)
+            if (ring[i*4 + 0] & 0x1u) { got = i; len = ring[i*4 + 1] & 0x1FFFu; break; }
+        rp1_delay_ms(10);
+    }
+    if (got >= 0)
+        printk("[RP1] eth: RX OK! frame in desc%d len=%u — GEM DMA works!\n", got, len);
+    else
+        printk("[RP1] eth: no RX (RSR=0x%x RBQP=0x%x/0x%x d0=%x,%x,%x ring_dma=0x%lx)\n",
+               rp1_r(RP1_ETH_BASE + 0x020),
+               rp1_r(RP1_ETH_BASE + GEM_RBQPH), rp1_r(RP1_ETH_BASE + MACB_RBQP),
+               ring[0], ring[1], ring[2], ring_dma);
+    /* Clear RSR sticky bits for a clean read next cycle. */
+    rp1_w(RP1_ETH_BASE + 0x020, 0xF);
+}
+
 /* rp1_eth_probe — step-0 for Ethernet: enable the GEM's clock gates (unlike USB,
  * the Ethernet clocks may be off at handoff) and dump identification registers
  * to confirm the Cadence GEM is reachable + clocked. */
@@ -167,6 +232,8 @@ rp1_eth_probe(void)
     uint16_t bmsr = gem_mdio_read(ETH_PHY_ADDR, 1);
     printk("[RP1] eth: PHY@%u id=0x%x%x BMSR=0x%x link=%u autoneg_done=%u\n",
            ETH_PHY_ADDR, id1, id2, bmsr, (bmsr >> 2) & 1u, (bmsr >> 5) & 1u);
+    if (bmsr & (1u << 2))              /* link up → try to receive a frame */
+        rp1_eth_rx_test();
 }
 
 /* rp1_init — map the BAR1 window and verify the chip is reachable. Leaves
