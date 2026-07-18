@@ -67,6 +67,14 @@ endif
 ifneq ($(NATIVE_REPRO),)
 CFLAGS += -DAEGIS_NATIVE_REPRO
 endif
+# NATIVE_WATCHDOG=1: arm the BCM2712 watchdog for a hands-free self-reset dev
+# loop, but boot NORMALLY (vigil -> login, no sh-init, no kbd_inject spam).
+# Board self-resets ~16s after the watchdog arms (early boot), so any probe
+# that prints before then (rp1_init etc.) is captured each cycle. For iterating
+# RP1 peripheral bring-up (eth/usb) without power-cycling.
+ifneq ($(NATIVE_WATCHDOG),)
+CFLAGS += -DAEGIS_NATIVE_WATCHDOG
+endif
 
 LDFLAGS = -T kernel/arch/arm64/native/linker-pi5-native.ld -nostdlib
 

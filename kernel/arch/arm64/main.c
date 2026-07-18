@@ -50,7 +50,8 @@ void nvme_set_dma_offset(uint64_t off);
 void nvme_set_dma_noncoherent(int nc);
 
 #if defined(AEGIS_BOOT_NATIVE) && \
-    (defined(AEGIS_NATIVE_TEST_STOP) || defined(AEGIS_NATIVE_REPRO))
+    (defined(AEGIS_NATIVE_TEST_STOP) || defined(AEGIS_NATIVE_REPRO) || \
+     defined(AEGIS_NATIVE_WATCHDOG))
 /* TEMPORARY (native-boot bring-up autonomy): arm the BCM2712 PM watchdog so
  * ANY hang self-recovers into a fresh TFTP-netboot -- it fires independent of
  * the (possibly wedged) CPU, unlike a PSCI self-reset. This is what makes the
@@ -170,7 +171,8 @@ kernel_main_arm64(void)
     serial_set_base(arch_dmap(arch_mm_get_uart_phys()));  /* off the early idmap */
 
 #if defined(AEGIS_BOOT_NATIVE) && \
-    (defined(AEGIS_NATIVE_TEST_STOP) || defined(AEGIS_NATIVE_REPRO))
+    (defined(AEGIS_NATIVE_TEST_STOP) || defined(AEGIS_NATIVE_REPRO) || \
+     defined(AEGIS_NATIVE_WATCHDOG))
     /* Arm the hardware watchdog as early as the DMAP allows, so a hang
      * anywhere past here (driver bring-up especially) self-recovers into a
      * fresh netboot ~16s later without any human touch. */

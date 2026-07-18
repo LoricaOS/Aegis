@@ -91,6 +91,84 @@ rp1_usb_probe(void)
            snpsid, cap & 0xffu, (cap >> 16) & 0xffffu);
 }
 
+/* RP1 clocks bank (per-peripheral gates; PLLs already locked by firmware). */
+#define RP1_CLOCKS        0x018000
+#define CLK_ETH_CTRL      0x064
+#define CLK_ETH_TSU_CTRL  0x134
+#define CLK_CTRL_ENABLE   (1u << 11)
+#define RP1_ETH_BASE      0x100000   /* Cadence GEM (cdns,macb) */
+#define GEM_NCR           0x000      /* Network Control */
+#define GEM_NCFGR         0x004      /* Network Config */
+#define GEM_MID           0x0FC      /* Module ID (IDNUM=0x2 => GEM) */
+#define GEM_DCFG1         0x280      /* Design Config Register 1 */
+#define GEM_NSR           0x008      /* Network Status; bit2 = MDIO IDLE */
+#define GEM_MAN           0x034      /* PHY Maintenance (MDIO) */
+#define ETH_PHY_ADDR      1          /* ethernet-phy@1 (DTB) */
+
+/* rp1_delay_ms — busy-wait using the physical counter (self-contained). */
+static void
+rp1_delay_ms(uint32_t ms)
+{
+    uint64_t freq, start, now;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(start));
+    uint64_t target = start + (freq * ms) / 1000u;
+    do { __asm__ volatile("mrs %0, cntpct_el0" : "=r"(now)); } while (now < target);
+}
+
+/* gem_mdio_wait — spin until the MDIO PHY-maintenance op finishes (NSR.IDLE). */
+static void
+gem_mdio_wait(void)
+{
+    for (int i = 0; i < 1000000; i++)
+        if (rp1_r(RP1_ETH_BASE + GEM_NSR) & (1u << 2))
+            break;
+}
+
+/* gem_mdio_read/write — Clause-22 MDIO via the GEM MAN register. */
+static uint16_t
+gem_mdio_read(uint8_t phy, uint8_t reg)
+{
+    rp1_w(RP1_ETH_BASE + GEM_MAN,
+          (1u << 30) | (2u << 28) | ((phy & 0x1Fu) << 23) |
+          ((reg & 0x1Fu) << 18) | (2u << 16));       /* SOF=01, OP=10(read) */
+    gem_mdio_wait();
+    return (uint16_t)(rp1_r(RP1_ETH_BASE + GEM_MAN) & 0xFFFFu);
+}
+
+static void
+gem_mdio_write(uint8_t phy, uint8_t reg, uint16_t val)
+{
+    rp1_w(RP1_ETH_BASE + GEM_MAN,
+          (1u << 30) | (1u << 28) | ((phy & 0x1Fu) << 23) |
+          ((reg & 0x1Fu) << 18) | (2u << 16) | val);  /* SOF=01, OP=01(write) */
+    gem_mdio_wait();
+}
+
+/* rp1_eth_probe — step-0 for Ethernet: enable the GEM's clock gates (unlike USB,
+ * the Ethernet clocks may be off at handoff) and dump identification registers
+ * to confirm the Cadence GEM is reachable + clocked. */
+static void
+rp1_eth_probe(void)
+{
+    rp1_w(RP1_CLOCKS + CLK_ETH_CTRL,     rp1_r(RP1_CLOCKS + CLK_ETH_CTRL)     | CLK_CTRL_ENABLE);
+    rp1_w(RP1_CLOCKS + CLK_ETH_TSU_CTRL, rp1_r(RP1_CLOCKS + CLK_ETH_TSU_CTRL) | CLK_CTRL_ENABLE);
+    printk("[RP1] eth: MID=0x%x NCR=0x%x NCFGR=0x%x DCFG1=0x%x\n",
+           rp1_r(RP1_ETH_BASE + GEM_MID),   rp1_r(RP1_ETH_BASE + GEM_NCR),
+           rp1_r(RP1_ETH_BASE + GEM_NCFGR), rp1_r(RP1_ETH_BASE + GEM_DCFG1));
+    uint16_t id1 = gem_mdio_read(ETH_PHY_ADDR, 2);   /* PHYID1 */
+    uint16_t id2 = gem_mdio_read(ETH_PHY_ADDR, 3);   /* PHYID2 */
+    /* Firmware tears the network down after netboot ("Stopping network"), so
+     * the link is dropped at handoff. Restart auto-negotiation (BMCR: ANEG
+     * enable bit12 + restart bit9) and give it time to complete. */
+    gem_mdio_write(ETH_PHY_ADDR, 0, 0x1200);
+    rp1_delay_ms(4000);
+    (void)gem_mdio_read(ETH_PHY_ADDR, 1);            /* BMSR link bit latches low */
+    uint16_t bmsr = gem_mdio_read(ETH_PHY_ADDR, 1);
+    printk("[RP1] eth: PHY@%u id=0x%x%x BMSR=0x%x link=%u autoneg_done=%u\n",
+           ETH_PHY_ADDR, id1, id2, bmsr, (bmsr >> 2) & 1u, (bmsr >> 5) & 1u);
+}
+
 /* rp1_init — map the BAR1 window and verify the chip is reachable. Leaves
  * s_rp1 set on success so later peripheral bring-up (fan/USB/eth) can reuse it.
  * Returns 1 if the RP1 answered with a known chip id, 0 otherwise. */
@@ -116,6 +194,7 @@ rp1_init(void)
                id);
         rp1_fan_full();       /* thermal relief now that the RP1 is reachable */
         rp1_usb_probe();      /* step-0: is the dwc3 USB controller reachable? */
+        rp1_eth_probe();      /* step-0: is the Cadence GEM reachable + clocked? */
         return 1;
     }
 
