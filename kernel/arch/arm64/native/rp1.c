@@ -171,12 +171,15 @@ gem_mdio_write(uint8_t phy, uint8_t reg, uint16_t val)
 #define GEM_SA1T     0x09C
 #define NCR_TSTART   (1u << 9)
 
+#define TX_DESCS     4            /* >1 so the GEM's wrap-prefetch hits a USED desc */
+
 static struct {
     volatile uint32_t *rx_ring;   /* RX_DESCS * 16B (Normal-NC) */
     uint8_t           *rx_bufs;   /* RX_DESCS pages, one buffer each */
     uint32_t           rx_head;
-    volatile uint32_t *tx_ring;   /* 1 descriptor */
-    uint8_t           *tx_buf;
+    volatile uint32_t *tx_ring;   /* TX_DESCS * 16B */
+    uint8_t           *tx_bufs;   /* TX_DESCS pages */
+    uint32_t           tx_prod;
     netdev_t           dev;
 } s_gem;
 
@@ -207,16 +210,21 @@ gem_send(netdev_t *dev, const void *pkt, uint16_t len)
 {
     (void)dev;
     if (len < 14 || len > RX_BUFSZ) return -1;
-    for (int t = 0; t < 200000; t++)               /* prev TX done (USED set)? */
-        if (s_gem.tx_ring[1] & (1u << 31)) break;
-    __builtin_memcpy(s_gem.tx_buf, pkt, len);
-    uint64_t bd = kva_page_phys(s_gem.tx_buf) + RP1_DMA_OFFSET;
-    s_gem.tx_ring[0] = (uint32_t)bd;
-    s_gem.tx_ring[2] = (uint32_t)(bd >> 32);
-    s_gem.tx_ring[3] = 0;
-    s_gem.tx_ring[1] = (uint32_t)len | (1u << 15) | (1u << 30);  /* len|LAST|WRAP, USED=0 */
+    uint32_t i = s_gem.tx_prod;
+    for (int t = 0; t < 200000; t++)               /* this slot free (USED set)? */
+        if (s_gem.tx_ring[i*4 + 1] & (1u << 31)) break;
+    uint8_t *buf = s_gem.tx_bufs + (uint64_t)i * RX_BUFSZ;
+    __builtin_memcpy(buf, pkt, len);
+    uint64_t bd = kva_page_phys(buf) + RP1_DMA_OFFSET;
+    s_gem.tx_ring[i*4 + 0] = (uint32_t)bd;
+    s_gem.tx_ring[i*4 + 2] = (uint32_t)(bd >> 32);
+    s_gem.tx_ring[i*4 + 3] = 0;
+    /* len | LAST, USED=0 (hand to GEM); WRAP only on the last ring slot. */
+    s_gem.tx_ring[i*4 + 1] = (uint32_t)len | (1u << 15) |
+                             (i == TX_DESCS - 1 ? (1u << 30) : 0u);
     __asm__ volatile("dsb sy" ::: "memory");
     rp1_w(RP1_ETH_BASE + GEM_NCR, rp1_r(RP1_ETH_BASE + GEM_NCR) | NCR_TSTART);
+    s_gem.tx_prod = (i + 1) % TX_DESCS;
     return 0;
 }
 
@@ -228,11 +236,12 @@ gem_setup(void)
     s_gem.rx_ring = (volatile uint32_t *)kva_alloc_pages_low_nc(1);
     s_gem.rx_bufs = (uint8_t *)kva_alloc_pages_low_nc(RX_DESCS);
     s_gem.tx_ring = (volatile uint32_t *)kva_alloc_pages_low_nc(1);
-    s_gem.tx_buf  = (uint8_t *)kva_alloc_pages_low_nc(1);
-    if (!s_gem.rx_ring || !s_gem.rx_bufs || !s_gem.tx_ring || !s_gem.tx_buf) {
+    s_gem.tx_bufs = (uint8_t *)kva_alloc_pages_low_nc(TX_DESCS);
+    if (!s_gem.rx_ring || !s_gem.rx_bufs || !s_gem.tx_ring || !s_gem.tx_bufs) {
         printk("[RP1] eth: netdev alloc failed\n"); return;
     }
     s_gem.rx_head = 0;
+    s_gem.tx_prod = 0;
 
     for (int i = 0; i < RX_DESCS; i++) {
         uint64_t bd = kva_page_phys(s_gem.rx_bufs + (uint64_t)i * RX_BUFSZ) + RP1_DMA_OFFSET;
@@ -241,12 +250,15 @@ gem_setup(void)
         s_gem.rx_ring[i*4 + 2] = (uint32_t)(bd >> 32);
         s_gem.rx_ring[i*4 + 3] = 0;
     }
-    /* TX ring: 1 descriptor, start USED=1 (SW owns) + WRAP so the GEM idles. */
-    uint64_t tb = kva_page_phys(s_gem.tx_buf) + RP1_DMA_OFFSET;
-    s_gem.tx_ring[0] = (uint32_t)tb;
-    s_gem.tx_ring[1] = (1u << 31) | (1u << 30);   /* USED | WRAP */
-    s_gem.tx_ring[2] = (uint32_t)(tb >> 32);
-    s_gem.tx_ring[3] = 0;
+    /* TX ring: all descriptors start USED=1 (SW owns, nothing to send); WRAP on
+     * the last so the GEM's ring pointer wraps but idles on USED descriptors. */
+    for (int i = 0; i < TX_DESCS; i++) {
+        uint64_t tb = kva_page_phys(s_gem.tx_bufs + (uint64_t)i * RX_BUFSZ) + RP1_DMA_OFFSET;
+        s_gem.tx_ring[i*4 + 0] = (uint32_t)tb;
+        s_gem.tx_ring[i*4 + 1] = (1u << 31) | (i == TX_DESCS - 1 ? (1u << 30) : 0u);
+        s_gem.tx_ring[i*4 + 2] = (uint32_t)(tb >> 32);
+        s_gem.tx_ring[i*4 + 3] = 0;
+    }
     __asm__ volatile("dsb sy" ::: "memory");
 
     uint64_t rd = kva_page_phys((void *)s_gem.rx_ring) + RP1_DMA_OFFSET;
@@ -266,7 +278,6 @@ gem_setup(void)
     uint32_t sat = s_gem.dev.mac[4] | ((uint32_t)s_gem.dev.mac[5] << 8);
     rp1_w(RP1_ETH_BASE + GEM_SA1B, sab);     /* program our unicast filter */
     rp1_w(RP1_ETH_BASE + GEM_SA1T, sat);     /* (writing SA1T activates it)  */
-    rp1_w(RP1_ETH_BASE + GEM_NCFGR, rp1_r(RP1_ETH_BASE + GEM_NCFGR) | (1u << 4)); /* CAF */
     rp1_w(RP1_ETH_BASE + GEM_NCR,
           rp1_r(RP1_ETH_BASE + GEM_NCR) | (1u << 2) | (1u << 3) | (1u << 4)); /* RE|TE|MPE */
 
