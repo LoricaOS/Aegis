@@ -290,4 +290,28 @@ arch_dcache_civac_range(const void *addr, uint64_t len)
     __asm__ volatile("dsb sy\n\tisb" ::: "memory");
 }
 
+/* arch_sync_icache_range — make freshly-written bytes safe to execute. ARM's
+ * instruction cache is NOT coherent with data stores (unlike x86): when
+ * execve/elf_load writes a program's code into physical frames via cacheable
+ * stores, the new instructions sit in the D-cache while the PIPT I-cache may
+ * still hold the PREVIOUS occupant's instructions for those (recycled) frames.
+ * Without this the CPU fetches stale/garbage code — undefined-instruction or
+ * wild data-abort faults that move from run to run depending on which frame was
+ * reused and what lingered in the I-cache. Clean the D-cache to the Point of
+ * Unification, then invalidate the I-cache for the same lines. `addr` may be
+ * any VA mapping the frames (elf_load passes its kernel kva view). 64B = A76
+ * I/DminLine. No-op on cache-coherent x86. */
+static inline void
+arch_sync_icache_range(const void *addr, uint64_t len)
+{
+    uint64_t start = (uint64_t)(uintptr_t)addr & ~63UL;
+    uint64_t end   = (uint64_t)(uintptr_t)addr + len;
+    for (uint64_t p = start; p < end; p += 64)
+        __asm__ volatile("dc cvau, %0" : : "r"(p) : "memory");  /* D → PoU     */
+    __asm__ volatile("dsb ish" ::: "memory");
+    for (uint64_t p = start; p < end; p += 64)
+        __asm__ volatile("ic ivau, %0" : : "r"(p) : "memory");  /* I inval PoU */
+    __asm__ volatile("dsb ish\n\tisb" ::: "memory");
+}
+
 #endif /* ARCH_H */

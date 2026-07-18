@@ -490,4 +490,11 @@ static inline void arch_dcache_civac_range(const void *addr, uint64_t len)
     (void)addr; (void)len;
 }
 
+/* x86 I-cache is coherent with data stores — no maintenance needed to execute
+ * freshly-written code. (arm64 counterpart does dc cvau + ic ivau.) */
+static inline void arch_sync_icache_range(const void *addr, uint64_t len)
+{
+    (void)addr; (void)len;
+}
+
 #endif
