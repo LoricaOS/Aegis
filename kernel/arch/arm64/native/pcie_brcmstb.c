@@ -416,16 +416,15 @@ set_outbound_window(uint32_t win, uint64_t phys, uint64_t pcie_addr, uint64_t si
     w32(PCIE_MEM_WIN0_LIMIT_HI(win), lh);
 }
 
-/* pcie_rp1_map_window — program a CPU->PCIe outbound window on the RP1's own
- * controller (pcie2 / domain 2, brcm,bcm2712-pcie node index 2) so the RP1's
- * BAR1 (PCIe address 0x0, per the DTB rp1 `ranges`) is reachable at CPU-phys
- * 0x1f_00000000. With `pciex4_reset=0` the firmware already trained this link
- * and enumerated the RP1, but left no usable outbound window for us -- a read
- * at 0x1f_00000000 returns the RC's 0xdeaddead poison. We add ONLY the window;
- * we deliberately do NOT reset/re-train the link (that would undo the firmware's
- * RP1 init and force a full cold bring-up). Self-contained (its own RC mapping +
- * register writes via the shared offset macros) so it can't disturb the pcie1/
- * NVMe path. Returns 1 on success. */
+/* pcie_rp1_map_window — bring up domain 2 (pcie@1000120000) far enough to reach
+ * the RP1's register window at CPU-phys 0x1f_00000000. Firmware (pciex4_reset=0)
+ * trained the link but left the RC bridge unenumerated for us, so we replicate
+ * the *usable-device* half of the NVMe bring-up (skip reset/link-train, which
+ * firmware did): present the RC as a PCI-PCI bridge, give it bus numbers so bus1
+ * exists, program the outbound window, enumerate the RP1, enable its decode +
+ * the bridge's memory-forwarding window. Reuses the exact NVMe helpers by
+ * pointing the shared s_base at pcie2's RC for the duration (saved/restored).
+ * Returns 1 if the RP1 (1de4:0001) enumerated. */
 int
 pcie_rp1_map_window(void)
 {
@@ -434,64 +433,56 @@ pcie_rp1_map_window(void)
         printk("[PCIE-BRCM] RP1: pcie2 node not found in DTB\n");
         return 0;
     }
-    volatile uint8_t *rc = (volatile uint8_t *)kva_map_mmio(base_phys, 16);
-    if (!rc) {
+    volatile uint8_t *rc2 = (volatile uint8_t *)kva_map_mmio(base_phys, 16);
+    if (!rc2) {
         printk("[PCIE-BRCM] RP1: pcie2 RC map failed\n");
         return 0;
     }
-#define RCW(off, v) (*(volatile uint32_t *)(rc + (off)) = (uint32_t)(v))
-#define RCR(off)    (*(volatile uint32_t *)(rc + (off)))
 
-    uint32_t st = RCR(PCIE_MISC_PCIE_STATUS);
-    if (!((st & STATUS_PCIE_DL_ACTIVE_MASK) && (st & STATUS_PCIE_PHYLINKUP_MASK))) {
-        printk("[PCIE-BRCM] RP1: pcie2 link DOWN (status=0x%x) — firmware didn't "
-               "train it (pciex4_reset!=0?)\n", st);
-        return 0;
+    volatile uint8_t *saved = s_base;
+    s_base = rc2;                          /* retarget the shared RC helpers */
+    int ok = 0;
+
+    uint32_t st = r32(PCIE_MISC_PCIE_STATUS);
+    if ((st & STATUS_PCIE_DL_ACTIVE_MASK) && (st & STATUS_PCIE_PHYLINKUP_MASK)) {
+        /* Present RC as a PCI-PCI bridge, give it bus numbers, open the window. */
+        uint32_t v = r32(PCIE_RC_CFG_PRIV1_ID_VAL3);
+        v = (v & ~(uint32_t)ID_VAL3_CLASS_CODE_MASK) | (uint32_t)BCM2712_CLASS_CODE;
+        w32(PCIE_RC_CFG_PRIV1_ID_VAL3, v);
+        program_bridge_bus_numbers(0, 1, 1);
+
+        uint32_t id = cfg_read32(1, 0, 0x00);
+        printk("[PCIE-BRCM] RP1: bus1 id=0x%x class=0x%x\n",
+               id, cfg_read32(1, 0, 0x08));
+        if ((id & 0xFFFFu) != 0xFFFFu) {
+            uint32_t bar1_raw = cfg_read32(1, 0, 0x14);
+            uint64_t bar1 = bar1_raw & ~0xFULL;   /* RP1's 4MB register window */
+            printk("[PCIE-BRCM] RP1: BAR0=0x%x BAR1=0x%x BAR2=0x%x BAR3=0x%x\n",
+                   cfg_read32(1, 0, 0x10), bar1_raw,
+                   cfg_read32(1, 0, 0x18), cfg_read32(1, 0, 0x1c));
+
+            /* Firmware put BAR1 at ~0x80000000, not 0x0 — aim both the outbound
+             * window (CPU 0x1f_00000000 -> PCIe bar1, 8MB covers BAR1/2/0) and
+             * the bridge's memory-forwarding window at that address (1MB gran:
+             * base A[31:20] in bits[15:4], limit A[31:20] in bits[31:20]). */
+            set_outbound_window(0, 0x1f00000000UL, bar1, 0x800000UL);
+            cfg_write32(1, 0, 0x04, cfg_read32(1, 0, 0x04) | 0x6u);
+            uint32_t fwd_base  = (uint32_t)(bar1 >> 20);
+            uint32_t fwd_limit = fwd_base + 7;                 /* +8MB */
+            cfg_write32(0, 0, 0x20, (fwd_limit << 20) | (fwd_base << 4));
+            cfg_write32(0, 0, 0x04, cfg_read32(0, 0, 0x04) | 0x6u);
+            printk("[PCIE-BRCM] RP1: window CPU 0x1f00000000 -> PCIe 0x%lx "
+                   "(link 0x%x)\n", bar1, st);
+            ok = 1;
+        } else {
+            printk("[PCIE-BRCM] RP1: no device on bus 1 — bridge routing failed\n");
+        }
+    } else {
+        printk("[PCIE-BRCM] RP1: pcie2 link DOWN (0x%x)\n", st);
     }
 
-    /* Diagnostic: dump the RP1's config space (bus 1, dev 0) to see where
-     * firmware assigned its BARs, and enable memory-space + bus-master decode
-     * (which firmware may have left off). EXT_CFG_INDEX selects bus/dev/fn once;
-     * then read/write EXT_CFG_DATA + reg-offset. */
-    RCW(PCIE_EXT_CFG_INDEX, (1u << 20));   /* bus 1, dev 0, fn 0 */
-    uint32_t vid  = RCR(PCIE_EXT_CFG_DATA + 0x00);
-    uint32_t cmd  = RCR(PCIE_EXT_CFG_DATA + 0x04);
-    uint32_t cls  = RCR(PCIE_EXT_CFG_DATA + 0x08);
-    uint32_t bar0 = RCR(PCIE_EXT_CFG_DATA + 0x10);
-    uint32_t bar1 = RCR(PCIE_EXT_CFG_DATA + 0x14);
-    uint32_t bar2 = RCR(PCIE_EXT_CFG_DATA + 0x18);
-    uint32_t bar3 = RCR(PCIE_EXT_CFG_DATA + 0x1c);
-    printk("[PCIE-BRCM] RP1: cfg id=0x%x cmd=0x%x class=0x%x\n", vid, cmd, cls);
-    printk("[PCIE-BRCM] RP1: BAR0=0x%x BAR1=0x%x BAR2=0x%x BAR3=0x%x\n",
-           bar0, bar1, bar2, bar3);
-    RCW(PCIE_EXT_CFG_DATA + 0x04, cmd | 0x6);   /* MEM space + bus master enable */
-
-    /* Outbound window 0: CPU-phys 0x1f_00000000 -> PCIe 0x0, 4 MiB (RP1 BAR1).
-     * Same base/limit-in-MB encoding as set_outbound_window(). */
-    const uint64_t cpu = 0x1f00000000UL, pci = 0x0UL, size = 0x400000UL;
-    const uint32_t win = 0;
-    RCW(PCIE_MEM_WIN0_LO(win), pci & 0xFFFFFFFFUL);
-    RCW(PCIE_MEM_WIN0_HI(win), pci >> 32);
-    uint64_t base_mb = cpu / 0x100000UL, limit_mb = (cpu + size - 1) / 0x100000UL;
-    uint32_t bl = RCR(PCIE_MEM_WIN0_BASE_LIMIT(win));
-    bl &= ~(uint32_t)(MEM_WIN0_BASE_LIMIT_BASE_MASK | MEM_WIN0_BASE_LIMIT_LIMIT_MASK);
-    bl |= ((uint32_t)base_mb  << MEM_WIN0_BASE_LIMIT_BASE_LSB)  & MEM_WIN0_BASE_LIMIT_BASE_MASK;
-    bl |= ((uint32_t)limit_mb << MEM_WIN0_BASE_LIMIT_LIMIT_LSB) & MEM_WIN0_BASE_LIMIT_LIMIT_MASK;
-    RCW(PCIE_MEM_WIN0_BASE_LIMIT(win), bl);
-    uint32_t bh = RCR(PCIE_MEM_WIN0_BASE_HI(win));
-    bh = (bh & ~(uint32_t)MEM_WIN0_BASE_HI_BASE_MASK) |
-         ((uint32_t)(base_mb >> MEM_WIN0_HIGH_ADDR_SHIFT) & MEM_WIN0_BASE_HI_BASE_MASK);
-    RCW(PCIE_MEM_WIN0_BASE_HI(win), bh);
-    uint32_t lh = RCR(PCIE_MEM_WIN0_LIMIT_HI(win));
-    lh = (lh & ~(uint32_t)MEM_WIN0_LIMIT_HI_LIMIT_MASK) |
-         ((uint32_t)(limit_mb >> MEM_WIN0_HIGH_ADDR_SHIFT) & MEM_WIN0_LIMIT_HI_LIMIT_MASK);
-    RCW(PCIE_MEM_WIN0_LIMIT_HI(win), lh);
-
-    printk("[PCIE-BRCM] RP1: pcie2 link up (0x%x), outbound win0 CPU 0x%lx -> "
-           "PCIe 0x%lx (%lu MB)\n", st, cpu, pci, size / 0x100000UL);
-#undef RCW
-#undef RCR
-    return 1;
+    s_base = saved;
+    return ok;
 }
 
 static void

@@ -202,10 +202,7 @@ kernel_main_arm64(void)
 #ifdef AEGIS_BOOT_NATIVE
     pi5_fb_init();            /* ask the VideoCore for a linear FB (real Pi 5) */
     pi5_thermal_report();     /* SoC temperature (AVS monitor) */
-    /* rp1_init() — WIP: needs full domain-2 PCIe enumeration (bridge bus setup
-     * + RP1 BAR discovery); firmware leaves the RC bridge unconfigured for us,
-     * so config reads return 0xffffffff. Disabled until that's built out. */
-    (void)rp1_init;
+    rp1_init();               /* RP1 southbridge: domain-2 enum + CHIP_ID probe */
 #endif
     fb_init();                /* silent when no framebuffer provided */
     cap_init();

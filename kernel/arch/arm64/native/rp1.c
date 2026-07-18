@@ -27,7 +27,7 @@
 #include <stdint.h>
 
 #define RP1_BAR1_PHYS      0x1f00000000UL
-#define RP1_WINDOW_PAGES   0x400          /* 4 MiB / 4 KiB = 1024 pages */
+#define RP1_WINDOW_PAGES   0x100          /* 1 MiB — covers SYSINFO..PADS (0xf0000) */
 
 #define RP1_SYSINFO_BASE   0x000000
 #define RP1_CHIP_ID_OFF    0x00
@@ -43,6 +43,36 @@ static inline volatile uint32_t *
 rp1_reg(uint32_t off)
 {
     return (volatile uint32_t *)(s_rp1 + off);
+}
+
+static inline void     rp1_w(uint32_t off, uint32_t v) { *rp1_reg(off) = v; }
+static inline uint32_t rp1_r(uint32_t off)             { return *rp1_reg(off); }
+
+/* RP1 GPIO/PAD/RIO for bank 2 (GPIOs 34-53). Per-pin CTRL @ bank+n*8+4
+ * (FUNCSEL in bits[4:0]); pad @ pads+4+n*4 (OUT_DISABLE=bit7); RIO OUT@+0, OE@+4
+ * with atomic SET@+0x2000 / CLR@+0x3000 aliases. */
+#define RP1_IO_BANK2    0x0d8000
+#define RP1_RIO2        0x0e8000
+#define RP1_PADS2       0x0f8000
+#define RP1_ATOM_SET    0x2000
+#define RP1_ATOM_CLR    0x3000
+#define RP1_FSEL_GPIO   0x05
+#define RP1_PAD_OUT_DIS (1u << 7)
+#define FAN_PIN         11          /* GPIO45 (FAN_PWM) = bank2 local pin 11 */
+
+/* rp1_fan_full — spin the Pi 5 fan at full. The FAN_PWM line is inverted
+ * (firmware drives it HIGH to STOP the fan), so full speed = pin driven LOW.
+ * Drive GPIO45 as a plain GPIO output held low — no PWM peripheral/clock. */
+static void
+rp1_fan_full(void)
+{
+    uint32_t ctrl = rp1_r(RP1_IO_BANK2 + FAN_PIN * 8 + 4);
+    rp1_w(RP1_IO_BANK2 + FAN_PIN * 8 + 4, (ctrl & ~0x1Fu) | RP1_FSEL_GPIO);
+    uint32_t pad = rp1_r(RP1_PADS2 + 4 + FAN_PIN * 4);
+    rp1_w(RP1_PADS2 + 4 + FAN_PIN * 4, pad & ~RP1_PAD_OUT_DIS);
+    rp1_w(RP1_RIO2 + RP1_ATOM_SET + 0x04, 1u << FAN_PIN);   /* output-enable */
+    rp1_w(RP1_RIO2 + RP1_ATOM_CLR + 0x00, 1u << FAN_PIN);   /* drive LOW = full */
+    printk("[RP1] fan: GPIO45 low (full speed, inverted line)\n");
 }
 
 /* rp1_init — map the BAR1 window and verify the chip is reachable. Leaves
@@ -68,6 +98,7 @@ rp1_init(void)
     if (id == RP1_CHIP_ID_C0 || id == RP1_CHIP_ID_B0) {
         printk("[RP1] OK: CHIP_ID 0x%x — reachable over PCIe (firmware-configured)\n",
                id);
+        rp1_fan_full();       /* thermal relief now that the RP1 is reachable */
         return 1;
     }
 
