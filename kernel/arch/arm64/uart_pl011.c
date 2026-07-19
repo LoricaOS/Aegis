@@ -88,6 +88,32 @@ static uint32_t s_head, s_tail;         /* head = write, tail = read */
 static uint32_t s_tty_pgrp;
 static uint32_t s_rx_count;             /* /proc/kbdstat serial counter */
 
+#ifdef AEGIS_BOOT_NATIVE
+/* Serial "reboot at will": on the real Pi 5 there is no reset button, so watch
+ * the console input for an SSH-style, line-anchored escape — "<newline>~~~" —
+ * and issue an immediate watchdog hard reset. Line-anchored (the tildes must be
+ * the first chars after Enter) so mid-line tildes in paths/pastes never trigger
+ * it; three of them make an accidental match essentially impossible. Works at
+ * the login prompt, in a shell, or even if userland has wedged, since every RX
+ * byte passes through here. Native-only (QEMU virt keeps normal console input).
+ * State: 1 = at line start, 2/3 = seen 1/2 tildes; a 3rd tilde resets.
+ * Fed from BOTH input paths — serial (drain_fifo) and USB keyboard
+ * (kbd_inject) — so it works whether the console is a serial screen or the
+ * physical keyboard on the graphical desktop. */
+static int s_reboot_esc = 1;   /* start as if at line start */
+static void
+reboot_escape_watch(char c)
+{
+    if (c == '\n' || c == '\r')
+        s_reboot_esc = 1;
+    else if (s_reboot_esc >= 1 && c == '~') {
+        if (++s_reboot_esc >= 4)
+            arch_native_reset();   /* never returns */
+    } else
+        s_reboot_esc = 0;
+}
+#endif
+
 /* drain_fifo — move any bytes waiting in the PL011 RX FIFO into the ring. */
 static void
 drain_fifo(void)
@@ -96,6 +122,9 @@ drain_fifo(void)
         char c = (char)rd(UART_DR);
         if (c == '\r')
             c = '\n';
+#ifdef AEGIS_BOOT_NATIVE
+        reboot_escape_watch(c);
+#endif
         uint32_t next = (s_head + 1) % RX_RING;
         if (next != s_tail) {           /* drop on overflow */
             s_ring[s_head] = c;
@@ -159,6 +188,9 @@ kbd_inject(char c)
 {
     if (c == '\0')
         return;
+#ifdef AEGIS_BOOT_NATIVE
+    reboot_escape_watch(c);   /* USB-keyboard input also arms the ~~~ reboot escape */
+#endif
     uint32_t next = (s_head + 1) % RX_RING;
     if (next != s_tail) {
         s_ring[s_head] = c;

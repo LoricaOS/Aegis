@@ -41,6 +41,9 @@ static volatile int s_shutdown;
 static uint64_t s_epoch_sec;        /* wall clock offset (NTP) */
 
 void gic_enable_ppi(uint32_t intid);
+#ifdef AEGIS_BOOT_NATIVE
+void pi5_fan_governor(void);   /* native/pi5_thermal.c — temp→fan-speed curve */
+#endif
 
 static inline void
 rearm(void)
@@ -93,6 +96,14 @@ timer_irq(void)
     s_ticks++;
 #ifdef AEGIS_BOOT_NATIVE
     native_watchdog_tick();     /* pet the BCM2712 watchdog while petting window open */
+    {
+        /* Temperature-based fan governor, ~1 Hz (MMIO-only, IRQ-context safe). */
+        static uint32_t s_fan_ticks = 0;
+        if (++s_fan_ticks >= TIMER_HZ) {
+            s_fan_ticks = 0;
+            pi5_fan_governor();
+        }
+    }
 #endif
     random_add_interrupt_entropy();
     poll_sources_run();
@@ -132,6 +143,30 @@ arch_debug_exit(unsigned char value)
     for (;;)
         arch_halt();
 }
+
+#ifdef AEGIS_BOOT_NATIVE
+/* arch_native_reset — deliberate hard reboot of the real Pi 5.
+ *
+ * The BCM2712 PM watchdog is the *proven* reset path on this board (the whole
+ * netboot dev-loop relies on it firing even a wedged CPU); the stock EL3 armstub
+ * does not implement PSCI SYSTEM_RESET, so `smc` reboot just falls through to a
+ * halt. Arm the watchdog with a tiny timeout (~10 ticks @ ~65 kHz ≈ 150 µs) and
+ * set PM_RSTC WRCFG_FULL_RESET → the board resets almost immediately and re-runs
+ * the firmware (→ TFTP netboot in dev). Register layout matches native_arm_
+ * watchdog() in main.c: watchdog@7d200000 → CPU-phys 0x10_7d200000, password
+ * 0x5a000000, PM_WDOG=+0x24, PM_RSTC=+0x1c. */
+void
+arch_native_reset(void)
+{
+    volatile uint8_t *pm = (volatile uint8_t *)arch_dmap(0x107d200000UL);
+    *(volatile uint32_t *)(pm + 0x24) = 0x5a000000UL | 0x0000000aUL;   /* PM_WDOG ~10 ticks */
+    uint32_t rstc = *(volatile uint32_t *)(pm + 0x1c);
+    *(volatile uint32_t *)(pm + 0x1c) =
+        0x5a000000UL | (rstc & 0xffffffcfUL) | 0x00000020UL;           /* WRCFG_FULL_RESET */
+    for (;;)
+        arch_halt();
+}
+#endif
 
 /* TSC-equivalent: the generic timer IS the calibrated clock. */
 void

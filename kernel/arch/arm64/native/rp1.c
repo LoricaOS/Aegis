@@ -80,6 +80,73 @@ rp1_fan_full(void)
     printk("[RP1] fan: GPIO45 low (full speed, inverted line)\n");
 }
 
+/* ── RP1 PWM1 fan speed control ─────────────────────────────────────────
+ * GPIO45 is pwm1 channel 3 (pinctrl funcsel 0; funcsel 5 = plain GPIO used by
+ * rp1_fan_full above). The Pi 5 fan line is inverted (Pi5 DTB:
+ * `<&rp1_pwm1 3 41566 PWM_POLARITY_INVERTED>`), so the channel runs
+ * polarity-inverted and DUTY reads directly as fan speed: 0 = off, RANGE = full
+ * (more LOW time = faster). PWM clock is 50 MHz, DTB period 41566 ns (~24 kHz)
+ * → RANGE = 41566/20 = 2078 clocks. Fan SPEED is DUTY/RANGE and independent of
+ * the exact clock rate, so if the firmware left pwm1 on a different clock only
+ * the carrier frequency shifts — still fine for the fan. Register layout per
+ * the RP1 datasheet / pwm-rp1 driver. */
+#define RP1_PWM1            0x09c000
+#define PWM_GLOBAL_CTRL     0x000
+#define PWM_CHAN_CTRL(x)    (0x014u + (x) * 16u)
+#define PWM_RANGE(x)        (0x018u + (x) * 16u)
+#define PWM_DUTY(x)         (0x020u + (x) * 16u)
+#define PWM_CHAN_DEFAULT    ((1u << 8) | (1u << 0))  /* FIFO_POP_MASK + trailing-edge M/S */
+#define PWM_POLARITY        (1u << 3)                /* inverted output (fan line inverted) */
+#define PWM_CHAN_ENABLE(x)  (1u << (x))
+#define PWM_SET_UPDATE      (1u << 31)               /* latch config into the channel */
+#define FAN_PWM_CHAN        3
+#define FAN_PWM_RANGE       2078u
+#define RP1_FSEL_PWM1       0x00
+#define RP1_CLOCKS          0x018000
+#define CLK_PWM1_CTRL       0x084
+#define CLK_PWM1_DIV_INT    0x088
+#define CLK_PWM1_SEL        0x090
+#define CLK_CTRL_ENABLE     (1u << 11)
+#define CLK_CTRL_AUXSRC_MSK (0x1Fu << 5)
+#define CLK_AUXSRC_XOSC     2u          /* aux parent index 2 = xosc (always on) */
+
+/* rp1_fan_set — set the Pi 5 fan speed in per-mille (0 = off .. 1000 = full).
+ * Muxes GPIO45 to pwm1 (funcsel 0) — switching away from the plain-GPIO full-on
+ * that rp1_fan_full leaves at boot — and programs channel 3. */
+void
+rp1_fan_set(uint32_t permille)
+{
+    if (!s_rp1)
+        return;
+    if (permille > 1000u)
+        permille = 1000u;
+
+    /* Bring up the PWM1 clock. The firmware hands off with AUXSRC=0 (an unused/
+     * empty parent), so merely setting ENABLE gives no output — the mux must
+     * first point at a live source. Use xosc (aux index 2, always running);
+     * the exact rate only shifts the PWM carrier frequency, not the duty ratio
+     * (= fan speed). DIV_INT is left as firmware set it (=1). */
+    {
+        uint32_t cc = rp1_r(RP1_CLOCKS + CLK_PWM1_CTRL);
+        cc = (cc & ~CLK_CTRL_AUXSRC_MSK) | (CLK_AUXSRC_XOSC << 5);
+        rp1_w(RP1_CLOCKS + CLK_PWM1_CTRL, cc | CLK_CTRL_ENABLE);
+    }
+
+    /* Mux GPIO45 → pwm1 function and enable the pad output driver. */
+    uint32_t ctrl = rp1_r(RP1_IO_BANK2 + FAN_PIN * 8 + 4);
+    rp1_w(RP1_IO_BANK2 + FAN_PIN * 8 + 4, (ctrl & ~0x1Fu) | RP1_FSEL_PWM1);
+    uint32_t pad = rp1_r(RP1_PADS2 + 4 + FAN_PIN * 4);
+    rp1_w(RP1_PADS2 + 4 + FAN_PIN * 4, pad & ~RP1_PAD_OUT_DIS);
+
+    /* Program channel 3: range + duty, polarity-inverted fixed-duty mode, latch. */
+    uint32_t duty = (uint32_t)(((uint64_t)permille * FAN_PWM_RANGE) / 1000u);
+    rp1_w(RP1_PWM1 + PWM_RANGE(FAN_PWM_CHAN), FAN_PWM_RANGE);
+    rp1_w(RP1_PWM1 + PWM_DUTY(FAN_PWM_CHAN), duty);
+    rp1_w(RP1_PWM1 + PWM_CHAN_CTRL(FAN_PWM_CHAN), PWM_CHAN_DEFAULT | PWM_POLARITY);
+    uint32_t g = rp1_r(RP1_PWM1 + PWM_GLOBAL_CTRL);
+    rp1_w(RP1_PWM1 + PWM_GLOBAL_CTRL, g | PWM_CHAN_ENABLE(FAN_PWM_CHAN) | PWM_SET_UPDATE);
+}
+
 /* dwc3 host controllers (RP1 offsets 0x200000/0x300000). xHCI regs at the
  * controller base (+0), dwc3 globals at +0xc100 (GSNPSID @ +0xc120 reads the
  * Synopsys core id 0x5533xxxx). Step-0 USB probe: confirm the dwc3 answers
@@ -96,36 +163,48 @@ rp1_fan_full(void)
 #define DWC3_GCTL_PRTCAP_HOST   (1u << 12)   /* PRTCAPDIR bits[13:12]=01 */
 #define DWC3_GCTL_PRTCAP_MASK   (3u << 12)
 #define RP1_USB0_XHCI_PHYS      0x1f00200000ULL  /* CPU-phys of USB0 xHCI base */
+#define RP1_USB1        0x300000                 /* second dwc3 — the other jacks */
+#define RP1_USB1_XHCI_PHYS      0x1f00300000ULL  /* CPU-phys of USB1 xHCI base */
 
-/* rp1_usb_init — put the RP1 dwc3 #0 core into host mode and hand its xHCI
- * interface to our xhci.c (with Normal-NC DMA — RP1 is non-coherent, identity
- * offset). Registers accessed via the RP1 window at offset 0x200000. */
+/* rp1_dwc3_host_init — core + USB2/USB3 PHY soft-reset then host-mode PRTCAP for
+ * the dwc3 at RP1 window offset `base` (0x200000 or 0x300000). Both RP1 dwc3
+ * controllers are identical, so the same sequence brings up either. */
+static void
+rp1_dwc3_host_init(uint32_t base)
+{
+    uint32_t snpsid = rp1_r(base + DWC3_GSNPSID);
+    printk("[RP1] dwc3@0x%x: GSNPSID=0x%x  xhci CAPLENGTH=0x%x\n",
+           base, snpsid, rp1_r(base + 0x00) & 0xffu);
+
+    /* Core + USB2/USB3 PHY soft reset, then release. */
+    rp1_w(base + DWC3_GCTL,          rp1_r(base + DWC3_GCTL) | DWC3_GCTL_CORESOFTRESET);
+    rp1_w(base + DWC3_GUSB3PIPECTL0, rp1_r(base + DWC3_GUSB3PIPECTL0) | DWC3_PHYSOFTRST);
+    rp1_w(base + DWC3_GUSB2PHYCFG0,  rp1_r(base + DWC3_GUSB2PHYCFG0)  | DWC3_PHYSOFTRST);
+    rp1_delay_ms(100);
+    rp1_w(base + DWC3_GUSB3PIPECTL0, rp1_r(base + DWC3_GUSB3PIPECTL0) & ~DWC3_PHYSOFTRST);
+    rp1_w(base + DWC3_GUSB2PHYCFG0,  rp1_r(base + DWC3_GUSB2PHYCFG0)  & ~DWC3_PHYSOFTRST);
+    rp1_delay_ms(100);
+    rp1_w(base + DWC3_GCTL,          rp1_r(base + DWC3_GCTL) & ~DWC3_GCTL_CORESOFTRESET);
+
+    /* Port capability = HOST. */
+    uint32_t g = rp1_r(base + DWC3_GCTL);
+    g = (g & ~DWC3_GCTL_PRTCAP_MASK) | DWC3_GCTL_PRTCAP_HOST;
+    rp1_w(base + DWC3_GCTL, g);
+    printk("[RP1] dwc3@0x%x: host mode (GCTL=0x%x)\n", base, rp1_r(base + DWC3_GCTL));
+}
+
+/* rp1_usb_init — bring up BOTH RP1 dwc3 controllers (USB0 @ 0x200000 + USB1 @
+ * 0x300000) in host mode and hand each xHCI interface to xhci.c. Two controllers
+ * cover all four USB-A jacks, so the keyboard and mouse can be on separate ones.
+ * Normal-NC DMA (RP1 masters are non-coherent, identity DMA offset). */
 static void
 rp1_usb_init(void)
 {
-    uint32_t snpsid = rp1_r(RP1_USB0 + DWC3_GSNPSID);
-    printk("[RP1] usb0: dwc3 GSNPSID=0x%x  xhci CAPLENGTH=0x%x\n",
-           snpsid, rp1_r(RP1_USB0 + 0x00) & 0xffu);
-
-    /* Core + USB2/USB3 PHY soft reset, then release. */
-    rp1_w(RP1_USB0 + DWC3_GCTL,          rp1_r(RP1_USB0 + DWC3_GCTL) | DWC3_GCTL_CORESOFTRESET);
-    rp1_w(RP1_USB0 + DWC3_GUSB3PIPECTL0, rp1_r(RP1_USB0 + DWC3_GUSB3PIPECTL0) | DWC3_PHYSOFTRST);
-    rp1_w(RP1_USB0 + DWC3_GUSB2PHYCFG0,  rp1_r(RP1_USB0 + DWC3_GUSB2PHYCFG0)  | DWC3_PHYSOFTRST);
-    rp1_delay_ms(100);
-    rp1_w(RP1_USB0 + DWC3_GUSB3PIPECTL0, rp1_r(RP1_USB0 + DWC3_GUSB3PIPECTL0) & ~DWC3_PHYSOFTRST);
-    rp1_w(RP1_USB0 + DWC3_GUSB2PHYCFG0,  rp1_r(RP1_USB0 + DWC3_GUSB2PHYCFG0)  & ~DWC3_PHYSOFTRST);
-    rp1_delay_ms(100);
-    rp1_w(RP1_USB0 + DWC3_GCTL,          rp1_r(RP1_USB0 + DWC3_GCTL) & ~DWC3_GCTL_CORESOFTRESET);
-
-    /* Port capability = HOST. */
-    uint32_t g = rp1_r(RP1_USB0 + DWC3_GCTL);
-    g = (g & ~DWC3_GCTL_PRTCAP_MASK) | DWC3_GCTL_PRTCAP_HOST;
-    rp1_w(RP1_USB0 + DWC3_GCTL, g);
-    printk("[RP1] usb0: dwc3 host mode (GCTL=0x%x) — starting xHCI\n",
-           rp1_r(RP1_USB0 + DWC3_GCTL));
-
     xhci_set_dma_noncoherent(1);
+    rp1_dwc3_host_init(RP1_USB0);
     xhci_init_at(RP1_USB0_XHCI_PHYS);
+    rp1_dwc3_host_init(RP1_USB1);
+    xhci_init_at(RP1_USB1_XHCI_PHYS);
 }
 
 /* RP1 clocks bank (per-peripheral gates; PLLs already locked by firmware). */

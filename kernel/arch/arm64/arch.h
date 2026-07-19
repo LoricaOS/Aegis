@@ -35,6 +35,11 @@ void gic_enable_spi(uint32_t intid);
 /* arch_debug_exit / shutdown — PSCI SYSTEM_OFF (HVC conduit on QEMU virt). */
 void arch_debug_exit(unsigned char value);
 void arch_request_shutdown(void);
+#ifdef AEGIS_BOOT_NATIVE
+/* Deliberate hard reboot of the real Pi 5 via the BCM2712 watchdog (the proven
+ * reset path; stock armstub has no PSCI SYSTEM_RESET). Never returns. */
+void arch_native_reset(void);
+#endif
 
 /* -------------------------------------------------------------------------
  * Physical memory interface
