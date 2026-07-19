@@ -19,9 +19,17 @@
  * corrupted ring_used()/ring_free() because 4055 = 0b1111_1101_0111 — bits 3
  * and 5 are clear, so any byte count with only those bits set masked to 0
  * (8 bytes available looked like 0 bytes available — see the lumen handshake
- * EAGAIN-after-POLLIN race, fixed 2026-04-15). 4096 fits in the same kva page
- * as the prior allocation (kva_alloc_pages(1) returns 4096 bytes). */
-#define UNIX_BUF_SIZE    4096
+ * EAGAIN-after-POLLIN race, fixed 2026-04-15).
+ *
+ * 16 KiB, raised from 4096 on 2026-07-19: the GUI protocol's menu frame is
+ * 4360 bytes, i.e. LARGER than the whole ring. A frame that cannot fit forces
+ * the writer to spin until the reader drains, and the single-threaded
+ * compositor cannot always do that promptly — the desktop shell wedged mid-
+ * frame and the top bar stopped responding. Keep this comfortably above the
+ * largest protocol message. Cost is UNIX_BUF_PAGES kva pages per direction,
+ * allocated per connection, not BSS. */
+#define UNIX_BUF_SIZE    16384
+#define UNIX_BUF_PAGES   (UNIX_BUF_SIZE / 4096)
 #define UNIX_NONE        0xFFFFFFFFU
 
 /* Staged fd for SCM_RIGHTS passing */
