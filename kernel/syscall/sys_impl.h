@@ -8,6 +8,7 @@
 #include "../mm/uaccess_user.h"   /* COPY_FROM_USER / COPY_TO_USER (+ _checked) */
 #include "../limits.h"
 #include "../include/aegis_errno.h"
+#include "../fs/vfs.h"       /* k_stat_t (emit_stat below) */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -19,6 +20,11 @@ extern void fork_child_return(void);
 #else
 extern void isr_post_dispatch(void);
 #endif
+
+/* emit_stat — the ONE copy-out for every stat-family syscall: repacks k_stat_t
+ * (x86-64 field order) into the per-arch struct stat musl expects. Defined in
+ * sys_file.c; sys_lstat in sys_meta.c must use it too. */
+uint64_t emit_stat(uint64_t uptr, const k_stat_t *ks);
 
 /* ── Common defines ─────────────────────────────────────────────────────── */
 

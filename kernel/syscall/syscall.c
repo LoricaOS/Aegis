@@ -27,7 +27,13 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case  88: num = 280; break;  /* utimensat (same arg order) */
     case  25: num = 72;  break;  /* fcntl */
     case  29: num = 16;  break;  /* ioctl */
-    case  35: num = 87; arg1 = arg2; break;  /* unlinkat → unlink (skip dirfd) */
+    case  35:                                /* unlinkat(dirfd,path,flags) */
+        /* AT_REMOVEDIR (0x200) selects rmdir. aarch64 has no rmdir syscall —
+         * musl's rmdir() IS unlinkat+AT_REMOVEDIR — so dropping the flag made
+         * every rmdir on arm64 an unlink of a directory, which fails. */
+        num = (arg3 & 0x200) ? 84 : 87;
+        arg1 = arg2;
+        break;
     case  46: num = 77;  break;  /* ftruncate — real (was stubbed to fstat, so
                                   * memfds never got sized: Lumen's client surface
                                   * mmap then failed → GUI clients got EIO) */
@@ -46,14 +52,22 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case  37: num = 86; arg1 = arg2; arg2 = arg4; break;  /* linkat → link (skip dirfds) */
     case  78: num = 89; arg1 = arg2; arg2 = arg3; arg3 = arg4; break;  /* readlinkat → readlink (skip dirfd) */
     case  53: num = 90; arg1 = arg2; arg2 = arg3; break;  /* fchmodat → chmod (skip dirfd+flags) */
-    case  54: num = 92; arg1 = arg2; arg2 = arg3; arg3 = arg4; break;  /* fchownat → chown (skip dirfd+flags) */
-    case  79: num = 4; arg1 = arg2; arg2 = arg3; break;
-                                 /* newfstatat(dirfd,path,statbuf,flags) → stat(path,statbuf).
-                                  * musl's stat family (fstatat_kstat) uses this for path-based
-                                  * stat on aarch64 (no legacy stat/lstat there). dirfd assumed
-                                  * AT_FDCWD/absolute; flags (incl SYMLINK_NOFOLLOW) dropped —
-                                  * lstat thus follows, acceptable v1. Was wrongly num=5 (fstat)
-                                  * with unshifted args, so ls -l/stat returned garbage/EBADF. */
+    case  54:                                /* fchownat(dirfd,path,uid,gid,flags) */
+        /* AT_SYMLINK_NOFOLLOW (0x100) → lchown: musl's lchown() is this call,
+         * and following the link would re-own whatever it points at. */
+        num = (arg5 & 0x100) ? 94 : 92;
+        arg1 = arg2; arg2 = arg3; arg3 = arg4;
+        break;
+    case  79:                    /* newfstatat(dirfd,path,statbuf,flags) */
+        /* musl's whole stat family goes through this on aarch64 (no legacy
+         * stat/lstat there). AT_SYMLINK_NOFOLLOW (0x100) picks lstat: dropping
+         * it made lstat() FOLLOW symlinks on arm64, so callers that walk a tree
+         * (a recursive copy or delete) saw a symlink-to-directory as a real
+         * directory and descended out of the tree they were given.
+         * dirfd is assumed AT_FDCWD/absolute. */
+        num = (arg4 & 0x100) ? 6 : 4;
+        arg1 = arg2; arg2 = arg3;
+        break;
     case  80: num = 5;   break;  /* fstat */
     case  82: num = 162; break;  /* fsync → sync */
     /* Process */

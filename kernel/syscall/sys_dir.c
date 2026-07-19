@@ -136,6 +136,14 @@ sys_rmdir(uint64_t arg1)
     char kpath[256];
     if (copy_path_resolved(kpath, arg1, sizeof(kpath)) != 0)
         return SYS_ERR(EFAULT);
+    /* Route ramfs (/tmp, /run) paths — as sys_mkdir and sys_unlink already do.
+     * Without this, ext2_rmdir returned EPERM for every path it does not own,
+     * so `mkdir /tmp/x` succeeded but `rmdir /tmp/x` could never undo it. */
+    {
+        int rc;
+        if (vfs_ramfs_rmdir(kpath, &rc))
+            return (rc < 0) ? (uint64_t)(int64_t)rc : 0;
+    }
     /* Check W+X permission on parent directory */
     {
         uint32_t parent_ino;

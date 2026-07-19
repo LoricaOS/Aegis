@@ -369,6 +369,40 @@ ramfs_mkdir(ramfs_t *inst, const char *name)
     return 0;
 }
 
+/* ramfs_rmdir — remove a directory marker, POSIX-style: it must exist, be a
+ * directory, and be empty. The namespace here is FLAT (a dentry name is the
+ * whole relative path, "lb/o.png"), so "empty" means no other live dentry
+ * starts with "<name>/". */
+int
+ramfs_rmdir(ramfs_t *inst, const char *name)
+{
+    uint32_t nlen = 0;
+    while (name[nlen]) nlen++;
+
+    irqflags_t fl = spin_lock_irqsave(&inst->lock);
+    ramfs_dent_t *d = dent_find(inst, name);
+    if (!d) { spin_unlock_irqrestore(&inst->lock, fl); return -ENOENT; }
+    ramfs_inode_t *n = &inst->inodes[d->inode];
+    if (!n->is_dir) { spin_unlock_irqrestore(&inst->lock, fl); return -ENOTDIR; }
+
+    for (int i = 0; i < RAMFS_MAX_DENTS; i++) {
+        ramfs_dent_t *e = &inst->dents[i];
+        if (!e->in_use || e == d) continue;
+        uint32_t k = 0;
+        while (k < nlen && e->name[k] == name[k]) k++;
+        if (k == nlen && e->name[nlen] == '/') {
+            spin_unlock_irqrestore(&inst->lock, fl);
+            return -ENOTEMPTY;
+        }
+    }
+
+    d->in_use = 0;
+    if (n->nlink) n->nlink--;
+    inode_release(n);
+    spin_unlock_irqrestore(&inst->lock, fl);
+    return 0;
+}
+
 int
 ramfs_unlink(ramfs_t *inst, const char *name)
 {

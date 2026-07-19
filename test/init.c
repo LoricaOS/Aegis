@@ -62,6 +62,16 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
 #define SYS_execve       221
 #define SYS_rt_sigaction 134
 #define SYS_rt_sigreturn 139
+/* The *at forms are the only ones aarch64 has; musl builds every legacy call
+ * out of them, so the test must use them too — that is precisely the path
+ * where the kernel's aarch64 translation has to preserve the flags. */
+#define SYS_mkdirat      34
+#define SYS_unlinkat     35
+#define SYS_symlinkat    36
+#define SYS_openat       56
+#define SYS_close        57
+#define SYS_readlinkat   78
+#define SYS_newfstatat   79
 #else
 #define SYS_clone        56
 #define SYS_wait4        61
@@ -69,7 +79,77 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
 #define SYS_execve       59
 #define SYS_rt_sigaction 13
 #define SYS_rt_sigreturn 15
+#define SYS_stat         4
+#define SYS_lstat        6
+#define SYS_close        3
+#define SYS_openat       257
+#define SYS_mkdir        83
+#define SYS_rmdir        84
+#define SYS_unlink       87
+#define SYS_symlink      88
+#define SYS_readlink     89
 #endif
+
+#define AT_FDCWD             -100
+#define AT_SYMLINK_NOFOLLOW  0x100
+#define AT_REMOVEDIR         0x200
+
+/* Portable wrappers over the two syscall dialects, so the checks below read
+ * the same on both arches. */
+static long k_mkdir(const char *p)
+{
+#ifdef __aarch64__
+    return sys3(SYS_mkdirat, AT_FDCWD, (long)p, 0755);
+#else
+    return sys3(SYS_mkdir, (long)p, 0755, 0);
+#endif
+}
+static long k_rmdir(const char *p)
+{
+#ifdef __aarch64__
+    return sys3(SYS_unlinkat, AT_FDCWD, (long)p, AT_REMOVEDIR);
+#else
+    return sys3(SYS_rmdir, (long)p, 0, 0);
+#endif
+}
+static long k_unlink(const char *p)
+{
+#ifdef __aarch64__
+    return sys3(SYS_unlinkat, AT_FDCWD, (long)p, 0);
+#else
+    return sys3(SYS_unlink, (long)p, 0, 0);
+#endif
+}
+static long k_symlink(const char *target, const char *link)
+{
+#ifdef __aarch64__
+    return sys3(SYS_symlinkat, (long)target, AT_FDCWD, (long)link);
+#else
+    return sys3(SYS_symlink, (long)target, (long)link, 0);
+#endif
+}
+/* Fills the caller's struct-stat buffer; returns 0 or negative errno. */
+static long k_stat_at(const char *p, void *st, int nofollow)
+{
+#ifdef __aarch64__
+    return sys6(SYS_newfstatat, AT_FDCWD, (long)p, (long)st,
+                nofollow ? AT_SYMLINK_NOFOLLOW : 0, 0, 0);
+#else
+    return sys3(nofollow ? SYS_lstat : SYS_stat, (long)p, (long)st, 0);
+#endif
+}
+/* st_mode's byte offset differs per arch (x86-64 puts st_nlink first). */
+static unsigned k_stat_mode(const void *st)
+{
+#ifdef __aarch64__
+    return *(const unsigned *)((const char *)st + 16);
+#else
+    return *(const unsigned *)((const char *)st + 24);
+#endif
+}
+#define K_IFMT  0170000
+#define K_IFDIR 0040000
+#define K_IFLNK 0120000
 
 #define SIGCHLD 17
 #define SIGUSR1 10
@@ -251,6 +331,55 @@ void _start(void)
         }
         if (ok && seen == 0xF) { pass++; out("[KTEST] PASS smp-fork (4 concurrent)\n"); }
         else out("[KTEST] FAIL smp-fork\n");
+    }
+
+    /* 9. Directory + symlink surface. Every one of these was silently broken
+     *    at some point: rmdir under /tmp fell through to ext2 and returned
+     *    EPERM; unlink/rmdir resolved THROUGH a final-component symlink; and
+     *    on aarch64 the flags of unlinkat/newfstatat were dropped in
+     *    translation, so rmdir() unlinked and lstat() followed. A recursive
+     *    delete built on those primitives escapes the tree it was given, so
+     *    these are correctness AND safety checks. */
+    {
+        char st[256];
+        int ok = 1;
+
+        /* Empty vs non-empty on the ext2 root. */
+        ok &= (k_mkdir("/ktdir") == 0);
+        ok &= (k_mkdir("/ktdir/sub") == 0);
+        ok &= (k_rmdir("/ktdir") < 0);            /* not empty → must refuse */
+        ok &= (k_rmdir("/ktdir/sub") == 0);
+        total++;
+        if (ok) { pass++; out("[KTEST] PASS rmdir (empty vs non-empty)\n"); }
+        else out("[KTEST] FAIL rmdir\n");
+
+        /* A symlink is its own object: lstat must not follow it, stat must,
+         * and unlink must remove the LINK, leaving the target alone. */
+        ok = 1;
+        ok &= (k_mkdir("/ktdir/tgt") == 0);
+        ok &= (k_symlink("/ktdir/tgt", "/ktdir/lnk") == 0);
+        ok &= (k_stat_at("/ktdir/lnk", st, 1) == 0);
+        ok &= ((k_stat_mode(st) & K_IFMT) == K_IFLNK);   /* lstat: the link  */
+        ok &= (k_stat_at("/ktdir/lnk", st, 0) == 0);
+        ok &= ((k_stat_mode(st) & K_IFMT) == K_IFDIR);   /* stat: the target */
+        ok &= (k_unlink("/ktdir/lnk") == 0);
+        ok &= (k_stat_at("/ktdir/tgt", st, 1) == 0);     /* target survived  */
+        ok &= (k_rmdir("/ktdir/tgt") == 0);
+        ok &= (k_rmdir("/ktdir") == 0);
+        total++;
+        if (ok) { pass++; out("[KTEST] PASS symlink (lstat/stat/unlink)\n"); }
+        else out("[KTEST] FAIL symlink\n");
+
+        /* /tmp is ramfs, a different backend with its own routing. */
+        ok = 1;
+        ok &= (k_mkdir("/tmp/ktdir") == 0);
+        ok &= (k_mkdir("/tmp/ktdir/sub") == 0);
+        ok &= (k_rmdir("/tmp/ktdir") < 0);        /* not empty → must refuse */
+        ok &= (k_rmdir("/tmp/ktdir/sub") == 0);
+        ok &= (k_rmdir("/tmp/ktdir") == 0);
+        total++;
+        if (ok) { pass++; out("[KTEST] PASS ramfs mkdir/rmdir (/tmp)\n"); }
+        else out("[KTEST] FAIL ramfs mkdir/rmdir\n");
     }
 
     if (pass == total) out("[KTEST] DONE all-pass\n");

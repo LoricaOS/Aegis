@@ -209,6 +209,7 @@ int vfs_open_ex(const char *path, int flags, uint16_t create_mode,
 int vfs_ramfs_unlink(const char *path, int *out_rc);
 int vfs_ramfs_rename(const char *oldp, const char *newp, int *out_rc);
 int vfs_ramfs_mkdir(const char *path, int *out_rc);
+int vfs_ramfs_rmdir(const char *path, int *out_rc);
 
 /* vfs_stat_path — stat a file by path.
  * Handles initrd files, directory paths (/,/etc,/bin), and /dev/ specials.

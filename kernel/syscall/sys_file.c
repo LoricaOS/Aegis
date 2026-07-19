@@ -347,8 +347,14 @@ struct kstat_arm64 {
 #endif
 
 /* emit_stat — copy k_stat_t out to the user's struct stat, repacked to the
- * per-arch layout musl expects. Returns 0 or SYS_ERR(EFAULT). */
-static uint64_t
+ * per-arch layout musl expects. Returns 0 or SYS_ERR(EFAULT).
+ *
+ * EVERY stat-family syscall must return through here. k_stat_t is the x86-64
+ * layout (nlink at 16, mode at 24); aarch64's struct stat puts mode at 16 and
+ * nlink at 20, so a raw copy_to_user of k_stat_t hands arm64 userspace a
+ * struct whose mode/uid/gid/rdev are all misread — sys_lstat did exactly that,
+ * which is why lstat() on arm64 reported a symlink's mode as 1. */
+uint64_t
 emit_stat(uint64_t uptr, const k_stat_t *ks)
 {
 #ifdef __aarch64__

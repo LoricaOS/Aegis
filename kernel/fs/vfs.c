@@ -98,6 +98,28 @@ vfs_ramfs_mkdir(const char *path, int *out_rc)
     return 1;
 }
 
+/* vfs_ramfs_rmdir — if path is on a ramfs mount, remove the directory there
+ * and set *out_rc; returns 1 if handled, 0 if not a ramfs path. Without this
+ * sys_rmdir fell through to ext2_rmdir, which returns EPERM for any path it
+ * does not own — so mkdir /tmp/x worked (it routes) but rmdir /tmp/x did not. */
+int
+vfs_ramfs_rmdir(const char *path, int *out_rc)
+{
+    const char *rel;
+    /* The mount roots themselves are not removable. */
+    {
+        const char *p = path;
+        int is_root =
+            ((p[0]=='/'&&p[1]=='t'&&p[2]=='m'&&p[3]=='p'&&(p[4]=='\0'||(p[4]=='/'&&p[5]=='\0'))) ||
+             (p[0]=='/'&&p[1]=='r'&&p[2]=='u'&&p[3]=='n'&&(p[4]=='\0'||(p[4]=='/'&&p[5]=='\0'))));
+        if (is_root) { *out_rc = -EBUSY; return 1; }
+    }
+    ramfs_t *r = ramfs_for_path(path, &rel);
+    if (!r) return 0;
+    *out_rc = ramfs_rmdir(r, rel);
+    return 1;
+}
+
 /* vfs_ramfs_rename — same-mount rename on a ramfs. Cross-mount renames
  * return EXDEV. Returns 1 if handled, 0 if neither path is ramfs. */
 int

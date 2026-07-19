@@ -104,8 +104,10 @@ sys_lstat(uint64_t arg1, uint64_t arg2)
     int rc = vfs_stat_path_ex(path, &ks, 0);
     if (rc != 0) return SYS_ERR(ENOENT);
 
-    COPY_TO_USER(arg2, &ks);
-    return 0;
+    /* Must go through emit_stat like sys_stat/sys_fstat — see the note there.
+     * A raw COPY_TO_USER wrote the x86-64 field order into an aarch64
+     * struct stat, so S_ISLNK() was never true on arm64. */
+    return emit_stat(arg2, &ks);
 }
 
 /*
