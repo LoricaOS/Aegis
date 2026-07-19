@@ -280,7 +280,7 @@ xhci_relax(void)
 #if defined(__aarch64__)
     __asm__ volatile("yield");
 #else
-    xhci_relax();
+    __asm__ volatile("pause");
 #endif
 }
 
