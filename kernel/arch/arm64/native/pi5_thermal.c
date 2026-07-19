@@ -49,16 +49,26 @@ pi5_thermal_report(void)
 /* rp1_fan_set — native/rp1.c: fan speed, per-mille (0 = off .. 1000 = full). */
 void rp1_fan_set(uint32_t permille);
 
-/* pi5_fan_governor — temperature→fan-speed curve, run ~once/second from the
- * arm64 timer tick. Curve (SoC temp):
- *   < 45 C   fan off
- *   45–70 C  linear 35% → 100%
- *   >= 70 C  100% (maxed out here, well below the ~80 C soft-throttle so the
- *            fan is already flat-out before the SoC would start slowing down)
- * The 35% floor when running is enough to spin the fan up reliably (lower duty
- * can stall it). Hysteresis: once running, keep going until below 40 C so it
- * doesn't chatter on/off around the 45 C turn-on threshold. */
-static int s_fan_running = 0;
+/* pi5_fan_governor — temperature→fan-speed governor, run ~once/second from the
+ * arm64 timer tick. DISCRETE STEPS (not a continuous ramp): the fan holds a
+ * speed and only changes at real thresholds. A continuous duty made the fan
+ * "hunt" — audibly waver — as the temperature micro-oscillated; stepping mirrors
+ * how the Pi firmware's cooling states work. Each step has FAN_HYST_MC
+ * hysteresis: rise to a step at its threshold, fall out of it only once the temp
+ * has dropped a full FAN_HYST_MC below. Maxes at 70 C — well below the ~80 C
+ * soft-throttle, so the fan is already flat-out before the SoC would slow. */
+static const struct { int32_t up_mC; uint16_t duty_pm; } s_fan_steps[] = {
+    {     0,    0 },   /* off              */
+    { 45000,  400 },   /* 40%              */
+    { 52000,  550 },   /* 55%              */
+    { 58000,  700 },   /* 70%              */
+    { 64000,  850 },   /* 85%              */
+    { 70000, 1000 },   /* 100% (curve max) */
+};
+#define FAN_NSTEPS  ((int)(sizeof s_fan_steps / sizeof s_fan_steps[0]))
+#define FAN_HYST_MC 3000            /* 3 C hysteresis on step-down */
+
+static int s_fan_step = 0;
 
 void
 pi5_fan_governor(void)
@@ -67,34 +77,21 @@ pi5_fan_governor(void)
     if (t == INT32_MIN)
         return;                     /* sensor not ready — leave fan as boot set it */
 
-    const int32_t  ON_MC = 45000, OFF_MC = 40000, FULL_MC = 70000;
-    const uint32_t FLOOR_PM = 350;
+    /* Rise while the next step's threshold is reached; fall while we're a full
+     * FAN_HYST_MC below the current step's threshold. */
+    while (s_fan_step < FAN_NSTEPS - 1 && t >= s_fan_steps[s_fan_step + 1].up_mC)
+        s_fan_step++;
+    while (s_fan_step > 0 && t < s_fan_steps[s_fan_step].up_mC - FAN_HYST_MC)
+        s_fan_step--;
 
-    if (s_fan_running) {
-        if (t < OFF_MC) s_fan_running = 0;
-    } else if (t >= ON_MC) {
-        s_fan_running = 1;
-    }
-
-    uint32_t pm;
-    if (!s_fan_running)
-        pm = 0;
-    else if (t >= FULL_MC)
-        pm = 1000;
-    else {
-        int32_t d = t - ON_MC;      /* 0 .. (FULL_MC-ON_MC) */
-        if (d < 0) d = 0;
-        pm = FLOOR_PM + (uint32_t)(((uint64_t)(1000u - FLOOR_PM) * (uint32_t)d)
-                                   / (uint32_t)(FULL_MC - ON_MC));
-    }
+    uint32_t pm = s_fan_steps[s_fan_step].duty_pm;
     rp1_fan_set(pm);
 
-    /* Log only when the duty crosses a 10% bucket, so steady state is quiet but
-     * transitions (and the off/full endpoints) still show on the console. */
-    static uint32_t s_last_bucket = 0xffffffff;
-    uint32_t bucket = pm / 100;
-    if (bucket != s_last_bucket) {
-        s_last_bucket = bucket;
-        printk("[FAN] SoC %d.%d C -> duty %u%%\n", t / 1000, (t % 1000) / 100, pm / 10);
+    /* Log only when the step changes, so steady state stays silent. */
+    static int s_last_step = -1;
+    if (s_fan_step != s_last_step) {
+        s_last_step = s_fan_step;
+        printk("[FAN] SoC %d.%d C -> step %d duty %u%%\n",
+               t / 1000, (t % 1000) / 100, s_fan_step, pm / 10);
     }
 }
