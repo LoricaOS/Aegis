@@ -178,8 +178,24 @@ arch_mm_init_native(uint64_t dtb_phys)
     s_early_pv_off    = 0;              /* identity-mapped (VA==PA), no HHDM     */
     s_rsdp_phys       = 0;              /* no ACPI on arm64                      */
     s_dtb_phys        = dtb_phys;
-    s_cmdline[0]      = '\0';           /* no cmdline source on this path yet    */
     s_uart_phys       = 0x107D001000UL; /* real Pi 5 PL011 (block index 65)      */
+
+    /* Native netboot has no bootloader-supplied cmdline. Bake the live-desktop
+     * defaults so a bare boot comes up straight into the graphical session,
+     * mirroring the live ISO's cmdline (see loricaos gen-limine-conf.sh):
+     *   boot=graphical        -> vigil runs the bastion greeter, not getty
+     *   bastion_autologin=live -> bastion skips the password (live-boot bypass)
+     *   aegis_live=1          -> vigil keeps the live state (no first-boot strip)
+     * ponytail: hardcoded for this single board; read /chosen/bootargs from the
+     * DTB if a second native target ever needs a different cmdline. */
+    {
+        static const char def[] =
+            "boot=graphical bastion_autologin=live aegis_live=1";
+        unsigned i = 0;
+        for (; i < sizeof(def) - 1 && i < sizeof(s_cmdline) - 1; i++)
+            s_cmdline[i] = def[i];
+        s_cmdline[i] = '\0';
+    }
 }
 
 /* Called after fdt_init() has captured the tree. No-op if Limine already

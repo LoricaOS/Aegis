@@ -200,8 +200,8 @@ kernel_main_arm64(void)
      * anywhere past here (driver bring-up especially) self-recovers into a
      * fresh netboot ~16s later without any human touch. */
     native_arm_watchdog();
-    s_wdog_pet_ticks = 5 * 60 * 100;   /* pet for ~5 min (100 Hz tick) then let it fire */
-    printk("[NATIVE] watchdog armed, petted ~5min — hangs auto-reset+netboot\n");
+    s_wdog_pet_ticks = 3 * 60 * 100;   /* pet for ~3 min (100 Hz tick) then let it fire */
+    printk("[NATIVE] watchdog armed, petted ~3min — hangs auto-reset+netboot\n");
 #endif
 
 #if defined(AEGIS_BOOT_NATIVE) && defined(AEGIS_NATIVE_TEST_STOP) && AEGIS_NATIVE_TEST_STOP <= 3
