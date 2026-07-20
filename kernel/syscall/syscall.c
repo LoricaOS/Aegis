@@ -287,6 +287,7 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 202: return sys_futex(arg1, arg2, arg3, arg4, arg5, arg6);
     case 510: return sys_blkdev_list(arg1, arg2);
     case 511: return sys_blkdev_io(arg1, arg2, arg3, arg4, arg5);
+    case 518: return sys_vfs_confine(arg1);   /* Aegis: confine to a subtree */
     case 512: return sys_gpt_rescan(arg1);
     case 513: return sys_fb_map(arg1);
     case 514: return sys_spawn(arg1, arg2, arg3, arg4, arg5);

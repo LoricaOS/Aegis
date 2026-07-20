@@ -196,6 +196,12 @@ _Static_assert(VFS_O_CLOEXEC == VFS_FD_CLOEXEC,
  * Populates *out on success; returns 0 on success, -2 (ENOENT) if not found.
  * Called by sys_open to resolve path to a vfs_file_t. */
 int vfs_open(const char *path, int flags, uint16_t create_mode, vfs_file_t *out);
+
+/* VFS confinement (sys_vfs_confine): path_canonicalize collapses ./../// in an
+ * absolute path; vfs_scope_allows returns 1 if `path` is within the calling
+ * process's confinement scope (or it is unconfined / kernel-internal). */
+void path_canonicalize(const char *in, char *out, uint32_t outsz);
+int  vfs_scope_allows(const char *path);
 /* Like vfs_open but the caller declares whether it is authorized to create
  * under an install-protected tree (has_install: holds CAP_KIND_INSTALL, or is
  * a POWER-authorized admin path like sys_adminconf). The ext2 create enforces

@@ -48,6 +48,70 @@ vfs_init(void)
  * Returns 0 on success, -2 (ENOENT) if not found, -12 (ENOMEM) if the
  * ext2 fd pool is exhausted.
  */
+/* ── VFS confinement (sys_vfs_confine) ───────────────────────────────────
+ * path_canonicalize collapses ".", ".." and duplicate slashes in an absolute
+ * path; vfs_scope_allows checks a path against the calling process's scope.
+ * The check is LEXICAL (post-canonicalization) — it blocks absolute-path and
+ * ".."-traversal escape. A symlink inside the scope that points outside is a
+ * known v1 limitation; because confinement only ever REMOVES authority, that
+ * gap merely degrades to the unconfined baseline for that one path and can
+ * never weaken the model. Sensitive files stay protected by the existing
+ * inode gates (shadow/admin/passwd/install) regardless of scope. */
+void
+path_canonicalize(const char *in, char *out, uint32_t outsz)
+{
+    uint32_t oi = 0;                 /* out holds "/a/b" form, no trailing slash */
+    const char *p = in;
+    while (*p) {
+        while (*p == '/') p++;                 /* collapse slashes */
+        if (!*p) break;
+        const char *s = p;
+        while (*p && *p != '/') p++;
+        uint32_t clen = (uint32_t)(p - s);
+        if (clen == 1 && s[0] == '.') continue;                /* "." */
+        if (clen == 2 && s[0] == '.' && s[1] == '.') {          /* ".." */
+            while (oi > 0 && out[oi - 1] != '/') oi--;          /* drop last comp */
+            if (oi > 0) oi--;                                   /* drop its '/' */
+            continue;
+        }
+        if (oi + 1 + clen >= outsz) break;                     /* truncate safely */
+        out[oi++] = '/';
+        for (uint32_t k = 0; k < clen; k++) out[oi++] = s[k];
+    }
+    if (oi == 0) out[oi++] = '/';              /* root */
+    out[oi] = '\0';
+}
+
+/* vfs_scope_allows — 1 if `path` is within the calling process's confinement
+ * scope (or the process is unconfined / kernel-internal), else 0. Relative
+ * paths are resolved against cwd first, then canonicalized. */
+int
+vfs_scope_allows(const char *path)
+{
+    if (!sched_current()->is_user) return 1;           /* kernel: unconfined */
+    aegis_process_t *proc = current_proc();
+    if (!proc || proc->vfs_scope_len == 0) return 1;   /* unconfined */
+
+    char abs[256];
+    uint32_t i = 0;
+    if (path[0] == '/') {
+        for (; path[i] && i < sizeof(abs) - 1; i++) abs[i] = path[i];
+    } else {
+        for (; proc->cwd[i] && i < sizeof(abs) - 1; i++) abs[i] = proc->cwd[i];
+        if (i == 0 || abs[i - 1] != '/') { if (i < sizeof(abs) - 1) abs[i++] = '/'; }
+        for (uint32_t j = 0; path[j] && i < sizeof(abs) - 1; j++) abs[i++] = path[j];
+    }
+    abs[i] = '\0';
+
+    char canon[256];
+    path_canonicalize(abs, canon, sizeof(canon));
+
+    uint32_t L = proc->vfs_scope_len;
+    for (uint32_t k = 0; k < L; k++)
+        if (canon[k] != proc->vfs_scope[k]) return 0;
+    return (canon[L] == '\0' || canon[L] == '/');      /* boundary match */
+}
+
 /* is_ramfs_path — returns the ramfs instance backing a "/tmp/..." or
  * "/run/..." path (and sets *rel to the name within it), else NULL. */
 static ramfs_t *
@@ -159,6 +223,10 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
     /* Default: not protected. Non-ext2 backends below don't touch kflags, so
      * this prevents a stale VFS_KF_PROTECTED bit leaking from a reused slot. */
     out->kflags = 0;
+
+    /* VFS confinement: a scoped process may only reach paths inside its scope. */
+    if (!vfs_scope_allows(path))
+        return -EACCES;
 
     /* /dev/ptmx → allocate PTY master */
     if (path[0]=='/' && path[1]=='d' && path[2]=='e' && path[3]=='v' && path[4]=='/' &&
@@ -405,6 +473,7 @@ int
 vfs_stat_path(const char *path, k_stat_t *out)
 {
     if (!path || !out) return -ENOENT;
+    if (!vfs_scope_allows(path)) return -EACCES;   /* confinement */
 
     /* /proc → procfs stat */
     if (path[0]=='/' && path[1]=='p' && path[2]=='r' && path[3]=='o' &&
@@ -526,6 +595,7 @@ int
 vfs_stat_path_ex(const char *path, k_stat_t *out, int follow)
 {
     if (!path || !out) return -ENOENT;
+    if (!vfs_scope_allows(path)) return -EACCES;   /* confinement */
 
     /* Dynamic mounts (tmpfs): no symlinks, delegate to vfs_stat_path */
     {

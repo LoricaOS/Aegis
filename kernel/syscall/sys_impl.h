@@ -217,6 +217,7 @@ uint64_t sys_mount(uint64_t source, uint64_t target, uint64_t fstype,
                    uint64_t mountflags, uint64_t data);
 uint64_t sys_umount(uint64_t target, uint64_t flags);
 void mount_selftest(void);
+uint64_t sys_vfs_confine(uint64_t path);
 
 /* ── sys_time.c ────────────────────────────────────────────────────────── */
 uint64_t sys_nanosleep(uint64_t a1, uint64_t a2);

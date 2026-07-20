@@ -80,6 +80,14 @@ typedef struct aegis_process {
     uint32_t      stop_signum;  /* signal that caused TASK_STOPPED; 0 = not stopped */
     uint32_t      term_signal;  /* signal that terminated the process; 0 = normal exit */
     char          cwd[256];     /* current working directory; init = "/" */
+    /* Optional VFS confinement (sys_vfs_confine): when vfs_scope_len != 0, this
+     * process may only touch paths within vfs_scope[] (a canonical absolute
+     * subtree). Voluntary + one-way (tightening only), inherited across fork and
+     * sticky across exec, so a confined process and its descendants cannot
+     * escape. Purely ADDITIVE — it only ever removes authority, never grants —
+     * so it cannot weaken the model. 0 = unconfined (default). */
+    char          vfs_scope[128];
+    uint32_t      vfs_scope_len; /* strlen(vfs_scope); 0 = unconfined */
     uint64_t      exit_status;  /* lower 8 bits = exit code; written before zombie */
     /* Phase 17 — signal subsystem */
     uint64_t      pending_signals;   /* bitmask; bit N = signal N pending */

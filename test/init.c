@@ -50,6 +50,7 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
 #define SYS_exit         60
 #define SYS_sethostname  170   /* gated on CAP_KIND_POWER — init HOLDS this */
 #define SYS_blkdev_list  510   /* gated on CAP_KIND_DISK_ADMIN — init LACKS this */
+#define SYS_vfs_confine  518   /* Aegis: confine self to a subtree (no cap) */
 
 /* Colliding syscalls: the x86 number would be MIS-translated on aarch64, so
  * use each arch's real Linux number (aarch64's are translated to the x86
@@ -222,6 +223,43 @@ void _start(void)
     if (sys6(SYS_mount, 0, (long)"/mnt/x", (long)"tmpfs", 0, 0, 0) < 0)
         { pass++; out("[KTEST] PASS mount-denied\n"); }
     else out("[KTEST] FAIL mount-NOT-denied (privesc!)\n");
+
+    /* 4c. VFS confinement — a CHILD confines itself to /tmp (so init stays
+     *     unconfined for the tests below), then: an in-scope create succeeds, an
+     *     out-of-scope open is refused (EACCES), and widening back out is
+     *     refused (one-way). Purely additive authority-dropping, no cap. */
+    total++;
+    {
+        long cpid = sys6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);
+        if (cpid == 0) {
+            int ok = 1;
+            if (sys3(SYS_vfs_confine, (long)"/tmp", 0, 0) != 0) ok = 0;
+            /* in-scope create → valid fd */
+            if (sys6(SYS_openat, AT_FDCWD, (long)"/tmp/cjail", 0x40 | 1, 0644, 0, 0) < 0)
+                ok = 0;
+            /* out-of-scope open must be denied */
+            if (sys6(SYS_openat, AT_FDCWD, (long)"/", 0, 0, 0, 0) >= 0)
+                ok = 0;
+            /* one-way: widening the scope must be refused */
+            if (sys3(SYS_vfs_confine, (long)"/", 0, 0) == 0)
+                ok = 0;
+            /* descendants inherit confinement: a grandchild must ALSO be denied
+             * "/" (it inherited /tmp scope across fork). */
+            long gpid = sys6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);
+            if (gpid == 0)
+                sys3(SYS_exit,
+                     (sys6(SYS_openat, AT_FDCWD, (long)"/", 0, 0, 0, 0) < 0) ? 0 : 1,
+                     0, 0);
+            long gstatus = -1;
+            sys6(SYS_wait4, gpid, (long)&gstatus, 0, 0, 0, 0);
+            if (((gstatus >> 8) & 0xff) != 0) ok = 0;   /* grandchild escaped scope */
+            sys3(SYS_exit, ok ? 0 : 1, 0, 0);
+        }
+        long cstatus = -1;
+        sys6(SYS_wait4, cpid, (long)&cstatus, 0, 0, 0, 0);
+        if (((cstatus >> 8) & 0xff) == 0) { pass++; out("[KTEST] PASS vfs-confine\n"); }
+        else out("[KTEST] FAIL vfs-confine\n");
+    }
 
     /* 5. FP/SIMD state survives a context switch (arm64 only — this
      *    test-init is built -mno-sse on x86, where the FXSAVE path is

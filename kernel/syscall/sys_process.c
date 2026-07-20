@@ -357,6 +357,8 @@ sys_clone(syscall_frame_t *frame, uint64_t flags, uint64_t child_stack,
     vma_share(child, parent);
     __builtin_memcpy(child->exe_path, parent->exe_path, sizeof(parent->exe_path));
     __builtin_memcpy(child->cwd, parent->cwd, sizeof(parent->cwd));
+    __builtin_memcpy(child->vfs_scope, parent->vfs_scope, sizeof(parent->vfs_scope));
+    child->vfs_scope_len = parent->vfs_scope_len;   /* VFS confinement is inherited */
     child->pid       = proc_alloc_pid();
     child->ppid      = parent->pid;
     child->uid       = parent->uid;
@@ -692,6 +694,8 @@ sys_fork(syscall_frame_t *frame, uint64_t u_rdi, uint64_t u_rsi, uint64_t u_rdx)
     child->task.fs_base    = parent_task->fs_base;
 #endif
     __builtin_memcpy(child->cwd, parent->cwd, sizeof(parent->cwd));
+    __builtin_memcpy(child->vfs_scope, parent->vfs_scope, sizeof(parent->vfs_scope));
+    child->vfs_scope_len = parent->vfs_scope_len;   /* VFS confinement is inherited */
     child->pid             = proc_alloc_pid();
     child->tgid            = child->pid;
     child->thread_count    = 1;
