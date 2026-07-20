@@ -105,6 +105,18 @@ SHARED_SRCS = \
     kernel/proc/proc.c kernel/proc/elf.c \
     kernel/arch/arm64/main.c
 
+# UBSAN=1 — Undefined Behavior Sanitizer (aarch64). Same curated check set and
+# rationale as the x86 Makefile: high-signal arithmetic/indexing UB only, not the
+# full -fsanitize=undefined (whose alignment/object-size checks are kernel noise).
+# The runtime (ubsan.c) is built WITHOUT the sanitizer via a
+# dedicated rule below; ubsan_test.c stays instrumented for the `ubsantest` cmdline.
+ifeq ($(UBSAN),1)
+UBSAN_CHECKS = shift,signed-integer-overflow,integer-divide-by-zero,bounds,unreachable,vla-bound,nonnull-attribute,returns-nonnull-attribute,pointer-overflow
+UBSAN_CFLAGS = -fsanitize=$(UBSAN_CHECKS) -fsanitize-recover=undefined
+CFLAGS      += $(UBSAN_CFLAGS) -DUBSAN=1
+SHARED_SRCS += kernel/mm/ubsan.c kernel/mm/ubsan_test.c
+endif
+
 C_OBJS   = $(patsubst kernel/%.c,$(BUILD)/%.o,$(ARCH_SRCS) $(SHARED_SRCS))
 ASM_OBJS = $(patsubst kernel/%.S,$(BUILD)/%.o,$(ARCH_ASMS))
 ALL_OBJS = $(ASM_OBJS) $(C_OBJS)
@@ -117,6 +129,12 @@ all: $(BUILD)/aegis-arm64.elf
 $(BUILD)/%.o: kernel/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+# The UBSAN runtime must not instrument itself (its report path touches memory;
+# self-instrumentation risks recursion — guarded, but not instrumenting is cleaner).
+$(BUILD)/mm/ubsan.o: kernel/mm/ubsan.c
+	@mkdir -p $(dir $@)
+	$(CC) $(filter-out $(UBSAN_CFLAGS),$(CFLAGS)) -MMD -MP -c $< -o $@
 
 $(BUILD)/%.o: kernel/%.S
 	@mkdir -p $(dir $@)

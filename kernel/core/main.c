@@ -22,6 +22,7 @@
 #include "vmm.h"
 #include "kva.h"
 #include "kasan.h"
+#include "ubsan.h"
 #include "sched.h"
 #include "proc.h"
 #include "vfs.h"
@@ -298,6 +299,17 @@ kernel_main(uint32_t mb_magic, void *mb_info)
         for (; *q; q++)
             if (q[0]=='k'&&q[1]=='a'&&q[2]=='s'&&q[3]=='a'&&q[4]=='n'&&
                 q[5]=='t'&&q[6]=='e'&&q[7]=='s'&&q[8]=='t') { kasan_selftest(); break; }
+    }
+#endif
+    ubsan_init();           /* [UBSAN] OK (UBSAN=1 build only; else no-op)    */
+#ifdef UBSAN
+    /* `ubsantest` cmdline token: prove the instrumentation catches UB. */
+    {
+        extern void ubsan_selftest(void);
+        const char *q = arch_get_cmdline();
+        for (; *q; q++)
+            if (q[0]=='u'&&q[1]=='b'&&q[2]=='s'&&q[3]=='a'&&q[4]=='n'&&
+                q[5]=='t'&&q[6]=='e'&&q[7]=='s'&&q[8]=='t') { ubsan_selftest(); break; }
     }
 #endif
     bph("mem");
