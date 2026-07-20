@@ -960,14 +960,15 @@ copy_path_resolved(char *kpath, uint64_t user_ptr, uint32_t bufsz)
  * write cache (NVMe FLUSH).  Without the device flush, "synced" data sits
  * in the drive's volatile cache and is not guaranteed to survive the
  * controller reset at reboot — QEMU never loses it, real drives can.
- * Matches POSIX sync(2): no arguments, no return value besides 0.
+ * Returns 0, or -EIO if a dirty block was dropped on a device write error
+ * since the last sync (so the failure is no longer silently swallowed).
  */
 uint64_t
 sys_sync(void)
 {
-    ext2_sync();
+    int err = ext2_sync();
 #ifdef __x86_64__
     nvme_flush();   /* no NVMe driver on arm64 yet */
 #endif
-    return 0;
+    return (uint64_t)(int64_t)err;   /* 0, or -EIO if a writeback was lost */
 }

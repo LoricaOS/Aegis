@@ -19,6 +19,14 @@ uint64_t s_cache_age = 0;
 uint64_t s_cache_dev_reads  = 0;
 uint64_t s_cache_dev_writes = 0;
 
+/* Sticky writeback-error flag.  A device write can fail during a dirty
+ * eviction (cache_evict) or during ext2_sync.  Silently clearing the dirty bit
+ * and moving on reports success to a following sync()/fsync() while the data
+ * was actually dropped — silent data loss on I/O error.  Instead we latch the
+ * failure here and ext2_sync() reports it as -EIO to the syscall (consume-on-
+ * report, like Linux's per-fd errseq: the error surfaces once). */
+static int s_fs_io_error = 0;
+
 /* cache_find — return slot index of block_num, or -1 if not cached */
 int cache_find(uint32_t block_num)
 {
@@ -63,7 +71,11 @@ int cache_evict(void)
         if (wr != 0) {
             printk("[EXT2] WARN: cache flush failed for block %u\n",
                    s_cache[best].block_num);
-            /* Clear dirty anyway to avoid infinite eviction loop */
+            /* Latch the failure so the next sync()/fsync() returns -EIO. We
+             * still clear dirty and reuse the slot — the caller needs it and
+             * re-picking this same dirty block forever would livelock — but the
+             * loss is no longer silent: userland's next sync learns about it. */
+            s_fs_io_error = 1;
         }
         s_cache[best].dirty = 0;
     }
@@ -132,7 +144,7 @@ uint8_t *cache_get_slot(uint32_t block_num)
 /* ext2_sync — flush all dirty cache slots to disk                     */
 /* ------------------------------------------------------------------ */
 
-void ext2_sync(void)
+int ext2_sync(void)
 {
     int i;
     int flushed = 0;
@@ -143,20 +155,32 @@ void ext2_sync(void)
     irqflags_t fl = ext2_lock_acquire();
     if (!s_mounted || !s_dev) {
         ext2_lock_release(fl);
-        return;
+        return 0;
     }
     for (i = 0; i < CACHE_SLOTS; i++) {
         if (s_cache[i].dirty && s_cache[i].block_num != 0) {
             uint64_t lba = (uint64_t)s_cache[i].block_num *
                            (s_block_size / 512);
             s_cache_dev_writes++;
-            s_dev->write(s_dev, lba, s_block_size / 512, s_cache[i].data);
+            if (s_dev->write(s_dev, lba, s_block_size / 512,
+                             s_cache[i].data) != 0) {
+                /* Leave the block dirty so a later sync retries it (this loop
+                 * runs once, so keeping it dirty can't livelock), and latch the
+                 * error for the return below. */
+                printk("[EXT2] WARN: sync writeback failed for block %u\n",
+                       s_cache[i].block_num);
+                s_fs_io_error = 1;
+                continue;
+            }
             s_cache[i].dirty = 0;
             flushed++;
         }
     }
+    int err = s_fs_io_error;
+    s_fs_io_error = 0;              /* consume-on-report */
     ext2_lock_release(fl);
     printk("[EXT2] sync: flushed %u dirty blocks\n", (uint32_t)flushed);
+    return err ? -EIO : 0;
 }
 
 /* ------------------------------------------------------------------ */

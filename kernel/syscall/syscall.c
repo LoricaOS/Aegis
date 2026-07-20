@@ -93,7 +93,7 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 175: num = 107; break;  /* geteuid */
     case 176: num = 104; break;  /* getgid */
     case 177: num = 108; break;  /* getegid */
-    case 178: num = 39;  break;  /* gettid → getpid */
+    case 178: num = 186; break;  /* gettid (real; internal 186 → sys_gettid) */
     case 214: num = 12;  break;  /* brk */
     case 215: num = 11;  break;  /* munmap */
     case 220: num = 56;  break;  /* clone */
