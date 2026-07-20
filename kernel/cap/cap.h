@@ -75,6 +75,21 @@ _Static_assert(CAP_KIND_MAX < CAP_TABLE_SIZE,
  * because it bypasses every fs-layer defense. See cap_apply_policy(). */
 #define CAP_TIER_SERVICE  1u  /* granted unconditionally at exec */
 #define CAP_TIER_ADMIN    2u  /* granted only if proc->authenticated */
+#define CAP_TIER_FIRSTBOOT 3u /* granted ONLY while the system is unconfigured
+                               * (g_first_boot) — the first-boot exception. Lets
+                               * the "Configure LoricaOS" setup program hold
+                               * INSTALL+AUTH to write the /etc/aegis tree
+                               * (admin credential, autologin, the configured
+                               * marker) before any admin session can exist. The
+                               * marker it writes flips g_first_boot off next
+                               * boot, so the grant is one-shot and self-closing.
+                               * Only the configure binary declares this tier. */
+
+/* g_first_boot — set at boot (kernel_main, after ext2 mount) when the
+ * first-boot marker /etc/aegis/configured is absent; drives CAP_TIER_FIRSTBOOT.
+ * Once the marker exists, subsequent boots leave this 0 and the exception is
+ * gone. Defined in cap_policy.c. */
+extern int g_first_boot;
 
 /* Maximum caps per policy entry and max policy entries */
 #define CAP_POLICY_MAX_CAPS    16u
@@ -99,6 +114,10 @@ typedef struct {
 /* Load all policy files from /etc/aegis/caps.d/ at boot.
  * Must be called after vfs_init() + console_init(). */
 void cap_policy_load(void);
+
+/* Detect the first-boot state (presence of /etc/aegis/configured) and set
+ * g_first_boot. Call once at boot after the root fs is mounted. */
+void cap_policy_detect_first_boot(void);
 
 /* Look up the policy for a binary by full exe_path.
  * Extracts basename (everything after last '/') and compares.

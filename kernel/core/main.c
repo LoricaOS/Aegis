@@ -485,6 +485,7 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     cap_policy_load();      /* load /etc/aegis/caps.d/ — must be after ext2  */
     ext2_anchors_reload();  /* register /etc/aegis/anchors install-anchors    */
     cap_anchor_audit();     /* WARN if a granting anchor isn't write-protected */
+    cap_policy_detect_first_boot(); /* /etc/aegis/configured? → g_first_boot   */
     poll_test();            /* VFS .poll self-test — [POLL] OK               */
     bph("mount+cap");
     xhci_init();            /* xHCI USB host — [XHCI] OK or silent skip     */

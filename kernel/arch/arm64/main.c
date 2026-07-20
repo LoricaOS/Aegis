@@ -382,6 +382,7 @@ kernel_main_arm64(void)
     cap_policy_load();        /* /etc/aegis/caps.d/ — after ext2 mount  */
     ext2_anchors_reload();
     cap_anchor_audit();
+    cap_policy_detect_first_boot();  /* /etc/aegis/configured? → g_first_boot */
     poll_test();
 
     virtio_net_init();        /* virtio-net NIC → eth0 (poll mode)      */

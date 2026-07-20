@@ -19,6 +19,27 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* First-boot exception flag (see cap.h / CAP_TIER_FIRSTBOOT). */
+int g_first_boot = 0;
+
+/* cap_policy_detect_first_boot — set g_first_boot from the presence of the
+ * /etc/aegis/configured marker. Call once at boot AFTER the root fs is mounted
+ * (kernel_main). Absent marker → unconfigured → first boot → the exception is
+ * live; present → normal gating. Fail-safe: if we cannot even open the fs, treat
+ * as CONFIGURED (no exception) rather than hand out the first-boot grant. */
+void cap_policy_detect_first_boot(void)
+{
+    vfs_file_t f;
+    if (vfs_open("/etc/aegis/configured", VFS_O_RDONLY, 0, &f) == 0) {
+        if (f.ops && f.ops->close) f.ops->close(f.priv);
+        g_first_boot = 0;                       /* marker present → configured  */
+    } else {
+        g_first_boot = 1;                       /* marker absent → first boot   */
+    }
+    printk("[CAP] first-boot exception: %s\n",
+           g_first_boot ? "ACTIVE (system unconfigured)" : "off (configured)");
+}
+
 /* Static policy table */
 static cap_policy_entry_t s_entries[CAP_POLICY_MAX_ENTRIES];
 static uint32_t s_entry_count;
@@ -177,6 +198,8 @@ parse_policy(const char *data, uint64_t len, cap_policy_entry_t *entry)
             tier = CAP_TIER_SERVICE;
         else if (streq(tier_buf, "admin"))
             tier = CAP_TIER_ADMIN;
+        else if (streq(tier_buf, "firstboot"))
+            tier = CAP_TIER_FIRSTBOOT;
         else
             continue;  /* unknown tier — skip line */
 
@@ -576,6 +599,19 @@ cap_apply_policy(cap_slot_t *caps, const char *path, int authenticated,
                              ? admin_session
                              : authenticated;
                 if (ok)
+                    cap_grant(caps, CAP_TABLE_SIZE,
+                              pol->caps[ci].kind, pol->caps[ci].rights);
+            } else if (pol->caps[ci].tier == CAP_TIER_FIRSTBOOT) {
+                /* The first-boot exception: granted ONLY while the system is
+                 * unconfigured (g_first_boot). This is the one path that hands
+                 * out INSTALL without an admin session — deliberately, so the
+                 * setup program can seed the /etc/aegis tree (admin credential,
+                 * autologin, the configured marker) on a machine that has no
+                 * account and thus no session to elevate. It is bounded: the
+                 * marker the setup writes leaves g_first_boot 0 on every later
+                 * boot, and only the trusted-path-anchored `configure` binary
+                 * declares this tier (cap_policy_lookup gates on the anchor). */
+                if (g_first_boot)
                     cap_grant(caps, CAP_TABLE_SIZE,
                               pol->caps[ci].kind, pol->caps[ci].rights);
             }
