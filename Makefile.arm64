@@ -70,7 +70,7 @@ SHARED_SRCS = \
     kernel/core/limine.c kernel/core/printk.c kernel/core/random.c \
     kernel/core/poll.c kernel/core/ksym.c kernel/core/trace.c \
     kernel/core/lockrank.c kernel/cap/cap.c kernel/cap/cap_policy.c \
-    kernel/mm/pmm.c kernel/mm/kva.c kernel/mm/vma.c \
+    kernel/mm/pmm.c kernel/mm/kva.c kernel/mm/kva_test.c kernel/mm/vma.c \
     kernel/lib/va_freelist.c kernel/lib/string.c \
     kernel/sched/sched.c kernel/sched/waitq.c \
     kernel/signal/signal.c \

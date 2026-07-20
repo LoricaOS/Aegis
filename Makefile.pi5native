@@ -54,6 +54,14 @@ CFLAGS = \
     -Ikernel/arch/arm64 -Ikernel/core -Ikernel/cap -Ikernel/mm \
     -Ikernel/sched -Ikernel/proc -Ikernel/syscall -Ikernel/fs \
     -Ikernel/tty -Ikernel/signal -Ikernel/drivers -Ikernel/net
+# NATIVE_KVATEST=1 (optional): append `kvatest` to the built-in cmdline so the
+# kernel VA allocator integrity stress runs early in boot. For chasing the arm64
+# multi-page corruption — it only ever reproduced on real hardware (the build
+# box's QEMU is TCG, whose soft-TLB is coherent by construction).
+ifeq ($(NATIVE_KVATEST),1)
+CFLAGS += -DAEGIS_NATIVE_KVATEST=1
+endif
+
 ifneq ($(NATIVE_TEST_STOP),)
 CFLAGS += -DAEGIS_NATIVE_TEST_STOP=$(NATIVE_TEST_STOP)
 endif
@@ -120,7 +128,7 @@ SHARED_SRCS = \
     kernel/core/printk.c kernel/core/random.c \
     kernel/core/poll.c kernel/core/ksym.c kernel/core/trace.c \
     kernel/core/lockrank.c kernel/cap/cap.c kernel/cap/cap_policy.c \
-    kernel/mm/pmm.c kernel/mm/kva.c kernel/mm/vma.c \
+    kernel/mm/pmm.c kernel/mm/kva.c kernel/mm/kva_test.c kernel/mm/vma.c \
     kernel/lib/va_freelist.c kernel/lib/string.c \
     kernel/sched/sched.c kernel/sched/waitq.c \
     kernel/signal/signal.c \

@@ -190,7 +190,16 @@ arch_mm_init_native(uint64_t dtb_phys)
      * DTB if a second native target ever needs a different cmdline. */
     {
         static const char def[] =
-            "boot=graphical bastion_autologin=live aegis_live=1";
+            "boot=graphical bastion_autologin=live aegis_live=1"
+#ifdef AEGIS_NATIVE_KVATEST
+            /* Diagnostic build (NATIVE_KVATEST=1): run the kernel VA allocator
+             * integrity stress early in boot. Real hardware is the ONLY place
+             * the arm64 multi-page corruption has ever shown — QEMU on the
+             * build box is TCG, whose soft-TLB is coherent by construction, so
+             * a stale-TLB bug cannot reproduce there. Costs ~2 serial lines. */
+            " kvatest"
+#endif
+            ;
         unsigned i = 0;
         for (; i < sizeof(def) - 1 && i < sizeof(s_cmdline) - 1; i++)
             s_cmdline[i] = def[i];

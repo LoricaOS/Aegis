@@ -41,6 +41,7 @@
 void poll_test(void);
 void arm64_map_early_uart(void);
 void uaccess_selftest(void);
+void kva_test_run(void);
 void pcie_brcmstb_init(void);
 void nvme_init(void);
 void pi5_fb_init(void);        /* native/vc_mailbox_fb.c — VideoCore framebuffer */
@@ -213,6 +214,16 @@ kernel_main_arm64(void)
     pmm_set_alloc_high_pref(1);
     arch_set_master_pml4(vmm_get_master_pml4());
     uaccess_selftest();       /* [UACCESS] OK: EL1 fault fixup             */
+
+    /* `kvatest` on the cmdline: stress the kernel VA allocator and assert its
+     * integrity invariants before anything else allocates. Chasing the arm64
+     * multi-page corruption — see kernel/mm/kva_test.c. */
+    {
+        const char *cl = arch_get_cmdline();
+        for (const char *p2 = cl; p2 && *p2; p2++)
+            if (p2[0]=='k' && p2[1]=='v' && p2[2]=='a' && p2[3]=='t' &&
+                p2[4]=='e' && p2[5]=='s' && p2[6]=='t') { kva_test_run(); break; }
+    }
 
 #if defined(AEGIS_BOOT_NATIVE) && defined(AEGIS_NATIVE_TEST_STOP) && AEGIS_NATIVE_TEST_STOP <= 4
     /* TEMPORARY (native-boot bring-up): a prior red-team investigation
