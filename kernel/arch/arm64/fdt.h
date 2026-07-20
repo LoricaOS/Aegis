@@ -53,4 +53,14 @@ int fdt_memory_regions(uint64_t *addr_out, uint64_t *size_out, int max);
  * (linux,initrd-start/end). Returns 1 with [*start,*end) on success. */
 int fdt_initrd(uint64_t *start_out, uint64_t *end_out);
 
+/* PSCI conduit from /psci "method": 1 = SMC (Pi 5 / TF-A), 0 = HVC (QEMU
+ * virt), -1 = no /psci node. Lets the SMP bring-up pick the right one at
+ * runtime instead of hardcoding per platform. */
+int fdt_psci_conduit(void);
+
+/* MPIDR affinity of the index-th /cpus/cpu@* node, for the PSCI CPU_ON
+ * target. Returns 1 + *mpidr_out, or 0 when index >= core count. Handles
+ * both QEMU virt (flat 0..3) and the Pi 5 (core index in Affinity 1). */
+int fdt_cpu_mpidr(int index, uint64_t *mpidr_out);
+
 #endif /* AEGIS_ARM64_FDT_H */

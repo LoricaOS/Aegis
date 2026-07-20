@@ -336,6 +336,137 @@ fdt_reg_by_compat_nth(const char *compat, int node_index,
     return 0;
 }
 
+/* Bytes at s_buf[val..val+len) equal the C string `want` (NUL included)? */
+static int
+val_str_is(uint32_t val, uint32_t len, const char *want)
+{
+    for (uint32_t k = 0; ; k++) {
+        char w = want[k];
+        char c = (k < len) ? (char)s_buf[val + k] : '\0';
+        if (w != c) return 0;
+        if (w == '\0') return 1;
+    }
+}
+
+/* Find the node_index-th node matching EITHER `compat` (in its "compatible"
+ * list, when compat != NULL) OR `devtype` (its "device_type" value, when
+ * devtype != NULL), and hand back its `propname` property bytes + length,
+ * plus the parent's #address-cells (for callers decoding a reg). Match and
+ * target property may appear in any order within the node, so both are
+ * stashed and resolved once seen. Returns 1 on success, 0 otherwise. */
+static int
+prop_by_match(const char *compat, const char *devtype, const char *propname,
+              int node_index, uint32_t *val_out, uint32_t *len_out,
+              uint32_t *pac_out)
+{
+    if (!s_ok || node_index < 0)
+        return 0;
+
+    uint32_t ac[FDT_MAX_DEPTH];
+    int depth = 0;
+    ac[0] = 2;
+
+    int      matched = 0, prop_seen = 0, seen_nodes = 0;
+    uint32_t pv = 0, pl = 0;
+
+    uint32_t off = s_struct_off;
+    while (off + 4 <= s_struct_end) {
+        uint32_t tok = be32(s_buf + off);
+        off += 4;
+
+        if (tok == FDT_BEGIN_NODE) {
+            uint32_t n = off;
+            while (n < s_struct_end && s_buf[n]) n++;
+            off = (n + 4) & ~3u;
+            if (depth + 1 >= FDT_MAX_DEPTH)
+                return 0;
+            depth++;
+            ac[depth] = 2;
+            matched = 0; prop_seen = 0;
+        } else if (tok == FDT_END_NODE) {
+            if (depth == 0) break;
+            depth--;
+            matched = 0; prop_seen = 0;
+        } else if (tok == FDT_PROP) {
+            if (off + 8 > s_struct_end) break;
+            uint32_t len     = be32(s_buf + off);
+            uint32_t nameoff = be32(s_buf + off + 4);
+            uint32_t val     = off + 8;
+            off = (val + len + 3) & ~3u;
+            if (val + len > s_struct_end)
+                break;
+
+            if (str_at_is(nameoff, "#address-cells") && len >= 4)
+                ac[depth] = be32(s_buf + val);
+            else if (compat && str_at_is(nameoff, "compatible")) {
+                if (compat_list_has(s_buf + val, len, compat)) matched = 1;
+            } else if (devtype && str_at_is(nameoff, "device_type")) {
+                if (val_str_is(val, len, devtype)) matched = 1;
+            } else if (str_at_is(nameoff, propname)) {
+                prop_seen = 1; pv = val; pl = len;
+            }
+
+            if (matched && prop_seen) {
+                if (seen_nodes != node_index) {
+                    seen_nodes++;
+                    matched = 0; prop_seen = 0;
+                    continue;
+                }
+                if (val_out) *val_out = pv;
+                if (len_out) *len_out = pl;
+                if (pac_out) *pac_out = ac[depth - 1];
+                return 1;
+            }
+        } else if (tok == FDT_NOP) {
+            /* nothing */
+        } else if (tok == FDT_END) {
+            break;
+        } else {
+            return 0;
+        }
+    }
+    return 0;
+}
+
+/* PSCI conduit from the /psci node's "method": 1 = SMC, 0 = HVC, -1 = no
+ * /psci node (caller falls back to its builtin default). QEMU virt says
+ * "hvc"; the Raspberry Pi 5 (TF-A PSCI at EL3) says "smc". */
+int
+fdt_psci_conduit(void)
+{
+    static const char *const cc[] = { "arm,psci-1.0", "arm,psci-0.2",
+                                      "arm,psci", 0 };
+    for (int i = 0; cc[i]; i++) {
+        uint32_t val, len;
+        if (prop_by_match(cc[i], 0, "method", 0, &val, &len, 0)) {
+            if (val_str_is(val, len, "smc")) return 1;
+            if (val_str_is(val, len, "hvc")) return 0;
+            return -1;
+        }
+    }
+    return -1;
+}
+
+/* MPIDR affinity of the index-th /cpus/cpu@* node (matched by device_type
+ * == "cpu"), decoded from its single-cell "reg". Returns 1 + *mpidr_out, or
+ * 0 when there is no such node (i.e. index >= core count). QEMU virt reports
+ * a flat 0,1,2,3; the Pi 5 reports 0,0x100,0x200,0x300 (core index in
+ * Affinity 1) — reading reg gets the right target for both. */
+int
+fdt_cpu_mpidr(int index, uint64_t *mpidr_out)
+{
+    uint32_t val, len, pac = 1;
+    if (!prop_by_match(0, "cpu", "reg", index, &val, &len, &pac))
+        return 0;
+    if (pac == 0 || pac > 2 || len < pac * 4)
+        return 0;
+    uint64_t m = 0;
+    for (uint32_t c = 0; c < pac; c++)
+        m = (m << 32) | be32(s_buf + val + c * 4);
+    if (mpidr_out) *mpidr_out = m;
+    return 1;
+}
+
 /* "memory" nodes are identified by device_type, not compatible -- a
  * separate walk from the compat-matching one above. Also different from
  * walk()'s single-match/single-reg-index contract: collects every reg

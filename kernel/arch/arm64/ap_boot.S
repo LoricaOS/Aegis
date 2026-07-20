@@ -23,6 +23,54 @@
 .globl ap_trampoline
 .type ap_trampoline, %function
 ap_trampoline:
+    mov x28, x0                 /* preserve params ptr across the EL drop */
+
+    /* ── EL2 -> EL1 drop, only if the firmware handed this core off at EL2.
+     * QEMU virt / PSCI enters secondaries at EL1 and skips this; stock Pi 5
+     * (TF-A PSCI at EL3) hands them off at EL2, same as the BSP. Mirrors the
+     * BSP's sequence in native/boot_probe.S — and, like it, deliberately does
+     * NOT touch ICC_SRE_EL2: the Pi 5 GIC is v2 (no ICC_* sysregs), so that
+     * access traps as undefined. `ldr =IMM` loads a constant from a PC-
+     * relative literal pool, so it is position-independent with the MMU off. */
+    mrs x0, CurrentEL
+    lsr x0, x0, #2
+    cmp x0, #2
+    b.ne .Lap_at_el1
+
+    ldr x0, =0x30C50830         /* INIT_SCTLR_EL2_MMU_OFF */
+    msr sctlr_el2, x0
+    isb
+    mov x0, #(1 << 31)          /* HCR_EL2.RW = 1 (EL1 is AArch64) */
+    msr hcr_el2, x0
+    msr vttbr_el2, xzr          /* no stage-2 translation */
+    mrs x0, cnthctl_el2
+    orr x0, x0, #3             /* EL1PCEN | EL1PCTEN */
+    msr cnthctl_el2, x0
+    msr cntvoff_el2, xzr
+    mov x0, #0x33FF            /* CPTR_EL2: no FP/SIMD trap to EL2 */
+    msr cptr_el2, x0
+    msr hstr_el2, xzr          /* no CP15 traps */
+    mrs x0, midr_el1
+    msr vpidr_el2, x0
+    mrs x0, mpidr_el1
+    msr vmpidr_el2, x0
+    ldr x0, =0x30D00800         /* INIT_SCTLR_EL1_MMU_OFF */
+    msr sctlr_el1, x0
+    mov x0, #0x3C5             /* EL1h, D|A|I|F masked */
+    msr spsr_el2, x0
+    adr x0, .Lap_at_el1        /* resume physically (MMU still off) at EL1 */
+    msr elr_el2, x0
+    isb
+    eret
+
+.Lap_at_el1:
+    msr daifset, #0xf
+    msr spsel, #1              /* use SP_EL1 (set again after the real sp below) */
+    mov x0, #(3 << 20)        /* CPACR_EL1.FPEN = 0b11 */
+    msr cpacr_el1, x0
+    isb
+    mov x0, x28                /* restore params ptr for the EL1 setup below */
+
     ldr x1, [x0, #0]            /* ttbr0 = identity map */
     ldr x2, [x0, #8]            /* ttbr1 = kernel tables */
     ldr x3, [x0, #16]           /* tcr   */
