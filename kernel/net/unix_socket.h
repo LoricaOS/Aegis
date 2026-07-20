@@ -21,14 +21,19 @@
  * (8 bytes available looked like 0 bytes available — see the lumen handshake
  * EAGAIN-after-POLLIN race, fixed 2026-04-15).
  *
- * 16 KiB, raised from 4096 on 2026-07-19: the GUI protocol's menu frame is
- * 4360 bytes, i.e. LARGER than the whole ring. A frame that cannot fit forces
- * the writer to spin until the reader drains, and the single-threaded
- * compositor cannot always do that promptly — the desktop shell wedged mid-
- * frame and the top bar stopped responding. Keep this comfortably above the
- * largest protocol message. Cost is UNIX_BUF_PAGES kva pages per direction,
- * allocated per connection, not BSS. */
-#define UNIX_BUF_SIZE    16384
+ * A protocol frame LARGER than this ring can never be written in one go: the
+ * writer spins for space and both ends can end up stuck mid-frame (that was
+ * the lumen top-bar freeze — a 4360-byte menu frame against this 4096 ring).
+ * The fix belongs on the protocol side (glyph's lumen_set_menu_t is now 2504
+ * bytes and static_asserts itself under 4096); raising the ring instead was
+ * tried on 2026-07-19 and corrupted memory on arm64 — see the note below.
+ *
+ * DO NOT raise this without understanding that: bumping it to 16384 (4 kva
+ * pages per ring) made the Pi 5 panic during shutdown in fd_table_unref with
+ * a garbage fds[].ops, i.e. two owners of the same pages. The alloc/free page
+ * counts were consistent and it never reproduced on x86 or in arm64 QEMU, so
+ * there is a latent multi-page kva/TLB bug on arm64 hiding behind it. */
+#define UNIX_BUF_SIZE    4096
 #define UNIX_BUF_PAGES   (UNIX_BUF_SIZE / 4096)
 #define UNIX_NONE        0xFFFFFFFFU
 
