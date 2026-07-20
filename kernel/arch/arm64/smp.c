@@ -132,9 +132,14 @@ ap_c_entry(uint64_t cpu)
     percpu_set_current(idle);
     arch_set_kernel_stack(idle->kernel_stack_top);
 
-    /* Outgoing-only throwaway TCB (like sched_start / x86 ap_entry). */
-    static aegis_task_t s_ap_dummy[MAX_CPUS];
-    ctx_switch(&s_ap_dummy[cpu], idle);
+    /* Outgoing-only throwaway TCB (like sched_start / x86 ap_entry): written by
+     * ctx_switch, never read (the __builtin_unreachable below — we never switch
+     * back to it).  A single SHARED static suffices, not one slot per CPU:
+     * concurrent APs saving discarded state into it during this one-shot entry
+     * is benign (garbage no one consumes).  Was aegis_task_t[MAX_CPUS] = ~1.25 MB
+     * of BSS for write-only scratch. */
+    static aegis_task_t s_ap_dummy;
+    ctx_switch(&s_ap_dummy, idle);
     __builtin_unreachable();
 }
 
