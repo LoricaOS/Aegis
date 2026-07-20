@@ -21,6 +21,7 @@
 #include "pmm.h"
 #include "vmm.h"
 #include "kva.h"
+#include "kasan.h"
 #include "sched.h"
 #include "proc.h"
 #include "vfs.h"
@@ -288,6 +289,17 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     pmm_init();             /* bitmap allocator — [PMM] OK                   */
     vmm_init();             /* page tables, higher-half map — [VMM] OK       */
     kva_init();             /* kernel virtual allocator — [KVA] OK           */
+    kasan_init();           /* [KASAN] OK (KASAN=1 build only; else no-op)    */
+#ifdef KASAN
+    /* `kasantest` cmdline token: prove the instrumentation catches an OOB. */
+    {
+        extern void kasan_selftest(void);
+        const char *q = arch_get_cmdline();
+        for (; *q; q++)
+            if (q[0]=='k'&&q[1]=='a'&&q[2]=='s'&&q[3]=='a'&&q[4]=='n'&&
+                q[5]=='t'&&q[6]=='e'&&q[7]=='s'&&q[8]=='t') { kasan_selftest(); break; }
+    }
+#endif
     bph("mem");
     /* Swap the 4GB bootstrap bitmap for a full RAM-sized one now that KVA is
      * up (needs no identity map — it's higher-half). After this, all of RAM

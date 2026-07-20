@@ -93,6 +93,20 @@ MM_SRCS = \
     kernel/lib/va_freelist.c \
     kernel/lib/string.c
 
+# KASAN=1 — build the kernel with the Address Sanitizer (globals/BSS coverage).
+# A debug-only build (slow: every memory access becomes an out-of-line call); it
+# catches out-of-bounds reads/writes on static arrays. The runtime (kasan.c) is
+# itself compiled WITHOUT the sanitizer via a dedicated rule below; kasan_test.c
+# stays instrumented so `kasantest` on the cmdline can prove it fires.
+ifeq ($(KASAN),1)
+KASAN_CFLAGS = -fsanitize=kernel-address \
+    --param asan-instrumentation-with-call-threshold=0 \
+    --param asan-globals=1 --param asan-stack=0 \
+    -fasan-shadow-offset=0xdffffc0000000000
+CFLAGS  += $(KASAN_CFLAGS) -DKASAN=1
+MM_SRCS += kernel/mm/kasan.c kernel/mm/kasan_test.c
+endif
+
 SCHED_SRCS  = kernel/sched/sched.c kernel/sched/waitq.c
 SIGNAL_SRCS = kernel/signal/signal.c
 TTY_SRCS    = kernel/tty/tty.c kernel/tty/pty.c
@@ -246,6 +260,13 @@ test-arm64:
 # pid/tgid offsets, so a stale procfs.o read pid as 0) — a silent wrong-binary
 # class that an incremental `make` cannot otherwise catch. -MP adds phony header
 # targets so deleting a header doesn't break the build with a missing-prereq error.
+# The KASAN runtime must not instrument itself — strip the sanitizer flags for
+# just this object (more specific than the generic rule below, so make prefers
+# it). -DKASAN stays so the file's own #ifdef KASAN body compiles in.
+$(BUILD)/mm/kasan.o: kernel/mm/kasan.c
+	@mkdir -p $(dir $@)
+	$(CC) $(filter-out $(KASAN_CFLAGS),$(CFLAGS)) -MMD -MP -c $< -o $@
+
 $(BUILD)/%.o: kernel/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
