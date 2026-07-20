@@ -303,6 +303,7 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 515: return sys_fb_flush();
     case 516: return sys_install_commit();
     case 517: return sys_admin_session(arg1);
+    case 519: return sys_admin_session_active();  /* Aegis: query own admin session */
     case 362: return sys_cap_query(arg1, arg2, arg3);
     /* 363 (sys_cap_grant_runtime) removed: retired in Phase 46c, zero callers,
      * and a live "inject a cap into any PID" primitive is attack surface. */

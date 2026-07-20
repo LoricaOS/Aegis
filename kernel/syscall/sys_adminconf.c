@@ -106,3 +106,22 @@ sys_set_ntp(uint64_t enable)
                     : kfile_write("/etc/aegis/ntp", "off\n", 4);
     return rc == 0 ? 0 : SYS_ERR(EIO);
 }
+
+/*
+ * sys_admin_session_active — syscall 519 (Aegis-private)
+ *
+ * Returns 1 if the CALLER holds a live admin session (the sudo-style elevated
+ * state set by sys_admin_session after /bin/login verifies /etc/aegis/admin),
+ * else 0. Queries only the caller's own state and confers no authority, so it
+ * needs no capability — a process may always ask about itself. Account tools
+ * (passwd/useradd/userdel/usermod) use it to self-gate account-mutating ops
+ * behind an admin session; the write itself is still independently gated by the
+ * kernel's CAP_KIND_AUTH inode check on /etc/shadow, so this is defence in
+ * depth for the tool's own policy, not the sole guard.
+ */
+uint64_t
+sys_admin_session_active(void)
+{
+    aegis_process_t *proc = current_proc();
+    return (proc && proc->admin_session) ? 1u : 0u;
+}
