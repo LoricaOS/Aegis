@@ -117,6 +117,7 @@ FS_SRCS = \
     kernel/fs/blkdev.c kernel/fs/gpt.c \
     kernel/fs/ext2.c kernel/fs/ext2_cache.c kernel/fs/ext2_dir.c kernel/fs/ext2_vfs.c \
     kernel/fs/ramfs.c kernel/fs/procfs.c kernel/fs/memfd.c kernel/fs/eventfd.c \
+    kernel/fs/mount.c \
     kernel/fs/poll_test.c
 
 DRIVER_SRCS = \
@@ -152,6 +153,7 @@ USERSPACE_SRCS = \
     kernel/syscall/sys_hostname.c kernel/syscall/sys_adminconf.c \
     kernel/syscall/sys_cap.c kernel/syscall/sys_time.c \
     kernel/syscall/sys_file.c kernel/syscall/sys_dir.c \
+    kernel/syscall/sys_mount.c \
     kernel/syscall/sys_meta.c kernel/syscall/sys_signal.c \
     kernel/syscall/sys_socket.c kernel/syscall/sys_random.c \
     kernel/syscall/sys_disk.c kernel/syscall/futex.c \

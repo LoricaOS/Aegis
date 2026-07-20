@@ -68,6 +68,10 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
         num = (arg4 & 0x100) ? 6 : 4;
         arg1 = arg2; arg2 = arg3;
         break;
+    case  40: num = 165; break;  /* mount   (aarch64 __NR_mount == 40) */
+    case  39: num = 166; break;  /* umount2 (aarch64 __NR_umount2 == 39; must
+                                  * translate — untranslated it would fall
+                                  * through to internal 39 = getpid) */
     case  80: num = 5;   break;  /* fstat */
     case  82: num = 162; break;  /* fsync → sync */
     /* Process */
@@ -237,6 +241,8 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 280: return sys_utimensat(arg1, arg2, arg3, arg4);
     case 257: return sys_openat(arg1, arg2, arg3, arg4);
     case 162: return sys_sync();
+    case 165: return sys_mount(arg1, arg2, arg3, arg4, arg5);   /* mount   */
+    case 166: return sys_umount(arg1, arg2);                    /* umount2 */
     /* fsync(74)/fdatasync(75): flush via the global sync. Per-file flush would
      * be tighter, but sync() is correct (it commits this file too) and matches
      * the aarch64 fsync→sync mapping above. Needed by tinysshd-makekey. */

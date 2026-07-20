@@ -47,7 +47,6 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
 /* Non-colliding syscalls: the x86 number passes through the aarch64 dispatch
  * unchanged (see kernel/syscall/syscall.c). */
 #define SYS_write        1
-#define SYS_getpid       39
 #define SYS_exit         60
 #define SYS_sethostname  170   /* gated on CAP_KIND_POWER — init HOLDS this */
 #define SYS_blkdev_list  510   /* gated on CAP_KIND_DISK_ADMIN — init LACKS this */
@@ -56,6 +55,10 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
  * use each arch's real Linux number (aarch64's are translated to the x86
  * dispatch numbers by the kernel). */
 #ifdef __aarch64__
+#define SYS_getpid       172   /* was non-colliding (x86 39 passed through) until
+                                * the mount syscall added aarch64 umount2(39) →
+                                * 39 now collides, so use the real aarch64 nr */
+#define SYS_mount        40
 #define SYS_clone        220
 #define SYS_wait4        260
 #define SYS_kill         129
@@ -73,6 +76,8 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
 #define SYS_readlinkat   78
 #define SYS_newfstatat   79
 #else
+#define SYS_getpid       39
+#define SYS_mount        165
 #define SYS_clone        56
 #define SYS_wait4        61
 #define SYS_kill         62
@@ -209,6 +214,14 @@ void _start(void)
     total++;
     if (sys3(SYS_blkdev_list, 0, 0, 0) < 0) { pass++; out("[KTEST] PASS diskadmin-denied\n"); }
     else out("[KTEST] FAIL diskadmin-NOT-denied (privesc!)\n");
+
+    /* 4b. NEGATIVE control — mount needs CAP_KIND_MOUNT, which init does NOT
+     *     hold, so the kernel must refuse sys_mount (fail closed): a filesystem
+     *     mounted over /etc would be a privilege-escalation primitive. */
+    total++;
+    if (sys6(SYS_mount, 0, (long)"/mnt/x", (long)"tmpfs", 0, 0, 0) < 0)
+        { pass++; out("[KTEST] PASS mount-denied\n"); }
+    else out("[KTEST] FAIL mount-NOT-denied (privesc!)\n");
 
     /* 5. FP/SIMD state survives a context switch (arm64 only — this
      *    test-init is built -mno-sse on x86, where the FXSAVE path is

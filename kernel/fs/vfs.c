@@ -3,6 +3,7 @@
 #include "initrd.h"
 #include "ext2.h"
 #include "ramfs.h"
+#include "mount.h"
 #include "procfs.h"
 #include "pty.h"
 #include "printk.h"
@@ -59,6 +60,12 @@ ramfs_for_path(const char *path, const char **rel)
     if (path[0]=='/' && path[1]=='r' && path[2]=='u' && path[3]=='n' && path[4]=='/') {
         *rel = path + 5;
         return &s_run_ramfs;
+    }
+    /* Dynamic tmpfs mounts (sys_mount) — routes unlink/mkdir/rmdir/rename too. */
+    {
+        void *ctx;
+        if (mount_resolve(path, &ctx, rel) == MOUNT_FS_TMPFS)
+            return (ramfs_t *)ctx;
     }
     return (ramfs_t *)0;
 }
@@ -193,6 +200,18 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
             return ramfs_opendir(&s_run_ramfs, out);
         if (path[4] == '/')
             return ramfs_open(&s_run_ramfs, path + 5, flags, out);
+    }
+
+    /* Dynamic mounts (sys_mount): a tmpfs subtree, e.g. under /mnt. Checked
+     * before ext2 so the mount shadows the (empty) mountpoint dir. */
+    {
+        void *ctx;
+        const char *rel;
+        if (mount_resolve(path, &ctx, &rel) == MOUNT_FS_TMPFS) {
+            if (*rel == '\0')
+                return ramfs_opendir((ramfs_t *)ctx, out);
+            return ramfs_open((ramfs_t *)ctx, rel, flags, out);
+        }
     }
 
     /* ext2 primary — writable root filesystem */
@@ -436,6 +455,24 @@ vfs_stat_path(const char *path, k_stat_t *out)
     if (path[0]=='/' && path[1]=='r' && path[2]=='u' && path[3]=='n' && path[4]=='/')
         return ramfs_stat(&s_run_ramfs, path + 5, out);
 
+    /* Dynamic mounts (sys_mount): tmpfs subtree */
+    {
+        void *ctx;
+        const char *rel;
+        if (mount_resolve(path, &ctx, &rel) == MOUNT_FS_TMPFS) {
+            if (*rel == '\0') {
+                /* the mount root itself — a synthetic directory */
+                __builtin_memset(out, 0, sizeof(*out));
+                out->st_dev   = 1;
+                out->st_ino   = 1;
+                out->st_nlink = 2;
+                out->st_mode  = S_IFDIR | 0755;
+                return 0;
+            }
+            return ramfs_stat((ramfs_t *)ctx, rel, out);
+        }
+    }
+
     /* ext2 primary */
     {
         uint32_t ino = 0;
@@ -489,6 +526,14 @@ int
 vfs_stat_path_ex(const char *path, k_stat_t *out, int follow)
 {
     if (!path || !out) return -ENOENT;
+
+    /* Dynamic mounts (tmpfs): no symlinks, delegate to vfs_stat_path */
+    {
+        void *ctx;
+        const char *rel;
+        if (mount_resolve(path, &ctx, &rel) != MOUNT_FS_NONE)
+            return vfs_stat_path(path, out);
+    }
 
     /* Non-ext2 paths: no symlinks, delegate to vfs_stat_path */
     if ((path[0]=='/' && path[1]=='p' && path[2]=='r' && path[3]=='o' &&

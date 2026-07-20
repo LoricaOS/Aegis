@@ -60,6 +60,7 @@ cap_name_to_kind(const char *name)
         { "INSTALL",        CAP_KIND_INSTALL },
         { "NET_LISTEN",     CAP_KIND_NET_LISTEN },
         { "ADMIN_AUTH",     CAP_KIND_ADMIN_AUTH },
+        { "MOUNT",          CAP_KIND_MOUNT },
     };
     /* T4 cap-enum guard: the table must name every cap kind 1..CAP_KIND_MAX
      * (CAP_KIND_NULL=0 is excluded — it is the empty-slot sentinel, not a

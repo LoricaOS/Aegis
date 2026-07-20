@@ -213,6 +213,10 @@ uint64_t sys_dup2(uint64_t a1, uint64_t a2);
 uint64_t sys_dup3(uint64_t oldfd, uint64_t newfd, uint64_t flags);
 uint64_t sys_getrusage(uint64_t who, uint64_t ubuf);
 uint64_t sys_sync(void);
+uint64_t sys_mount(uint64_t source, uint64_t target, uint64_t fstype,
+                   uint64_t mountflags, uint64_t data);
+uint64_t sys_umount(uint64_t target, uint64_t flags);
+void mount_selftest(void);
 
 /* ── sys_time.c ────────────────────────────────────────────────────────── */
 uint64_t sys_nanosleep(uint64_t a1, uint64_t a2);

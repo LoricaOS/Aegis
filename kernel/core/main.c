@@ -361,6 +361,14 @@ kernel_main(uint32_t mb_magic, void *mb_info)
 
     vfs_init();             /* [VFS] OK + [INITRD] OK                        */
     console_init();         /* register stdout device (silent)               */
+    /* `mounttest` cmdline: exercise the mount table + VFS routing end to end. */
+    {
+        extern void mount_selftest(void);
+        const char *q = arch_get_cmdline();
+        for (; *q; q++)
+            if (q[0]=='m'&&q[1]=='o'&&q[2]=='u'&&q[3]=='n'&&q[4]=='t'&&
+                q[5]=='t'&&q[6]=='e'&&q[7]=='s'&&q[8]=='t') { mount_selftest(); break; }
+    }
     bph("fs-base");
     acpi_init();            /* parse MCFG+MADT — [ACPI] OK                   */
     bph("acpi");
