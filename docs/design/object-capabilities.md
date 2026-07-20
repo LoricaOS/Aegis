@@ -237,7 +237,30 @@ opposite trajectory to the one the Linux comparison warned about.
 ## 5. Staging
 
 1. **`openat` honors `dirfd`** for ordinary directory fds (no capability semantics
-   yet) — pure ABI-correctness fix, unblocks everything below. (Small.)
+   yet) — unblocks everything below. **Not a trivial fix (the earlier "small"
+   estimate was wrong) — it is a focused multi-layer change**, because the VFS is
+   path-based and an fd stores no path/inode. The *correct, lifecycle-free* approach
+   (verified against the code 2026-07-20):
+   - **Resolve by inode, never store a path.** A per-fd path buffer is rejected:
+     there is no sub-page allocator (page-granular kva only) and ~30 scattered
+     fd-close sites in code with a UAF history — a matching free at each is a
+     minefield. An inode is a scalar: copied by value on fork/dup, no free, no
+     lifecycle.
+   - **The pieces already exist.** `ext2_open_ex` is really *path→inode*; an ext2
+     fd's `priv` already carries the inode; `ext2_walk_impl` already walks
+     component-by-component from a start inode (`current_ino = EXT2_ROOT_INODE`,
+     `ext2.c:~1204`). Add a start-inode variant (`ext2_walk_from(start_ino, rel,
+     …)`), get the dir fd's inode from its `priv`, resolve `rel` from it, and build
+     the target fd the same way the ext2 VFS open already does.
+   - **Scope:** ext2-backed directory fds (the real capability roots — `/etc`,
+     `/apps`, `/home`). Synthetic dirs (`/dev`, `/proc`) are not capability roots
+     and can stay `AT_FDCWD`/absolute-only.
+   - **Watch (bites step 2):** `ext2_walk_impl` clamps `..` to the *filesystem*
+     root (`ext2.c:~1234`). A confined capability fd must clamp `..` to the **cap
+     root**, or confinement leaks. Step 1 keeps clamp-to-`/`; step 2 makes it
+     clamp-to-cap-root when `cap_confined`.
+   - KTEST: `openat(dirfd, "sub/file")` opens the right file; behaves identically to
+     absolute open. (Confinement/escape tests arrive with step 2.)
 2. **Directory-fd capability fields + confined `*at` resolution** (§3.1–3.2) +
    `sys_cap_rights_limit` (§3.3). Opt-in, additive; nothing regresses. KTEST: a
    confined dir-fd cannot `openat("../etc/shadow")`, cannot exceed its rights.
