@@ -313,6 +313,8 @@ reload_binary:
     proc->pending_signals = 0;
     proc->signal_mask = 0;
     __builtin_memset(proc->sigactions, 0, sizeof(proc->sigactions));
+    proc->altstack_sp = 0;          /* execve resets the alternate signal stack */
+    proc->altstack_size = 0;
 
     /* 6. Load new ELF */
     elf_load_result_t er;

@@ -31,6 +31,21 @@
 #define SIG_DFL ((void (*)(int))0)
 #define SIG_IGN ((void (*)(int))1)
 
+/* ── Alternate signal stack (sigaltstack / SA_ONSTACK) ─────────── */
+#define SA_ONSTACK   0x08000000u   /* deliver this signal on the alt stack */
+#define SS_ONSTACK   1             /* ss_flags: currently executing on it   */
+#define SS_DISABLE   2             /* ss_flags: no alt stack installed      */
+#define MINSIGSTKSZ  2048          /* minimum acceptable ss_size            */
+
+/* Userland stack_t, LP64 layout {void*, int, size_t} = 24 bytes both arches. */
+typedef struct {
+    uint64_t ss_sp;
+    uint32_t ss_flags;
+    uint32_t _pad;
+    uint64_t ss_size;
+} k_stack_t;
+_Static_assert(sizeof(k_stack_t) == 24, "k_stack_t must be 24 bytes (stack_t)");
+
 /* ── Architecture-specific signal frame structures ─────────────── */
 
 /* k_sigaction_t: kernel's view of struct sigaction.

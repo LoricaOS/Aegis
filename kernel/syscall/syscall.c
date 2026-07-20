@@ -86,7 +86,10 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 124: num = 35;  break;  /* sched_yield → nanosleep(0) */
     case 129: num = 62;  break;  /* kill */
     case 130: num = 130; break;  /* rt_sigsuspend */
-    case 131: num = 13;  break;  /* sigaltstack → rt_sigaction (stub) */
+    case 131: num = 13;  break;  /* aarch64 131 = tgkill; historically (mis)stubbed
+                                  * to rt_sigaction. Left as-is (pre-existing, out
+                                  * of scope). Real sigaltstack is aarch64 132 → 131. */
+    case 132: num = 131; break;  /* sigaltstack (aarch64 __NR_sigaltstack == 132) */
     case 134: num = 13;  break;  /* rt_sigaction */
     case 135: num = 14;  break;  /* rt_sigprocmask */
     case 139: num = 15;  break;  /* rt_sigreturn */
@@ -180,6 +183,7 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 14: return sys_rt_sigprocmask(arg1, arg2, arg3, arg4);
     case 15: return sys_rt_sigreturn(frame);
     case 130: return sys_rt_sigsuspend(arg1, arg2);
+    case 131: return sys_sigaltstack(arg1, arg2);   /* real alt signal stack */
     case 20: return sys_writev(arg1, arg2, arg3);
     case 39: return sys_getpid();
     case 56: return sys_clone(frame, arg1, arg2, arg3, arg4, arg5, arg1, arg2, arg3);

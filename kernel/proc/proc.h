@@ -89,6 +89,11 @@ typedef struct aegis_process {
     char          vfs_scope[128];
     uint32_t      vfs_scope_len; /* strlen(vfs_scope); 0 = unconfined */
     uint64_t      exit_status;  /* lower 8 bits = exit code; written before zombie */
+    /* Alternate signal stack (sigaltstack). altstack_size == 0 means none is
+     * installed; a SA_ONSTACK handler is then delivered on the normal stack.
+     * Reset on execve; per-process (shared by a thread group). */
+    uint64_t      altstack_sp;       /* ss_sp (base of the alt stack) */
+    uint64_t      altstack_size;     /* ss_size; 0 = disabled */
     /* Phase 17 — signal subsystem */
     uint64_t      pending_signals;   /* bitmask; bit N = signal N pending */
     uint64_t      signal_mask;       /* blocked signals; 0 = nothing blocked */

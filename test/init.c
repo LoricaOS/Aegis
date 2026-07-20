@@ -66,6 +66,7 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
 #define SYS_execve       221
 #define SYS_rt_sigaction 134
 #define SYS_rt_sigreturn 139
+#define SYS_sigaltstack  132
 /* The *at forms are the only ones aarch64 has; musl builds every legacy call
  * out of them, so the test must use them too — that is precisely the path
  * where the kernel's aarch64 translation has to preserve the flags. */
@@ -85,6 +86,7 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
 #define SYS_execve       59
 #define SYS_rt_sigaction 13
 #define SYS_rt_sigreturn 15
+#define SYS_sigaltstack  131
 #define SYS_stat         4
 #define SYS_lstat        6
 #define SYS_close        3
@@ -159,6 +161,8 @@ static unsigned k_stat_mode(const void *st)
 
 #define SIGCHLD 17
 #define SIGUSR1 10
+#define SIGUSR2 12
+#define SA_ONSTACK 0x08000000UL
 
 static unsigned slen(const char *s) { unsigned n = 0; while (s[n]) n++; return n; }
 static void out(const char *s) { sys3(SYS_write, 2, (long)s, slen(s)); }
@@ -169,6 +173,18 @@ static void out(const char *s) { sys3(SYS_write, 2, (long)s, slen(s)); }
 static volatile int g_sig_got = 0;
 static void sig_handler(int signum) { g_sig_got = signum; }
 static volatile long g_cow = 0;   /* dedicated COW test page (data, not stack) */
+
+/* sigaltstack test: a SA_ONSTACK handler records the stack region it ran on
+ * (the address of a local), which must fall inside g_altstack if delivery used
+ * the alternate signal stack. */
+static char g_altstack[8192];
+static volatile unsigned long g_altsp = 0;
+static void sig_alt_handler(int signum) {
+    char probe;
+    g_altsp = (unsigned long)(void *)&probe;
+    g_sig_got = signum;
+}
+struct kstack { void *ss_sp; int ss_flags; unsigned long ss_size; };
 
 #ifdef __aarch64__
 __asm__(".globl sig_restorer\nsig_restorer:\n\tmov x8, #139\n\tsvc #0\n");
@@ -325,6 +341,30 @@ void _start(void)
         sys3(SYS_kill, mypid, SIGUSR1, 0);
         if (g_sig_got == SIGUSR1) { pass++; out("[KTEST] PASS signal+sigreturn\n"); }
         else out("[KTEST] FAIL signal\n");
+    }
+
+    /* 7b. sigaltstack + SA_ONSTACK. Install an alternate signal stack, register
+     *     a SA_ONSTACK handler for SIGUSR2, raise it, and confirm the handler
+     *     ran ON the alt stack (a local's address lands inside g_altstack).
+     *     Was a no-op stub aliased to rt_sigaction. */
+    total++;
+    {
+        struct kstack ss = { g_altstack, 0, sizeof(g_altstack) };
+        struct ksigaction act;
+        act.sa_handler  = sig_alt_handler;
+        act.sa_flags    = SA_ONSTACK;
+        act.sa_restorer = sig_restorer;
+        act.sa_mask     = 0;
+        g_altsp = 0;
+        g_sig_got = 0;
+        long r = sys3(SYS_sigaltstack, (long)&ss, 0, 0);
+        sys6(SYS_rt_sigaction, SIGUSR2, (long)&act, 0, 8, 0, 0);
+        sys3(SYS_kill, sys3(SYS_getpid, 0, 0, 0), SIGUSR2, 0);
+        unsigned long lo = (unsigned long)(void *)g_altstack;
+        unsigned long hi = lo + sizeof(g_altstack);
+        if (r == 0 && g_sig_got == SIGUSR2 && g_altsp >= lo && g_altsp < hi) {
+            pass++; out("[KTEST] PASS sigaltstack (handler on alt stack)\n");
+        } else out("[KTEST] FAIL sigaltstack\n");
     }
 
     /* 8. execve: fork a child that execs a SECOND binary (/bin/exectest).

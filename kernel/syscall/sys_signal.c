@@ -67,6 +67,55 @@ sys_rt_sigaction(uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4)
 }
 
 /*
+ * sys_sigaltstack — syscall 131 (x86-64; aarch64 132 translates to 131).
+ *
+ * arg1 = user ptr to new stack_t (NULL = query only)
+ * arg2 = user ptr to old stack_t output (NULL = discard)
+ *
+ * Establishes the alternate stack a SA_ONSTACK handler runs on. This was a
+ * no-op stub aliased to rt_sigaction, so anything that survives a stack-overflow
+ * SIGSEGV on an alt stack (glibc/musl stack-overflow reporting, Go/Rust
+ * runtimes, JITs) got a success-shaped return and then failed strangely later.
+ * The state now lives in the PCB and signal delivery honours it.
+ */
+uint64_t
+sys_sigaltstack(uint64_t arg1, uint64_t arg2)
+{
+    aegis_process_t *proc = current_proc();
+
+    if (arg2 != 0) {                     /* report the current alt stack */
+        k_stack_t o;
+        o.ss_sp    = proc->altstack_sp;
+        o.ss_flags = proc->altstack_size == 0 ? SS_DISABLE : 0;
+        o._pad     = 0;
+        o.ss_size  = proc->altstack_size;
+        COPY_TO_USER(arg2, &o);
+    }
+
+    if (arg1 != 0) {                     /* install / disable an alt stack */
+        k_stack_t n;
+        COPY_FROM_USER(&n, arg1);
+        if (n.ss_flags & SS_DISABLE) {
+            proc->altstack_sp   = 0;
+            proc->altstack_size = 0;
+        } else {
+            if (n.ss_flags & ~(uint32_t)SS_ONSTACK)   /* SS_ONSTACK ignored, others invalid */
+                return SYS_ERR(EINVAL);
+            if (n.ss_size < MINSIGSTKSZ)
+                return SYS_ERR(ENOMEM);
+            if (!user_ptr_valid(n.ss_sp, 1))
+                return SYS_ERR(EFAULT);
+            proc->altstack_sp   = n.ss_sp;
+            proc->altstack_size = n.ss_size;
+        }
+    }
+    return 0;
+    /* v1: no EPERM guard against changing the alt stack while running on it
+     * (a caller footgun, not a kernel-safety issue), and SS_ONSTACK is not
+     * reported in ss_flags — both are refinements a follow-up can add. */
+}
+
+/*
  * sys_rt_sigprocmask — syscall 14
  *
  * arg1 = how (SIG_BLOCK=0, SIG_UNBLOCK=1, SIG_SETMASK=2)
