@@ -74,10 +74,17 @@
  * cost. Fits under the 8 MB ceiling. APPLIED 2026-06-15: 64 -> 128. */
 #define AEGIS_SOCK_TABLE_SIZE 128
 
-/* UNIX_SOCK_MAX (unix_socket.h): the whole GUI/IPC bus; 64 = 32 concurrent
- * connections. Each unix_sock_t carries UNIX_BUF_SIZE(4096) — so +32 entries is
- * ~256 KB BSS. Fits under the 8 MB ceiling. APPLIED 2026-06-15: 32 -> 64. */
-#define AEGIS_UNIX_SOCK_MAX   64
+/* UNIX_SOCK_MAX (unix_socket.h): the whole GUI/IPC bus; 128 = 64 concurrent
+ * connections. SerenityOS-comparison S1-2 flagged 64 (=32 concurrent) as the
+ * ceiling a compositor hits first — a couple dozen windows exhausts it. The
+ * ring buffer is a kva pointer (`uint8_t *ring`), NOT embedded, so unix_sock_t
+ * is only ~550 B; +64 entries measured 2026-07-20 at +35 KB BSS (5.846 -> 5.881
+ * MB), leaving ~2.5 MB headroom under the 8 MB image window (the linker.ld
+ * ASSERT is the hard guard). The per-connection 4 KB ring is kva, allocated
+ * when a socket is actually opened. (An earlier revision of this comment
+ * claimed each entry embeds UNIX_BUF_SIZE — stale: the ring was moved off the
+ * struct.) APPLIED 2026-06-15: 32 -> 64.  APPLIED 2026-07-20: 64 -> 128. */
+#define AEGIS_UNIX_SOCK_MAX   128
 
 /* UNIX_PASSED_FD_MAX (unix_socket.h): max fds carried in one SCM_RIGHTS send,
  * staged on the receiving socket until recvmsg installs them. Each
