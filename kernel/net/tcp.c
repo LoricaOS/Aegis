@@ -73,11 +73,13 @@ static uint8_t s_tcp_buf[1480];
 static tcp_conn_t s_rst_conn;
 static spinlock_t tcp_lock = SPINLOCK_INIT;
 
-/* tcp_claim_slot: zero slot i for reuse while preserving the kva-allocated ring
- * pointers (rbuf/sbuf are allocated once at boot and never freed — see
- * tcp_init). A raw memset of the slot would NULL them and the next data op
- * would dereference NULL. Every claim site (tcp_alloc, tcp_listen, tcp_connect)
- * must go through this, never a bare kmemset(&s_tcp[i], ...). */
+/* tcp_claim_slot: zero slot i for reuse while preserving its ring-buffer
+ * pointers. rbuf/sbuf are attached LAZILY (tcp_attach_buffers) the first time a
+ * slot goes active and then kept for the life of the table — so a raw memset
+ * would NULL a reused slot's buffers and the next data op would dereference
+ * NULL. A never-yet-used slot has NULL buffers here (preserved as NULL); its
+ * claim site attaches them. Every claim site (tcp_alloc, tcp_listen,
+ * tcp_connect) must go through this, never a bare kmemset(&s_tcp[i], ...). */
 static void tcp_claim_slot(uint32_t i)
 {
     uint8_t *rb = s_tcp[i].rbuf;
@@ -89,13 +91,29 @@ static void tcp_claim_slot(uint32_t i)
 
 void tcp_init(void)
 {
-    /* Zero the table FIRST, then attach the kva rings — the alloc loop must run
-     * after the memset so the pointers survive. */
+    /* Zero the table.  Ring buffers are NOT allocated here — the old eager loop
+     * allocated TCP_RBUF_SIZE+TCP_SBUF_SIZE (320 KB) for ALL TCP_MAX_CONNS slots
+     * up front (~41 MB resident before a single packet moves, and a boot-time
+     * panic on any machine too small to satisfy it, even with the network
+     * unused).  Each slot's rbuf/sbuf are now attached on demand the first time
+     * the slot goes active (tcp_attach_buffers, from tcp_alloc/tcp_connect) and
+     * kept for reuse, so peak residency tracks peak concurrent connections and
+     * an idle/network-less system pays nothing. */
     kmemset(s_tcp, 0, sizeof(s_tcp));
-    for (uint32_t i = 0; i < TCP_MAX_CONNS; i++) {
-        s_tcp[i].rbuf = kva_alloc_pages(TCP_RBUF_SIZE / 4096); /* 64 pages, panics on OOM */
-        s_tcp[i].sbuf = kva_alloc_pages(TCP_SBUF_SIZE / 4096); /* 16 pages, panics on OOM */
-    }
+}
+
+/* tcp_attach_buffers — attach this slot's rx/tx rings if not already present.
+ * No-op for a reused slot that still holds its buffers.  Uses kva_alloc_pages,
+ * which panics only on genuine kernel OOM (consistent with every other kva
+ * caller) — but that can now happen only under real connection load, never at
+ * boot.  The connection-count ceiling itself stays graceful: tcp_alloc returns
+ * NULL when all slots are busy and callers already handle that. */
+static void tcp_attach_buffers(tcp_conn_t *c)
+{
+    if (c->rbuf)
+        return;                                  /* reused slot: keep buffers */
+    c->rbuf = kva_alloc_pages(TCP_RBUF_SIZE / 4096);   /* 64 pages */
+    c->sbuf = kva_alloc_pages(TCP_SBUF_SIZE / 4096);   /* 16 pages */
 }
 
 /* tcp_adv_window — compute the (network-order) 16-bit window field to advertise.
@@ -368,6 +386,7 @@ static tcp_conn_t *tcp_alloc(void)
     for (i = 0; i < TCP_MAX_CONNS; i++) {
         if (s_tcp[i].state == TCP_CLOSED) {
             tcp_claim_slot((uint32_t)i);
+            tcp_attach_buffers(&s_tcp[i]);
             return &s_tcp[i];
         }
     }
@@ -1124,6 +1143,7 @@ tcp_connect(uint32_t sock_id, ip4_addr_t dst_ip, uint16_t dst_port,
     for (i = 0; i < TCP_MAX_CONNS; i++) {
         if (s_tcp[i].state == TCP_CLOSED) {
             tcp_claim_slot(i);
+            tcp_attach_buffers(&s_tcp[i]);
             s_tcp[i].state       = TCP_SYN_SENT;
             net_get_config(&s_tcp[i].local_ip, (ip4_addr_t *)0, (ip4_addr_t *)0);
             /* Loopback: use 127.0.0.1 as local IP (net_get_config returns

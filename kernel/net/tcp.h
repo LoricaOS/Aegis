@@ -84,9 +84,11 @@ typedef struct {
                                * we decide to offer scaling on this conn */
     uint16_t    snd_mss;       /* peer's MSS from its SYN (clamped to TCP_ADVMSS);
                                * 0 (zeroed slot) → treat as 536 default */
-    uint8_t    *rbuf;          /* kva-allocated at boot, never freed */
+    uint8_t    *rbuf;          /* kva ring, attached lazily on first active use
+                               * (tcp_attach_buffers); NULL for an unused/LISTEN
+                               * slot; kept across slot reuse, never freed */
     uint32_t    rbuf_head, rbuf_tail;
-    uint8_t    *sbuf;          /* kva-allocated at boot, never freed */
+    uint8_t    *sbuf;          /* kva ring, see rbuf */
     uint32_t    sbuf_head, sbuf_tail;
     uint32_t    retransmit_at;
     uint8_t     retransmit_count;
