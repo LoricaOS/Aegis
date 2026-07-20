@@ -145,6 +145,9 @@ void udp_rx(netdev_t *dev, ip4_addr_t src_ip, ip4_addr_t dst_ip,
                 continue;
         }
 
+        /* Ring is lazily allocated for DGRAM sockets; a matched bound socket
+         * always has one, but drop rather than deref if somehow absent. */
+        if (!s->udp_rx) goto udp_out;
         /* Find a free UDP RX slot (SPSC ring: producer owns tail,
          * consumer owns head). */
         uint8_t next = (uint8_t)((s->udp_rx_tail + 1) & (UDP_RX_SLOTS - 1));

@@ -381,6 +381,14 @@ kernel_main(uint32_t mb_magic, void *mb_info)
             if (q[0]=='m'&&q[1]=='o'&&q[2]=='u'&&q[3]=='n'&&q[4]=='t'&&
                 q[5]=='t'&&q[6]=='e'&&q[7]=='s'&&q[8]=='t') { mount_selftest(); break; }
     }
+    /* `socktest` cmdline: prove the lazy UDP-ring alloc/free contract. */
+    {
+        extern void sock_selftest(void);
+        const char *q = arch_get_cmdline();
+        for (; *q; q++)
+            if (q[0]=='s'&&q[1]=='o'&&q[2]=='c'&&q[3]=='k'&&q[4]=='t'&&
+                q[5]=='e'&&q[6]=='s'&&q[7]=='t') { sock_selftest(); break; }
+    }
     bph("fs-base");
     acpi_init();            /* parse MCFG+MADT — [ACPI] OK                   */
     bph("acpi");
