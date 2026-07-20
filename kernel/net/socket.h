@@ -58,8 +58,13 @@ typedef struct {
     /* accept queue: ring of completed tcp_conn_id values */
     uint32_t      accept_queue[8];
     uint8_t       accept_head, accept_tail;
-    /* UDP receive ring */
-    udp_rx_slot_t udp_rx[UDP_RX_SLOTS];
+    /* UDP receive ring — lazily kva-allocated (UDP_RX_SLOTS slots) only for
+     * SOCK_DGRAM sockets, NULL otherwise.  Was an inline udp_rx[UDP_RX_SLOTS]
+     * array = ~12 KB embedded in EVERY slot (all 128, TCP and free alike) =
+     * ~1.5 MB BSS; now a TCP socket / free slot carries just this pointer.
+     * Invariant: a SOCK_FREE slot always has udp_rx == NULL (sock_free reclaims
+     * it), so sock_alloc's memset can never strand a live ring. */
+    udp_rx_slot_t *udp_rx;
     uint8_t       udp_rx_head, udp_rx_tail;
     /* epoll back-reference */
     uint32_t      epoll_id;      /* SOCK_NONE = not watched */

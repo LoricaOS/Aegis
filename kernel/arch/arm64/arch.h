@@ -35,6 +35,11 @@ void gic_enable_spi(uint32_t intid);
 /* arch_debug_exit / shutdown — PSCI SYSTEM_OFF (HVC conduit on QEMU virt). */
 void arch_debug_exit(unsigned char value);
 void arch_request_shutdown(void);
+#ifdef AEGIS_BOOT_NATIVE
+/* Deliberate hard reboot of the real Pi 5 via the BCM2712 watchdog (the proven
+ * reset path; stock armstub has no PSCI SYSTEM_RESET). Never returns. */
+void arch_native_reset(void);
+#endif
 
 /* -------------------------------------------------------------------------
  * Physical memory interface
@@ -67,6 +72,7 @@ typedef struct {
 } arch_fb_info_t;
 
 int arch_get_fb_info(arch_fb_info_t *out);
+void arch_native_set_fb(uint64_t addr, uint32_t w, uint32_t h, uint32_t pitch);
 int arch_get_module(uint64_t *phys_out, uint64_t *size_out);
 int arch_get_module2(uint64_t *phys_out, uint64_t *size_out);
 const char *arch_get_cmdline(void);
@@ -76,6 +82,25 @@ void arch_mm_ingest(const struct aegis_bootinfo *bi);
 uint64_t arch_kern_phys_slide(void);
 uint64_t arch_early_pv_off(void);
 uint64_t arch_get_dtb_phys(void);
+
+/* Native (non-Limine) boot path -- kernel/arch/arm64/native/native_entry.c.
+ * arch_mm_init_native() plays the same role arch_mm_ingest() does for
+ * Limine (sets dtb_phys/slide/pv_off/cmdline), but there is no
+ * aegis_bootinfo_t: no memory map is handed to us at entry, no HHDM
+ * exists (the native path runs off boot_probe.S's own identity map).
+ * arch_mm_populate_regions_from_dtb() fills regions[] from the DTB's
+ * memory nodes afterward -- must be called after fdt_init() has
+ * captured the tree, and is a no-op if Limine already gave us regions. */
+void arch_mm_init_native(uint64_t dtb_phys);
+void arch_mm_populate_regions_from_dtb(void);
+
+/* Platform UART physical base, for code that needs it after vmm_init has
+ * replaced the early identity map (vmm.c's DMAP device window, main.c's
+ * post-vmm_init serial_set_base call). Defaults to QEMU virt's PL011
+ * (0x09000000); arch_mm_init_native() overrides it for real Pi 5
+ * hardware (0x107D001000 -- confirmed this address on real hardware
+ * during the native-boot bring-up, see rpi5-port-research memory). */
+uint64_t arch_mm_get_uart_phys(void);
 
 /* Highest canonical user-space virtual address (48-bit VA, TTBR0 half). */
 #define USER_ADDR_MAX 0x0000FFFFFFFFFFFFUL
@@ -251,5 +276,48 @@ static inline void arch_wait_for_irq(void)
 }
 
 static inline int arch_early_key_held(void) { return 0; }
+
+/* arch_dcache_civac_range — clean+invalidate a data range to the Point of
+ * Coherency. Needed when consuming DRAM written by a NON-coherent agent (the
+ * Pi's VideoCore/VPU stages the netboot kernel + rootfs into RAM and does not
+ * snoop the A76 caches) through a cacheable mapping: without it the CPU may
+ * return speculatively-filled or stale cache lines instead of the producer's
+ * actual writes -- an intermittent, position-dependent corruption over any
+ * span larger than the cache. `civac` (clean AND invalidate) is the safe
+ * choice (harmless on a clean line, leaves nothing stale); 64 bytes is the
+ * A76 DminLine/CWG. */
+static inline void
+arch_dcache_civac_range(const void *addr, uint64_t len)
+{
+    uint64_t p   = (uint64_t)(uintptr_t)addr & ~63UL;
+    uint64_t end = (uint64_t)(uintptr_t)addr + len;
+    for (; p < end; p += 64)
+        __asm__ volatile("dc civac, %0" : : "r"(p) : "memory");
+    __asm__ volatile("dsb sy\n\tisb" ::: "memory");
+}
+
+/* arch_sync_icache_range — make freshly-written bytes safe to execute. ARM's
+ * instruction cache is NOT coherent with data stores (unlike x86): when
+ * execve/elf_load writes a program's code into physical frames via cacheable
+ * stores, the new instructions sit in the D-cache while the PIPT I-cache may
+ * still hold the PREVIOUS occupant's instructions for those (recycled) frames.
+ * Without this the CPU fetches stale/garbage code — undefined-instruction or
+ * wild data-abort faults that move from run to run depending on which frame was
+ * reused and what lingered in the I-cache. Clean the D-cache to the Point of
+ * Unification, then invalidate the I-cache for the same lines. `addr` may be
+ * any VA mapping the frames (elf_load passes its kernel kva view). 64B = A76
+ * I/DminLine. No-op on cache-coherent x86. */
+static inline void
+arch_sync_icache_range(const void *addr, uint64_t len)
+{
+    uint64_t start = (uint64_t)(uintptr_t)addr & ~63UL;
+    uint64_t end   = (uint64_t)(uintptr_t)addr + len;
+    for (uint64_t p = start; p < end; p += 64)
+        __asm__ volatile("dc cvau, %0" : : "r"(p) : "memory");  /* D → PoU     */
+    __asm__ volatile("dsb ish" ::: "memory");
+    for (uint64_t p = start; p < end; p += 64)
+        __asm__ volatile("ic ivau, %0" : : "r"(p) : "memory");  /* I inval PoU */
+    __asm__ volatile("dsb ish\n\tisb" ::: "memory");
+}
 
 #endif /* ARCH_H */

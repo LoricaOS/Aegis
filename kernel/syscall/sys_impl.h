@@ -8,6 +8,7 @@
 #include "../mm/uaccess_user.h"   /* COPY_FROM_USER / COPY_TO_USER (+ _checked) */
 #include "../limits.h"
 #include "../include/aegis_errno.h"
+#include "../fs/vfs.h"       /* k_stat_t (emit_stat below) */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -19,6 +20,11 @@ extern void fork_child_return(void);
 #else
 extern void isr_post_dispatch(void);
 #endif
+
+/* emit_stat — the ONE copy-out for every stat-family syscall: repacks k_stat_t
+ * (x86-64 field order) into the per-arch struct stat musl expects. Defined in
+ * sys_file.c; sys_lstat in sys_meta.c must use it too. */
+uint64_t emit_stat(uint64_t uptr, const k_stat_t *ks);
 
 /* ── Common defines ─────────────────────────────────────────────────────── */
 
@@ -207,9 +213,20 @@ uint64_t sys_dup2(uint64_t a1, uint64_t a2);
 uint64_t sys_dup3(uint64_t oldfd, uint64_t newfd, uint64_t flags);
 uint64_t sys_getrusage(uint64_t who, uint64_t ubuf);
 uint64_t sys_sync(void);
+uint64_t sys_mount(uint64_t source, uint64_t target, uint64_t fstype,
+                   uint64_t mountflags, uint64_t data);
+uint64_t sys_umount(uint64_t target, uint64_t flags);
+void mount_selftest(void);
+uint64_t sys_vfs_confine(uint64_t path);
+uint64_t sys_sigaltstack(uint64_t ss, uint64_t old_ss);
+uint64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_size,
+                    uint64_t flags, uint64_t new_addr);
 
 /* ── sys_time.c ────────────────────────────────────────────────────────── */
 uint64_t sys_nanosleep(uint64_t a1, uint64_t a2);
+uint64_t sys_clock_nanosleep(uint64_t clk_id, uint64_t flags, uint64_t req_uptr, uint64_t rem_uptr);
+uint64_t sys_sched_yield(void);
+uint64_t sys_tgkill(uint64_t a1, uint64_t a2, uint64_t a3);
 uint64_t sys_clock_gettime(uint64_t clk_id, uint64_t timespec_uptr);
 uint64_t sys_clock_settime(uint64_t clk_id, uint64_t timespec_uptr);
 

@@ -331,14 +331,19 @@ ap_entry(void)
     arch_set_kernel_stack(idle->kernel_stack_top);
 
     /* dummy is outgoing-only (same pattern as sched_start): ctx_switch saves
-     * our throwaway boot-stack pointer into it and abandons it.  Use a STATIC
-     * per-CPU dummy rather than a stack local: ctx_switch's fxsave needs the
-     * outgoing TCB 16-byte aligned, and the AP trampoline does not guarantee
-     * the System V incoming-RSP alignment a stack local's auto-alignment
-     * relies on (sched_start gets it for free via a normal call).  A static
-     * aegis_task_t is 16-aligned by the struct's fpu_state member; each AP
-     * writes only its own slot during this one-shot entry. */
-    static aegis_task_t s_ap_entry_dummy[MAX_CPUS];
-    ctx_switch(&s_ap_entry_dummy[my_idx], idle);
+     * our throwaway boot-stack pointer into it and abandons it (the
+     * __builtin_unreachable below — we never switch back TO the dummy, so it is
+     * written and never read).  A STATIC is used rather than a stack local
+     * because ctx_switch's fxsave needs the outgoing TCB 16-byte aligned and the
+     * AP trampoline does not guarantee the System V incoming-RSP alignment a
+     * stack local relies on; a static aegis_task_t is >=16-aligned by its
+     * fpu_state member (the compiler rejects _Alignas(16) here as a REDUCTION,
+     * which confirms the guarantee).  A single SHARED instance suffices (not one
+     * slot per CPU): because nothing ever reads it, concurrent APs saving their
+     * discarded state into it during this one-shot entry is benign — garbage no
+     * one consumes.  This replaces a former aegis_task_t[MAX_CPUS] that cost
+     * ~1.25 MB of BSS for write-only scratch (MAX_CPUS=1024 x ~1.2 KB). */
+    static aegis_task_t s_ap_entry_dummy;
+    ctx_switch(&s_ap_entry_dummy, idle);
     __builtin_unreachable();
 }

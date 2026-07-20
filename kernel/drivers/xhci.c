@@ -102,63 +102,98 @@ static uint32_t s_ctx_entry_size = 32u;
  * Static state
  * ---------------------------------------------------------------------- */
 
-static int                       s_xhci_active    = 0;
 static volatile int              s_msc_busy       = 0;  /* MSC owns the event ring */
 static int                       s_post_boot      = 0;
-static uint8_t                  *s_bar0_va         = NULL;
-/* SAFETY: s_cap and s_op are volatile MMIO pointers — volatile prevents the
- * compiler from caching hardware register reads/writes. */
-static volatile xhci_cap_regs_t *s_cap             = NULL;
-static volatile xhci_op_regs_t  *s_op              = NULL;
 
-/* Command Ring */
-static xhci_trb_t               *s_cmd_ring        = NULL;
-static uint64_t                   s_cmd_ring_phys   = 0;
-static int                        s_cmd_cycle       = 1;
-static uint32_t                   s_cmd_enqueue     = 0;
+/* Per-controller state. The RP1 has TWO independent dwc3/xHCI controllers
+ * (USB0 @ 0x1f00200000, USB1 @ 0x1f00300000), each driving one black + one
+ * blue jack. To run both (keyboard on one, mouse on the other) every register
+ * pointer, ring, DCBAA and per-slot table must be per-controller. Rather than
+ * thread a handle through the whole 3000-line driver, all that state lives in
+ * one struct; `s_cur` selects the active controller and the s_* macros below
+ * redirect the unchanged driver body at it. xhci_init_at() and xhci_poll()
+ * set s_cur; nothing else in the logic changes. */
+#ifndef XHCI_MAX_HC
+#define XHCI_MAX_HC 2u
+#endif
+struct xhci_ctrl {
+    int                        active;
+    uint8_t                   *bar0_va;
+    /* SAFETY: cap/op are volatile MMIO pointers — no caching of reg access. */
+    volatile xhci_cap_regs_t  *cap;
+    volatile xhci_op_regs_t   *op;
+    /* Command Ring */
+    xhci_trb_t                *cmd_ring;
+    uint64_t                   cmd_ring_phys;
+    int                        cmd_cycle;
+    uint32_t                   cmd_enqueue;
+    /* Event Ring (volatile: cycle-bit polls must not be optimised away) */
+    volatile xhci_trb_t       *evt_ring;
+    uint64_t                   evt_ring_phys;
+    uint32_t                   evt_dequeue;
+    int                        evt_cycle;
+    uint32_t                   max_ports;
+    uint32_t                   max_slots;
+    uint8_t                    port_is_usb2[XHCI_MAX_PORTS + 1];
+    uint8_t                    port_is_usb3[XHCI_MAX_PORTS + 1];
+    uint8_t                    pending_enum[XHCI_MAX_PORTS + 1];
+    uint64_t                   dcbaa_phys;
+    uint64_t                  *dcbaa;
+    /* Per-slot HID state (index 0 unused; xHCI slots are 1-based) */
+    int                        hid_slots[XHCI_MAX_SLOTS];
+    uint8_t                    hid_slot_type[XHCI_MAX_SLOTS];
+    uint8_t                    slot_port[XHCI_MAX_SLOTS];
+    uint8_t                   *hid_buf[XHCI_MAX_SLOTS];
+    uint64_t                   hid_buf_phys[XHCI_MAX_SLOTS];
+    xhci_trb_t                *xfer_ring[XHCI_MAX_SLOTS];
+    uint64_t                   xfer_ring_phys[XHCI_MAX_SLOTS];
+    uint32_t                   xfer_enqueue[XHCI_MAX_SLOTS];
+    int                        xfer_cycle[XHCI_MAX_SLOTS];
+    /* Per-slot Output Device Context (xHCI §4.2). */
+    uint8_t                   *dev_ctx[XHCI_MAX_SLOTS];
+    uint64_t                   dev_ctx_phys[XHCI_MAX_SLOTS];
+    /* Per-port enumeration diagnostics (/proc/usbnet). */
+    uint8_t                    enum_stage[XHCI_MAX_PORTS + 1];
+    uint8_t                    enum_cc[XHCI_MAX_PORTS + 1];
+    uint32_t                   enum_usbsts[XHCI_MAX_PORTS + 1];
+};
+static struct xhci_ctrl  s_hc[XHCI_MAX_HC];
+static struct xhci_ctrl *s_cur = &s_hc[0];
+static uint32_t          s_hc_count = 0;   /* # of controllers brought up */
 
-/* Event Ring */
-/* SAFETY: s_evt_ring is volatile so cycle-bit polls are not optimised away. */
-static volatile xhci_trb_t      *s_evt_ring         = NULL;
-static uint64_t                  s_evt_ring_phys    = 0;  /* event ring base PA (for ERDP) */
-static uint32_t                   s_evt_dequeue      = 0;
-static int                        s_evt_cycle        = 1;
-
-static uint32_t                   s_max_ports        = 0;
-static uint32_t                   s_max_slots        = 0;
-
-/* Bitmap of which 1-based port numbers belong to a USB 2.0 protocol per
- * the Supported Protocol extended capability. Ports we should NOT scan
- * for USB 2.0 device enumeration are those marked USB 3.x only. */
-static uint8_t                    s_port_is_usb2[XHCI_MAX_PORTS + 1];
-static uint8_t                    s_port_is_usb3[XHCI_MAX_PORTS + 1];
-
-/* Pending hot-enumerate work queue: ports needing enumeration after the
- * xhci_poll outer loop drains. Avoids re-entrant event ring consumption
- * (poll_cmd_completion called from inside xhci_poll's iteration). */
-static uint8_t                    s_pending_enum[XHCI_MAX_PORTS + 1];
-
-/* DCBAA */
-static uint64_t                   s_dcbaa_phys       = 0;
-static uint64_t                  *s_dcbaa             = NULL;
-
-/* Per-slot HID state (index 0 unused; xHCI slots are 1-based) */
-static int        s_hid_slots[XHCI_MAX_SLOTS];        /* 1 = active HID device */
-static uint8_t    s_hid_slot_type[XHCI_MAX_SLOTS];   /* USB_DEV_NONE/KBD/MOUSE */
-static uint8_t    s_slot_port[XHCI_MAX_SLOTS];       /* port_num for each slot */
-static uint8_t   *s_hid_buf[XHCI_MAX_SLOTS];          /* VA of 8-byte report */
-static uint64_t   s_hid_buf_phys[XHCI_MAX_SLOTS];     /* PA of report buffer */
-static xhci_trb_t *s_xfer_ring[XHCI_MAX_SLOTS];       /* transfer ring VA */
-static uint64_t    s_xfer_ring_phys[XHCI_MAX_SLOTS];  /* transfer ring PA */
-static uint32_t    s_xfer_enqueue[XHCI_MAX_SLOTS];
-static int         s_xfer_cycle[XHCI_MAX_SLOTS];
-
-/* Per-slot Output Device Context (xHCI §4.2): the controller writes slot +
- * endpoint state here; its PA MUST be installed in DCBAA[slot] BEFORE Address
- * Device. The HID path historically left DCBAA[slot]=0, which QEMU tolerates
- * for LS/FS but a SuperSpeed endpoint's state tracking does not. */
-static uint8_t    *s_dev_ctx[XHCI_MAX_SLOTS];
-static uint64_t    s_dev_ctx_phys[XHCI_MAX_SLOTS];
+#define s_xhci_active     (s_cur->active)
+#define s_bar0_va         (s_cur->bar0_va)
+#define s_cap             (s_cur->cap)
+#define s_op              (s_cur->op)
+#define s_cmd_ring        (s_cur->cmd_ring)
+#define s_cmd_ring_phys   (s_cur->cmd_ring_phys)
+#define s_cmd_cycle       (s_cur->cmd_cycle)
+#define s_cmd_enqueue     (s_cur->cmd_enqueue)
+#define s_evt_ring        (s_cur->evt_ring)
+#define s_evt_ring_phys   (s_cur->evt_ring_phys)
+#define s_evt_dequeue     (s_cur->evt_dequeue)
+#define s_evt_cycle       (s_cur->evt_cycle)
+#define s_max_ports       (s_cur->max_ports)
+#define s_max_slots       (s_cur->max_slots)
+#define s_port_is_usb2    (s_cur->port_is_usb2)
+#define s_port_is_usb3    (s_cur->port_is_usb3)
+#define s_pending_enum    (s_cur->pending_enum)
+#define s_dcbaa_phys      (s_cur->dcbaa_phys)
+#define s_dcbaa           (s_cur->dcbaa)
+#define s_hid_slots       (s_cur->hid_slots)
+#define s_hid_slot_type   (s_cur->hid_slot_type)
+#define s_slot_port       (s_cur->slot_port)
+#define s_hid_buf         (s_cur->hid_buf)
+#define s_hid_buf_phys    (s_cur->hid_buf_phys)
+#define s_xfer_ring       (s_cur->xfer_ring)
+#define s_xfer_ring_phys  (s_cur->xfer_ring_phys)
+#define s_xfer_enqueue    (s_cur->xfer_enqueue)
+#define s_xfer_cycle      (s_cur->xfer_cycle)
+#define s_dev_ctx         (s_cur->dev_ctx)
+#define s_dev_ctx_phys    (s_cur->dev_ctx_phys)
+#define s_enum_stage      (s_cur->enum_stage)
+#define s_enum_cc         (s_cur->enum_cc)
+#define s_enum_usbsts     (s_cur->enum_usbsts)
 
 /* -------------------------------------------------------------------------
  * MMIO accessor helpers
@@ -213,9 +248,40 @@ static uint64_t s_cycles_per_ms = 0;
 static inline uint64_t
 xhci_rdtsc(void)
 {
+#if defined(__aarch64__)
+    uint64_t v;
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(v));   /* physical counter */
+    return v;
+#else
     uint32_t lo, hi;
     __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
     return ((uint64_t)hi << 32) | lo;
+#endif
+}
+
+/* Counter ticks per millisecond. arm64 has a real timebase (cntfrq_el0);
+ * x86 assumes >=1 GHz TSC as a safe floor (may wait longer, never shorter). */
+static inline uint64_t
+xhci_ticks_per_ms(void)
+{
+#if defined(__aarch64__)
+    uint64_t f;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
+    return f / 1000u;
+#else
+    return 1000000ULL;
+#endif
+}
+
+/* CPU relax hint inside a spin loop. */
+static inline void
+xhci_relax(void)
+{
+#if defined(__aarch64__)
+    __asm__ volatile("yield");
+#else
+    __asm__ volatile("pause");
+#endif
 }
 
 static void
@@ -226,12 +292,12 @@ xhci_busy_wait_ms(uint32_t ms)
          * fixed-cycle loop and ASSUME at least 1 GHz; on a 4 GHz CPU
          * the actual wait will be 4x what we ask for, which is safe.
          * We use 1,000,000 cycles per ms as the floor (= 1 GHz). */
-        s_cycles_per_ms = 1000000ULL;
+        s_cycles_per_ms = xhci_ticks_per_ms();
     }
     uint64_t start = xhci_rdtsc();
     uint64_t deadline = start + (uint64_t)ms * s_cycles_per_ms;
     while (xhci_rdtsc() < deadline)
-        __asm__ volatile("pause");
+        xhci_relax();
 }
 
 /* op_spin_until_set — busy-wait until (op_reg_at_off & mask) != 0.
@@ -240,12 +306,12 @@ xhci_busy_wait_ms(uint32_t ms)
 static int
 op_spin_until_set_ms(uint32_t off, uint32_t mask, uint32_t ms_timeout)
 {
-    if (s_cycles_per_ms == 0) s_cycles_per_ms = 1000000ULL;
+    if (s_cycles_per_ms == 0) s_cycles_per_ms = xhci_ticks_per_ms();
     uint64_t deadline = xhci_rdtsc() + (uint64_t)ms_timeout * s_cycles_per_ms;
     while (xhci_rdtsc() < deadline) {
         if (op_read32(off) & mask)
             return 0;
-        __asm__ volatile("pause");
+        xhci_relax();
     }
     return -1;
 }
@@ -254,12 +320,12 @@ op_spin_until_set_ms(uint32_t off, uint32_t mask, uint32_t ms_timeout)
 static int
 op_spin_until_clear_ms(uint32_t off, uint32_t mask, uint32_t ms_timeout)
 {
-    if (s_cycles_per_ms == 0) s_cycles_per_ms = 1000000ULL;
+    if (s_cycles_per_ms == 0) s_cycles_per_ms = xhci_ticks_per_ms();
     uint64_t deadline = xhci_rdtsc() + (uint64_t)ms_timeout * s_cycles_per_ms;
     while (xhci_rdtsc() < deadline) {
         if (!(op_read32(off) & mask))
             return 0;
-        __asm__ volatile("pause");
+        xhci_relax();
     }
     return -1;
 }
@@ -276,12 +342,21 @@ op_spin_until_clear(uint32_t off, uint32_t mask)
  * Page allocator helper
  * ---------------------------------------------------------------------- */
 
+/* When set, all xHCI DMA memory is allocated Normal-NC (non-coherent) instead of
+ * cacheable. Needed for controllers behind a non-coherent bus (the RP1 dwc3 on
+ * Pi 5); x86 leaves it 0 (coherent). Set via xhci_set_dma_noncoherent(). */
+static int s_xhci_dma_nc = 0;
+void xhci_set_dma_noncoherent(int nc) { s_xhci_dma_nc = nc; }
+
 /* alloc_page — allocate one 4KB zeroed page, return VA; set *phys_out.
  * Follows the nvme.c alloc_queue_page() pattern exactly. */
 static void *
 alloc_page(uint64_t *phys_out)
 {
-    void *va = kva_alloc_pages(1);
+    /* Non-coherent path (RP1): Normal-NC <4GB page — the controller's DMA sees
+     * the writes without cache maintenance, and the RP1 inbound window is
+     * identity so kva_page_phys is the bus address directly. */
+    void *va = s_xhci_dma_nc ? kva_alloc_pages_low_nc(1) : kva_alloc_pages(1);
     /* SAFETY: kva_alloc_pages returns a kernel VA for a PMM-allocated page;
      * zeroing via __builtin_memset is safe. */
     __builtin_memset(va, 0, 4096);
@@ -359,12 +434,12 @@ xhci_bios_handoff(void)
         /* Set OS Owned bit, wait for BIOS Owned to clear (up to 1s).
          * Use rdtsc-based timing — runs in early boot, no PIT IRQs. */
         *legsup = val | XHCI_LEGSUP_OS_OWNED;
-        if (s_cycles_per_ms == 0) s_cycles_per_ms = 1000000ULL;
+        if (s_cycles_per_ms == 0) s_cycles_per_ms = xhci_ticks_per_ms();
         uint64_t deadline = xhci_rdtsc() + 1000ULL * s_cycles_per_ms;
         while (xhci_rdtsc() < deadline) {
             if (!((*legsup) & XHCI_LEGSUP_BIOS_OWNED))
                 break;
-            __asm__ volatile("pause");
+            xhci_relax();
         }
         if ((*legsup) & XHCI_LEGSUP_BIOS_OWNED) {
             /* BIOS never released — force ownership (workaround for
@@ -518,7 +593,7 @@ poll_cmd_completion(void)
      * jittery for a real SuperSpeed Address Device, which intermittently took
      * longer and "timed out" (cc=timeout) run-to-run. Matches the control-
      * transfer path's timeout discipline. */
-    if (s_cycles_per_ms == 0) s_cycles_per_ms = 1000000ULL;
+    if (s_cycles_per_ms == 0) s_cycles_per_ms = xhci_ticks_per_ms();
     uint64_t deadline = xhci_rdtsc() + 1000ULL * s_cycles_per_ms;
     while (xhci_rdtsc() < deadline) {
         volatile xhci_trb_t *trb = &s_evt_ring[s_evt_dequeue];
@@ -526,7 +601,7 @@ poll_cmd_completion(void)
          * volatile qualifier ensures each cycle-bit read goes to memory. */
         uint32_t ctrl = trb->control;
         if ((ctrl & 1u) != (uint32_t)s_evt_cycle) {
-            __asm__ volatile("pause");
+            xhci_relax();
             continue;   /* no new event yet */
         }
 
@@ -702,14 +777,19 @@ issue_configure_ep(uint8_t slot_id, uint8_t port_num, uint8_t speed)
     ((volatile uint32_t *)ictx)[0] = 0u;
     ((volatile uint32_t *)ictx)[1] = 0x9u;
 
-    /* Slot Context: ContextEntries=3 (highest DCI in use is 3 = EP1 IN).
-     * RootHubPortNumber goes in dword1[23:16], NOT dword2 (same fix as
-     * issue_address_device — see comment there). */
+    /* Slot Context: copy the CURRENT device slot context (set up by Address
+     * Device: device address, slot state, speed, port) and only bump Context
+     * Entries to 3 (highest DCI in use = EP1 IN). Building it from scratch left
+     * the address/state fields zero, which the strict Synopsys dwc3 (RP1)
+     * rejects with cc=17 (lenient x86 xHCIs accepted it). */
     {
         uint8_t *sc = ictx + XHCI_CTX_ENTRY_SIZE;
-        ((volatile uint32_t *)sc)[0] =
-            ((uint32_t)speed << 20) | (3u << 27);
-        ((volatile uint32_t *)sc)[1] = (uint32_t)port_num << 16;
+        (void)speed; (void)port_num;
+        __builtin_memcpy((void *)sc, (const void *)s_dev_ctx[slot_id],
+                         XHCI_CTX_ENTRY_SIZE);
+        uint32_t d0 = ((volatile uint32_t *)sc)[0];
+        d0 = (d0 & ~(0x1Fu << 27)) | (3u << 27);   /* Context Entries = 3 */
+        ((volatile uint32_t *)sc)[0] = d0;
     }
 
     /* EP1 IN Context at byte offset (DCI+1) * ctx_size = 4 * ctx_size.
@@ -726,19 +806,41 @@ issue_configure_ep(uint8_t slot_id, uint8_t port_num, uint8_t speed)
      * descriptor value. */
     {
         uint8_t *ep1in = ictx + 4u * XHCI_CTX_ENTRY_SIZE;
-        /* dword0: Interval[23:16] */
-        ((volatile uint32_t *)ep1in)[0] = (0xAu << 16);
-        /* dword1: CErr=3, EPType=INT_IN(7), MaxPacketSize=64 */
+        /* Low-Speed endpoints max out at 8-byte packets; the strict Synopsys
+         * dwc3 (RP1) rejects the x86 anti-Babble MaxPacketSize=64 for a LS
+         * device with cc=17. Size it to the port speed (boot keyboards send 8). */
+        uint32_t mps = (speed == XHCI_SPEED_LS) ? 8u : 64u;
+        /* dword0: Interval[23:16]. xHCI FS/LS interrupt period = 2^Interval ×
+         * 125µs, so 6 = 8ms (~125 Hz) — the standard USB mouse/keyboard poll
+         * rate. (The old 0xA was mislabeled "10ms" but is actually 2^10×125µs =
+         * 128ms ≈ 8 Hz, which made the pointer visibly laggy.) */
+        ((volatile uint32_t *)ep1in)[0] = (0x6u << 16);
+        /* dword1: CErr=3, EPType=INT_IN(7), MaxPacketSize */
         ((volatile uint32_t *)ep1in)[1] =
-            (3u << 1) | (XHCI_EP_TYPE_INT_IN << 3) | (64u << 16);
-        /* dword2: TR Dequeue Pointer Lo [63:4] | DCS (dequeue cycle state) */
+            (3u << 1) | (XHCI_EP_TYPE_INT_IN << 3) | (mps << 16);
+        /* dword2/3: TR Dequeue Pointer [63:4] | DCS (dequeue cycle state).
+         * The interrupt EP shares EP0's transfer ring, so point its dequeue at
+         * the CURRENT enqueue slot — where xhci_schedule_interrupt_in will place
+         * the first interrupt TRB — NOT the ring base (offset 0), which still
+         * holds a stale, already-consumed control TRB from enumeration. The
+         * strict RP1 dwc3 executes whatever the dequeue points at: aimed at the
+         * base it fetched that stale Setup-Stage TRB and never ran the interrupt
+         * transfer, so no completion event was ever generated and no HID report
+         * reached the CPU. (Lenient x86/QEMU xHCIs re-read and masked this.)
+         * Caller guarantees no EP0 traffic runs between here and the first
+         * xhci_schedule_interrupt_in, so this snapshot stays valid. */
+        uint64_t int_deq = xfer_phys +
+            (uint64_t)s_xfer_enqueue[slot_id] * sizeof(xhci_trb_t);
         ((volatile uint32_t *)ep1in)[2] =
-            (uint32_t)(xfer_phys & 0xFFFFFFF0u) |
+            (uint32_t)(int_deq & 0xFFFFFFF0u) |
             (uint32_t)s_xfer_cycle[slot_id];
-        /* dword3: TR Dequeue Pointer Hi */
-        ((volatile uint32_t *)ep1in)[3] = (uint32_t)(xfer_phys >> 32);
-        /* dword4: Average TRB Length = 8 bytes */
-        ((volatile uint32_t *)ep1in)[4] = 8u;
+        ((volatile uint32_t *)ep1in)[3] = (uint32_t)(int_deq >> 32);
+        /* dword4: Max ESIT Payload [31:16] | Average TRB Length [15:0].
+         * The Synopsys dwc3 (RP1) validates Max ESIT Payload and rejects a
+         * zero with cc=17 (Parameter Error); = MaxPacketSize * (burst+1) *
+         * (mult+1) = MaxPacketSize. (Lenient x86 xHCIs accept 0, which is why
+         * this was invisible until real Pi 5 hardware.) */
+        ((volatile uint32_t *)ep1in)[4] = (mps << 16) | 8u;
     }
 
     enqueue_cmd(ictx_phys, 0,
@@ -878,7 +980,7 @@ issue_control_transfer(uint8_t slot_id, uint64_t setup_pkt, int data_dir)
     while (xhci_rdtsc() < deadline) {
         evt = &s_evt_ring[s_evt_dequeue];
         if ((evt->control & 1u) != (uint32_t)s_evt_cycle) {
-            __asm__ volatile("pause");
+            xhci_relax();
             continue;
         }
 
@@ -1118,9 +1220,8 @@ static int8_t  s_hdiag_adopted = -1;
 #define XHCI_ENUM_CFG_FAIL  4u  /* Configure Endpoint failed (HID) */
 #define XHCI_ENUM_HID_OK    5u  /* HID device ready */
 #define XHCI_ENUM_PROBED    6u  /* non-HID → handed to usb-ethernet probe */
-static uint8_t s_enum_stage[XHCI_MAX_PORTS + 1];
-static uint8_t s_enum_cc[XHCI_MAX_PORTS + 1];  /* cmd completion code at a failed stage */
-static uint32_t s_enum_usbsts[XHCI_MAX_PORTS + 1]; /* USBSTS at a failed enum stage */
+/* s_enum_stage / s_enum_cc / s_enum_usbsts are now per-controller fields in
+ * struct xhci_ctrl (see the s_* macros near the top). */
 
 void
 xhci_host_diag(xhci_host_diag_t *out)
@@ -1622,7 +1723,7 @@ usb_eth_send(netdev_t *dev, const void *pkt, uint16_t len)
         }
         s_eth.tx_inflight = 0;
     }
-    if (s_cycles_per_ms == 0) s_cycles_per_ms = 1000000ULL;
+    if (s_cycles_per_ms == 0) s_cycles_per_ms = xhci_ticks_per_ms();
     s_eth.tx_deadline = xhci_rdtsc() + 1000ULL * s_cycles_per_ms;  /* 1s */
 
     uint8_t *tb = s_eth.tx_buf;
@@ -1792,7 +1893,7 @@ msc_bulk_one(uint8_t dci, xhci_trb_t *ring,
     uint64_t deadline = xhci_rdtsc() + 1000ULL * s_cycles_per_ms;
     while (xhci_rdtsc() < deadline) {
         volatile xhci_trb_t *evt = &s_evt_ring[s_evt_dequeue];
-        if ((evt->control & 1u) != (uint32_t)s_evt_cycle) { __asm__ volatile("pause"); continue; }
+        if ((evt->control & 1u) != (uint32_t)s_evt_cycle) { xhci_relax(); continue; }
         uint32_t etype = (evt->control >> 10) & 0x3Fu;
         uint8_t  eslot = (uint8_t)((evt->control >> 24) & 0xFFu);
         uint8_t  cc    = (uint8_t)((evt->status >> 24) & 0xFFu);
@@ -2361,12 +2462,12 @@ enumerate_port(uint32_t port_num)
          * hardware can take 50-80ms. Use rdtsc-based timing because
          * xhci_init runs early in boot before PIT IRQs fire. */
         {
-            if (s_cycles_per_ms == 0) s_cycles_per_ms = 1000000ULL;
+            if (s_cycles_per_ms == 0) s_cycles_per_ms = xhci_ticks_per_ms();
             uint64_t deadline = xhci_rdtsc() + 100ULL * s_cycles_per_ms;
             while (xhci_rdtsc() < deadline) {
                 if (*portsc_reg & XHCI_PORTSC_PRC)
                     break;
-                __asm__ volatile("pause");
+                xhci_relax();
             }
         }
         if (!(*portsc_reg & XHCI_PORTSC_PRC)) {
@@ -2486,7 +2587,27 @@ enumerate_port(uint32_t port_num)
             return;
         }
 
-        /* HID device — now install the interrupt IN endpoint. */
+        /* HID device. FIRST put it in the Configured state via a USB
+         * SET_CONFIGURATION(1): the xHCI Configure Endpoint command below only
+         * sets up the HOST-side endpoint contexts — the DEVICE only enables its
+         * interrupt endpoint once it's configured. Without this the interrupt-IN
+         * gets no valid response (cc=4 USB Transaction Error) and the endpoint
+         * halts, so no keystroke/motion report is ever delivered (the strict RP1
+         * dwc3 exposes it; lenient x86/QEMU device models answered regardless).
+         * Then SET_PROTOCOL(boot). Both are EP0 control transfers and must
+         * precede Configure Endpoint: the interrupt EP shares EP0's transfer
+         * ring, and issue_configure_ep snapshots its TR Dequeue Pointer to the
+         * current ring position — no EP0 traffic may follow that snapshot. All
+         * boot-HID configurations use bConfigurationValue=1. */
+        {
+            uint64_t sc = (uint64_t)0x00u          /* bmRequestType: H2D/std/dev */
+                        | ((uint64_t)0x09u << 8)   /* bRequest = SET_CONFIGURATION */
+                        | ((uint64_t)1u    << 16); /* wValue = config #1          */
+            issue_control_transfer(slot_id, sc, 0);   /* no data stage */
+        }
+        issue_set_protocol(slot_id);
+
+        /* Now install the interrupt IN endpoint. */
         if (issue_configure_ep(slot_id, (uint8_t)port_num, speed) != 0) {
             if (port_num <= XHCI_MAX_PORTS) s_enum_stage[port_num] = XHCI_ENUM_CFG_FAIL;
             if (!s_post_boot)
@@ -2496,7 +2617,6 @@ enumerate_port(uint32_t port_num)
         }
         printk("[XHCI] slot %u Configure EP OK\n", (unsigned)slot_id);
 
-        issue_set_protocol(slot_id);
         s_hid_slots[slot_id]     = 1;
         s_hid_slot_type[slot_id] = (proto == 1) ? USB_DEV_KBD : USB_DEV_MOUSE;
         s_slot_port[slot_id]     = (uint8_t)port_num;
@@ -2510,8 +2630,9 @@ enumerate_port(uint32_t port_num)
      * report drops are observed under load, increase the queue depth. */
     xhci_schedule_interrupt_in(slot_id, XHCI_EP1_IN_DCI,
                                s_hid_buf_phys[slot_id], 8u);
-    printk("[XHCI] slot %u HID kbd ready, first interrupt-in scheduled\n",
-           (unsigned)slot_id);
+    printk("[XHCI] slot %u HID %s ready, first interrupt-in scheduled\n",
+           (unsigned)slot_id,
+           s_hid_slot_type[slot_id] == USB_DEV_MOUSE ? "mouse" : "kbd");
 }
 
 /* -------------------------------------------------------------------------
@@ -2574,6 +2695,10 @@ xhci_init(void)
         if (rc > 0) {
             printk("[XHCI] controller #%u has connected device(s) — adopting\n",
                    (unsigned)n_xhci);
+            /* This PCI-scan path (x86) adopts a single controller into s_hc[0]
+             * (s_cur's default); mark one controller live so xhci_poll iterates
+             * it. (The native RP1 path uses xhci_init_at, which counts its own.) */
+            s_hc_count = 1;
             return;
         }
         if (rc == 0) {
@@ -2606,6 +2731,36 @@ xhci_init(void)
     printk("[XHCI] no xHCI controller had connected devices\n");
 }
 
+/* xhci_init_at — bring up an xHCI controller at an explicit MMIO base rather
+ * than a discoverable PCI function. For the RP1 dwc3 on Pi 5, whose xHCI
+ * registers are an MMIO block inside the RP1 BAR1 window. The caller must have
+ * put the dwc3 core in host mode and, for a non-coherent bus, called
+ * xhci_set_dma_noncoherent(1) first. Injects a synthetic pcie_device_t with
+ * bus==0xFF so xhci_init_one skips the PCI config-space step. */
+void
+xhci_init_at(uint64_t bar0_phys)
+{
+    if (s_hc_count >= XHCI_MAX_HC) {
+        printk("[XHCI] init_at 0x%lx: no free controller slot\n", bar0_phys);
+        return;
+    }
+    /* Claim the next controller slot; all the s_* state now redirects here. */
+    s_cur = &s_hc[s_hc_count];
+    pcie_device_t d;
+    __builtin_memset(&d, 0, sizeof(d));
+    d.bus = 0xFFu; d.dev = 0; d.fn = 0;
+    d.class_code = 0x0Cu; d.subclass = 0x03u; d.progif = 0x30u;
+    d.bar[0] = bar0_phys;
+    int rc = xhci_init_one(&d);
+    printk("[XHCI] init_at 0x%lx (hc%u) -> rc=%d\n",
+           bar0_phys, (unsigned)s_hc_count, rc);
+    /* Keep any controller that initialised (rc 0=empty or 1=has device) so
+     * xhci_poll iterates it; the per-controller `active` guard skips empties.
+     * rc<0 means the controller is broken — leave the slot for reuse. */
+    if (rc >= 0)
+        s_hc_count++;
+}
+
 /* The actual init body. Returns 1=success+ports, 0=success+empty, -1=fail. */
 static int
 xhci_init_one(const pcie_device_t *dev)
@@ -2620,8 +2775,10 @@ xhci_init_one(const pcie_device_t *dev)
      * with Bus Master disabled the controller cannot DMA completion TRBs into
      * the event ring, so no command/transfer ever completes and nothing
      * enumerates. QEMU pre-enables both, which is why this was invisible until
-     * bare metal. Mirrors rtl8169.c (pcie.h exposes only 32-bit cfg writes). */
-    {
+     * bare metal. Mirrors rtl8169.c (pcie.h exposes only 32-bit cfg writes).
+     * Skipped for an injected MMIO controller (bus==0xFF, e.g. the RP1 dwc3):
+     * it has no PCI config space, and firmware already enabled it. */
+    if (dev->bus != 0xFFu) {
         uint32_t cmd = pcie_read32(dev->bus, dev->dev, dev->fn, 0x04);
         cmd &= 0xFFFF0000u;     /* preserve the status word (upper 16 bits) */
         cmd |= 0x02u | 0x04u;   /* bit1 = Memory Space Enable, bit2 = Bus Master */
@@ -2931,13 +3088,19 @@ xhci_poll(void)
 {
     volatile xhci_trb_t *trb;
 
+    /* Service EVERY brought-up controller. RP1 has two independent xHCIs, so
+     * the keyboard and mouse can live on different ones; s_cur redirects all
+     * the s_* state at the controller being serviced this iteration. */
+    for (uint32_t hc = 0; hc < s_hc_count; hc++) {
+    s_cur = &s_hc[hc];
+
     if (!s_xhci_active)
-        return;
+        continue;
     /* USB mass storage drives the event ring synchronously (CBW/data/CSW). While
      * it does, the ISR must NOT consume the shared event ring or it desyncs the
      * cycle bit out from under the MSC poll. */
     if (s_msc_busy)
-        return;
+        continue;
 
     trb = &s_evt_ring[s_evt_dequeue];
 
@@ -3080,6 +3243,7 @@ xhci_poll(void)
         }
     }
 
+    }   /* end for (hc) — service the next controller */
 }
 
 /* -------------------------------------------------------------------------
@@ -3107,12 +3271,19 @@ xhci_schedule_interrupt_in(uint8_t slot_id, uint8_t ep_id,
 
     s_xfer_enqueue[slot_id]++;
     if (s_xfer_enqueue[slot_id] >= XHCI_TRANSFER_RING_SIZE - 1u) {
-        /* Wrap: flip cycle, reset enqueue, update Link TRB cycle bit. */
-        s_xfer_cycle[slot_id]  ^= 1;
-        s_xfer_enqueue[slot_id] = 0;
+        /* Wrap. The Link TRB must carry the cycle of the TRBs BEFORE it (the
+         * CURRENT producer cycle) so the controller — which reaches it with a
+         * matching consumer cycle — finds it owned, follows it, and only then
+         * toggles its cycle. Stamp the Link FIRST, THEN flip our producer cycle
+         * for the wrapped region. (Flipping first stamped the Link with the
+         * already-toggled cycle, leaving it "not owned" the moment the ring
+         * wrapped, which halted the endpoint after exactly one lap — the "mouse
+         * dies after a few seconds" symptom.) */
         s_xfer_ring[slot_id][XHCI_TRANSFER_RING_SIZE - 1].control =
             (uint32_t)(XHCI_TRB_LINK << 10) | (1u << 1) |
             (uint32_t)s_xfer_cycle[slot_id];
+        s_xfer_cycle[slot_id]  ^= 1;
+        s_xfer_enqueue[slot_id] = 0;
     }
 
     /* Ring doorbell: slot_id selects device doorbell, ep_id selects endpoint.

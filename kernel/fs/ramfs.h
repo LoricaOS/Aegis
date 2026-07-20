@@ -79,6 +79,9 @@ int ramfs_mkdir(ramfs_t *inst, const char *name);
  * data) is freed only when its last dentry AND last open fd are gone. */
 int ramfs_unlink(ramfs_t *inst, const char *name);
 
+/* Remove an empty directory marker. -ENOENT / -ENOTDIR / -ENOTEMPTY. */
+int ramfs_rmdir(ramfs_t *inst, const char *name);
+
 /* ramfs_rename — re-link oldname → newname (replacing newname if present).
  * Data never moves (the inode is untouched). Returns 0, or -2 (ENOENT). */
 int ramfs_rename(ramfs_t *inst, const char *oldname, const char *newname);

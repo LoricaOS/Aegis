@@ -19,9 +19,26 @@
  * corrupted ring_used()/ring_free() because 4055 = 0b1111_1101_0111 — bits 3
  * and 5 are clear, so any byte count with only those bits set masked to 0
  * (8 bytes available looked like 0 bytes available — see the lumen handshake
- * EAGAIN-after-POLLIN race, fixed 2026-04-15). 4096 fits in the same kva page
- * as the prior allocation (kva_alloc_pages(1) returns 4096 bytes). */
+ * EAGAIN-after-POLLIN race, fixed 2026-04-15).
+ *
+ * A protocol frame LARGER than this ring can never be written in one go: the
+ * writer spins for space and both ends can end up stuck mid-frame (that was
+ * the lumen top-bar freeze — a 4360-byte menu frame against this 4096 ring).
+ * The fix belongs on the protocol side (glyph's lumen_set_menu_t is now 2504
+ * bytes and static_asserts itself under 4096); raising the ring instead was
+ * tried on 2026-07-19 and corrupted memory on arm64 — see the note below.
+ *
+ * DO NOT raise this without understanding that: bumping it to 16384 (4 kva
+ * pages per ring) made the Pi 5 panic during shutdown in fd_table_unref with
+ * a garbage fds[].ops, i.e. two owners of the same pages. The alloc/free page
+ * counts were consistent and it never reproduced on x86 or in arm64 QEMU, so
+ * there is a latent multi-page kva/TLB bug on arm64 hiding behind it. */
+/* Overridable for experiments (-DUNIX_BUF_SIZE=16384) without editing this
+ * header — used to reproduce the arm64 corruption with instrumentation on. */
+#ifndef UNIX_BUF_SIZE
 #define UNIX_BUF_SIZE    4096
+#endif
+#define UNIX_BUF_PAGES   (UNIX_BUF_SIZE / 4096)
 #define UNIX_NONE        0xFFFFFFFFU
 
 /* Staged fd for SCM_RIGHTS passing */

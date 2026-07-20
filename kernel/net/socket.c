@@ -5,6 +5,7 @@
 #include "printk.h"
 #include "tcp.h"
 #include "udp.h"
+#include "kva.h"
 #include "sched.h"
 #include "wait_event.h"
 #include "signal.h"
@@ -18,6 +19,9 @@
 
 static sock_t s_socks[SOCK_TABLE_SIZE];  /* zero-initialized by C runtime */
 static spinlock_t sock_lock = SPINLOCK_INIT;
+
+/* Pages backing one socket's lazily-allocated UDP receive ring. */
+#define UDP_RX_RING_PAGES  ((sizeof(udp_rx_slot_t) * UDP_RX_SLOTS + AEGIS_PAGE_SIZE - 1) / AEGIS_PAGE_SIZE)
 
 /* ── Socket VFS ops ─────────────────────────────────────────────────────── */
 
@@ -247,6 +251,18 @@ static int sock_vfs_stat(void *priv, k_stat_t *st)
 
 int sock_alloc(uint8_t type)
 {
+    /* A DGRAM socket gets its UDP rx ring off-slot (kva), so TCP sockets and
+     * free slots no longer each carry ~12 KB of dead buffer in BSS. Allocate
+     * BEFORE taking sock_lock — kva_alloc_pages must not run under it (kva_lock
+     * would nest below the sock leaf lock). kva does not zero, so memset it (the
+     * per-slot in_use flags must start clear). */
+    udp_rx_slot_t *ring = (udp_rx_slot_t *)0;
+    if (type == SOCK_TYPE_DGRAM) {
+        ring = (udp_rx_slot_t *)kva_alloc_pages(UDP_RX_RING_PAGES);
+        if (!ring) return -1;   /* out of kva — fail closed */
+        __builtin_memset(ring, 0, UDP_RX_RING_PAGES * AEGIS_PAGE_SIZE);
+    }
+
     irqflags_t fl = spin_lock_irqsave(&sock_lock);
     uint32_t i;
     for (i = 0; i < SOCK_TABLE_SIZE; i++) {
@@ -256,6 +272,7 @@ int sock_alloc(uint8_t type)
             s_socks[i].type        = type;
             s_socks[i].tcp_conn_id = SOCK_NONE;
             s_socks[i].epoll_id    = SOCK_NONE;
+            s_socks[i].udp_rx      = ring;   /* NULL for STREAM */
             /* One reference for the creating fd. The memset above zeroed the
              * count; this explicit init sets it to 1 (a 0 count would make the
              * first .dup inc-from-0 and refcount_inc_not_zero refuse). */
@@ -266,7 +283,46 @@ int sock_alloc(uint8_t type)
         }
     }
     spin_unlock_irqrestore(&sock_lock, fl);
+    if (ring) kva_free_pages(ring, UDP_RX_RING_PAGES);   /* table full — undo */
     return -1;
+}
+
+/* sock_selftest — `socktest` cmdline gate. Proves the lazy UDP-ring contract:
+ * DGRAM sockets get a zeroed ring, STREAM sockets get none, sock_free reclaims
+ * the ring, and a long alloc/free loop never exhausts kva (i.e. free doesn't
+ * leak). Exercises exactly the alloc/free pairing whose UAF history motivated
+ * the belt-and-suspenders refcounting in this file. */
+void sock_selftest(void)
+{
+    int d = sock_alloc(SOCK_TYPE_DGRAM);
+    sock_t *s = (d >= 0) ? sock_get((uint32_t)d) : (sock_t *)0;
+    int ok_dgram = s && s->udp_rx;
+    int ok_zero  = ok_dgram && !s->udp_rx[0].in_use && !s->udp_rx[UDP_RX_SLOTS-1].in_use;
+    int ok_ring  = 0;
+    if (ok_dgram) {                       /* touch first + last slot in-bounds */
+        s->udp_rx[0].len = 5;
+        s->udp_rx[UDP_RX_SLOTS-1].in_use = 1;
+        ok_ring = (s->udp_rx[0].len == 5 && s->udp_rx[UDP_RX_SLOTS-1].in_use);
+    }
+    if (d >= 0) sock_free((uint32_t)d);
+
+    int t = sock_alloc(SOCK_TYPE_STREAM);
+    sock_t *st = (t >= 0) ? sock_get((uint32_t)t) : (sock_t *)0;
+    int ok_stream = st && st->udp_rx == (udp_rx_slot_t *)0;
+    if (t >= 0) sock_free((uint32_t)t);
+
+    int ok_leak = 1;                      /* 300 cycles exhaust kva iff free leaks */
+    for (int i = 0; i < 300; i++) {
+        int x = sock_alloc(SOCK_TYPE_DGRAM);
+        if (x < 0) { ok_leak = 0; break; }
+        sock_free((uint32_t)x);
+    }
+
+    if (ok_dgram && ok_zero && ok_ring && ok_stream && ok_leak)
+        printk("[SOCKTEST] PASS: DGRAM ring lazy+zeroed, STREAM ring NULL, 300x alloc/free no leak\n");
+    else
+        printk("[SOCKTEST] FAIL: dgram=%d zero=%d ring=%d stream=%d leak=%d\n",
+               ok_dgram, ok_zero, ok_ring, ok_stream, ok_leak);
 }
 
 sock_t *sock_get(uint32_t sock_id)
@@ -305,8 +361,15 @@ void sock_free(uint32_t sock_id)
         spin_unlock_irqrestore(&sock_lock, fl);
         return;
     }
+    /* Reclaim the UDP rx ring (if any) on the transition to FREE. Capture + NULL
+     * under the lock, free after unlock (kva_lock must not nest under sock_lock).
+     * Idempotent: a second sock_free sees udp_rx == NULL. Re-establishes the
+     * "SOCK_FREE ⟹ udp_rx == NULL" invariant sock_alloc's memset relies on. */
+    udp_rx_slot_t *ring = s_socks[sock_id].udp_rx;
+    s_socks[sock_id].udp_rx = (udp_rx_slot_t *)0;
     s_socks[sock_id].state = SOCK_FREE;
     spin_unlock_irqrestore(&sock_lock, fl);
+    if (ring) kva_free_pages(ring, UDP_RX_RING_PAGES);
 }
 
 /* sock_wake: wake everything blocked on this socket — blocking accept/connect/

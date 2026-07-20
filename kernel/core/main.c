@@ -21,6 +21,8 @@
 #include "pmm.h"
 #include "vmm.h"
 #include "kva.h"
+#include "kasan.h"
+#include "ubsan.h"
 #include "sched.h"
 #include "proc.h"
 #include "vfs.h"
@@ -288,6 +290,28 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     pmm_init();             /* bitmap allocator — [PMM] OK                   */
     vmm_init();             /* page tables, higher-half map — [VMM] OK       */
     kva_init();             /* kernel virtual allocator — [KVA] OK           */
+    kasan_init();           /* [KASAN] OK (KASAN=1 build only; else no-op)    */
+#ifdef KASAN
+    /* `kasantest` cmdline token: prove the instrumentation catches an OOB. */
+    {
+        extern void kasan_selftest(void);
+        const char *q = arch_get_cmdline();
+        for (; *q; q++)
+            if (q[0]=='k'&&q[1]=='a'&&q[2]=='s'&&q[3]=='a'&&q[4]=='n'&&
+                q[5]=='t'&&q[6]=='e'&&q[7]=='s'&&q[8]=='t') { kasan_selftest(); break; }
+    }
+#endif
+    ubsan_init();           /* [UBSAN] OK (UBSAN=1 build only; else no-op)    */
+#ifdef UBSAN
+    /* `ubsantest` cmdline token: prove the instrumentation catches UB. */
+    {
+        extern void ubsan_selftest(void);
+        const char *q = arch_get_cmdline();
+        for (; *q; q++)
+            if (q[0]=='u'&&q[1]=='b'&&q[2]=='s'&&q[3]=='a'&&q[4]=='n'&&
+                q[5]=='t'&&q[6]=='e'&&q[7]=='s'&&q[8]=='t') { ubsan_selftest(); break; }
+    }
+#endif
     bph("mem");
     /* Swap the 4GB bootstrap bitmap for a full RAM-sized one now that KVA is
      * up (needs no identity map — it's higher-half). After this, all of RAM
@@ -349,6 +373,22 @@ kernel_main(uint32_t mb_magic, void *mb_info)
 
     vfs_init();             /* [VFS] OK + [INITRD] OK                        */
     console_init();         /* register stdout device (silent)               */
+    /* `mounttest` cmdline: exercise the mount table + VFS routing end to end. */
+    {
+        extern void mount_selftest(void);
+        const char *q = arch_get_cmdline();
+        for (; *q; q++)
+            if (q[0]=='m'&&q[1]=='o'&&q[2]=='u'&&q[3]=='n'&&q[4]=='t'&&
+                q[5]=='t'&&q[6]=='e'&&q[7]=='s'&&q[8]=='t') { mount_selftest(); break; }
+    }
+    /* `socktest` cmdline: prove the lazy UDP-ring alloc/free contract. */
+    {
+        extern void sock_selftest(void);
+        const char *q = arch_get_cmdline();
+        for (; *q; q++)
+            if (q[0]=='s'&&q[1]=='o'&&q[2]=='c'&&q[3]=='k'&&q[4]=='t'&&
+                q[5]=='e'&&q[6]=='s'&&q[7]=='t') { sock_selftest(); break; }
+    }
     bph("fs-base");
     acpi_init();            /* parse MCFG+MADT — [ACPI] OK                   */
     bph("acpi");

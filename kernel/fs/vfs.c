@@ -3,6 +3,7 @@
 #include "initrd.h"
 #include "ext2.h"
 #include "ramfs.h"
+#include "mount.h"
 #include "procfs.h"
 #include "pty.h"
 #include "printk.h"
@@ -47,6 +48,70 @@ vfs_init(void)
  * Returns 0 on success, -2 (ENOENT) if not found, -12 (ENOMEM) if the
  * ext2 fd pool is exhausted.
  */
+/* ── VFS confinement (sys_vfs_confine) ───────────────────────────────────
+ * path_canonicalize collapses ".", ".." and duplicate slashes in an absolute
+ * path; vfs_scope_allows checks a path against the calling process's scope.
+ * The check is LEXICAL (post-canonicalization) — it blocks absolute-path and
+ * ".."-traversal escape. A symlink inside the scope that points outside is a
+ * known v1 limitation; because confinement only ever REMOVES authority, that
+ * gap merely degrades to the unconfined baseline for that one path and can
+ * never weaken the model. Sensitive files stay protected by the existing
+ * inode gates (shadow/admin/passwd/install) regardless of scope. */
+void
+path_canonicalize(const char *in, char *out, uint32_t outsz)
+{
+    uint32_t oi = 0;                 /* out holds "/a/b" form, no trailing slash */
+    const char *p = in;
+    while (*p) {
+        while (*p == '/') p++;                 /* collapse slashes */
+        if (!*p) break;
+        const char *s = p;
+        while (*p && *p != '/') p++;
+        uint32_t clen = (uint32_t)(p - s);
+        if (clen == 1 && s[0] == '.') continue;                /* "." */
+        if (clen == 2 && s[0] == '.' && s[1] == '.') {          /* ".." */
+            while (oi > 0 && out[oi - 1] != '/') oi--;          /* drop last comp */
+            if (oi > 0) oi--;                                   /* drop its '/' */
+            continue;
+        }
+        if (oi + 1 + clen >= outsz) break;                     /* truncate safely */
+        out[oi++] = '/';
+        for (uint32_t k = 0; k < clen; k++) out[oi++] = s[k];
+    }
+    if (oi == 0) out[oi++] = '/';              /* root */
+    out[oi] = '\0';
+}
+
+/* vfs_scope_allows — 1 if `path` is within the calling process's confinement
+ * scope (or the process is unconfined / kernel-internal), else 0. Relative
+ * paths are resolved against cwd first, then canonicalized. */
+int
+vfs_scope_allows(const char *path)
+{
+    if (!sched_current()->is_user) return 1;           /* kernel: unconfined */
+    aegis_process_t *proc = current_proc();
+    if (!proc || proc->vfs_scope_len == 0) return 1;   /* unconfined */
+
+    char abs[256];
+    uint32_t i = 0;
+    if (path[0] == '/') {
+        for (; path[i] && i < sizeof(abs) - 1; i++) abs[i] = path[i];
+    } else {
+        for (; proc->cwd[i] && i < sizeof(abs) - 1; i++) abs[i] = proc->cwd[i];
+        if (i == 0 || abs[i - 1] != '/') { if (i < sizeof(abs) - 1) abs[i++] = '/'; }
+        for (uint32_t j = 0; path[j] && i < sizeof(abs) - 1; j++) abs[i++] = path[j];
+    }
+    abs[i] = '\0';
+
+    char canon[256];
+    path_canonicalize(abs, canon, sizeof(canon));
+
+    uint32_t L = proc->vfs_scope_len;
+    for (uint32_t k = 0; k < L; k++)
+        if (canon[k] != proc->vfs_scope[k]) return 0;
+    return (canon[L] == '\0' || canon[L] == '/');      /* boundary match */
+}
+
 /* is_ramfs_path — returns the ramfs instance backing a "/tmp/..." or
  * "/run/..." path (and sets *rel to the name within it), else NULL. */
 static ramfs_t *
@@ -59,6 +124,12 @@ ramfs_for_path(const char *path, const char **rel)
     if (path[0]=='/' && path[1]=='r' && path[2]=='u' && path[3]=='n' && path[4]=='/') {
         *rel = path + 5;
         return &s_run_ramfs;
+    }
+    /* Dynamic tmpfs mounts (sys_mount) — routes unlink/mkdir/rmdir/rename too. */
+    {
+        void *ctx;
+        if (mount_resolve(path, &ctx, rel) == MOUNT_FS_TMPFS)
+            return (ramfs_t *)ctx;
     }
     return (ramfs_t *)0;
 }
@@ -98,6 +169,28 @@ vfs_ramfs_mkdir(const char *path, int *out_rc)
     return 1;
 }
 
+/* vfs_ramfs_rmdir — if path is on a ramfs mount, remove the directory there
+ * and set *out_rc; returns 1 if handled, 0 if not a ramfs path. Without this
+ * sys_rmdir fell through to ext2_rmdir, which returns EPERM for any path it
+ * does not own — so mkdir /tmp/x worked (it routes) but rmdir /tmp/x did not. */
+int
+vfs_ramfs_rmdir(const char *path, int *out_rc)
+{
+    const char *rel;
+    /* The mount roots themselves are not removable. */
+    {
+        const char *p = path;
+        int is_root =
+            ((p[0]=='/'&&p[1]=='t'&&p[2]=='m'&&p[3]=='p'&&(p[4]=='\0'||(p[4]=='/'&&p[5]=='\0'))) ||
+             (p[0]=='/'&&p[1]=='r'&&p[2]=='u'&&p[3]=='n'&&(p[4]=='\0'||(p[4]=='/'&&p[5]=='\0'))));
+        if (is_root) { *out_rc = -EBUSY; return 1; }
+    }
+    ramfs_t *r = ramfs_for_path(path, &rel);
+    if (!r) return 0;
+    *out_rc = ramfs_rmdir(r, rel);
+    return 1;
+}
+
 /* vfs_ramfs_rename — same-mount rename on a ramfs. Cross-mount renames
  * return EXDEV. Returns 1 if handled, 0 if neither path is ramfs. */
 int
@@ -130,6 +223,10 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
     /* Default: not protected. Non-ext2 backends below don't touch kflags, so
      * this prevents a stale VFS_KF_PROTECTED bit leaking from a reused slot. */
     out->kflags = 0;
+
+    /* VFS confinement: a scoped process may only reach paths inside its scope. */
+    if (!vfs_scope_allows(path))
+        return -EACCES;
 
     /* /dev/ptmx → allocate PTY master */
     if (path[0]=='/' && path[1]=='d' && path[2]=='e' && path[3]=='v' && path[4]=='/' &&
@@ -171,6 +268,18 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
             return ramfs_opendir(&s_run_ramfs, out);
         if (path[4] == '/')
             return ramfs_open(&s_run_ramfs, path + 5, flags, out);
+    }
+
+    /* Dynamic mounts (sys_mount): a tmpfs subtree, e.g. under /mnt. Checked
+     * before ext2 so the mount shadows the (empty) mountpoint dir. */
+    {
+        void *ctx;
+        const char *rel;
+        if (mount_resolve(path, &ctx, &rel) == MOUNT_FS_TMPFS) {
+            if (*rel == '\0')
+                return ramfs_opendir((ramfs_t *)ctx, out);
+            return ramfs_open((ramfs_t *)ctx, rel, flags, out);
+        }
     }
 
     /* ext2 primary — writable root filesystem */
@@ -364,6 +473,7 @@ int
 vfs_stat_path(const char *path, k_stat_t *out)
 {
     if (!path || !out) return -ENOENT;
+    if (!vfs_scope_allows(path)) return -EACCES;   /* confinement */
 
     /* /proc → procfs stat */
     if (path[0]=='/' && path[1]=='p' && path[2]=='r' && path[3]=='o' &&
@@ -413,6 +523,24 @@ vfs_stat_path(const char *path, k_stat_t *out)
     /* /run/ -> run ramfs stat */
     if (path[0]=='/' && path[1]=='r' && path[2]=='u' && path[3]=='n' && path[4]=='/')
         return ramfs_stat(&s_run_ramfs, path + 5, out);
+
+    /* Dynamic mounts (sys_mount): tmpfs subtree */
+    {
+        void *ctx;
+        const char *rel;
+        if (mount_resolve(path, &ctx, &rel) == MOUNT_FS_TMPFS) {
+            if (*rel == '\0') {
+                /* the mount root itself — a synthetic directory */
+                __builtin_memset(out, 0, sizeof(*out));
+                out->st_dev   = 1;
+                out->st_ino   = 1;
+                out->st_nlink = 2;
+                out->st_mode  = S_IFDIR | 0755;
+                return 0;
+            }
+            return ramfs_stat((ramfs_t *)ctx, rel, out);
+        }
+    }
 
     /* ext2 primary */
     {
@@ -467,6 +595,15 @@ int
 vfs_stat_path_ex(const char *path, k_stat_t *out, int follow)
 {
     if (!path || !out) return -ENOENT;
+    if (!vfs_scope_allows(path)) return -EACCES;   /* confinement */
+
+    /* Dynamic mounts (tmpfs): no symlinks, delegate to vfs_stat_path */
+    {
+        void *ctx;
+        const char *rel;
+        if (mount_resolve(path, &ctx, &rel) != MOUNT_FS_NONE)
+            return vfs_stat_path(path, out);
+    }
 
     /* Non-ext2 paths: no symlinks, delegate to vfs_stat_path */
     if ((path[0]=='/' && path[1]=='p' && path[2]=='r' && path[3]=='o' &&

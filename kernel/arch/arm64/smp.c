@@ -16,6 +16,7 @@
 #include "vmm.h"
 #include "arch_vmm.h"
 #include "lockrank.h"
+#include "fdt.h"
 #include <stdint.h>
 
 percpu_t          g_percpu[MAX_CPUS];
@@ -58,19 +59,35 @@ clean_dcache(const void *addr, uint64_t len)
     __asm__ volatile("dsb sy" ::: "memory");
 }
 
-/* PSCI CPU_ON (64-bit) via HVC. Returns 0 (SUCCESS) or a negative error. */
+/* PSCI conduit: 1 = SMC, 0 = HVC. Chosen once in smp_start_aps from the DTB
+ * /psci "method" (QEMU virt = hvc, Pi 5 / TF-A = smc); defaults to HVC when
+ * there is no DTB, which is the working QEMU behaviour. */
+static int s_psci_use_smc;
+
+/* One PSCI SMCCC call over the selected conduit. HVC and SMC are distinct
+ * instructions (not a runtime-conduit register), so the branch is here. */
+static long
+psci_call(uint64_t func, uint64_t a1, uint64_t a2, uint64_t a3)
+{
+    register uint64_t x0 __asm__("x0") = func;
+    register uint64_t x1 __asm__("x1") = a1;
+    register uint64_t x2 __asm__("x2") = a2;
+    register uint64_t x3 __asm__("x3") = a3;
+    if (s_psci_use_smc)
+        __asm__ volatile("smc #0" : "+r"(x0)
+                         : "r"(x1), "r"(x2), "r"(x3) : "memory");
+    else
+        __asm__ volatile("hvc #0" : "+r"(x0)
+                         : "r"(x1), "r"(x2), "r"(x3) : "memory");
+    return (long)x0;
+}
+
+/* PSCI CPU_ON (64-bit). Returns 0 (SUCCESS) or a negative error. */
 static long
 psci_cpu_on(uint64_t target_mpidr, uint64_t entry_phys, uint64_t ctx)
 {
-    register uint64_t x0 __asm__("x0") = 0xC4000003UL;   /* PSCI_CPU_ON_AARCH64 */
-    register uint64_t x1 __asm__("x1") = target_mpidr;
-    register uint64_t x2 __asm__("x2") = entry_phys;
-    register uint64_t x3 __asm__("x3") = ctx;
-    __asm__ volatile("hvc #0"
-                     : "+r"(x0)
-                     : "r"(x1), "r"(x2), "r"(x3)
-                     : "memory");
-    return (long)x0;
+    return psci_call(0xC4000003UL /* PSCI_CPU_ON_AARCH64 */,
+                     target_mpidr, entry_phys, ctx);
 }
 
 void
@@ -115,9 +132,14 @@ ap_c_entry(uint64_t cpu)
     percpu_set_current(idle);
     arch_set_kernel_stack(idle->kernel_stack_top);
 
-    /* Outgoing-only throwaway TCB (like sched_start / x86 ap_entry). */
-    static aegis_task_t s_ap_dummy[MAX_CPUS];
-    ctx_switch(&s_ap_dummy[cpu], idle);
+    /* Outgoing-only throwaway TCB (like sched_start / x86 ap_entry): written by
+     * ctx_switch, never read (the __builtin_unreachable below — we never switch
+     * back to it).  A single SHARED static suffices, not one slot per CPU:
+     * concurrent APs saving discarded state into it during this one-shot entry
+     * is benign (garbage no one consumes).  Was aegis_task_t[MAX_CPUS] = ~1.25 MB
+     * of BSS for write-only scratch. */
+    static aegis_task_t s_ap_dummy;
+    ctx_switch(&s_ap_dummy, idle);
     __builtin_unreachable();
 }
 
@@ -148,8 +170,22 @@ smp_start_aps(void)
     clean_dcache(s_idmap_l0, sizeof(s_idmap_l0));
     clean_dcache(s_idmap_l1, sizeof(s_idmap_l1));
 
+    /* Pick the PSCI conduit from the DTB (QEMU virt = HVC, Pi 5 = SMC).
+     * Default HVC when the DTB has no /psci node — the working QEMU path. */
+    s_psci_use_smc = (fdt_psci_conduit() == 1);
+    printk("[SMP] PSCI conduit: %s\n", s_psci_use_smc ? "SMC" : "HVC");
+
     uint32_t online = 1;
     for (uint32_t cpu = 1; cpu < MAX_CPUS; cpu++) {
+        /* Target MPIDR for CPU_ON. The DTB's /cpus/cpu@N reg is the real
+         * affinity — flat 0..3 on QEMU, core-index-in-Aff1 (0x100,0x200,…)
+         * on the Pi 5 — so read it rather than assume a topology. No such
+         * node means we have enumerated every core; stop. Falls back to a
+         * flat index when there is no DTB at all. */
+        uint64_t target = cpu;
+        if (fdt_available() && !fdt_cpu_mpidr((int)cpu, &target))
+            break;
+
         /* Per-CPU kernel boot stack (higher-half). */
         void *stk = kva_alloc_pages(4);
         if (!stk)
@@ -169,15 +205,26 @@ smp_start_aps(void)
         s_ap_params[cpu].cpu_index = cpu;
         clean_dcache(&s_ap_params[cpu], sizeof(s_ap_params[cpu]));
 
-        long r = psci_cpu_on((uint64_t)cpu,
+        long r = psci_cpu_on(target,
                              img_phys(ap_trampoline),
                              img_phys(&s_ap_params[cpu]));
         if (r != 0) {
-            /* PSCI_INVALID_PARAMETERS (-2) = no such core → done probing. */
-            if (r == -2)
-                break;
-            printk("[SMP] WARN: CPU_ON cpu%u failed (%ld)\n", cpu, r);
-            continue;
+            /* Any failure ends the probe. On a flat MPIDR topology (QEMU
+             * virt and Pi 5, cpu index == Aff0) the first failure means no
+             * higher core exists. PSCI_INVALID_PARAMETERS (-2) is the clean
+             * "no such core". On the native Pi 5 path PSCI lives at EL3 and
+             * needs the SMC conduit, but this driver issues HVC (correct for
+             * QEMU); since we dropped past EL2, HVC is unhandled and returns
+             * the CPU_ON function id unchanged (0xc4000003) rather than a
+             * PSCI error. Without breaking here that "failure" repeats for
+             * ~1024 candidate cores, flooding the log and blowing the boot's
+             * time budget (the watchdog fired before init). Break on the
+             * first failure either way; real multi-core Pi 5 SMP is a
+             * follow-up (switch the conduit to SMC on this path). */
+            if (r != -2)
+                printk("[SMP] WARN: CPU_ON cpu%u failed (%ld) — stopping probe "
+                       "(1 core; SMC conduit needed for native Pi5 SMP)\n", cpu, r);
+            break;
         }
 
         /* Wait for the AP to signal online (~200ms budget). */
@@ -186,10 +233,16 @@ smp_start_aps(void)
             arch_pause();
             spin++;
         }
-        if (g_ap_online[cpu])
+        if (g_ap_online[cpu]) {
             online++;
-        else
-            printk("[SMP] WARN: cpu%u did not come online\n", cpu);
+        } else {
+            /* Also stop here (not just on a CPU_ON error): if the first AP
+             * never signals online, none will on this conduit, and the
+             * ~200ms-per-core wait × ~1024 candidates otherwise blows the
+             * boot time budget (watchdog before init). */
+            printk("[SMP] WARN: cpu%u did not come online — stopping probe\n", cpu);
+            break;
+        }
     }
 
     g_cpu_count = online;

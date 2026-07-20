@@ -38,14 +38,19 @@ typedef struct {
                                     * the separate admin credential first (reusing its libauth/crypt
                                     * machinery, like login + CAP_KIND_AUTH). The shell delegates to
                                     * login -elevate; no shell holds this cap. */
+#define CAP_KIND_MOUNT        20u  /* may call sys_mount / sys_umount (attach a
+                                    * filesystem into the /mnt tree). A distinct,
+                                    * least-authority cap: mounting a tmpfs must
+                                    * not require raw-disk (DISK_ADMIN) rights. */
 
 /* CAP_KIND_MAX — highest DEFINED capability kind. Used to reject undefined kinds
  * (e.g. the sys_spawn cap_mask delegation path) without hardcoding a specific
  * kind that goes stale when a new one is added. MUST be bumped whenever a
  * CAP_KIND_* above is added — a stale bound silently makes the newest cap
  * undelegatable (exactly the bug that left NET_LISTEN undelegatable when the
- * check still read `> CAP_KIND_INSTALL`). */
-#define CAP_KIND_MAX          CAP_KIND_ADMIN_AUTH
+ * check still read `> CAP_KIND_INSTALL`). Also add a name to cap_policy.c's
+ * table (the _Static_assert there lists every kind 1..MAX). */
+#define CAP_KIND_MAX          CAP_KIND_MOUNT
 
 /* Compile-time invariants for the cap-kind space (T4 cap-enum guards). These
  * turn the prose contract above into build errors:

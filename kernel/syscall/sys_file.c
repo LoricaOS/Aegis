@@ -347,8 +347,14 @@ struct kstat_arm64 {
 #endif
 
 /* emit_stat — copy k_stat_t out to the user's struct stat, repacked to the
- * per-arch layout musl expects. Returns 0 or SYS_ERR(EFAULT). */
-static uint64_t
+ * per-arch layout musl expects. Returns 0 or SYS_ERR(EFAULT).
+ *
+ * EVERY stat-family syscall must return through here. k_stat_t is the x86-64
+ * layout (nlink at 16, mode at 24); aarch64's struct stat puts mode at 16 and
+ * nlink at 20, so a raw copy_to_user of k_stat_t hands arm64 userspace a
+ * struct whose mode/uid/gid/rdev are all misread — sys_lstat did exactly that,
+ * which is why lstat() on arm64 reported a symlink's mode as 1. */
+uint64_t
 emit_stat(uint64_t uptr, const k_stat_t *ks)
 {
 #ifdef __aarch64__
@@ -929,7 +935,7 @@ copy_path_resolved(char *kpath, uint64_t user_ptr, uint32_t bufsz)
     if (r != 0)
         return r;
     if (kpath[0] == '/' || kpath[0] == '\0')
-        return 0;                       /* absolute or empty — nothing to do */
+        return vfs_scope_allows(kpath) ? 0 : -EACCES;   /* confinement gate */
 
     aegis_process_t *proc = current_proc();
     char tmp[256];
@@ -944,6 +950,58 @@ copy_path_resolved(char *kpath, uint64_t user_ptr, uint32_t bufsz)
     if (sep) tmp[cwdlen] = '/';
     __builtin_memcpy(tmp + cwdlen + sep, kpath, plen + 1);
     __builtin_memcpy(kpath, tmp, cwdlen + sep + plen + 1);
+    return vfs_scope_allows(kpath) ? 0 : -EACCES;   /* confinement gate */
+}
+
+/*
+ * sys_vfs_confine — voluntarily confine this process (and, by inheritance, its
+ * descendants) to the subtree `path`. One-way: an already-confined process may
+ * only NARROW its scope, never widen or clear it. No capability is required —
+ * dropping your own authority never needs one — and it is purely additive
+ * (removes reach, never grants it), so it cannot weaken the security model.
+ * Aegis syscall 511.
+ */
+uint64_t
+sys_vfs_confine(uint64_t path_u)
+{
+    aegis_process_t *proc = current_proc();
+    char raw[128];
+    if (copy_path_from_user(raw, path_u, sizeof(raw)) != 0)
+        return SYS_ERR(EFAULT);
+
+    /* Build absolute (relative → against cwd), then canonicalize. */
+    char abs[256];
+    uint32_t i = 0;
+    if (raw[0] == '/') {
+        for (; raw[i] && i < sizeof(abs) - 1; i++) abs[i] = raw[i];
+    } else {
+        for (; proc->cwd[i] && i < sizeof(abs) - 1; i++) abs[i] = proc->cwd[i];
+        if (i == 0 || abs[i - 1] != '/') { if (i < sizeof(abs) - 1) abs[i++] = '/'; }
+        for (uint32_t j = 0; raw[j] && i < sizeof(abs) - 1; j++) abs[i++] = raw[j];
+    }
+    abs[i] = '\0';
+
+    char canon[256];
+    path_canonicalize(abs, canon, sizeof(canon));
+    uint32_t L = 0;
+    while (canon[L]) L++;
+    if (L == 0 || L >= sizeof(proc->vfs_scope))
+        return SYS_ERR(ENAMETOOLONG);
+
+    /* One-way: if already confined, the new scope must lie within the old. */
+    if (proc->vfs_scope_len != 0) {
+        uint32_t O = proc->vfs_scope_len;
+        int within = 1;
+        for (uint32_t k = 0; k < O; k++)
+            if (canon[k] != proc->vfs_scope[k]) { within = 0; break; }
+        if (within && !(canon[O] == '\0' || canon[O] == '/')) within = 0;
+        if (!within)
+            return SYS_ERR(EACCES);          /* cannot widen confinement */
+    }
+
+    for (uint32_t k = 0; k < L; k++) proc->vfs_scope[k] = canon[k];
+    proc->vfs_scope[L] = '\0';
+    proc->vfs_scope_len = L;
     return 0;
 }
 
@@ -954,14 +1012,15 @@ copy_path_resolved(char *kpath, uint64_t user_ptr, uint32_t bufsz)
  * write cache (NVMe FLUSH).  Without the device flush, "synced" data sits
  * in the drive's volatile cache and is not guaranteed to survive the
  * controller reset at reboot — QEMU never loses it, real drives can.
- * Matches POSIX sync(2): no arguments, no return value besides 0.
+ * Returns 0, or -EIO if a dirty block was dropped on a device write error
+ * since the last sync (so the failure is no longer silently swallowed).
  */
 uint64_t
 sys_sync(void)
 {
-    ext2_sync();
+    int err = ext2_sync();
 #ifdef __x86_64__
     nvme_flush();   /* no NVMe driver on arm64 yet */
 #endif
-    return 0;
+    return (uint64_t)(int64_t)err;   /* 0, or -EIO if a writeback was lost */
 }

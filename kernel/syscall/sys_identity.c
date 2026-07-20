@@ -422,8 +422,12 @@ sys_reboot(uint64_t cmd)
                 null_idtr = { 0, 0 };
             __asm__ volatile ("lidt %0; int3" : : "m"(null_idtr));
         }
+#elif defined(AEGIS_BOOT_NATIVE)
+        /* Real Pi 5: BCM2712 watchdog hard reset (stock armstub has no PSCI
+         * SYSTEM_RESET — see arch_native_reset). Never returns. */
+        arch_native_reset();
 #else
-        /* ARM64: PSCI SYSTEM_RESET would go here; for now fall through to halt */
+        /* QEMU virt: PSCI SYSTEM_RESET via HVC. */
         arch_debug_exit(1);
 #endif
         arch_disable_irq();

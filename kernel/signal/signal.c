@@ -49,8 +49,15 @@ signal_deliver(cpu_state_t *s)
         __builtin_unreachable();
     }
 
-    /* Build signal frame on user stack */
+    /* Build signal frame on user stack — or the alternate signal stack if the
+     * handler is SA_ONSTACK, one is installed, and we are not already on it
+     * (sp not within its range, so nested SA_ONSTACK handlers stack correctly). */
     uint64_t user_sp = s->sp_el0;
+    if ((sa->sa_flags & SA_ONSTACK) && proc->altstack_size != 0) {
+        uint64_t lo = proc->altstack_sp, hi = proc->altstack_sp + proc->altstack_size;
+        if (!(user_sp > lo && user_sp <= hi))
+            user_sp = hi;                       /* top of the alt stack (grows down) */
+    }
     uint64_t new_sp = (user_sp - sizeof(rt_sigframe_t)) & ~0xFUL; /* 16-byte align */
 
     /* Validate new_sp */
@@ -141,8 +148,14 @@ signal_deliver_sysret(syscall_frame_t *frame, uint64_t *saved_rdi_ptr)
         __builtin_unreachable();
     }
 
-    /* Build frame on user stack and redirect */
+    /* Build frame on user stack — or the alternate signal stack if the handler
+     * is SA_ONSTACK, one is installed, and we are not already on it. */
     uint64_t user_sp = frame->user_sp;
+    if ((sa->sa_flags & SA_ONSTACK) && proc->altstack_size != 0) {
+        uint64_t lo = proc->altstack_sp, hi = proc->altstack_sp + proc->altstack_size;
+        if (!(user_sp > lo && user_sp <= hi))
+            user_sp = hi;                       /* top of the alt stack (grows down) */
+    }
     uint64_t new_sp = (user_sp - sizeof(rt_sigframe_t)) & ~0xFUL;
 
     if (new_sp >= user_sp || new_sp > USER_ADDR_MAX || new_sp < 0x1000) {
@@ -263,8 +276,15 @@ signal_deliver(cpu_state_t *s)
         signal_terminate(proc, signum);  /* bad restorer address */
     }
 
-    /* User handler: build rt_sigframe_t on user stack, redirect iretq to handler */
+    /* User handler: build rt_sigframe_t on user stack, redirect iretq to handler.
+     * SA_ONSTACK: use the alternate signal stack if installed and we are not
+     * already on it (so nested SA_ONSTACK handlers stack correctly). */
     uint64_t user_rsp = s->rsp;  /* user RSP from the iretq frame */
+    if ((sa->sa_flags & SA_ONSTACK) && proc->altstack_size != 0) {
+        uint64_t lo = proc->altstack_sp, hi = proc->altstack_sp + proc->altstack_size;
+        if (!(user_rsp > lo && user_rsp <= hi))
+            user_rsp = hi;                      /* top of the alt stack (grows down) */
+    }
     uint64_t new_rsp  = ((user_rsp - sizeof(rt_sigframe_t)) & ~15ULL) - 8;
 
     rt_sigframe_t sf;
@@ -378,8 +398,14 @@ signal_deliver_sysret(syscall_frame_t *frame, uint64_t *saved_rdi_ptr)
         signal_terminate(proc, signum);  /* bad restorer address */
     }
 
-    /* User handler: build rt_sigframe_t on user stack */
+    /* User handler: build rt_sigframe_t on user stack (or the alternate signal
+     * stack if the handler is SA_ONSTACK and one is installed). */
     uint64_t user_rsp = frame->user_rsp;
+    if ((sa->sa_flags & SA_ONSTACK) && proc->altstack_size != 0) {
+        uint64_t lo = proc->altstack_sp, hi = proc->altstack_sp + proc->altstack_size;
+        if (!(user_rsp > lo && user_rsp <= hi))
+            user_rsp = hi;                      /* top of the alt stack (grows down) */
+    }
     uint64_t new_rsp  = ((user_rsp - sizeof(rt_sigframe_t)) & ~15ULL) - 8;
 
     rt_sigframe_t sf;

@@ -115,6 +115,8 @@ ensure_table(uint64_t table_phys, uint64_t idx)
         __asm__ volatile("dsb ishst" ::: "memory");
         return child;
     }
+    if (!(e & 2UL))
+        panic_halt("[VMM] FAIL: ensure_table found a block where a table was expected");
     return ARCH_PTE_ADDR(e);
 }
 
@@ -163,11 +165,27 @@ map_page_in(uint64_t root_phys, uint64_t va, uint64_t phys,
         panic_halt("[VMM] FAIL: vmm map double-map");
     }
     l3[i] = phys | arch_pte_from_flags(flags | VMM_FLAG_PRESENT);
-    /* Same reasoning as ensure_table: this leaf may be used (by this core
-     * or another) the instant we return, so the write must be ordered
-     * before any subsequent access through it — a fresh valid entry needs
-     * no TLBI (nothing stale to invalidate), just this store barrier. */
-    __asm__ volatile("dsb ishst" ::: "memory");
+    /* Full runtime PTE-install discipline (the canonical ARM sequence:
+     * STR -> DSB ISHST -> TLBI -> DSB ISH -> ISB). The old code did only
+     * the DSB ISHST, on the "fresh invalid->valid transitions need no
+     * TLBI" architecture rule -- but that rule only covers entries the TLB
+     * was never PERMITTED to cache; it does not help if this VA ever had a
+     * previous live translation that was torn down without its own TLBI
+     * (early-boot idmaps, VA reuse via the kva freelist), and it does not
+     * order the walker's view for the caller's very next load through the
+     * new mapping. Found on real RPi5 hardware: a kva_map_mmio()'d MMIO
+     * page whose leaf PTE decoded bit-perfect (correct PA/attrs) returned
+     * garbage on the first read while an arch_dmap block mapping of the
+     * SAME physical byte read correctly -- the signature of the load being
+     * satisfied by a stale cached translation, not the new entry. The
+     * conservative per-map cost (one TLBI+ISB) is noise next to that
+     * failure mode. */
+    __asm__ volatile(
+        "dsb ishst\n\t"
+        "tlbi vaae1is, %0\n\t"
+        "dsb ish\n\t"
+        "isb"
+        : : "r"(va >> 12) : "memory");
     return 0;
 }
 
@@ -182,6 +200,7 @@ vmm_init(void)
 
     uint64_t slide = arch_kern_phys_slide();
     uint64_t root  = alloc_table_or_panic();
+    printk("[VMM] diagnostic: root table allocated (native-boot bring-up)\n");
 
     /* 1. Kernel image: KERN_VMA+PHYS_BASE .. _kernel_end → slide'd phys,
      *    4K pages (Limine guarantees contiguity, not 2MB alignment).
@@ -205,10 +224,23 @@ vmm_init(void)
                 A64_PTE_ATTR(A64_ATTR_NORMAL_WB) | A64_PTE_UXN;
         }
     }
+    printk("[VMM] diagnostic: step 1 (kernel image) done\n");
 
     /* 2. Device window: PA [0 .. 1GB) → DMAP_BASE, one 1GB Device block.
      *    Covers the QEMU-virt MMIO space (GICv3 0x080xxxxx, PL011
-     *    0x09000000, RTC/fw-cfg/virtio-mmio, ...). */
+     *    0x09000000, RTC/fw-cfg/virtio-mmio, ...).
+     *
+     *    Skipped entirely on the native Pi 5 path: that board has genuine
+     *    usable RAM inside this same PA[0,1GB) range (only PA[0,0x200000)
+     *    is excluded, see arch_mm_populate_regions_from_dtb) -- mapping
+     *    this whole range as one Device block here would collide with
+     *    step 3's RAM direct-map, which needs to walk right through it as
+     *    Normal memory. Found via a real-hardware hang: step 3's very
+     *    first iteration (pa=0x200000, inside this block) descended into
+     *    this 1GB *block* descriptor expecting a *table*, handed back
+     *    garbage, and silently wedged. The platform UART (wherever it
+     *    lives) is still covered by step 2b below. */
+#ifndef AEGIS_BOOT_NATIVE
     {
         uint64_t va  = ARCH_DMAP_BASE;
         uint64_t l1p = ensure_table(root, (va >> 39) & 0x1FF);
@@ -216,6 +248,29 @@ vmm_init(void)
         uint64_t *l1 = pv(l1p);
         l1[(va >> 30) & 0x1FF] = 0UL | A64_BLOCK_DEVICE;
     }
+#endif
+    printk("[VMM] diagnostic: step 2 (device window) done\n");
+
+    /* 2b. Extra device block for the platform UART, if it falls outside
+     *    the PA[0,1GB) window above -- real Pi 5 doesn't: its PL011 sits
+     *    at 0x107D001000 (1GB-block index 65, confirmed this session's
+     *    native-boot bring-up), well past QEMU-virt's low MMIO window.
+     *    No-op on QEMU (arch_mm_get_uart_phys() == 0x09000000, already
+     *    inside block 0 above). Needed before main.c's post-vmm_init
+     *    serial_set_base(arch_dmap(arch_mm_get_uart_phys())) call, or
+     *    that resolves to an unmapped VA and faults/hangs. */
+    {
+        uint64_t uart_pa = arch_mm_get_uart_phys();
+        uint64_t block   = uart_pa & ~0x3FFFFFFFUL;
+        if (block != 0) {
+            uint64_t va  = ARCH_DMAP_BASE + block;
+            uint64_t l1p = ensure_table(root, (va >> 39) & 0x1FF);
+            if (!l1p) panic_halt("[VMM] FAIL: OOM mapping UART device block");
+            uint64_t *l1 = pv(l1p);
+            l1[(va >> 30) & 0x1FF] = block | A64_BLOCK_DEVICE;
+        }
+    }
+    printk("[VMM] diagnostic: step 2b (UART device block) done\n");
 
     /* 3. RAM direct map: every usable/reserved-RAM region (incl. the
      *    kernel image and boot modules) → DMAP_BASE + PA, 2MB Normal-WB
@@ -242,7 +297,15 @@ vmm_init(void)
             panic_halt("[VMM] FAIL: no RAM regions");
         lo &= ~0x1FFFFFUL;
         hi  = (hi + 0x1FFFFF) & ~0x1FFFFFUL;
+        printk("[VMM] diagnostic: step 3 direct-map loop lo=0x%lx hi=0x%lx\n", lo, hi);
+        uint64_t iter = 0;
         for (uint64_t pa = lo; pa < hi; pa += 0x200000UL) {
+            /* DIAGNOSTIC (temporary, native-boot bring-up): this loop hangs
+             * somewhere on real hardware with no fault/exception visible --
+             * periodic checkpoint to narrow down which pa it stalls at. */
+            if ((iter & 0xFF) == 0)
+                printk("[VMM] diagnostic:   iter=%lu pa=0x%lx\n", iter, pa);
+            iter++;
             uint64_t va  = ARCH_DMAP_BASE + pa;
             uint64_t l1p = ensure_table(root, (va >> 39) & 0x1FF);
             uint64_t l2p = ensure_table(l1p, (va >> 30) & 0x1FF);
@@ -252,19 +315,30 @@ vmm_init(void)
             l2[(va >> 21) & 0x1FF] = pa | A64_BLOCK_NORMAL;
         }
     }
+    printk("[VMM] diagnostic: step 3 (RAM direct map) done\n");
 
     /* 4. Empty user table — the "master pml4" loaded while no user task
      *    runs (fail closed: kernel-only context has NO user mappings). */
     s_empty_user = alloc_table_or_panic();
+    printk("[VMM] diagnostic: step 4 (empty user table) done, about to load ttbr1\n");
 
     /* 5. Go live: load TTBR1, nuke every stale entry. TTBR0 is left on
      * start.c's early device idmap — the PL011 printks below still go
      * through it (main.c repoints serial at the DMAP right after we
-     * return, and the first vmm_switch_to replaces TTBR0 for good). */
+     * return, and the first vmm_switch_to replaces TTBR0 for good).
+     *
+     * The leading `dsb ish` is REQUIRED (not the trailing one): all the block-
+     * PTE stores in steps 1-4 above (written via the direct pv() pointer, not
+     * ordered by anything yet) must be observable to the table walker BEFORE
+     * `msr ttbr1_el1` points the walker at `root` -- otherwise the walker may
+     * begin (possibly speculative) walks against not-yet-completed table
+     * memory. A trailing dsb does not retroactively close that window. Real
+     * defect on the A76: fits an intermittent hang right after "step 3 done". */
     s_ttbr1_phys = root;
     __asm__ volatile(
+        "dsb ish\n\t"               /* table stores observable before the switch */
         "msr ttbr1_el1, %0\n\t"
-        "dsb ish\n\t"
+        "isb\n\t"
         "tlbi vmalle1\n\t"
         "dsb ish\n\t"
         "isb"
@@ -437,6 +511,20 @@ vmm_pte_of_user_raw(uint64_t pml4_phys, uint64_t virt)
     /* Boundary contract: return the ABSTRACT form (callers test
      * VMM_FLAG_SHARED etc. against this). */
     return hw ? arch_pte_to_flags(hw) : 0;
+}
+
+/* DIAGNOSTIC (temporary, RPi5 native-boot kva_map_mmio investigation):
+ * the literal hardware leaf PTE for a KERNEL (TTBR1) mapping, no
+ * abstract-flag translation -- lets a caller directly inspect AttrIdx/SH/
+ * AF/output-address bits rather than trust a derived value. */
+uint64_t
+vmm_debug_raw_kernel_pte(uint64_t virt)
+{
+    irqflags_t fl = spin_lock_irqsave(&vmm_lock);
+    uint64_t *pte = walk_to_pte(s_ttbr1_phys, virt);
+    uint64_t hw = pte ? *pte : 0;
+    spin_unlock_irqrestore(&vmm_lock, fl);
+    return hw;
 }
 
 void

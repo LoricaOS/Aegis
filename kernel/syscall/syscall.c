@@ -27,7 +27,13 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case  88: num = 280; break;  /* utimensat (same arg order) */
     case  25: num = 72;  break;  /* fcntl */
     case  29: num = 16;  break;  /* ioctl */
-    case  35: num = 87; arg1 = arg2; break;  /* unlinkat → unlink (skip dirfd) */
+    case  35:                                /* unlinkat(dirfd,path,flags) */
+        /* AT_REMOVEDIR (0x200) selects rmdir. aarch64 has no rmdir syscall —
+         * musl's rmdir() IS unlinkat+AT_REMOVEDIR — so dropping the flag made
+         * every rmdir on arm64 an unlink of a directory, which fails. */
+        num = (arg3 & 0x200) ? 84 : 87;
+        arg1 = arg2;
+        break;
     case  46: num = 77;  break;  /* ftruncate — real (was stubbed to fstat, so
                                   * memfds never got sized: Lumen's client surface
                                   * mmap then failed → GUI clients got EIO) */
@@ -46,14 +52,26 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case  37: num = 86; arg1 = arg2; arg2 = arg4; break;  /* linkat → link (skip dirfds) */
     case  78: num = 89; arg1 = arg2; arg2 = arg3; arg3 = arg4; break;  /* readlinkat → readlink (skip dirfd) */
     case  53: num = 90; arg1 = arg2; arg2 = arg3; break;  /* fchmodat → chmod (skip dirfd+flags) */
-    case  54: num = 92; arg1 = arg2; arg2 = arg3; arg3 = arg4; break;  /* fchownat → chown (skip dirfd+flags) */
-    case  79: num = 4; arg1 = arg2; arg2 = arg3; break;
-                                 /* newfstatat(dirfd,path,statbuf,flags) → stat(path,statbuf).
-                                  * musl's stat family (fstatat_kstat) uses this for path-based
-                                  * stat on aarch64 (no legacy stat/lstat there). dirfd assumed
-                                  * AT_FDCWD/absolute; flags (incl SYMLINK_NOFOLLOW) dropped —
-                                  * lstat thus follows, acceptable v1. Was wrongly num=5 (fstat)
-                                  * with unshifted args, so ls -l/stat returned garbage/EBADF. */
+    case  54:                                /* fchownat(dirfd,path,uid,gid,flags) */
+        /* AT_SYMLINK_NOFOLLOW (0x100) → lchown: musl's lchown() is this call,
+         * and following the link would re-own whatever it points at. */
+        num = (arg5 & 0x100) ? 94 : 92;
+        arg1 = arg2; arg2 = arg3; arg3 = arg4;
+        break;
+    case  79:                    /* newfstatat(dirfd,path,statbuf,flags) */
+        /* musl's whole stat family goes through this on aarch64 (no legacy
+         * stat/lstat there). AT_SYMLINK_NOFOLLOW (0x100) picks lstat: dropping
+         * it made lstat() FOLLOW symlinks on arm64, so callers that walk a tree
+         * (a recursive copy or delete) saw a symlink-to-directory as a real
+         * directory and descended out of the tree they were given.
+         * dirfd is assumed AT_FDCWD/absolute. */
+        num = (arg4 & 0x100) ? 6 : 4;
+        arg1 = arg2; arg2 = arg3;
+        break;
+    case  40: num = 165; break;  /* mount   (aarch64 __NR_mount == 40) */
+    case  39: num = 166; break;  /* umount2 (aarch64 __NR_umount2 == 39; must
+                                  * translate — untranslated it would fall
+                                  * through to internal 39 = getpid) */
     case  80: num = 5;   break;  /* fstat */
     case  82: num = 162; break;  /* fsync → sync */
     /* Process */
@@ -64,11 +82,14 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 101: num = 35;  break;  /* nanosleep */
     case 112: num = 227; break;  /* clock_settime */
     case 113: num = 228; break;  /* clock_gettime */
-    case 115: num = 35; arg1 = arg3; arg2 = arg4; break; /* clock_nanosleep → nanosleep (skip clk_id+flags) */
-    case 124: num = 35;  break;  /* sched_yield → nanosleep(0) */
+    case 115: num = 230; break;  /* clock_nanosleep (real; honors clk_id+TIMER_ABSTIME) */
+    case 124: num = 24;  break;  /* sched_yield (real yield, not nanosleep(0)) */
     case 129: num = 62;  break;  /* kill */
     case 130: num = 130; break;  /* rt_sigsuspend */
-    case 131: num = 13;  break;  /* sigaltstack → rt_sigaction (stub) */
+    case 131: num = 234; break;  /* tgkill (aarch64 __NR_tgkill == 131; real — was
+                                  * (mis)stubbed to rt_sigaction, a lying syscall
+                                  * that broke musl raise()/abort()/pthread_kill) */
+    case 132: num = 131; break;  /* sigaltstack (aarch64 __NR_sigaltstack == 132) */
     case 134: num = 13;  break;  /* rt_sigaction */
     case 135: num = 14;  break;  /* rt_sigprocmask */
     case 139: num = 15;  break;  /* rt_sigreturn */
@@ -79,11 +100,12 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 175: num = 107; break;  /* geteuid */
     case 176: num = 104; break;  /* getgid */
     case 177: num = 108; break;  /* getegid */
-    case 178: num = 39;  break;  /* gettid → getpid */
+    case 178: num = 186; break;  /* gettid (real; internal 186 → sys_gettid) */
     case 214: num = 12;  break;  /* brk */
     case 215: num = 11;  break;  /* munmap */
     case 220: num = 56;  break;  /* clone */
     case 221: num = 59;  break;  /* execve */
+    case 216: num = 25;  break;  /* mremap (aarch64 __NR_mremap == 216) */
     case 222: num = 9;   break;  /* mmap */
     case 226: num = 10;  break;  /* mprotect */
     case 233: num = 95;  break;  /* umask */
@@ -139,6 +161,8 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case  8: return sys_lseek(arg1, arg2, arg3);
     case 21: return sys_access(arg1, arg2);
     case 35: return sys_nanosleep(arg1, arg2);
+    case 230: return sys_clock_nanosleep(arg1, arg2, arg3, arg4);
+    case 24: return sys_sched_yield();
     case 10: return sys_mprotect(arg1, arg2, arg3);
     case 16: return sys_ioctl(arg1, arg2, arg3);
     case 22: return sys_pipe2(arg1, 0); /* pipe(2) = pipe2(pipefd, 0) */
@@ -148,6 +172,7 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 98: return sys_getrusage(arg1, arg2);
     case  9: return sys_mmap(arg1, arg2, arg3, arg4, arg5, arg6);
     case 11: return sys_munmap(arg1, arg2);
+    case 25: return sys_mremap(arg1, arg2, arg3, arg4, arg5);
     /* madvise(28): advisory only — accept as a no-op success. Aegis has no
      * page-cache RSS to release, so MADV_DONTNEED/FREE/WILLNEED are all benign.
      * Returning ENOSYS (the default) crashes apps that VERIFY the result — e.g.
@@ -162,6 +187,7 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 14: return sys_rt_sigprocmask(arg1, arg2, arg3, arg4);
     case 15: return sys_rt_sigreturn(frame);
     case 130: return sys_rt_sigsuspend(arg1, arg2);
+    case 131: return sys_sigaltstack(arg1, arg2);   /* real alt signal stack */
     case 20: return sys_writev(arg1, arg2, arg3);
     case 39: return sys_getpid();
     case 56: return sys_clone(frame, arg1, arg2, arg3, arg4, arg5, arg1, arg2, arg3);
@@ -177,6 +203,7 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 60: return sys_exit(arg1);
     case 61: return sys_waitpid(arg1, arg2, arg3);
     case 62: return sys_kill(arg1, arg2);
+    case 234: return sys_tgkill(arg1, arg2, arg3);
     case 360: return sys_setfg(arg1);
     case 364: return sys_auth_session(arg1, arg2);
     case  79: return sys_getcwd(arg1, arg2);
@@ -223,6 +250,8 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 280: return sys_utimensat(arg1, arg2, arg3, arg4);
     case 257: return sys_openat(arg1, arg2, arg3, arg4);
     case 162: return sys_sync();
+    case 165: return sys_mount(arg1, arg2, arg3, arg4, arg5);   /* mount   */
+    case 166: return sys_umount(arg1, arg2);                    /* umount2 */
     /* fsync(74)/fdatasync(75): flush via the global sync. Per-file flush would
      * be tighter, but sync() is correct (it commits this file too) and matches
      * the aarch64 fsync→sync mapping above. Needed by tinysshd-makekey. */
@@ -267,6 +296,7 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 202: return sys_futex(arg1, arg2, arg3, arg4, arg5, arg6);
     case 510: return sys_blkdev_list(arg1, arg2);
     case 511: return sys_blkdev_io(arg1, arg2, arg3, arg4, arg5);
+    case 518: return sys_vfs_confine(arg1);   /* Aegis: confine to a subtree */
     case 512: return sys_gpt_rescan(arg1);
     case 513: return sys_fb_map(arg1);
     case 514: return sys_spawn(arg1, arg2, arg3, arg4, arg5);

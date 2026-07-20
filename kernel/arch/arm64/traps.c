@@ -189,10 +189,18 @@ arm64_irq(cpu_state_t *s)
         uint32_t intid = gic_ack();
         if (intid >= 1020 && intid <= 1023)
             break;                      /* spurious / no more pending */
-        if (intid == 27) {
+#ifdef AEGIS_BOOT_NATIVE
+        if (intid == 30) {              /* physical-timer PPI (real Pi5) */
+#else
+        if (intid == 27) {              /* virtual-timer PPI (QEMU) */
+#endif
             gic_eoi(intid);             /* EOI first: sched_tick may switch */
             timer_irq();
-        } else if (intid == 33) {
+#ifdef AEGIS_BOOT_NATIVE
+        } else if (intid == 153) {      /* Pi5 debug PL011 RX (DTB SPI 0x79) */
+#else
+        } else if (intid == 33) {       /* QEMU virt PL011 RX */
+#endif
             gic_eoi(intid);
             uart_rx_irq();
         } else {
@@ -210,6 +218,37 @@ arm64_fault_el1(cpu_state_t *s)
 {
     uint64_t esr = read_esr();
     uint64_t ec  = (esr >> 26) & 0x3F;
+
+    /* Demand-paging / COW break for KERNEL-mode accesses to user pages
+     * (copy_*_user et al.). A kernel copy into a not-yet-faulted lazy anonymous
+     * mmap page (or a COW page inherited from fork) faults at EL1. Without
+     * handling it here the fault falls to the exception-table fixup below, which
+     * SHORT-COPIES (returns the un-copied count) and silently leaves the rest of
+     * the buffer stale/zero — sys_read ignores that count, so the caller sees a
+     * correct byte total but zeroed tail. That zeroed the tail of every large
+     * read() into an mmap'd (>musl mmap-threshold) buffer: fonts/wallpaper/logos
+     * loaded as zeros while small brk-heap reads worked. Populate / break-COW
+     * exactly as an EL0 fault (el0_fault) would and retry the faulting
+     * instruction. This is the arm64 counterpart of the x86 kernel-mode
+     * demand-paging in idt.c. Guarded on a user address + a user task so a
+     * genuine kernel-address bug still panics via the fixup/backtrace below. */
+    if (ec == EC_DABT_CUR) {
+        uint64_t far  = read_far();
+        uint64_t dfsc = esr & 0x3F;
+        int is_write  = (esr & (1UL << 6)) != 0;
+        aegis_task_t *t = sched_current();
+        if (t && t->is_user && far <= USER_ADDR_MAX) {
+            aegis_process_t *proc = (aegis_process_t *)t;
+            if (dfsc >= 0x04 && dfsc <= 0x07) {           /* not-present → demand-page */
+                if (mm_populate_fault(proc, far) == 0)
+                    return;
+            }
+            if (is_write && dfsc >= 0x0C && dfsc <= 0x0F) { /* write-perm → COW break */
+                if (vmm_cow_fault_handle(proc->pml4_phys, far) == 0)
+                    return;
+            }
+        }
+    }
 
     /* Fault-tolerant uaccess: a data/instruction abort taken while the
      * kernel was touching a user buffer (copy_*_user). If the faulting PC

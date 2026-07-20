@@ -264,6 +264,16 @@ elf_load(struct aegis_process *proc, uint64_t pml4_phys, const uint8_t *data,
         for (k = ph->p_filesz; k < ph->p_memsz; k++)
             dst[va_offset + k] = 0;
 
+        /* We just wrote this segment's bytes through a cacheable kernel
+         * mapping. On ARM the I-cache is not coherent with those stores, and
+         * these frames were likely recycled from an exited process, so the
+         * PIPT I-cache can still hold the old occupant's instructions — sync
+         * D→PoU + invalidate I before the frames become executable, or the
+         * process fetches stale/garbage code (undefined-instruction / wild
+         * faults). No-op on x86. Done while `dst` still maps the frames. */
+        if (ph->p_flags & PF_X)
+            arch_sync_icache_range(dst, (uint64_t)page_count * 4096UL);
+
         /* Map each page into the user address space.
          * kva_page_phys recovers the physical address of each page
          * (individual walk — O(page_count × 4) invlpg, acceptable at this scale).

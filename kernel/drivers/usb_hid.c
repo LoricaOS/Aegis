@@ -88,6 +88,7 @@ void usb_hid_process_report(const uint8_t *data, uint32_t len)
         case 0x50: arrow = 'D'; break;  /* left arrow  */
         case 0x51: arrow = 'B'; break;  /* down arrow  */
         case 0x52: arrow = 'A'; break;  /* up arrow    */
+        case 0x46: arrow = 'p'; break;  /* PrintScreen → ESC[p (compositor screenshot) */
         }
         if (arrow) {
             kbd_usb_inject(0x1B);

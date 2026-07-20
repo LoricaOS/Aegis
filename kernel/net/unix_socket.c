@@ -233,7 +233,7 @@ int unix_sock_alloc(void)
         }
     }
     spin_unlock_irqrestore(&unix_lock, fl);
-    if (orphan) kva_free_pages(orphan, 1);
+    if (orphan) kva_free_pages(orphan, UNIX_BUF_PAGES);
     return ret;
 }
 
@@ -260,11 +260,11 @@ int unix_sock_pair(uint32_t *a, uint32_t *b)
     if (id1 < 0) { unix_sock_free((uint32_t)id0); return -EMFILE; }
 
     /* One tx ring per direction (kva_alloc_pages may sleep — no lock held). */
-    uint8_t *ring0 = (uint8_t *)kva_alloc_pages(1);  /* id0 writes; id1 reads */
-    uint8_t *ring1 = (uint8_t *)kva_alloc_pages(1);  /* id1 writes; id0 reads */
+    uint8_t *ring0 = (uint8_t *)kva_alloc_pages(UNIX_BUF_PAGES);  /* id0 writes; id1 reads */
+    uint8_t *ring1 = (uint8_t *)kva_alloc_pages(UNIX_BUF_PAGES);  /* id1 writes; id0 reads */
     if (!ring0 || !ring1) {
-        if (ring0) kva_free_pages(ring0, 1);
-        if (ring1) kva_free_pages(ring1, 1);
+        if (ring0) kva_free_pages(ring0, UNIX_BUF_PAGES);
+        if (ring1) kva_free_pages(ring1, UNIX_BUF_PAGES);
         unix_sock_free((uint32_t)id0);
         unix_sock_free((uint32_t)id1);
         return -ENOMEM;
@@ -362,8 +362,8 @@ void unix_sock_free(uint32_t id)
     }
     us->in_use = 0;
     spin_unlock_irqrestore(&unix_lock, fl);
-    if (free_a) kva_free_pages(free_a, 1);
-    if (free_b) kva_free_pages(free_b, 1);
+    if (free_a) kva_free_pages(free_a, UNIX_BUF_PAGES);
+    if (free_b) kva_free_pages(free_b, UNIX_BUF_PAGES);
 }
 
 /* unix_sock_wake: wake everything blocked on this socket — blocking accept/
@@ -481,9 +481,9 @@ int unix_sock_connect(uint32_t id, const char *path)
     spin_unlock_irqrestore(&unix_lock, fl);
     /* Free the orphaned ring now that the lock is dropped (TLB shootdown must
      * not run under unix_lock — see unix_sock_alloc). */
-    if (orphan) kva_free_pages(orphan, 1);
-    uint8_t *ring_a = (uint8_t *)kva_alloc_pages(1);  /* client→server */
-    uint8_t *ring_b = (uint8_t *)kva_alloc_pages(1);  /* server→client */
+    if (orphan) kva_free_pages(orphan, UNIX_BUF_PAGES);
+    uint8_t *ring_a = (uint8_t *)kva_alloc_pages(UNIX_BUF_PAGES);  /* client→server */
+    uint8_t *ring_b = (uint8_t *)kva_alloc_pages(UNIX_BUF_PAGES);  /* server→client */
     fl = spin_lock_irqsave(&unix_lock);
 
     /* Re-validate after the lock gap: another thread sharing this fd table
@@ -512,8 +512,8 @@ int unix_sock_connect(uint32_t id, const char *path)
         spin_unlock_irqrestore(&unix_lock, fl);
         /* Free the rings after unlocking (TLB shootdown — never under
          * unix_lock; see unix_sock_alloc). */
-        if (ring_a) kva_free_pages(ring_a, 1);
-        if (ring_b) kva_free_pages(ring_b, 1);
+        if (ring_a) kva_free_pages(ring_a, UNIX_BUF_PAGES);
+        if (ring_b) kva_free_pages(ring_b, UNIX_BUF_PAGES);
         return fail;
     }
 

@@ -93,6 +93,44 @@ MM_SRCS = \
     kernel/lib/va_freelist.c \
     kernel/lib/string.c
 
+# KASAN=1 — build the kernel with the Address Sanitizer (globals/BSS coverage).
+# A debug-only build (slow: every memory access becomes an out-of-line call); it
+# catches out-of-bounds reads/writes on static arrays. The runtime (kasan.c) is
+# itself compiled WITHOUT the sanitizer via a dedicated rule below; kasan_test.c
+# stays instrumented so `kasantest` on the cmdline can prove it fires.
+ifeq ($(KASAN),1)
+KASAN_CFLAGS = -fsanitize=kernel-address \
+    --param asan-instrumentation-with-call-threshold=0 \
+    --param asan-globals=1 --param asan-stack=0 \
+    -fasan-shadow-offset=0xdffffc0000000000
+CFLAGS  += $(KASAN_CFLAGS) -DKASAN=1
+MM_SRCS += kernel/mm/kasan.c kernel/mm/kasan_test.c
+endif
+
+# UBSAN=1 — build the kernel with the Undefined Behavior Sanitizer. A debug-only
+# build; the compiler emits an out-of-line __ubsan_handle_* call at every site it
+# can't prove free of the checked classes. Disjoint from KASAN in what it catches,
+# but the two don't co-fit: KASAN's redzones + UBSAN's checks together overrun the
+# 8MB image window (tools/linker.ld), so run them as separate builds, not combined.
+# -fsanitize-recover keeps the handlers non-abort so ubsan.c can report-and-continue.
+#
+# We enable a CURATED subset, not the full -fsanitize=undefined, matching how a
+# real kernel (Linux CONFIG_UBSAN) configures it — for two reasons: (1) the full
+# set's `alignment`/`object-size` checks fire constantly on a kernel's deliberate
+# unaligned casts and pointer arithmetic, which is noise, not bugs; (2) that flood
+# of extra checks bloats .text past the 8MB image window the linker enforces
+# (tools/linker.ld). The subset below is the high-signal one: real arithmetic and
+# indexing UB on (often untrusted) input at the trust boundary.
+#
+# The runtime (ubsan.c) is built WITHOUT the sanitizer via a dedicated rule below;
+# ubsan_test.c stays instrumented so `ubsantest` on the cmdline can prove it fires.
+ifeq ($(UBSAN),1)
+UBSAN_CHECKS = shift,signed-integer-overflow,integer-divide-by-zero,bounds,unreachable,vla-bound,nonnull-attribute,returns-nonnull-attribute,pointer-overflow
+UBSAN_CFLAGS = -fsanitize=$(UBSAN_CHECKS) -fsanitize-recover=undefined
+CFLAGS  += $(UBSAN_CFLAGS) -DUBSAN=1
+MM_SRCS += kernel/mm/ubsan.c kernel/mm/ubsan_test.c
+endif
+
 SCHED_SRCS  = kernel/sched/sched.c kernel/sched/waitq.c
 SIGNAL_SRCS = kernel/signal/signal.c
 TTY_SRCS    = kernel/tty/tty.c kernel/tty/pty.c
@@ -103,6 +141,7 @@ FS_SRCS = \
     kernel/fs/blkdev.c kernel/fs/gpt.c \
     kernel/fs/ext2.c kernel/fs/ext2_cache.c kernel/fs/ext2_dir.c kernel/fs/ext2_vfs.c \
     kernel/fs/ramfs.c kernel/fs/procfs.c kernel/fs/memfd.c kernel/fs/eventfd.c \
+    kernel/fs/mount.c \
     kernel/fs/poll_test.c
 
 DRIVER_SRCS = \
@@ -138,6 +177,7 @@ USERSPACE_SRCS = \
     kernel/syscall/sys_hostname.c kernel/syscall/sys_adminconf.c \
     kernel/syscall/sys_cap.c kernel/syscall/sys_time.c \
     kernel/syscall/sys_file.c kernel/syscall/sys_dir.c \
+    kernel/syscall/sys_mount.c \
     kernel/syscall/sys_meta.c kernel/syscall/sys_signal.c \
     kernel/syscall/sys_socket.c kernel/syscall/sys_random.c \
     kernel/syscall/sys_disk.c kernel/syscall/futex.c \
@@ -246,6 +286,21 @@ test-arm64:
 # pid/tgid offsets, so a stale procfs.o read pid as 0) — a silent wrong-binary
 # class that an incremental `make` cannot otherwise catch. -MP adds phony header
 # targets so deleting a header doesn't break the build with a missing-prereq error.
+# The KASAN runtime must not instrument itself — strip the sanitizer flags for
+# just this object (more specific than the generic rule below, so make prefers
+# it). -DKASAN stays so the file's own #ifdef KASAN body compiles in.
+$(BUILD)/mm/kasan.o: kernel/mm/kasan.c
+	@mkdir -p $(dir $@)
+	$(CC) $(filter-out $(KASAN_CFLAGS),$(CFLAGS)) -MMD -MP -c $< -o $@
+
+# The UBSAN runtime must not instrument itself (a report is a memory-touching
+# path; self-instrumentation risks recursion — the runtime has a guard, but not
+# instrumenting it is cleaner and matches the KASAN rule above). -DUBSAN stays so
+# the file's own #ifdef UBSAN body compiles in.
+$(BUILD)/mm/ubsan.o: kernel/mm/ubsan.c
+	@mkdir -p $(dir $@)
+	$(CC) $(filter-out $(UBSAN_CFLAGS),$(CFLAGS)) -MMD -MP -c $< -o $@
+
 $(BUILD)/%.o: kernel/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@

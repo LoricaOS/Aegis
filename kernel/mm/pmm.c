@@ -211,7 +211,7 @@ static int pmm_page_in_usable_ram(uint64_t addr)
     return 0;
 }
 
-static void pmm_reserve_region(uint64_t base, uint64_t len)
+void pmm_reserve_region(uint64_t base, uint64_t len)
 {
     /* Align base down, end up — reserve conservatively. */
     uint64_t start = base & ~(PAGE_SIZE - 1);

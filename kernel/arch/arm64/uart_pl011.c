@@ -88,15 +88,43 @@ static uint32_t s_head, s_tail;         /* head = write, tail = read */
 static uint32_t s_tty_pgrp;
 static uint32_t s_rx_count;             /* /proc/kbdstat serial counter */
 
-/* uart_rx_irq — drain the RX FIFO into the ring; called from arm64_irq
- * (INTID 33). Wakes console readers like the x86 kbd ISR does. */
-void
-uart_rx_irq(void)
+#ifdef AEGIS_BOOT_NATIVE
+/* Serial "reboot at will": on the real Pi 5 there is no reset button, so watch
+ * the console input for an SSH-style, line-anchored escape — "<newline>~~~" —
+ * and issue an immediate watchdog hard reset. Line-anchored (the tildes must be
+ * the first chars after Enter) so mid-line tildes in paths/pastes never trigger
+ * it; three of them make an accidental match essentially impossible. Works at
+ * the login prompt, in a shell, or even if userland has wedged, since every RX
+ * byte passes through here. Native-only (QEMU virt keeps normal console input).
+ * State: 1 = at line start, 2/3 = seen 1/2 tildes; a 3rd tilde resets.
+ * Fed from BOTH input paths — serial (drain_fifo) and USB keyboard
+ * (kbd_inject) — so it works whether the console is a serial screen or the
+ * physical keyboard on the graphical desktop. */
+static int s_reboot_esc = 1;   /* start as if at line start */
+static void
+reboot_escape_watch(char c)
+{
+    if (c == '\n' || c == '\r')
+        s_reboot_esc = 1;
+    else if (s_reboot_esc >= 1 && c == '~') {
+        if (++s_reboot_esc >= 4)
+            arch_native_reset();   /* never returns */
+    } else
+        s_reboot_esc = 0;
+}
+#endif
+
+/* drain_fifo — move any bytes waiting in the PL011 RX FIFO into the ring. */
+static void
+drain_fifo(void)
 {
     while (!(rd(UART_FR) & FR_RXFE)) {
         char c = (char)rd(UART_DR);
         if (c == '\r')
             c = '\n';
+#ifdef AEGIS_BOOT_NATIVE
+        reboot_escape_watch(c);
+#endif
         uint32_t next = (s_head + 1) % RX_RING;
         if (next != s_tail) {           /* drop on overflow */
             s_ring[s_head] = c;
@@ -104,6 +132,14 @@ uart_rx_irq(void)
         }
         s_rx_count++;
     }
+}
+
+/* uart_rx_irq — drain the RX FIFO into the ring; called from arm64_irq.
+ * Wakes console readers like the x86 kbd ISR does. */
+void
+uart_rx_irq(void)
+{
+    drain_fifo();
     wr(UART_ICR, 1u << 4);
     waitq_wake_all(&g_console_waiters);
 }
@@ -117,6 +153,13 @@ kbd_init(void)
 int
 kbd_poll(char *out)
 {
+    /* Also poll the FIFO directly, not just the IRQ-filled ring: the console
+     * read path spins on kbd_poll + arch_wait_for_irq (woken every timer
+     * tick), so draining here makes serial input work even if the RX
+     * interrupt isn't being delivered. ponytail: no IRQ-vs-poll lock -- the
+     * FIFO is tiny and this is the console; add one if the RX IRQ and a
+     * concurrent poll ever both run hot. */
+    drain_fifo();
     if (s_tail == s_head)
         return 0;
     *out = s_ring[s_tail];
@@ -127,6 +170,7 @@ kbd_poll(char *out)
 int
 kbd_has_data(void)
 {
+    drain_fifo();
     return s_tail != s_head;
 }
 
@@ -144,6 +188,9 @@ kbd_inject(char c)
 {
     if (c == '\0')
         return;
+#ifdef AEGIS_BOOT_NATIVE
+    reboot_escape_watch(c);   /* USB-keyboard input also arms the ~~~ reboot escape */
+#endif
     uint32_t next = (s_head + 1) % RX_RING;
     if (next != s_tail) {
         s_ring[s_head] = c;

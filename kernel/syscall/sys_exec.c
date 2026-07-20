@@ -313,6 +313,8 @@ reload_binary:
     proc->pending_signals = 0;
     proc->signal_mask = 0;
     __builtin_memset(proc->sigactions, 0, sizeof(proc->sigactions));
+    proc->altstack_sp = 0;          /* execve resets the alternate signal stack */
+    proc->altstack_size = 0;
 
     /* 6. Load new ELF */
     elf_load_result_t er;
@@ -1031,6 +1033,11 @@ sys_spawn(uint64_t path_uptr, uint64_t argv_uptr,
 
     /* cwd: inherit from parent */
     __builtin_memcpy(child->cwd, parent->cwd, sizeof(parent->cwd));
+
+    /* VFS confinement: inherit the parent's scope, or spawn would be a
+     * confinement-escape (a confined process could spawn an unconfined child). */
+    __builtin_memcpy(child->vfs_scope, parent->vfs_scope, sizeof(parent->vfs_scope));
+    child->vfs_scope_len = parent->vfs_scope_len;
 
     /* VMA tracking for the stack.  The table was already allocated in step 5a
      * (vma_init, before elf_load) and now also holds the child's ELF segments.

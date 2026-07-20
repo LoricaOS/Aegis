@@ -462,6 +462,66 @@ gen_cpuinfo(char *buf, uint32_t bufsz)
     }
 #endif
 
+#ifdef __aarch64__
+    /* aarch64 has no CPUID; the core identifies itself in MIDR_EL1 (ARM ARM
+     * D13.2.xx): implementer in [31:24], part number in [15:4]. Decode it to
+     * the marketing core name — the same thing Linux prints as "CPU part",
+     * except spelled out. Anything unrecognised still reports its raw part
+     * number rather than falling back to "Unknown Processor". */
+    {
+        uint64_t midr;
+        __asm__ volatile("mrs %0, midr_el1" : "=r"(midr));
+        unsigned impl = (unsigned)((midr >> 24) & 0xFF);
+        unsigned part = (unsigned)((midr >> 4) & 0xFFF);
+
+        const char *vname = "unknown";
+        switch (impl) {
+        case 0x41: vname = "ARM";       break;
+        case 0x42: vname = "Broadcom";  break;
+        case 0x43: vname = "Cavium";    break;
+        case 0x4E: vname = "NVIDIA";    break;
+        case 0x51: vname = "Qualcomm";  break;
+        case 0x53: vname = "Samsung";   break;
+        case 0x56: vname = "Marvell";   break;
+        case 0x61: vname = "Apple";     break;
+        case 0xC0: vname = "Ampere";    break;
+        }
+        pfs_strcpy(vendor, vname);
+
+        /* ARM-designed cores (impl 0x41). The Raspberry Pi line is in here:
+         * Pi 3 = A53, Pi 4 = A72, Pi 5 (BCM2712) = A76. */
+        const char *core = 0;
+        if (impl == 0x41) {
+            switch (part) {
+            case 0xD03: core = "Arm Cortex-A53";     break;
+            case 0xD04: core = "Arm Cortex-A35";     break;
+            case 0xD05: core = "Arm Cortex-A55";     break;
+            case 0xD07: core = "Arm Cortex-A57";     break;
+            case 0xD08: core = "Arm Cortex-A72";     break;
+            case 0xD09: core = "Arm Cortex-A73";     break;
+            case 0xD0A: core = "Arm Cortex-A75";     break;
+            case 0xD0B: core = "Arm Cortex-A76";     break;
+            case 0xD0C: core = "Arm Neoverse-N1";    break;
+            case 0xD0D: core = "Arm Cortex-A77";     break;
+            case 0xD41: core = "Arm Cortex-A78";     break;
+            case 0xD44: core = "Arm Cortex-X1";      break;
+            case 0xD49: core = "Arm Neoverse-N2";    break;
+            case 0xD4F: core = "Arm Neoverse-V2";    break;
+            }
+        }
+        if (core) {
+            pfs_strcpy(brand, core);
+        } else {
+            /* e.g. "CPU impl 0x41 part 0xd4b" — still identifies the silicon. */
+            char *q = pfs_strcpy(brand, "CPU impl 0x");
+            q = pfs_u64_hex(q, impl, 2);
+            q = pfs_strcpy(q, " part 0x");
+            q = pfs_u64_hex(q, part, 3);
+            *q = '\0';
+        }
+    }
+#endif
+
     /* Trim leading spaces the brand string often carries. */
     const char *bs = brand;
     while (*bs == ' ') bs++;

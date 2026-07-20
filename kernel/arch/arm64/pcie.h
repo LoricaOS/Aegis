@@ -37,6 +37,11 @@ void     pcie_write32(uint8_t bus, uint8_t dev, uint8_t fn,
 int                   pcie_device_count(void);
 const pcie_device_t  *pcie_get_devices(void);
 
+/* Inject a device found by a non-ECAM host bridge (native RPi5 Broadcom RC)
+ * into the shared table. bar[] must hold clean CPU-physical bases. Returns 0
+ * ok, -1 if full. */
+int                   pcie_register_device(const pcie_device_t *dev);
+
 /* Find first device matching class/subclass/progif. Returns NULL if not found.
  * Pass 0xFF for a field to match any value. */
 const pcie_device_t *pcie_find_device(uint8_t class_code, uint8_t subclass,

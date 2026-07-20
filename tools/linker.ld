@@ -51,6 +51,17 @@ SECTIONS
         KEEP(*(.limine_requests_end))
     }
 
+    /* Global constructors.  GCC places asan.module_ctor (globals KASAN) here;
+     * kasan_init() walks [__init_array_start, __init_array_end) at boot.  Empty
+     * and harmless in a non-KASAN build. */
+    .init_array : AT(ADDR(.init_array) - KERN_VMA) {
+        . = ALIGN(8);
+        PROVIDE(__init_array_start = .);
+        KEEP(*(.init_array .init_array.*))
+        KEEP(*(.ctors))
+        PROVIDE(__init_array_end = .);
+    }
+
     .bss : AT(ADDR(.bss) - KERN_VMA) {
         *(COMMON)
         *(.bss .bss.*)

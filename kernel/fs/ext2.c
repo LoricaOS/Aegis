@@ -2227,8 +2227,13 @@ int ext2_unlink(const char *path, int has_install)
         return -1;
     }
 
+    /* NO-FOLLOW: unlink() operates on the final component itself, never on
+     * what a symlink points at (POSIX). Resolving with follow=1 meant
+     * `unlink(link-to-dir)` returned EISDIR — the link could not be removed
+     * at all — and `unlink(link-to-file)` would have deleted the TARGET while
+     * leaving the dangling link behind. */
     uint32_t ino;
-    if (ext2_open(path, &ino) != 0) {
+    if (ext2_open_ex(path, &ino, 0) != 0) {
         ext2_lock_release(fl);
         return -1;
     }
@@ -2409,8 +2414,12 @@ int ext2_rmdir(const char *path, int has_install)
         return -1;
     }
 
+    /* NO-FOLLOW: rmdir() must not traverse a final-component symlink. With
+     * follow=1, `rmdir(link-to-dir)` removed the DIRECTORY the link pointed
+     * at and left the link dangling; POSIX says ENOTDIR (the S_IFDIR check
+     * below now sees the link itself and reports it). */
     uint32_t ino;
-    if (ext2_open(path, &ino) != 0) {
+    if (ext2_open_ex(path, &ino, 0) != 0) {
         ext2_lock_release(fl);
         return -1;
     }

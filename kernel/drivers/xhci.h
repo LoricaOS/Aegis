@@ -102,6 +102,12 @@ typedef struct __attribute__((packed)) {
  * Prints [XHCI] OK or skip message. */
 void xhci_init(void);
 
+/* xhci_init_at — bring up an xHCI controller at an explicit MMIO base (not a PCI
+ * device); for the RP1 dwc3 on Pi 5. Call xhci_set_dma_noncoherent(1) first if
+ * the controller's DMA is behind a non-coherent bus. */
+void xhci_init_at(uint64_t bar0_phys);
+void xhci_set_dma_noncoherent(int nc);
+
 /* Poll event ring for completed transfers. Called from PIT handler at 100Hz. */
 void xhci_poll(void);
 

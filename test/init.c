@@ -47,32 +47,137 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
 /* Non-colliding syscalls: the x86 number passes through the aarch64 dispatch
  * unchanged (see kernel/syscall/syscall.c). */
 #define SYS_write        1
-#define SYS_getpid       39
 #define SYS_exit         60
 #define SYS_sethostname  170   /* gated on CAP_KIND_POWER — init HOLDS this */
 #define SYS_blkdev_list  510   /* gated on CAP_KIND_DISK_ADMIN — init LACKS this */
+#define SYS_vfs_confine  518   /* Aegis: confine self to a subtree (no cap) */
 
 /* Colliding syscalls: the x86 number would be MIS-translated on aarch64, so
  * use each arch's real Linux number (aarch64's are translated to the x86
  * dispatch numbers by the kernel). */
 #ifdef __aarch64__
+#define SYS_getpid       172   /* was non-colliding (x86 39 passed through) until
+                                * the mount syscall added aarch64 umount2(39) →
+                                * 39 now collides, so use the real aarch64 nr */
+#define SYS_mount        40
 #define SYS_clone        220
 #define SYS_wait4        260
 #define SYS_kill         129
 #define SYS_execve       221
 #define SYS_rt_sigaction 134
 #define SYS_rt_sigreturn 139
+#define SYS_sigaltstack  132
+#define SYS_mmap         222
+#define SYS_mremap       216
+#define SYS_clock_gettime  113
+#define SYS_clock_nanosleep 115
+#define SYS_sched_yield  124
+#define SYS_tgkill       131
+/* The *at forms are the only ones aarch64 has; musl builds every legacy call
+ * out of them, so the test must use them too — that is precisely the path
+ * where the kernel's aarch64 translation has to preserve the flags. */
+#define SYS_mkdirat      34
+#define SYS_unlinkat     35
+#define SYS_symlinkat    36
+#define SYS_openat       56
+#define SYS_close        57
+#define SYS_readlinkat   78
+#define SYS_newfstatat   79
 #else
+#define SYS_getpid       39
+#define SYS_mount        165
 #define SYS_clone        56
 #define SYS_wait4        61
 #define SYS_kill         62
 #define SYS_execve       59
 #define SYS_rt_sigaction 13
 #define SYS_rt_sigreturn 15
+#define SYS_sigaltstack  131
+#define SYS_mmap         9
+#define SYS_mremap       25
+#define SYS_clock_gettime  228
+#define SYS_clock_nanosleep 230
+#define SYS_sched_yield  24
+#define SYS_tgkill       234
+#define SYS_stat         4
+#define SYS_lstat        6
+#define SYS_close        3
+#define SYS_openat       257
+#define SYS_mkdir        83
+#define SYS_rmdir        84
+#define SYS_unlink       87
+#define SYS_symlink      88
+#define SYS_readlink     89
 #endif
+
+#define AT_FDCWD             -100
+#define AT_SYMLINK_NOFOLLOW  0x100
+#define AT_REMOVEDIR         0x200
+
+/* Portable wrappers over the two syscall dialects, so the checks below read
+ * the same on both arches. */
+static long k_mkdir(const char *p)
+{
+#ifdef __aarch64__
+    return sys3(SYS_mkdirat, AT_FDCWD, (long)p, 0755);
+#else
+    return sys3(SYS_mkdir, (long)p, 0755, 0);
+#endif
+}
+static long k_rmdir(const char *p)
+{
+#ifdef __aarch64__
+    return sys3(SYS_unlinkat, AT_FDCWD, (long)p, AT_REMOVEDIR);
+#else
+    return sys3(SYS_rmdir, (long)p, 0, 0);
+#endif
+}
+static long k_unlink(const char *p)
+{
+#ifdef __aarch64__
+    return sys3(SYS_unlinkat, AT_FDCWD, (long)p, 0);
+#else
+    return sys3(SYS_unlink, (long)p, 0, 0);
+#endif
+}
+static long k_symlink(const char *target, const char *link)
+{
+#ifdef __aarch64__
+    return sys3(SYS_symlinkat, (long)target, AT_FDCWD, (long)link);
+#else
+    return sys3(SYS_symlink, (long)target, (long)link, 0);
+#endif
+}
+/* Fills the caller's struct-stat buffer; returns 0 or negative errno. */
+static long k_stat_at(const char *p, void *st, int nofollow)
+{
+#ifdef __aarch64__
+    return sys6(SYS_newfstatat, AT_FDCWD, (long)p, (long)st,
+                nofollow ? AT_SYMLINK_NOFOLLOW : 0, 0, 0);
+#else
+    return sys3(nofollow ? SYS_lstat : SYS_stat, (long)p, (long)st, 0);
+#endif
+}
+/* st_mode's byte offset differs per arch (x86-64 puts st_nlink first). */
+static unsigned k_stat_mode(const void *st)
+{
+#ifdef __aarch64__
+    return *(const unsigned *)((const char *)st + 16);
+#else
+    return *(const unsigned *)((const char *)st + 24);
+#endif
+}
+#define K_IFMT  0170000
+#define K_IFDIR 0040000
+#define K_IFLNK 0120000
 
 #define SIGCHLD 17
 #define SIGUSR1 10
+#define SIGUSR2 12
+#define SA_ONSTACK 0x08000000UL
+#define PROT_RW        0x3        /* PROT_READ | PROT_WRITE */
+#define MAP_ANON_PRIV  0x22       /* MAP_PRIVATE | MAP_ANONYMOUS */
+#define MREMAP_MAYMOVE 1
 
 static unsigned slen(const char *s) { unsigned n = 0; while (s[n]) n++; return n; }
 static void out(const char *s) { sys3(SYS_write, 2, (long)s, slen(s)); }
@@ -83,6 +188,18 @@ static void out(const char *s) { sys3(SYS_write, 2, (long)s, slen(s)); }
 static volatile int g_sig_got = 0;
 static void sig_handler(int signum) { g_sig_got = signum; }
 static volatile long g_cow = 0;   /* dedicated COW test page (data, not stack) */
+
+/* sigaltstack test: a SA_ONSTACK handler records the stack region it ran on
+ * (the address of a local), which must fall inside g_altstack if delivery used
+ * the alternate signal stack. */
+static char g_altstack[8192];
+static volatile unsigned long g_altsp = 0;
+static void sig_alt_handler(int signum) {
+    char probe;
+    g_altsp = (unsigned long)(void *)&probe;
+    g_sig_got = signum;
+}
+struct kstack { void *ss_sp; int ss_flags; unsigned long ss_size; };
 
 #ifdef __aarch64__
 __asm__(".globl sig_restorer\nsig_restorer:\n\tmov x8, #139\n\tsvc #0\n");
@@ -129,6 +246,51 @@ void _start(void)
     total++;
     if (sys3(SYS_blkdev_list, 0, 0, 0) < 0) { pass++; out("[KTEST] PASS diskadmin-denied\n"); }
     else out("[KTEST] FAIL diskadmin-NOT-denied (privesc!)\n");
+
+    /* 4b. NEGATIVE control — mount needs CAP_KIND_MOUNT, which init does NOT
+     *     hold, so the kernel must refuse sys_mount (fail closed): a filesystem
+     *     mounted over /etc would be a privilege-escalation primitive. */
+    total++;
+    if (sys6(SYS_mount, 0, (long)"/mnt/x", (long)"tmpfs", 0, 0, 0) < 0)
+        { pass++; out("[KTEST] PASS mount-denied\n"); }
+    else out("[KTEST] FAIL mount-NOT-denied (privesc!)\n");
+
+    /* 4c. VFS confinement — a CHILD confines itself to /tmp (so init stays
+     *     unconfined for the tests below), then: an in-scope create succeeds, an
+     *     out-of-scope open is refused (EACCES), and widening back out is
+     *     refused (one-way). Purely additive authority-dropping, no cap. */
+    total++;
+    {
+        long cpid = sys6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);
+        if (cpid == 0) {
+            int ok = 1;
+            if (sys3(SYS_vfs_confine, (long)"/tmp", 0, 0) != 0) ok = 0;
+            /* in-scope create → valid fd */
+            if (sys6(SYS_openat, AT_FDCWD, (long)"/tmp/cjail", 0x40 | 1, 0644, 0, 0) < 0)
+                ok = 0;
+            /* out-of-scope open must be denied */
+            if (sys6(SYS_openat, AT_FDCWD, (long)"/", 0, 0, 0, 0) >= 0)
+                ok = 0;
+            /* one-way: widening the scope must be refused */
+            if (sys3(SYS_vfs_confine, (long)"/", 0, 0) == 0)
+                ok = 0;
+            /* descendants inherit confinement: a grandchild must ALSO be denied
+             * "/" (it inherited /tmp scope across fork). */
+            long gpid = sys6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);
+            if (gpid == 0)
+                sys3(SYS_exit,
+                     (sys6(SYS_openat, AT_FDCWD, (long)"/", 0, 0, 0, 0) < 0) ? 0 : 1,
+                     0, 0);
+            long gstatus = -1;
+            sys6(SYS_wait4, gpid, (long)&gstatus, 0, 0, 0, 0);
+            if (((gstatus >> 8) & 0xff) != 0) ok = 0;   /* grandchild escaped scope */
+            sys3(SYS_exit, ok ? 0 : 1, 0, 0);
+        }
+        long cstatus = -1;
+        sys6(SYS_wait4, cpid, (long)&cstatus, 0, 0, 0, 0);
+        if (((cstatus >> 8) & 0xff) == 0) { pass++; out("[KTEST] PASS vfs-confine\n"); }
+        else out("[KTEST] FAIL vfs-confine\n");
+    }
 
     /* 5. FP/SIMD state survives a context switch (arm64 only — this
      *    test-init is built -mno-sse on x86, where the FXSAVE path is
@@ -196,6 +358,30 @@ void _start(void)
         else out("[KTEST] FAIL signal\n");
     }
 
+    /* 7b. sigaltstack + SA_ONSTACK. Install an alternate signal stack, register
+     *     a SA_ONSTACK handler for SIGUSR2, raise it, and confirm the handler
+     *     ran ON the alt stack (a local's address lands inside g_altstack).
+     *     Was a no-op stub aliased to rt_sigaction. */
+    total++;
+    {
+        struct kstack ss = { g_altstack, 0, sizeof(g_altstack) };
+        struct ksigaction act;
+        act.sa_handler  = sig_alt_handler;
+        act.sa_flags    = SA_ONSTACK;
+        act.sa_restorer = sig_restorer;
+        act.sa_mask     = 0;
+        g_altsp = 0;
+        g_sig_got = 0;
+        long r = sys3(SYS_sigaltstack, (long)&ss, 0, 0);
+        sys6(SYS_rt_sigaction, SIGUSR2, (long)&act, 0, 8, 0, 0);
+        sys3(SYS_kill, sys3(SYS_getpid, 0, 0, 0), SIGUSR2, 0);
+        unsigned long lo = (unsigned long)(void *)g_altstack;
+        unsigned long hi = lo + sizeof(g_altstack);
+        if (r == 0 && g_sig_got == SIGUSR2 && g_altsp >= lo && g_altsp < hi) {
+            pass++; out("[KTEST] PASS sigaltstack (handler on alt stack)\n");
+        } else out("[KTEST] FAIL sigaltstack\n");
+    }
+
     /* 8. execve: fork a child that execs a SECOND binary (/bin/exectest).
      *    Validates the full exec path — ELF load of a new image + the EL0/
      *    ring-3 entry trampoline. exectest exits 42; execve only returns on
@@ -220,6 +406,28 @@ void _start(void)
         if (pid > 0 && cs == 42) { pass++; out("[KTEST] PASS exec\n"); }
         else if (cs == 43) out("[KTEST] FAIL svc-tier-DISK_ADMIN-granted (privesc!)\n");
         else out("[KTEST] FAIL exec\n");
+    }
+
+    /* 8b. mremap: grow a lazy anon mapping in place (data preserved + new area
+     *     usable), then shrink it back. Was absent (ENOSYS). */
+    total++;
+    {
+        long p = sys6(SYS_mmap, 0, 4096, PROT_RW, MAP_ANON_PRIV, -1, 0);
+        int ok = (p > 0);
+        if (ok) {
+            volatile unsigned char *m = (volatile unsigned char *)p;
+            m[0] = 0x42; m[4095] = 0x24;
+            long p2 = sys6(SYS_mremap, p, 4096, 8192, MREMAP_MAYMOVE, 0, 0);
+            if (p2 != p) ok = 0;                       /* grew in place */
+            else {
+                m[8191] = 0x7;                         /* the new area is usable */
+                if (m[0] != 0x42 || m[4095] != 0x24 || m[8191] != 0x7) ok = 0;
+                long p3 = sys6(SYS_mremap, p, 8192, 4096, 0, 0, 0);   /* shrink back */
+                if (p3 != p || m[0] != 0x42) ok = 0;
+            }
+        }
+        if (ok) { pass++; out("[KTEST] PASS mremap (grow-in-place + shrink)\n"); }
+        else out("[KTEST] FAIL mremap\n");
     }
 
     /* 9. Concurrent multi-core scheduling: fork 4 children that each spin
@@ -251,6 +459,114 @@ void _start(void)
         }
         if (ok && seen == 0xF) { pass++; out("[KTEST] PASS smp-fork (4 concurrent)\n"); }
         else out("[KTEST] FAIL smp-fork\n");
+    }
+
+    /* 9. Directory + symlink surface. Every one of these was silently broken
+     *    at some point: rmdir under /tmp fell through to ext2 and returned
+     *    EPERM; unlink/rmdir resolved THROUGH a final-component symlink; and
+     *    on aarch64 the flags of unlinkat/newfstatat were dropped in
+     *    translation, so rmdir() unlinked and lstat() followed. A recursive
+     *    delete built on those primitives escapes the tree it was given, so
+     *    these are correctness AND safety checks. */
+    {
+        char st[256];
+        int ok = 1;
+
+        /* Empty vs non-empty on the ext2 root. */
+        ok &= (k_mkdir("/ktdir") == 0);
+        ok &= (k_mkdir("/ktdir/sub") == 0);
+        ok &= (k_rmdir("/ktdir") < 0);            /* not empty → must refuse */
+        ok &= (k_rmdir("/ktdir/sub") == 0);
+        total++;
+        if (ok) { pass++; out("[KTEST] PASS rmdir (empty vs non-empty)\n"); }
+        else out("[KTEST] FAIL rmdir\n");
+
+        /* A symlink is its own object: lstat must not follow it, stat must,
+         * and unlink must remove the LINK, leaving the target alone. */
+        ok = 1;
+        ok &= (k_mkdir("/ktdir/tgt") == 0);
+        ok &= (k_symlink("/ktdir/tgt", "/ktdir/lnk") == 0);
+        ok &= (k_stat_at("/ktdir/lnk", st, 1) == 0);
+        ok &= ((k_stat_mode(st) & K_IFMT) == K_IFLNK);   /* lstat: the link  */
+        ok &= (k_stat_at("/ktdir/lnk", st, 0) == 0);
+        ok &= ((k_stat_mode(st) & K_IFMT) == K_IFDIR);   /* stat: the target */
+        ok &= (k_unlink("/ktdir/lnk") == 0);
+        ok &= (k_stat_at("/ktdir/tgt", st, 1) == 0);     /* target survived  */
+        ok &= (k_rmdir("/ktdir/tgt") == 0);
+        ok &= (k_rmdir("/ktdir") == 0);
+        total++;
+        if (ok) { pass++; out("[KTEST] PASS symlink (lstat/stat/unlink)\n"); }
+        else out("[KTEST] FAIL symlink\n");
+
+        /* /tmp is ramfs, a different backend with its own routing. */
+        ok = 1;
+        ok &= (k_mkdir("/tmp/ktdir") == 0);
+        ok &= (k_mkdir("/tmp/ktdir/sub") == 0);
+        ok &= (k_rmdir("/tmp/ktdir") < 0);        /* not empty → must refuse */
+        ok &= (k_rmdir("/tmp/ktdir/sub") == 0);
+        ok &= (k_rmdir("/tmp/ktdir") == 0);
+        total++;
+        if (ok) { pass++; out("[KTEST] PASS ramfs mkdir/rmdir (/tmp)\n"); }
+        else out("[KTEST] FAIL ramfs mkdir/rmdir\n");
+    }
+
+    /* 10. clock_nanosleep honors TIMER_ABSTIME. Read monotonic t0, sleep until
+     *     an absolute deadline ~50 ms out, confirm we actually waited, and that a
+     *     deadline already in the past returns immediately. Was aliased to
+     *     nanosleep(req) discarding clk_id+flags → ABSTIME silently became a
+     *     relative sleep of the whole deadline's magnitude. */
+    total++;
+    {
+        /* Run in a fresh child: interruptible sleeps return early on ANY pending
+         * signal, and the smp-fork test above leaves a SIGCHLD pending on some
+         * arches — a clean child isolates the timing check from that. Child exits
+         * 0 iff the absolute-deadline sleep actually waited (~50 ms) AND a past
+         * deadline returned immediately. */
+        long cp = sys6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);
+        if (cp == 0) {
+            long ts0[2] = {0,0}, ts1[2] = {0,0};
+            sys3(SYS_clock_gettime, 1 /*MONOTONIC*/, (long)ts0, 0);
+            long tgt[2] = { ts0[0], ts0[1] + 50L*1000000L };   /* +50 ms */
+            if (tgt[1] >= 1000000000L) { tgt[0]++; tgt[1] -= 1000000000L; }
+            long r  = sys6(SYS_clock_nanosleep, 1, 1 /*TIMER_ABSTIME*/, (long)tgt, 0, 0, 0);
+            sys3(SYS_clock_gettime, 1, (long)ts1, 0);
+            long elapsed_ms = (ts1[0]-ts0[0])*1000L + (ts1[1]-ts0[1])/1000000L;
+            long past[2] = { ts0[0], ts0[1] };                 /* already-past deadline */
+            long r2 = sys6(SYS_clock_nanosleep, 1, 1, (long)past, 0, 0, 0);
+            sys3(SYS_exit, (r == 0 && r2 == 0 && elapsed_ms >= 30) ? 0 : 1, 0, 0);
+        }
+        int st = 0;
+        sys6(SYS_wait4, cp, (long)&st, 0, 0, 0, 0);
+        if (cp > 0 && ((st >> 8) & 0xff) == 0) {
+            pass++; out("[KTEST] PASS clock_nanosleep (ABSTIME honored)\n");
+        } else out("[KTEST] FAIL clock_nanosleep\n");
+    }
+
+    /* 11. tgkill delivers a thread-directed signal (tid==pid in Aegis). Install a
+     *     SIGUSR1 handler, tgkill(pid,pid,SIGUSR1), confirm it ran. Was aliased on
+     *     arm64 to rt_sigaction — a lying syscall that broke raise()/abort(). */
+    total++;
+    {
+        struct ksigaction act;
+        act.sa_handler  = sig_handler;
+        act.sa_flags    = 0;
+        act.sa_restorer = sig_restorer;
+        act.sa_mask     = 0;
+        g_sig_got = 0;
+        sys6(SYS_rt_sigaction, SIGUSR1, (long)&act, 0, 8, 0, 0);
+        long mypid = sys3(SYS_getpid, 0, 0, 0);
+        sys3(SYS_tgkill, mypid, mypid, SIGUSR1);           /* tgid, tid, sig */
+        if (g_sig_got == SIGUSR1) { pass++; out("[KTEST] PASS tgkill (thread-directed)\n"); }
+        else out("[KTEST] FAIL tgkill\n");
+    }
+
+    /* 12. sched_yield returns cleanly (was a no-op nanosleep(0) alias on arm64;
+     *     now a real scheduler yield). Single-threaded we assert it returns 0
+     *     without hanging. */
+    total++;
+    {
+        if (sys3(SYS_sched_yield, 0, 0, 0) == 0) { pass++; out("[KTEST] PASS sched_yield\n"); }
+        else out("[KTEST] FAIL sched_yield\n");
     }
 
     if (pass == total) out("[KTEST] DONE all-pass\n");

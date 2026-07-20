@@ -419,6 +419,10 @@ kbd_feed_scancode(uint8_t sc)
         case 0x4D: arrow = 'C'; break;  /* right */
         case 0x47: arrow = 'H'; break;  /* Home */
         case 0x4F: arrow = 'F'; break;  /* End */
+        /* PrintScreen makes E0 2A E0 37; the 2A filler falls through
+         * unmapped. ESC[p is the compositor's screenshot key (same
+         * sequence the USB HID path emits for usage 0x46). */
+        case 0x37: arrow = 'p'; break;  /* PrintScreen */
         }
         if (arrow) {
             buf_push('\033');

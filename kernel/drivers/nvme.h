@@ -82,6 +82,15 @@ typedef struct __attribute__((packed)) {
  * Safe to call when no NVMe device present — prints skip message. */
 void nvme_init(void);
 
+/* Set the CPU-phys -> PCIe-bus DMA offset before nvme_init (default 0). Used
+ * by the native RPi5 path, whose Broadcom RC inbound window maps PCIe bus
+ * 0x10_00000000 -> CPU 0x0. */
+void nvme_set_dma_offset(uint64_t off);
+
+/* Allocate DMA buffers non-cacheable (nc != 0) for non-coherent hosts like the
+ * RPi5 Broadcom RC. Call before nvme_init; default is coherent (0). */
+void nvme_set_dma_noncoherent(int nc);
+
 /* Commit the drive's volatile write cache to media (NVMe FLUSH).
  * No-op when no NVMe controller is present. Called from sys_sync. */
 void nvme_flush(void);

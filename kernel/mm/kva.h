@@ -22,6 +22,13 @@ void *kva_alloc_pages(uint64_t n);
  * unconstrained kva_alloc_pages. */
 void *kva_alloc_pages_low(uint64_t n);
 
+/* kva_alloc_pages_low_nc — same <4GB DMA pool as kva_alloc_pages_low, but the
+ * pages are mapped NON-CACHEABLE (Normal-NC on arm64). For non-coherent DMA
+ * devices (e.g. the RPi5 Broadcom PCIe RC, no `dma-coherent` in its DTB) whose
+ * controller does not snoop the CPU cache. Callers must access these frames
+ * ONLY through the returned VA, never the cacheable DMAP alias. */
+void *kva_alloc_pages_low_nc(uint64_t n);
+
 /* kva_map_phys_pages — map num_pages of existing physical memory starting at
  * phys_base into contiguous kernel VA. Does NOT allocate physical pages from
  * PMM — the pages must already exist (e.g. GRUB-loaded module).

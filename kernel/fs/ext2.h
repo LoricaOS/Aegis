@@ -212,8 +212,9 @@ int ext2_open_ex(const char *path, uint32_t *inode_out, int follow_final);
 int ext2_lookup_parent(const char *path, uint32_t *parent_ino_out,
                        const char **basename_out);
 
-/* Flush all dirty cache slots to disk */
-void ext2_sync(void);
+/* Flush all dirty cache slots to disk.  Returns 0, or -EIO if any writeback
+ * failed since the previous sync (the error is consumed on report). */
+int ext2_sync(void);
 
 /* Restore the superblock's clean state (set EXT2_VALID_FS) — call on an orderly
  * shutdown, after ext2_sync(), so the next mount does not report an unclean
