@@ -67,6 +67,8 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
 #define SYS_rt_sigaction 134
 #define SYS_rt_sigreturn 139
 #define SYS_sigaltstack  132
+#define SYS_mmap         222
+#define SYS_mremap       216
 /* The *at forms are the only ones aarch64 has; musl builds every legacy call
  * out of them, so the test must use them too — that is precisely the path
  * where the kernel's aarch64 translation has to preserve the flags. */
@@ -87,6 +89,8 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
 #define SYS_rt_sigaction 13
 #define SYS_rt_sigreturn 15
 #define SYS_sigaltstack  131
+#define SYS_mmap         9
+#define SYS_mremap       25
 #define SYS_stat         4
 #define SYS_lstat        6
 #define SYS_close        3
@@ -163,6 +167,9 @@ static unsigned k_stat_mode(const void *st)
 #define SIGUSR1 10
 #define SIGUSR2 12
 #define SA_ONSTACK 0x08000000UL
+#define PROT_RW        0x3        /* PROT_READ | PROT_WRITE */
+#define MAP_ANON_PRIV  0x22       /* MAP_PRIVATE | MAP_ANONYMOUS */
+#define MREMAP_MAYMOVE 1
 
 static unsigned slen(const char *s) { unsigned n = 0; while (s[n]) n++; return n; }
 static void out(const char *s) { sys3(SYS_write, 2, (long)s, slen(s)); }
@@ -391,6 +398,28 @@ void _start(void)
         if (pid > 0 && cs == 42) { pass++; out("[KTEST] PASS exec\n"); }
         else if (cs == 43) out("[KTEST] FAIL svc-tier-DISK_ADMIN-granted (privesc!)\n");
         else out("[KTEST] FAIL exec\n");
+    }
+
+    /* 8b. mremap: grow a lazy anon mapping in place (data preserved + new area
+     *     usable), then shrink it back. Was absent (ENOSYS). */
+    total++;
+    {
+        long p = sys6(SYS_mmap, 0, 4096, PROT_RW, MAP_ANON_PRIV, -1, 0);
+        int ok = (p > 0);
+        if (ok) {
+            volatile unsigned char *m = (volatile unsigned char *)p;
+            m[0] = 0x42; m[4095] = 0x24;
+            long p2 = sys6(SYS_mremap, p, 4096, 8192, MREMAP_MAYMOVE, 0, 0);
+            if (p2 != p) ok = 0;                       /* grew in place */
+            else {
+                m[8191] = 0x7;                         /* the new area is usable */
+                if (m[0] != 0x42 || m[4095] != 0x24 || m[8191] != 0x7) ok = 0;
+                long p3 = sys6(SYS_mremap, p, 8192, 4096, 0, 0, 0);   /* shrink back */
+                if (p3 != p || m[0] != 0x42) ok = 0;
+            }
+        }
+        if (ok) { pass++; out("[KTEST] PASS mremap (grow-in-place + shrink)\n"); }
+        else out("[KTEST] FAIL mremap\n");
     }
 
     /* 9. Concurrent multi-core scheduling: fork 4 children that each spin

@@ -883,6 +883,73 @@ sys_munmap(uint64_t arg1, uint64_t arg2)
 }
 
 /*
+ * sys_mremap — syscall 25
+ *
+ * mremap(old_addr, old_size, new_size, flags, new_addr).
+ *
+ * v1 operates on a whole anonymous (VMA_MMAP) mapping. Anonymous mmap is lazy,
+ * so growing just extends the VMA (pages fault in zero-filled on touch) when the
+ * region right after it is free, and shrinking unmaps+frees the tail. A grow
+ * that would need to RELOCATE the mapping returns ENOMEM — a caller like musl
+ * realloc then falls back to malloc+copy+free, exactly today's behaviour, but
+ * the common in-place grow now avoids the copy. MREMAP_FIXED, sub-range,
+ * file-backed and shared mappings are rejected with EINVAL.
+ */
+#define MREMAP_MAYMOVE 1u
+#define MREMAP_FIXED   2u
+
+uint64_t
+sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_size,
+           uint64_t flags, uint64_t new_addr)
+{
+    (void)new_addr;
+    aegis_process_t *proc = current_proc();
+
+    if ((old_addr & 0xFFFUL) || old_size == 0 || new_size == 0)
+        return SYS_ERR(EINVAL);
+    if (flags & ~(uint64_t)MREMAP_MAYMOVE)          /* MREMAP_FIXED unsupported */
+        return SYS_ERR(EINVAL);
+
+    uint64_t osz = (old_size + 4095UL) & ~4095UL;
+    uint64_t nsz = (new_size + 4095UL) & ~4095UL;
+
+    /* v1: whole anonymous mapping only. */
+    vma_entry_t *v = vma_find(proc, old_addr);
+    if (!v || v->type != VMA_MMAP || v->base != old_addr || v->len != osz)
+        return SYS_ERR(EINVAL);
+    uint32_t prot = v->prot;    /* read before any table mutation invalidates v */
+
+    if (nsz == osz)
+        return old_addr;
+
+    if (nsz < osz) {                     /* shrink: drop and free the tail */
+        uint64_t tail = old_addr + nsz, tlen = osz - nsz;
+        if (vma_remove(proc, tail, tlen) != 0)
+            return SYS_ERR(ENOMEM);      /* table full for the split — untouched */
+        for (uint64_t va = tail; va < tail + tlen; va += 4096UL) {
+            uint64_t p = vmm_phys_of_user_raw(proc->pml4_phys, va);
+            if (p) { vmm_unmap_user_page(proc->pml4_phys, va); pmm_free_page(p); }
+        }
+        return old_addr;
+    }
+
+    /* grow: extend in place iff the region right after is entirely free */
+    uint64_t ext = old_addr + osz, glen = nsz - osz;
+    for (uint64_t va = ext; va < ext + glen; va += 4096UL) {
+        if (vma_find(proc, va) || vmm_phys_of_user_raw(proc->pml4_phys, va))
+            return SYS_ERR(ENOMEM);      /* blocked — v1 does not relocate */
+    }
+    /* Same prot+type and adjacent, so vma_insert MERGES the extension into the
+     * existing entry: the mapping becomes [old_addr, nsz). Lazy — no pages
+     * allocated here. */
+    if (vma_insert(proc, ext, glen, prot, VMA_MMAP) != 0)
+        return SYS_ERR(ENOMEM);
+    if (ext + glen > proc->mmap_base)
+        proc->mmap_base = ext + glen;
+    return old_addr;
+}
+
+/*
  * sys_mprotect — syscall 10
  *
  * arg1 = addr (must be page-aligned)

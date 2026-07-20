@@ -105,6 +105,7 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 215: num = 11;  break;  /* munmap */
     case 220: num = 56;  break;  /* clone */
     case 221: num = 59;  break;  /* execve */
+    case 216: num = 25;  break;  /* mremap (aarch64 __NR_mremap == 216) */
     case 222: num = 9;   break;  /* mmap */
     case 226: num = 10;  break;  /* mprotect */
     case 233: num = 95;  break;  /* umask */
@@ -169,6 +170,7 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 98: return sys_getrusage(arg1, arg2);
     case  9: return sys_mmap(arg1, arg2, arg3, arg4, arg5, arg6);
     case 11: return sys_munmap(arg1, arg2);
+    case 25: return sys_mremap(arg1, arg2, arg3, arg4, arg5);
     /* madvise(28): advisory only — accept as a no-op success. Aegis has no
      * page-cache RSS to release, so MADV_DONTNEED/FREE/WILLNEED are all benign.
      * Returning ENOSYS (the default) crashes apps that VERIFY the result — e.g.
