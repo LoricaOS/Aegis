@@ -224,6 +224,9 @@ uint64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_size,
 
 /* ── sys_time.c ────────────────────────────────────────────────────────── */
 uint64_t sys_nanosleep(uint64_t a1, uint64_t a2);
+uint64_t sys_clock_nanosleep(uint64_t clk_id, uint64_t flags, uint64_t req_uptr, uint64_t rem_uptr);
+uint64_t sys_sched_yield(void);
+uint64_t sys_tgkill(uint64_t a1, uint64_t a2, uint64_t a3);
 uint64_t sys_clock_gettime(uint64_t clk_id, uint64_t timespec_uptr);
 uint64_t sys_clock_settime(uint64_t clk_id, uint64_t timespec_uptr);
 

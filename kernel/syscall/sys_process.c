@@ -18,6 +18,23 @@
 int g_cow_fork     = 1;   /* DEFAULT-ON; `nocow` cmdline forces eager copy     */
 int g_perfbench_mm = 0;   /* `perfbench_mm` — print [PERFMM] fork timing     */
 
+/*
+ * sys_sched_yield — syscall 24
+ *
+ * Yield the CPU to the next runnable task, staying runnable ourselves. Was
+ * aliased to nanosleep(0) on arm64 — which, with tv_nsec==0, computes a 0-tick
+ * deadline and returns WITHOUT yielding at all (a no-op), so a cooperative
+ * spin-loop calling sched_yield() never actually gave up the CPU. This is the
+ * real thing: rotate to the next task via the scheduler (a no-op only when we
+ * are the sole runnable task, which is correct).
+ */
+uint64_t
+sys_sched_yield(void)
+{
+    sched_yield_to_next();
+    return 0;
+}
+
 /* sched_lock protects the global circular task list (and the RUNNING-only
  * run queue) — defined in sched.c.  Every ->next walk in this file must
  * hold it: sched_add (fork/clone/spawn) and the sys_waitpid zombie unlink

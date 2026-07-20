@@ -82,13 +82,13 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 101: num = 35;  break;  /* nanosleep */
     case 112: num = 227; break;  /* clock_settime */
     case 113: num = 228; break;  /* clock_gettime */
-    case 115: num = 35; arg1 = arg3; arg2 = arg4; break; /* clock_nanosleep → nanosleep (skip clk_id+flags) */
-    case 124: num = 35;  break;  /* sched_yield → nanosleep(0) */
+    case 115: num = 230; break;  /* clock_nanosleep (real; honors clk_id+TIMER_ABSTIME) */
+    case 124: num = 24;  break;  /* sched_yield (real yield, not nanosleep(0)) */
     case 129: num = 62;  break;  /* kill */
     case 130: num = 130; break;  /* rt_sigsuspend */
-    case 131: num = 13;  break;  /* aarch64 131 = tgkill; historically (mis)stubbed
-                                  * to rt_sigaction. Left as-is (pre-existing, out
-                                  * of scope). Real sigaltstack is aarch64 132 → 131. */
+    case 131: num = 234; break;  /* tgkill (aarch64 __NR_tgkill == 131; real — was
+                                  * (mis)stubbed to rt_sigaction, a lying syscall
+                                  * that broke musl raise()/abort()/pthread_kill) */
     case 132: num = 131; break;  /* sigaltstack (aarch64 __NR_sigaltstack == 132) */
     case 134: num = 13;  break;  /* rt_sigaction */
     case 135: num = 14;  break;  /* rt_sigprocmask */
@@ -161,6 +161,8 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case  8: return sys_lseek(arg1, arg2, arg3);
     case 21: return sys_access(arg1, arg2);
     case 35: return sys_nanosleep(arg1, arg2);
+    case 230: return sys_clock_nanosleep(arg1, arg2, arg3, arg4);
+    case 24: return sys_sched_yield();
     case 10: return sys_mprotect(arg1, arg2, arg3);
     case 16: return sys_ioctl(arg1, arg2, arg3);
     case 22: return sys_pipe2(arg1, 0); /* pipe(2) = pipe2(pipefd, 0) */
@@ -201,6 +203,7 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 60: return sys_exit(arg1);
     case 61: return sys_waitpid(arg1, arg2, arg3);
     case 62: return sys_kill(arg1, arg2);
+    case 234: return sys_tgkill(arg1, arg2, arg3);
     case 360: return sys_setfg(arg1);
     case 364: return sys_auth_session(arg1, arg2);
     case  79: return sys_getcwd(arg1, arg2);

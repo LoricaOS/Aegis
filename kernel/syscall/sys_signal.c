@@ -368,6 +368,44 @@ sys_kill(uint64_t arg1, uint64_t arg2)
 }
 
 /*
+ * sys_tgkill — syscall 234
+ *
+ * arg1 = tgid (thread-group id), arg2 = tid (target thread), arg3 = signum
+ *
+ * Deliver signum to thread `tid`. In Aegis tid == pid (one task per id;
+ * sys_gettid returns the pid), so this targets that specific task via the same
+ * mechanism as sys_kill. Was aliased on arm64 to rt_sigaction (aarch64 131) —
+ * a lying syscall: musl's raise()/pthread_kill() call tgkill, so abort() and
+ * every thread-directed signal was silently reinterpreted as "install a signal
+ * handler" with garbage arguments. This is the real implementation.
+ *
+ * ponytail: tgid is not validated against tid's thread group — tid alone
+ * uniquely identifies the task here, and musl always passes the matching tgid.
+ */
+uint64_t
+sys_tgkill(uint64_t arg1, uint64_t arg2, uint64_t arg3)
+{
+    (void)arg1;                              /* tgid — see note above */
+    int32_t tid = (int32_t)(uint32_t)arg2;
+    int     sig = (int)arg3;
+    if (sig <= 0 || sig >= 64 || tid <= 0) return SYS_ERR(EINVAL);
+
+    /* Same gate as sys_kill: directing a signal at a task is process mgmt. */
+    aegis_process_t *cur = current_proc();
+    if (cap_check(cur->caps, CAP_TABLE_SIZE,
+                  CAP_KIND_PROC_READ, CAP_RIGHTS_WRITE) < 0)
+        return SYS_ERR(EPERM);
+    if (tid == 1 && cur->pid != 1) {         /* init: same POWER guard as kill */
+        if (cap_check(cur->caps, CAP_TABLE_SIZE,
+                      CAP_KIND_POWER, CAP_RIGHTS_READ) < 0)
+            return SYS_ERR(EPERM);
+    }
+
+    signal_send_pid((uint32_t)tid, sig);
+    return 0;
+}
+
+/*
  * sys_setfg — syscall 360 (Aegis private)
  *
  * arg1 = pid of the foreground process (0 = clear foreground)

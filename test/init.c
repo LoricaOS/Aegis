@@ -69,6 +69,10 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
 #define SYS_sigaltstack  132
 #define SYS_mmap         222
 #define SYS_mremap       216
+#define SYS_clock_gettime  113
+#define SYS_clock_nanosleep 115
+#define SYS_sched_yield  124
+#define SYS_tgkill       131
 /* The *at forms are the only ones aarch64 has; musl builds every legacy call
  * out of them, so the test must use them too — that is precisely the path
  * where the kernel's aarch64 translation has to preserve the flags. */
@@ -91,6 +95,10 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
 #define SYS_sigaltstack  131
 #define SYS_mmap         9
 #define SYS_mremap       25
+#define SYS_clock_gettime  228
+#define SYS_clock_nanosleep 230
+#define SYS_sched_yield  24
+#define SYS_tgkill       234
 #define SYS_stat         4
 #define SYS_lstat        6
 #define SYS_close        3
@@ -500,6 +508,65 @@ void _start(void)
         total++;
         if (ok) { pass++; out("[KTEST] PASS ramfs mkdir/rmdir (/tmp)\n"); }
         else out("[KTEST] FAIL ramfs mkdir/rmdir\n");
+    }
+
+    /* 10. clock_nanosleep honors TIMER_ABSTIME. Read monotonic t0, sleep until
+     *     an absolute deadline ~50 ms out, confirm we actually waited, and that a
+     *     deadline already in the past returns immediately. Was aliased to
+     *     nanosleep(req) discarding clk_id+flags → ABSTIME silently became a
+     *     relative sleep of the whole deadline's magnitude. */
+    total++;
+    {
+        /* Run in a fresh child: interruptible sleeps return early on ANY pending
+         * signal, and the smp-fork test above leaves a SIGCHLD pending on some
+         * arches — a clean child isolates the timing check from that. Child exits
+         * 0 iff the absolute-deadline sleep actually waited (~50 ms) AND a past
+         * deadline returned immediately. */
+        long cp = sys6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);
+        if (cp == 0) {
+            long ts0[2] = {0,0}, ts1[2] = {0,0};
+            sys3(SYS_clock_gettime, 1 /*MONOTONIC*/, (long)ts0, 0);
+            long tgt[2] = { ts0[0], ts0[1] + 50L*1000000L };   /* +50 ms */
+            if (tgt[1] >= 1000000000L) { tgt[0]++; tgt[1] -= 1000000000L; }
+            long r  = sys6(SYS_clock_nanosleep, 1, 1 /*TIMER_ABSTIME*/, (long)tgt, 0, 0, 0);
+            sys3(SYS_clock_gettime, 1, (long)ts1, 0);
+            long elapsed_ms = (ts1[0]-ts0[0])*1000L + (ts1[1]-ts0[1])/1000000L;
+            long past[2] = { ts0[0], ts0[1] };                 /* already-past deadline */
+            long r2 = sys6(SYS_clock_nanosleep, 1, 1, (long)past, 0, 0, 0);
+            sys3(SYS_exit, (r == 0 && r2 == 0 && elapsed_ms >= 30) ? 0 : 1, 0, 0);
+        }
+        int st = 0;
+        sys6(SYS_wait4, cp, (long)&st, 0, 0, 0, 0);
+        if (cp > 0 && ((st >> 8) & 0xff) == 0) {
+            pass++; out("[KTEST] PASS clock_nanosleep (ABSTIME honored)\n");
+        } else out("[KTEST] FAIL clock_nanosleep\n");
+    }
+
+    /* 11. tgkill delivers a thread-directed signal (tid==pid in Aegis). Install a
+     *     SIGUSR1 handler, tgkill(pid,pid,SIGUSR1), confirm it ran. Was aliased on
+     *     arm64 to rt_sigaction — a lying syscall that broke raise()/abort(). */
+    total++;
+    {
+        struct ksigaction act;
+        act.sa_handler  = sig_handler;
+        act.sa_flags    = 0;
+        act.sa_restorer = sig_restorer;
+        act.sa_mask     = 0;
+        g_sig_got = 0;
+        sys6(SYS_rt_sigaction, SIGUSR1, (long)&act, 0, 8, 0, 0);
+        long mypid = sys3(SYS_getpid, 0, 0, 0);
+        sys3(SYS_tgkill, mypid, mypid, SIGUSR1);           /* tgid, tid, sig */
+        if (g_sig_got == SIGUSR1) { pass++; out("[KTEST] PASS tgkill (thread-directed)\n"); }
+        else out("[KTEST] FAIL tgkill\n");
+    }
+
+    /* 12. sched_yield returns cleanly (was a no-op nanosleep(0) alias on arm64;
+     *     now a real scheduler yield). Single-threaded we assert it returns 0
+     *     without hanging. */
+    total++;
+    {
+        if (sys3(SYS_sched_yield, 0, 0, 0) == 0) { pass++; out("[KTEST] PASS sched_yield\n"); }
+        else out("[KTEST] FAIL sched_yield\n");
     }
 
     if (pass == total) out("[KTEST] DONE all-pass\n");
