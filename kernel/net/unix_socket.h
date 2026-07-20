@@ -33,7 +33,11 @@
  * a garbage fds[].ops, i.e. two owners of the same pages. The alloc/free page
  * counts were consistent and it never reproduced on x86 or in arm64 QEMU, so
  * there is a latent multi-page kva/TLB bug on arm64 hiding behind it. */
+/* Overridable for experiments (-DUNIX_BUF_SIZE=16384) without editing this
+ * header — used to reproduce the arm64 corruption with instrumentation on. */
+#ifndef UNIX_BUF_SIZE
 #define UNIX_BUF_SIZE    4096
+#endif
 #define UNIX_BUF_PAGES   (UNIX_BUF_SIZE / 4096)
 #define UNIX_NONE        0xFFFFFFFFU
 
