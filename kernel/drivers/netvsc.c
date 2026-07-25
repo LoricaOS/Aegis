@@ -130,15 +130,31 @@ nvsp_send_wait(nvsp_t *msg, uint32_t len, int want_reply, nvsp_t *reply)
 static void
 netvsc_consume_rndis(uint32_t offset, uint32_t length)
 {
+    /* EVERY value below comes from the host: the transfer-page range
+     * (offset/length) and the RNDIS data_offset/data_len inside it. data_len
+     * was bounded but the OFFSETS were not, so a crafted descriptor made this
+     * parse arbitrary kernel memory as an ethernet frame — and if those bytes
+     * happened to form a valid ICMP echo, icmp_rx reflected them onto the
+     * wire. The hypervisor is already in the TCB so this is robustness, not a
+     * boundary crossing, but every other RX driver bounds it. */
+    const uint32_t bufsz = RECV_BUF_PAGES * 4096u;
     if (length < sizeof(rndis_hdr_t)) return;
+    if (offset > bufsz || length > bufsz - offset) return;   /* range in buf */
     rndis_hdr_t *rh = (rndis_hdr_t *)(s_recv_buf + offset);
     if (rh->type == RNDIS_MSG_PACKET) {
+        if (length < sizeof(rndis_hdr_t) + sizeof(rndis_packet_t)) return;
         rndis_packet_t *rp = (rndis_packet_t *)(s_recv_buf + offset + sizeof(rndis_hdr_t));
-        uint32_t fo = offset + sizeof(rndis_hdr_t) + rp->data_offset;
-        if (rp->data_len > 0 && rp->data_len <= 2048u)
+        uint32_t hdrs = (uint32_t)sizeof(rndis_hdr_t) + rp->data_offset;
+        /* Overflow-safe: hdrs is bounded against `length` before it is added
+         * to `offset`, and the range itself is already inside the buffer. */
+        if (rp->data_offset > length || hdrs > length) return;
+        uint32_t fo = offset + hdrs;
+        if (rp->data_len > 0 && rp->data_len <= 2048u &&
+            rp->data_len <= length - hdrs)
             netdev_rx_deliver(&s_nd, s_recv_buf + fo, (uint16_t)rp->data_len);
     } else {
         /* control completion (INIT_C / QUERY_C / SET_C): req_id is first body word */
+        if (length < sizeof(rndis_hdr_t) + sizeof(uint32_t)) return;
         uint32_t req = *(uint32_t *)(s_recv_buf + offset + sizeof(rndis_hdr_t));
         if (req == s_wait_req) {
             uint32_t c = length < sizeof(s_ctrl_buf) ? length : sizeof(s_ctrl_buf);

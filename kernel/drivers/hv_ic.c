@@ -68,7 +68,10 @@ hv_ic_negotiate(uint8_t *buf, uint32_t len)
     uint32_t fw_cnt  = neg->icframe_vercnt;
     uint32_t msg_cnt = neg->icmsg_vercnt;
     uint32_t avail   = (len - IC_BODY_OFF - 8u) / sizeof(ic_version_t);
-    if (fw_cnt + msg_cnt > avail) { fw_cnt = 0; msg_cnt = 0; }
+    /* Compare each side separately as well as the sum: both counts come from
+     * the host and are uint32, so `fw_cnt + msg_cnt` can WRAP and sail past a
+     * bounds check that only looks at the total. */
+    if (fw_cnt > avail || msg_cnt > avail - fw_cnt) { fw_cnt = 0; msg_cnt = 0; }
     ic_version_t fw  = pick_version(neg->versions, fw_cnt);
     ic_version_t msg = pick_version(neg->versions + fw_cnt, msg_cnt);
     neg->icframe_vercnt = 1;

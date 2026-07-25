@@ -224,7 +224,14 @@ vmbus_recv(vmbus_channel_t *ch, void *buf, uint32_t buflen,
     uint32_t copy  = plen < buflen ? plen : buflen;
     ring_get(ch->in_data, ch->data_len, (r + poff) & (ch->data_len - 1), buf, copy);
 
-    if (out_len)     *out_len = plen;
+    /* Report what was COPIED, not what the host claimed. *out_len used to be
+     * the full packet length even when it exceeded buflen, and callers treat
+     * it as "bytes in buf": hv_ic_poll_buf then read past its 256-byte buffer
+     * and handed those bytes straight back to the host via vmbus_send_inband.
+     * The host is inside the TCB already, so this is robustness rather than a
+     * boundary crossing — but a driver should not read out of bounds because
+     * the other side lied about a size. */
+    if (out_len)     *out_len = copy;
     if (out_type)    *out_type = hdr.type;
     if (out_transid) *out_transid = hdr.trans_id;
 
