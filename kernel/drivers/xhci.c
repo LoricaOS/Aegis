@@ -357,8 +357,20 @@ alloc_page(uint64_t *phys_out)
      * the writes without cache maintenance, and the RP1 inbound window is
      * identity so kva_page_phys is the bus address directly. */
     void *va = s_xhci_dma_nc ? kva_alloc_pages_low_nc(1) : kva_alloc_pages(1);
-    /* SAFETY: kva_alloc_pages returns a kernel VA for a PMM-allocated page;
-     * zeroing via __builtin_memset is safe. */
+    /* The two allocators fail DIFFERENTLY, and the NC one is the Pi 5 path:
+     * kva_alloc_pages panics on exhaustion, but kva_alloc_pages_low_nc
+     * (s_xhci_dma_nc, selected on RP1) RETURNS NULL when the <4 GB pool is
+     * drained. This driver never frees on disconnect (acknowledged leak
+     * below) and re-allocates on every enumeration, so a USB gadget cycling
+     * connect/disconnect drains that pool — and the unconditional memset then
+     * faulted at EL1 on a NULL page. Report the failure instead; callers
+     * already handle a NULL ring/context. */
+    if (!va) {
+        printk("[XHCI] FAIL: DMA page allocation failed (low/NC pool "
+               "exhausted)\n");
+        *phys_out = 0;
+        return (void *)0;
+    }
     __builtin_memset(va, 0, 4096);
     *phys_out = kva_page_phys(va);
     return va;
