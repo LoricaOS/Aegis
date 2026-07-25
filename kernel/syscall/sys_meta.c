@@ -484,8 +484,13 @@ sys_utimensat(uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4)
         /* NULL times → set both to now */
         atime = mtime = (uint32_t)now_sec;
     } else {
-        /* struct timespec[2]: two {int64 tv_sec; int64 tv_nsec} = 32 bytes */
+        /* struct timespec[2]: two {int64 tv_sec; int64 tv_nsec} = 32 bytes.
+         * Validate first: copy_from_user does not range-check, and ts[0]/ts[2]
+         * land in the inode where stat() reads them back — an unvalidated arg3
+         * is a 4-byte-at-a-time arbitrary kernel read oracle. */
         int64_t ts[4];
+        if (!user_ptr_valid(arg3, sizeof(ts)))
+            return SYS_ERR(EFAULT);
         if (copy_from_user(ts, (const void *)(uintptr_t)arg3, sizeof(ts)) != 0)
             return SYS_ERR(EFAULT);
         int64_t a_nsec = ts[1], m_nsec = ts[3];

@@ -249,20 +249,25 @@ elf_load(struct aegis_process *proc, uint64_t pml4_phys, const uint8_t *data,
             return -1;
         }
 
-        /* Zero the first (possibly partial) page so bytes before p_vaddr
-         * within it are clean.  Then copy file bytes at the sub-page offset. */
-        uint64_t k;
-        for (k = 0; k < va_offset; k++)
-            dst[k] = 0;
+        /* Zero the WHOLE allocation before filling any of it. kva_alloc_pages
+         * does not zero and pmm_free_page does not scrub, so these frames still
+         * hold the memory of whatever process last owned them — and all
+         * page_count pages get mapped user-readable below. Zeroing only
+         * [0, va_offset) and the BSS range left the tail from
+         * va_offset + p_memsz to the end of the final page intact: an
+         * unprivileged exec of an ELF with 64 one-byte PT_LOAD segments
+         * harvested ~256 KB of another process's freed memory per call.
+         * Covering the whole allocation also means any future gap in the fill
+         * logic reads as zero rather than as somebody else's data. */
+        __builtin_memset(dst, 0, page_count * 4096UL);
 
-        /* Copy file bytes through kernel VA */
+        /* Copy file bytes through kernel VA, at the sub-page offset. Bytes
+         * before p_vaddr within the first page, and the BSS past p_filesz,
+         * are already zero from the memset above. */
+        uint64_t k;
         const uint8_t *src = data + ph->p_offset;
         for (k = 0; k < ph->p_filesz; k++)
             dst[va_offset + k] = src[k];
-
-        /* Zero BSS (bytes past p_filesz up to p_memsz) */
-        for (k = ph->p_filesz; k < ph->p_memsz; k++)
-            dst[va_offset + k] = 0;
 
         /* We just wrote this segment's bytes through a cacheable kernel
          * mapping. On ARM the I-cache is not coherent with those stores, and
@@ -346,7 +351,23 @@ elf_load(struct aegis_process *proc, uint64_t pml4_phys, const uint8_t *data,
         return -1;
     }
 
-    out->entry       = eh->e_entry + base;
+    /* Bound the entry point. It goes straight into FRAME_IP and reaches the
+     * x86 syscall-return path as RCX, where a non-canonical value makes SYSRET
+     * #GP *at CPL 0* — after swapgs has installed the user GS.base and `pop rsp`
+     * the user stack, and with no IST for #GP, so the handler runs ring-0 on
+     * attacker-controlled, concurrently-writable memory (the CVE-2012-0217
+     * pattern) from a plain execve. The PT_LOAD checks above validate segments,
+     * not e_entry, and nothing downstream re-checks it. Bounding it here means
+     * all three callers (sys_execve, sys_spawn, proc_spawn) inherit the guard.
+     * Wrap-check the base addition first, as the PT_LOAD path does; > (not >=)
+     * matches sys_rt_sigreturn's rule for the same register. */
+    uint64_t entry = eh->e_entry + base;
+    if (entry < eh->e_entry || entry > USER_ADDR_MAX) {
+        printk("[ELF] FAIL: entry point outside user address space\n");
+        return -1;
+    }
+
+    out->entry       = entry;
     out->brk         = (seg_end + 4095UL) & ~4095UL;
     out->phdr_va     = first_pt_load_vaddr + base + eh->e_phoff;
     out->phdr_count  = eh->e_phnum;

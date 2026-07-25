@@ -92,6 +92,16 @@ sys_write(uint64_t arg1, uint64_t arg2, uint64_t arg3)
     if ((proc->fd_table->fds[arg1].flags & VFS_O_ACCMODE) == VFS_O_RDONLY)
         return SYS_ERR(EBADF);
 
+    /* Re-validate authority on USE — the write-side mirror of the check in
+     * sys_read. An O_RDWR fd onto /etc/shadow or /etc/aegis/admin carries
+     * VFS_KF_AUTH_GATED and survives execve (only FD_CLOEXEC fds are closed),
+     * while the exec'd image's caps are re-derived from policy. Without this,
+     * a capless child could not READ the inherited fd but could WRITE a forged
+     * hash through it — the unprotected direction was the more damaging one. */
+    if ((proc->fd_table->fds[arg1].kflags & VFS_KF_AUTH_GATED) &&
+        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_AUTH, CAP_RIGHTS_READ) != 0)
+        return SYS_ERR(EACCES);
+
     if (!user_ptr_valid(arg2, arg3))
         return SYS_ERR(EFAULT);
 
@@ -161,6 +171,11 @@ sys_writev(uint64_t arg1, uint64_t arg2, uint64_t arg3)
 
     if ((proc->fd_table->fds[arg1].flags & VFS_O_ACCMODE) == VFS_O_RDONLY)
         return SYS_ERR(EBADF);       /* fd not opened for writing */
+
+    /* AUTH-gated fd re-check on use — see the comment in sys_write. */
+    if ((proc->fd_table->fds[arg1].kflags & VFS_KF_AUTH_GATED) &&
+        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_AUTH, CAP_RIGHTS_READ) != 0)
+        return SYS_ERR(EACCES);
 
     /* Reject unreasonable iovcnt before multiplying to avoid overflow. */
     if (arg3 > 1024)
@@ -399,6 +414,10 @@ sys_pwrite64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t off)
     if (!f->ops || !f->ops->write) return SYS_ERR(EBADF);
     if ((f->flags & VFS_O_ACCMODE) == VFS_O_RDONLY)
         return SYS_ERR(EBADF);           /* fd not opened for writing */
+    /* AUTH-gated fd re-check on use — see the comment in sys_write. */
+    if ((f->kflags & VFS_KF_AUTH_GATED) &&
+        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_AUTH, CAP_RIGHTS_READ) != 0)
+        return SYS_ERR(EACCES);
     if (!f->ops->seek)
         return SYS_ERR(ESPIPE);          /* not positionable → can't pwrite */
     if (!user_ptr_valid(buf, count)) return SYS_ERR(EFAULT);

@@ -349,7 +349,13 @@ struct kstat_arm64 {
 /* emit_stat — copy k_stat_t out to the user's struct stat, repacked to the
  * per-arch layout musl expects. Returns 0 or SYS_ERR(EFAULT).
  *
- * EVERY stat-family syscall must return through here. k_stat_t is the x86-64
+ * EVERY stat-family syscall must return through here. It is also the single
+ * validation point for the destination: copy_to_user does NOT range-check, so
+ * without the user_ptr_valid below an unprivileged stat()/fstat()/lstat() writes
+ * 144 attacker-influenced bytes (st_size is a chosen qword) to any kernel
+ * address — and the physmap aliases all RAM writable, making that an arbitrary
+ * physical write. Callers pass arg2 through raw; do not add a caller that skips
+ * this function. k_stat_t is the x86-64
  * layout (nlink at 16, mode at 24); aarch64's struct stat puts mode at 16 and
  * nlink at 20, so a raw copy_to_user of k_stat_t hands arm64 userspace a
  * struct whose mode/uid/gid/rdev are all misread — sys_lstat did exactly that,
@@ -368,10 +374,14 @@ emit_stat(uint64_t uptr, const k_stat_t *ks)
     a.st_atime = ks->st_atime; a.st_atime_nsec = ks->st_atime_nsec;
     a.st_mtime = ks->st_mtime; a.st_mtime_nsec = ks->st_mtime_nsec;
     a.st_ctime = ks->st_ctime; a.st_ctime_nsec = ks->st_ctime_nsec;
+    if (!user_ptr_valid(uptr, sizeof(a)))
+        return SYS_ERR(EFAULT);
     if (copy_to_user((void *)(uintptr_t)uptr, &a, sizeof(a)) != 0)
         return SYS_ERR(EFAULT);
     return 0;
 #else
+    if (!user_ptr_valid(uptr, sizeof(*ks)))
+        return SYS_ERR(EFAULT);
     if (copy_to_user((void *)(uintptr_t)uptr, ks, sizeof(*ks)) != 0)
         return SYS_ERR(EFAULT);
     return 0;
