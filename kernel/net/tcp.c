@@ -87,6 +87,13 @@ static void tcp_claim_slot(uint32_t i)
     kmemset(&s_tcp[i], 0, sizeof(s_tcp[i]));
     s_tcp[i].rbuf = rb;
     s_tcp[i].sbuf = sb;
+    /* NOT zero: 0 is a perfectly valid socket id (s_socks[0]), so a memset
+     * leaves every freshly claimed slot looking like it belongs to socket 0 —
+     * which would hand sock 0 ownership of every recycled connection under
+     * tcp_conn_owned_locked. SOCK_NONE matches no socket. Callers that do have
+     * an owner (tcp_listen, tcp_connect) overwrite this immediately. */
+    s_tcp[i].sock_id     = SOCK_NONE;
+    s_tcp[i].listener_id = SOCK_NONE;
 }
 
 void tcp_init(void)
@@ -1185,16 +1192,39 @@ tcp_connect(uint32_t sock_id, ip4_addr_t dst_ip, uint16_t dst_port,
     return -1;
 }
 
+/* tcp_conn_owned_locked — resolve conn_id to a slot STILL OWNED by sock_id.
+ * Caller must hold tcp_lock. Returns NULL if the id is out of range or the
+ * slot has moved on to another socket.
+ *
+ * A bare `conn_id < TCP_MAX_CONNS` bounds check (all these accessors used to
+ * do) is not enough: a slot rejoins the free pool the instant its state
+ * becomes TCP_CLOSED — which a single in-window RST does, remotely — WITHOUT
+ * anything clearing the owning sock_t's tcp_conn_id. tcp_alloc/tcp_connect
+ * then scan low-to-high, so reuse is deterministic and attacker-schedulable,
+ * and tcp_claim_slot zeroes the ring indices. The stale socket would go on
+ * reading the NEW connection's live stream, and its send() would splice
+ * attacker bytes into a victim's outbound stream. Checking the back-reference
+ * under tcp_lock closes it: the slot cannot be reclaimed while we hold it, and
+ * a reclaimed slot always has a different sock_id (tcp_claim_slot resets it to
+ * SOCK_NONE, and SOCK_NONE never matches a real socket id). */
+static tcp_conn_t *
+tcp_conn_owned_locked(uint32_t conn_id, uint32_t sock_id)
+{
+    if (conn_id >= TCP_MAX_CONNS) return (tcp_conn_t *)0;
+    if (s_tcp[conn_id].sock_id != sock_id) return (tcp_conn_t *)0;
+    return &s_tcp[conn_id];
+}
+
 /* tcp_conn_recv: read up to max_len bytes from rbuf. max_len=0 returns available count. */
 int
-tcp_conn_recv(uint32_t conn_id, void *dst, uint16_t max_len)
+tcp_conn_recv(uint32_t sock_id, uint32_t conn_id, void *dst, uint16_t max_len)
 {
     irqflags_t fl = spin_lock_irqsave(&tcp_lock);
-    if (conn_id >= TCP_MAX_CONNS) {
+    tcp_conn_t *c = tcp_conn_owned_locked(conn_id, sock_id);
+    if (!c) {
         spin_unlock_irqrestore(&tcp_lock, fl);
         return -1;
     }
-    tcp_conn_t *c = &s_tcp[conn_id];
     /* TCP_RBUF_SIZE is a power of two, so the free-running rbuf_tail/rbuf_head
      * counters mask to the live byte count — identical form to the `used`
      * computations in tcp_rx and the window-update math below. */
@@ -1266,14 +1296,14 @@ tcp_conn_recv(uint32_t conn_id, void *dst, uint16_t max_len)
  * Used by the socket layer's blocking send so a write larger than
  * TCP_SBUF_SIZE waits for ACKs instead of truncating. */
 int
-tcp_conn_send_ready(uint32_t conn_id)
+tcp_conn_send_ready(uint32_t sock_id, uint32_t conn_id)
 {
     irqflags_t fl = spin_lock_irqsave(&tcp_lock);
-    if (conn_id >= TCP_MAX_CONNS) {
+    tcp_conn_t *c = tcp_conn_owned_locked(conn_id, sock_id);
+    if (!c) {
         spin_unlock_irqrestore(&tcp_lock, fl);
         return -1;
     }
-    tcp_conn_t *c = &s_tcp[conn_id];
     if (c->state != TCP_ESTABLISHED && c->state != TCP_CLOSE_WAIT) {
         spin_unlock_irqrestore(&tcp_lock, fl);
         return -1;
@@ -1284,14 +1314,14 @@ tcp_conn_send_ready(uint32_t conn_id)
 }
 
 int
-tcp_conn_send(uint32_t conn_id, const void *data, uint16_t len)
+tcp_conn_send(uint32_t sock_id, uint32_t conn_id, const void *data, uint16_t len)
 {
     irqflags_t fl = spin_lock_irqsave(&tcp_lock);
-    if (conn_id >= TCP_MAX_CONNS) {
+    tcp_conn_t *c = tcp_conn_owned_locked(conn_id, sock_id);
+    if (!c) {
         spin_unlock_irqrestore(&tcp_lock, fl);
         return -1;
     }
-    tcp_conn_t *c = &s_tcp[conn_id];
     /* ESTABLISHED and CLOSE_WAIT both permit sending: in CLOSE_WAIT the peer
      * has closed its send side (we got its FIN) but our send side is still
      * open until we close() — POSIX half-close.  All other states (closing,
@@ -1393,14 +1423,14 @@ tcp_conn_send(uint32_t conn_id, const void *data, uint16_t len)
 /* tcp_conn_close: send FIN (active close from ESTABLISHED, or passive close
  * from CLOSE_WAIT).  No-op in any other state. */
 int
-tcp_conn_close(uint32_t conn_id)
+tcp_conn_close(uint32_t sock_id, uint32_t conn_id)
 {
     irqflags_t fl = spin_lock_irqsave(&tcp_lock);
-    if (conn_id >= TCP_MAX_CONNS) {
+    tcp_conn_t *c = tcp_conn_owned_locked(conn_id, sock_id);
+    if (!c) {
         spin_unlock_irqrestore(&tcp_lock, fl);
         return -1;
     }
-    tcp_conn_t *c = &s_tcp[conn_id];
     /* Active close (ESTABLISHED → FIN_WAIT_1) and passive close
      * (CLOSE_WAIT → LAST_ACK) both send a FIN at SND.NXT and bump it by one.
      * The old code handled only ESTABLISHED, so a server that closes after the
@@ -1452,8 +1482,16 @@ tcp_conn_set_sock(uint32_t conn_id, uint32_t sock_id)
 
 /* tcp_conn_get: return pointer to tcp_conn_t for conn_id, or NULL if invalid. */
 tcp_conn_t *
-tcp_conn_get(uint32_t conn_id)
+tcp_conn_get(uint32_t sock_id, uint32_t conn_id)
 {
+    /* Lockless by design (callers only peek at ->state for poll/epoll
+     * readiness), so the ownership check is a hint, not a guarantee: the slot
+     * could be reclaimed the instant after it passes. That is fine here and
+     * only here — a stale readiness bit costs one wasted poll wakeup, and the
+     * caller re-validates through tcp_conn_recv, which checks under tcp_lock.
+     * Do NOT use this pointer to move data. */
     if (conn_id >= TCP_MAX_CONNS) return (tcp_conn_t *)0;
+    if (__atomic_load_n(&s_tcp[conn_id].sock_id, __ATOMIC_RELAXED) != sock_id)
+        return (tcp_conn_t *)0;
     return &s_tcp[conn_id];
 }

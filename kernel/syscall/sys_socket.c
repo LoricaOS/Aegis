@@ -547,7 +547,10 @@ sys_sendto(uint64_t fd, uint64_t buf, uint64_t len,
             uint64_t remain = len, off = 0, total = 0;
             while (remain > 0) {
                 uint32_t chunk = remain > UNIX_BUF_SIZE ? UNIX_BUF_SIZE : (uint32_t)remain;
-                copy_from_user(kbuf, (const void *)(uintptr_t)(buf + off), chunk);
+                /* Faulting mid-loop must not hand the peer an unfilled kbuf
+                 * (kernel stack, or the previous chunk's bytes). */
+                if (copy_from_user(kbuf, (const void *)(uintptr_t)(buf + off), chunk) != 0)
+                    return total > 0 ? (uint64_t)total : SYS_ERR(EFAULT);
                 int n = unix_sock_write(uuid, kbuf, chunk);
                 if (n < 0)
                     return total > 0 ? (uint64_t)total : (uint64_t)(int64_t)n;
@@ -603,7 +606,10 @@ sys_sendto(uint64_t fd, uint64_t buf, uint64_t len,
      * caller B's payload to A's destination (cross-socket corruption / leak).
      * 1472 B is safe on the 16 KB kernel stack. */
     uint8_t udpbuf[1472];
-    copy_from_user(udpbuf, (const void *)(uintptr_t)buf, (uint32_t)len);
+    /* A short copy would put up to 1472 bytes of uninitialised kernel stack on
+     * the wire, to an attacker-chosen destination. */
+    if (copy_from_user(udpbuf, (const void *)(uintptr_t)buf, (uint32_t)len) != 0)
+        return SYS_ERR(EFAULT);
 
     netdev_t *dev = netdev_get("eth0");
     if (!dev) return SYS_ERR(ENETDOWN);
@@ -675,7 +681,7 @@ sys_recvfrom(uint64_t fd, uint64_t buf, uint64_t len,
 
     if (s->type == SOCK_TYPE_STREAM) {
         for (;;) {
-            int n = tcp_conn_recv(s->tcp_conn_id, (void *)0, 0);  /* peek */
+            int n = tcp_conn_recv(s->sock_id, s->tcp_conn_id, (void *)0, 0);  /* peek */
             if (n > 0) {
                 /* Bounce through a STACK buffer — NOT a shared static. A static
                  * bounce raced two concurrent recvfrom() calls: caller A
@@ -694,18 +700,18 @@ sys_recvfrom(uint64_t fd, uint64_t buf, uint64_t len,
                     uint32_t remain = (uint32_t)len - total;
                     uint32_t want   = remain < (uint32_t)n ? remain : (uint32_t)n;
                     if (want > sizeof(rbuf)) want = sizeof(rbuf);
-                    int got = tcp_conn_recv(s->tcp_conn_id, rbuf, (uint16_t)want);
+                    int got = tcp_conn_recv(s->sock_id, s->tcp_conn_id, rbuf, (uint16_t)want);
                     if (got <= 0) break;
                     copy_to_user((void *)(uintptr_t)(buf + total), rbuf,
                                  (uint32_t)got);
                     total += (uint32_t)got;
-                    n = tcp_conn_recv(s->tcp_conn_id, (void *)0, 0);  /* re-peek */
+                    n = tcp_conn_recv(s->sock_id, s->tcp_conn_id, (void *)0, 0);  /* re-peek */
                 }
                 if (total > 0)
                     return (sock_unref(sid), (uint64_t)total);
                 /* total==0: nothing actually consumed (lost a race to another
                  * reader) — fall through to the block/EOF/EAGAIN logic. */
-                n = tcp_conn_recv(s->tcp_conn_id, (void *)0, 0);
+                n = tcp_conn_recv(s->sock_id, s->tcp_conn_id, (void *)0, 0);
             }
             if (n == 0) return (sock_unref(sid), 0);  /* EOF / FIN */
             /* n < 0: -11 (alive, empty → block) or -1 (dead conn). */
@@ -720,10 +726,10 @@ sys_recvfrom(uint64_t fd, uint64_t buf, uint64_t len,
             int rc;
             if (has_timeout)
                 wait_event_timeout(&s->poll_waiters,
-                    tcp_conn_recv(s->tcp_conn_id, (void *)0, 0) >= 0, deadline, rc);
+                    tcp_conn_recv(s->sock_id, s->tcp_conn_id, (void *)0, 0) >= 0, deadline, rc);
             else
                 wait_event_interruptible(&s->poll_waiters,
-                    tcp_conn_recv(s->tcp_conn_id, (void *)0, 0) >= 0, rc);
+                    tcp_conn_recv(s->sock_id, s->tcp_conn_id, (void *)0, 0) >= 0, rc);
             if (rc == BLOCK_EINTR) return (sock_unref(sid), SYS_ERR(EINTR));
         }
     }
@@ -858,7 +864,10 @@ uint64_t sys_sendmsg(uint64_t fd, uint64_t msg_ptr, uint64_t flags)
         uint64_t off = 0;
         while (remain > 0) {
             uint32_t chunk = remain > UNIX_BUF_SIZE ? UNIX_BUF_SIZE : (uint32_t)remain;
-            copy_from_user(kbuf, (const void *)((uintptr_t)iov.iov_base + off), chunk);
+            /* See the sys_sendto AF_UNIX loop: an unfilled kbuf reaching the
+             * peer is a kernel-stack disclosure. */
+            if (copy_from_user(kbuf, (const void *)((uintptr_t)iov.iov_base + off), chunk) != 0)
+                return total_sent > 0 ? (uint64_t)total_sent : SYS_ERR(EFAULT);
             int n = unix_sock_write(uid, kbuf, chunk);
             if (n < 0) return total_sent > 0 ? (uint64_t)total_sent : (uint64_t)(int64_t)n;
             total_sent += n;
@@ -1096,7 +1105,7 @@ sys_shutdown(uint64_t fd, uint64_t how)
     if (err) return err;
 
     if (s->type == SOCK_TYPE_STREAM && s->tcp_conn_id != SOCK_NONE) {
-        tcp_conn_close(s->tcp_conn_id);
+        tcp_conn_close(s->sock_id, s->tcp_conn_id);
     }
     s->state = SOCK_CLOSED;
     return 0;

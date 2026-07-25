@@ -54,6 +54,10 @@ typedef struct {
     uint16_t      local_port;
     ip4_addr_t    remote_ip;
     uint16_t      remote_port;
+    /* Own index in s_socks[]. Set once by sock_alloc, never changes. Exists so
+     * a sock_t can prove ownership of the tcp slot it points at — see
+     * tcp_conn_recv() and the tcp_conn_t.sock_id back-reference. */
+    uint32_t      sock_id;
     uint32_t      tcp_conn_id;   /* index into tcp_conn table; SOCK_NONE if none */
     /* accept queue: ring of completed tcp_conn_id values */
     uint32_t      accept_queue[8];

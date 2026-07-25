@@ -115,16 +115,22 @@ int tcp_send_segment(netdev_t *dev, tcp_conn_t *conn,
 int  tcp_listen(uint16_t port, uint32_t sock_id);
 int  tcp_connect(uint32_t sock_id, ip4_addr_t dst_ip, uint16_t dst_port,
                  uint32_t *conn_id_out);
-int  tcp_conn_recv(uint32_t conn_id, void *dst, uint16_t max_len);
-int  tcp_conn_send(uint32_t conn_id, const void *data, uint16_t len);
+/* The tcp_conn_* accessors take the CALLER'S sock_id as well as the conn_id
+ * and refuse any slot whose ->sock_id no longer matches: a conn slot is a
+ * reusable index, and a remote RST can hand it to a different socket while a
+ * stale sock_t still points at it. See tcp_conn_owned_locked in tcp.c. */
+int  tcp_conn_recv(uint32_t sock_id, uint32_t conn_id, void *dst, uint16_t max_len);
+int  tcp_conn_send(uint32_t sock_id, uint32_t conn_id, const void *data, uint16_t len);
 /* tcp_conn_send_ready: 1=send space available, 0=block (ring full), -1=not
  * sendable (EPIPE).  For the socket layer's blocking send. */
-int  tcp_conn_send_ready(uint32_t conn_id);
-int  tcp_conn_close(uint32_t conn_id);
+int  tcp_conn_send_ready(uint32_t sock_id, uint32_t conn_id);
+int  tcp_conn_close(uint32_t sock_id, uint32_t conn_id);
 void tcp_conn_get_addr(uint32_t conn_id, ip4_addr_t *rip, uint16_t *rport,
                        ip4_addr_t *lip, uint16_t *lport);
 void tcp_conn_set_sock(uint32_t conn_id, uint32_t sock_id);
-/* tcp_conn_get: return pointer to tcp_conn_t for conn_id, or NULL if invalid. */
-tcp_conn_t *tcp_conn_get(uint32_t conn_id);
+/* tcp_conn_get: pointer to tcp_conn_t for conn_id, or NULL if invalid or not
+ * owned by sock_id. Lockless — a readiness HINT only; never move data through
+ * it (see tcp.c). */
+tcp_conn_t *tcp_conn_get(uint32_t sock_id, uint32_t conn_id);
 
 #endif /* TCP_H */

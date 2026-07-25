@@ -118,7 +118,10 @@ static int unix_vfs_write(void *priv, const void *buf, uint64_t len)
     uint8_t kbuf[1024];
     uint32_t want = (uint32_t)len;
     if (want > 1024) want = 1024;
-    copy_from_user(kbuf, buf, want);
+    /* Never write an unfilled kbuf into the peer's ring — that is a straight
+     * kernel-stack disclosure to the process on the other end. */
+    if (copy_from_user(kbuf, buf, want) != 0)
+        return -EFAULT;
     return unix_sock_write(id, kbuf, want);
 }
 

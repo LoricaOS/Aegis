@@ -79,11 +79,11 @@ static int sock_vfs_read(void *priv, void *buf, uint64_t off, uint64_t len)
          *   CLOSE_WAIT/CLOSED:    return 0 (EOF — FIN received).
          */
         for (;;) {
-            int avail = tcp_conn_recv(s->tcp_conn_id, (void *)0, 0);  /* peek */
+            int avail = tcp_conn_recv(s->sock_id, s->tcp_conn_id, (void *)0, 0);  /* peek */
             if (avail > 0) {
                 uint32_t want = (uint32_t)len < (uint32_t)avail ? (uint32_t)len : (uint32_t)avail;
                 if (want > 8192) want = 8192;
-                int r = tcp_conn_recv(s->tcp_conn_id, buf, (uint16_t)want);
+                int r = tcp_conn_recv(s->sock_id, s->tcp_conn_id, buf, (uint16_t)want);
                 sock_vfs_close(priv);   /* drop the recv pin */
                 return r;
             }
@@ -106,7 +106,7 @@ static int sock_vfs_read(void *priv, void *buf, uint64_t off, uint64_t len)
              * this loop after the wait returns. */
             int rc;
             wait_event_interruptible(&s->poll_waiters,
-                tcp_conn_recv(s->tcp_conn_id, (void *)0, 0) != -11, rc);
+                tcp_conn_recv(s->sock_id, s->tcp_conn_id, (void *)0, 0) != -11, rc);
             if (rc == BLOCK_EINTR) {
                 sock_vfs_close(priv);   /* drop the recv pin */
                 return -EINTR;
@@ -132,17 +132,24 @@ int64_t sock_stream_send(sock_t *s, uint64_t ubuf, uint64_t len)
     while (sent < len) {
         uint64_t rem = len - sent;
         uint32_t chunk = (uint32_t)(rem > 1460 ? 1460 : rem);
-        copy_from_user(sndbuf, (const void *)(uintptr_t)(ubuf + sent), chunk);
-        int n = tcp_conn_send(s->tcp_conn_id, sndbuf, (uint16_t)chunk);
+        /* A faulting copy must not be transmitted: sndbuf is uninitialised
+         * kernel stack on the first chunk, so sending `chunk` bytes of it puts
+         * kernel memory on the wire. The window is wide open here — this loop
+         * BLOCKS between iterations, so a sibling thread has unbounded time to
+         * munmap the buffer under us. Zeroing instead of failing would only
+         * turn the leak into silent stream corruption. */
+        if (copy_from_user(sndbuf, (const void *)(uintptr_t)(ubuf + sent), chunk) != 0)
+            return sent > 0 ? (int64_t)sent : -EFAULT;
+        int n = tcp_conn_send(s->sock_id, s->tcp_conn_id, sndbuf, (uint16_t)chunk);
         if (n > 0) { sent += (uint64_t)n; continue; }
         if (n < 0) return sent > 0 ? (int64_t)sent : n;       /* EPIPE etc. */
         /* n == 0: send ring full (would-block). */
         if (s->nonblocking) return sent > 0 ? (int64_t)sent : -EAGAIN;
         int rc = 0;
         wait_event_interruptible(&s->poll_waiters,
-                                 tcp_conn_send_ready(s->tcp_conn_id) != 0, rc);
+                                 tcp_conn_send_ready(s->sock_id, s->tcp_conn_id) != 0, rc);
         if (rc < 0) return sent > 0 ? (int64_t)sent : rc;     /* -EINTR */
-        if (tcp_conn_send_ready(s->tcp_conn_id) < 0)
+        if (tcp_conn_send_ready(s->sock_id, s->tcp_conn_id) < 0)
             return sent > 0 ? (int64_t)sent : -EPIPE;          /* conn died */
         /* space available — retry the same chunk */
     }
@@ -212,7 +219,7 @@ static void sock_vfs_close(void *priv)
      * is reclaimed once it reaches TCP_CLOSED (ACK-of-FIN, or the
      * retransmit-limit RST in tcp_tick). */
     if (type == SOCK_TYPE_STREAM && connid != SOCK_NONE)
-        tcp_conn_close(connid);
+        tcp_conn_close(sock_id, connid);
     sock_free(sock_id);
 }
 
@@ -270,6 +277,7 @@ int sock_alloc(uint8_t type)
             __builtin_memset(&s_socks[i], 0, sizeof(s_socks[i]));
             s_socks[i].state       = SOCK_CREATED;
             s_socks[i].type        = type;
+            s_socks[i].sock_id     = i;
             s_socks[i].tcp_conn_id = SOCK_NONE;
             s_socks[i].epoll_id    = SOCK_NONE;
             s_socks[i].udp_rx      = ring;   /* NULL for STREAM */
@@ -447,8 +455,8 @@ sock_vfs_poll(void *priv)
     uint16_t r = 0;
     if (s->type == SOCK_TYPE_STREAM) {
         if (s->state == SOCK_CONNECTED) {
-            tcp_conn_t *tc = tcp_conn_get(s->tcp_conn_id);
-            int peek = tcp_conn_recv(s->tcp_conn_id, (void *)0, 0);
+            tcp_conn_t *tc = tcp_conn_get(s->sock_id, s->tcp_conn_id);
+            int peek = tcp_conn_recv(s->sock_id, s->tcp_conn_id, (void *)0, 0);
             /* POLLIN: data available OR EOF (recv will return 0). */
             if (peek > 0 || peek == 0) r |= SOCK_POLLIN;
             r |= SOCK_POLLOUT;            /* no per-socket TX flow control */
@@ -471,7 +479,7 @@ sock_vfs_poll(void *priv)
              * updates s->state, so the sock can sit in SOCK_CONNECTING forever.
              * Inspect the tcp_conn directly so the poller wakes
              * (POLLOUT|POLLERR|POLLHUP) and reads SO_ERROR. */
-            tcp_conn_t *tc = tcp_conn_get(s->tcp_conn_id);
+            tcp_conn_t *tc = tcp_conn_get(s->sock_id, s->tcp_conn_id);
             if (tc && tc->state == TCP_CLOSED)
                 r |= SOCK_POLLOUT | SOCK_POLLERR | SOCK_POLLHUP;
         } else if (s->state == SOCK_CLOSED) {
