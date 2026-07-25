@@ -2219,6 +2219,20 @@ int ext2_create(const char *path, uint16_t mode, int has_install)
         return -1;
     }
 
+    /* Reject an existing name BEFORE allocating. Every other creator in this
+     * file checks; ext2_create did not, so two concurrent O_CREATs (or a
+     * create over an existing file) produced TWO dirents with the same name
+     * pointing at different inodes — a lookup then resolves to whichever comes
+     * first, and the loser's inode is leaked with no name reachable to free
+     * it. */
+    {
+        uint32_t existing;
+        if (ext2_open_ex(path, &existing, 0) == 0) {
+            ext2_lock_release(fl);
+            return -EEXIST;
+        }
+    }
+
     uint32_t new_ino = ext2_alloc_inode(0);
     if (new_ino == 0) {
         printk("[EXT2] creat: alloc_inode failed\n");

@@ -15,6 +15,7 @@
 #include "arch.h"
 #include "random.h"
 #include "vma.h"
+#include "printk.h"
 
 /* Copy a NULL-terminated user array of C-strings into a FLAT kernel buffer:
  * up to `max` entries, appended NUL-separated into strbuf[strbuf_sz], with a
@@ -182,6 +183,15 @@ reload_binary:
                     (uint16_t)proc->uid, (uint16_t)proc->gid, 1);
                 if (xperm != 0)
                     { ret = SYS_ERR(EACCES); goto done; }
+            } else {
+                /* No else-branch here meant: any path ext2_open cannot resolve
+                 * but vfs_open CAN (a ramfs /tmp or /run file, a mounted tmpfs)
+                 * was exec'd with NO X_OK check whatsoever — the permission
+                 * test was simply skipped rather than failed. Those backends
+                 * have no executable bit to consult, so refuse to exec from
+                 * them outright: a writable-by-anyone filesystem is not a place
+                 * to run code from, and nothing in the system does. */
+                ret = SYS_ERR(EACCES); goto done;
             }
         }
         vfs_file_t vf;
@@ -639,7 +649,27 @@ reload_binary:
     }
     } /* table_qwords/table_bytes scope */
 
-    /* 9. Close all O_CLOEXEC file descriptors before loading new image */
+    /* 9. Close all O_CLOEXEC file descriptors before loading new image.
+     *
+     * Unshare the table first if it is shared. POSIX requires exec to give the
+     * process a private descriptor table, and this sweep MUTATES it: on a
+     * CLONE_FILES-shared table it closed the CLOEXEC descriptors of every
+     * other thread/process sharing it, out from under them. (The thread-group
+     * teardown above means siblings are gone by now, but a CLONE_FILES share
+     * with a process outside the group survives — vfork/posix_spawn shapes.)
+     * If the copy fails we keep the shared table rather than fail the exec:
+     * we are past the point of no return. */
+    if (proc->fd_table &&
+        __atomic_load_n(&proc->fd_table->refcount, __ATOMIC_ACQUIRE) > 1) {
+        fd_table_t *priv_tbl = fd_table_copy(proc->fd_table);
+        if (priv_tbl) {
+            fd_table_unref(proc->fd_table);
+            proc->fd_table = priv_tbl;
+        } else {
+            printk("[EXEC] WARN: could not unshare fd table; CLOEXEC sweep "
+                   "will affect sharers\n");
+        }
+    }
     {
         int cfd;
         for (cfd = 0; cfd < PROC_MAX_FDS; cfd++) {

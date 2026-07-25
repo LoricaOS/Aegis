@@ -195,7 +195,19 @@ sys_open(uint64_t arg1, uint64_t arg2, uint64_t arg3)
 uint64_t
 sys_openat(uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4)
 {
-    (void)arg1;  /* dirfd — only AT_FDCWD (-100) or absolute paths handled */
+    /* dirfd is not implemented: paths resolve against cwd. Silently ignoring
+     * it is an authority-shape LIE — a caller that opened a directory fd and
+     * passed it believes resolution is anchored there, which matters under
+     * VFS confinement. Accept only AT_FDCWD (or an absolute path, where dirfd
+     * is ignored by definition) and refuse anything else rather than resolving
+     * somewhere the caller did not ask for. */
+    if ((int64_t)(int32_t)arg1 != -100 /* AT_FDCWD */) {
+        char probe;
+        if (user_ptr_valid(arg2, 1) &&
+            copy_from_user(&probe, (const void *)(uintptr_t)arg2, 1) == 0 &&
+            probe != '/')
+            return SYS_ERR(ENOSYS);   /* relative + real dirfd: unsupported */
+    }
     return sys_open(arg2, arg3, arg4);
 }
 
@@ -639,6 +651,12 @@ sys_fcntl(uint64_t arg1, uint64_t arg2, uint64_t arg3)
         return 0;
     case 0:   /* F_DUPFD */
     case 1030: { /* F_DUPFD_CLOEXEC (0x406) — same as F_DUPFD + set FD_CLOEXEC */
+        /* Reject an out-of-range floor rather than truncating it: arg3 is a
+         * 64-bit user value and casting to uint32_t made e.g. 0x1_0000_0000
+         * wrap to 0, so a caller asking for "lowest fd >= 4 billion" got fd 0
+         * — quietly duplicating onto stdin. */
+        if (arg3 >= PROC_MAX_FDS)
+            return SYS_ERR(EINVAL);
         uint32_t new_fd;
         for (new_fd = (uint32_t)arg3; new_fd < PROC_MAX_FDS; new_fd++) {
             if (!proc->fd_table->fds[new_fd].ops) break;

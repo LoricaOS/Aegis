@@ -103,6 +103,11 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 178: num = 186; break;  /* gettid (real; internal 186 → sys_gettid) */
     case 214: num = 12;  break;  /* brk */
     case 215: num = 11;  break;  /* munmap */
+    case  21: num = 233; break;  /* epoll_ctl (aarch64 __NR_epoll_ctl == 21).
+                                  * Untranslated, 21 fell through to the x86
+                                  * dispatch and hit sys_access — so epoll_ctl
+                                  * was UNREACHABLE on arm64 and silently did
+                                  * something else entirely. */
     case 220: num = 56;  break;  /* clone */
     case 221: num = 59;  break;  /* execve */
     case 216: num = 25;  break;  /* mremap (aarch64 __NR_mremap == 216) */
@@ -122,7 +127,13 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
                                   * newfstatat/fstat above. Was wrongly → arch_prctl(158). */
     /* Directory */
     case  34: num = 83; arg1 = arg2; arg2 = arg3; break; /* mkdirat → mkdir (skip dirfd) */
-    case  38: num = 82; arg1 = arg2; arg2 = arg4; break; /* renameat2 → rename (skip dirfds) */
+    /* renameat2 → rename. flags (arg5) MUST be 0: RENAME_NOREPLACE is the
+     * standard TOCTOU-safe "create or fail" primitive, and silently dropping
+     * it degrades it into a CLOBBERING rename — the caller believes it cannot
+     * overwrite and it can. Reject rather than lie. */
+    case  38:
+        if (arg5 != 0) return SYS_ERR(ENOSYS);
+        num = 82; arg1 = arg2; arg2 = arg4; break;
     /* Networking */
     case 198: num = 41;  break;  /* socket */
     case 200: num = 49;  break;  /* bind */

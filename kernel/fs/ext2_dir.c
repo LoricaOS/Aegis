@@ -175,9 +175,19 @@ int ext2_dir_remove_entry(uint32_t dir_ino, const char *name)
     if (ext2_read_inode(dir_ino, &dir) != 0)
         return -1;
 
-    uint8_t name_len = 0;
-    while (name[name_len])
-        name_len++;
+    /* uint32 counter with a hard cap: this was a uint8_t, so a basename of
+     * 255+ bytes wrapped it and the loop never terminated — WITH ext2_lock
+     * held, wedging every other CPU that touches the filesystem. Unreachable
+     * from syscalls today (paths cap at 256) but ext2_walk builds 512-byte
+     * paths out of symlink expansion, so the input is not bounded by the
+     * syscall layer. A name that cannot fit an ext2 dirent cannot match one
+     * either, so refusing it is correct as well as safe. */
+    uint32_t name_len32 = 0;
+    while (name_len32 < 256u && name[name_len32])
+        name_len32++;
+    if (name_len32 >= 256u)
+        return -1;              /* longer than any ext2 dirent can hold */
+    uint8_t name_len = (uint8_t)name_len32;
 
     uint32_t pos = 0;
     uint32_t file_block_idx = 0;
