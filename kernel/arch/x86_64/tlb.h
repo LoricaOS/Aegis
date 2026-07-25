@@ -25,6 +25,11 @@ void tlb_shootdown(uint64_t target_cr3, uint64_t va_start, uint64_t va_end);
  * that still cached the kernel VA.  ~0 is never a real (physical) CR3. */
 #define TLB_TARGET_ALL  (~0ULL)
 
+/* Width of the shootdown CPU bitmask. smp_start_aps refuses to start CPUs at or
+ * above this — a CPU that cannot be named in a request would never invalidate.
+ * Raise this and the mask type in tlb.c together, never separately. */
+#define TLB_MAX_SHOOTDOWN_CPUS 64
+
 /* Invalidate a kernel-half VA range on all online CPUs unconditionally.
  * Thin wrapper over tlb_shootdown with TLB_TARGET_ALL.  Call OUTSIDE
  * vmm_window_lock (shootdown deadlock rule). */

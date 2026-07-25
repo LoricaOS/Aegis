@@ -141,6 +141,17 @@ smp_start_aps(void)
         uint8_t apic_id = g_smp_cpus[i].apic_id;
         if (apic_id == g_bsp_apic_id)      continue;   /* skip BSP */
         if (!g_smp_cpus[i].enabled)        continue;   /* skip MADT-disabled */
+        /* Fail CLOSED past the TLB shootdown bitmask width. A CPU beyond it
+         * cannot be named in a shootdown request and would never invalidate,
+         * so running user code on it means stale writable TLB entries into
+         * recycled page tables. Leaving the core idle costs throughput; using
+         * it costs memory safety. See TLB_MAX_SHOOTDOWN_CPUS in tlb.c. */
+        if (i >= TLB_MAX_SHOOTDOWN_CPUS) {
+            printk("[SMP] CPU %u NOT started: beyond the %u-CPU TLB shootdown "
+                   "mask (raise TLB_MAX_SHOOTDOWN_CPUS together with the mask "
+                   "width to use it)\n", i, (unsigned)TLB_MAX_SHOOTDOWN_CPUS);
+            continue;
+        }
 
         /* Allocate per-AP kernel stack (4 pages = 16KB) */
         void *stack_base = kva_alloc_pages(AP_STACK_PAGES);

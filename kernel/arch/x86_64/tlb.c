@@ -63,8 +63,28 @@ static spinlock_t        s_shootdown_lock = SPINLOCK_INIT;
 static volatile uint64_t s_target_cr3;
 static volatile uint64_t s_va_start;
 static volatile uint64_t s_va_end;
-static volatile uint16_t s_pending;  /* bitmask: CPUs that must respond */
-static volatile uint16_t s_ack;      /* bitmask: CPUs that have responded */
+/* CPU bitmasks for the in-flight request. 64-bit, and the bring-up refuses
+ * CPUs at or above TLB_MAX_SHOOTDOWN_CPUS, because these were uint16_t while
+ * MAX_CPUS is 1024:
+ *   - CPU 16-31: `1u << my_id` truncated to 0, so tlb_service_incoming returned
+ *     without invalidating — and the request loops clamped at `i < 16`, so those
+ *     CPUs were never even asked;
+ *   - CPU >= 32: the shift is UB and in practice aliases another CPU's bit, so a
+ *     CPU could ACK ON ANOTHER'S BEHALF.
+ * Either way munmap/mprotect/COW-write-protect/address-space teardown all
+ * completed believing every core had flushed, leaving stale WRITABLE TLB entries
+ * pointing at frames already recycled into page tables — ring 0 on any box with
+ * more than 16 cores. (arm64 is unaffected: `tlbi ...is` broadcasts in hardware.)
+ *
+ * 64 is not a design limit anyone will hit here (the Pi 5 has 4, the test boxes
+ * far fewer than 64); it is one word of atomics instead of a multi-word bitmap
+ * loop, and smp_start_aps fails CLOSED above it rather than silently skipping
+ * invalidation. Raise both together if that ever changes.
+ * (TLB_MAX_SHOOTDOWN_CPUS lives in tlb.h — smp.c enforces it at bring-up.) */
+_Static_assert(TLB_MAX_SHOOTDOWN_CPUS <= 64,
+               "shootdown bitmask is a single uint64_t");
+static volatile uint64_t s_pending;  /* bitmask: CPUs that must respond */
+static volatile uint64_t s_ack;      /* bitmask: CPUs that have responded */
 static volatile uint8_t  s_full_flush; /* 1 = receivers reload CR3 (flush ALL
                                         * TLB + paging-structure caches) instead
                                         * of invlpg'ing a range — used by
@@ -92,12 +112,14 @@ static void
 tlb_service_incoming(void)
 {
     uint8_t  my_id  = percpu_self()->cpu_id;
-    uint16_t my_bit = (uint16_t)(1u << my_id);
+    if (my_id >= TLB_MAX_SHOOTDOWN_CPUS)
+        return;                       /* never brought up — see the note above */
+    uint64_t my_bit = 1ULL << my_id;
 
     if (!(__atomic_load_n(&s_pending, __ATOMIC_ACQUIRE) & my_bit))
         return;
 
-    uint16_t old = __atomic_fetch_and(&s_pending, (uint16_t)~my_bit,
+    uint64_t old = __atomic_fetch_and(&s_pending, ~my_bit,
                                       __ATOMIC_ACQ_REL);
     if (!(old & my_bit))
         return;   /* the other path (IPI vs poll) already claimed it */
@@ -167,15 +189,15 @@ tlb_shootdown(uint64_t target_cr3, uint64_t va_start, uint64_t va_end)
      * here (and IPI it) or it loads CR3 after the PTE clear (and caches nothing
      * stale) — never both-miss. */
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    uint16_t target_mask = 0;
-    for (uint32_t i = 0; i < MAX_CPUS && i < 16; i++) {
+    uint64_t target_mask = 0;
+    for (uint32_t i = 0; i < MAX_CPUS && i < TLB_MAX_SHOOTDOWN_CPUS; i++) {
         if (i == my_id)
             continue;
         if (!g_ap_online[i])
             continue;
         if (target_cr3 != TLB_TARGET_ALL && g_cpu_cr3[i] != target_cr3)
             continue;
-        target_mask |= (uint16_t)(1u << i);
+        target_mask |= 1ULL << i;
     }
 
     /* Local invalidation first. */
@@ -244,11 +266,11 @@ tlb_flush_all_cpus(void)
     }
 
     uint8_t my_id = percpu_self()->cpu_id;
-    uint16_t target_mask = 0;
-    for (uint32_t i = 0; i < MAX_CPUS; i++) {
+    uint64_t target_mask = 0;
+    for (uint32_t i = 0; i < MAX_CPUS && i < TLB_MAX_SHOOTDOWN_CPUS; i++) {
         if (i == my_id) continue;
         if (!g_ap_online[i]) continue;
-        target_mask |= (uint16_t)(1u << i);
+        target_mask |= 1ULL << i;
     }
     if (target_mask == 0) {
         spin_unlock(&s_shootdown_lock);
@@ -300,12 +322,12 @@ tlb_flush_cr3(uint64_t pml4_phys)
 
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     uint8_t my_id = percpu_self()->cpu_id;
-    uint16_t target_mask = 0;
-    for (uint32_t i = 0; i < MAX_CPUS && i < 16; i++) {
+    uint64_t target_mask = 0;
+    for (uint32_t i = 0; i < MAX_CPUS && i < TLB_MAX_SHOOTDOWN_CPUS; i++) {
         if (i == my_id) continue;
         if (!g_ap_online[i]) continue;
         if (g_cpu_cr3[i] != pml4_phys) continue;
-        target_mask |= (uint16_t)(1u << i);
+        target_mask |= 1ULL << i;
     }
     if (target_mask == 0) {
         spin_unlock(&s_shootdown_lock);
