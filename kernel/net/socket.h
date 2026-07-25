@@ -89,6 +89,11 @@ typedef struct {
     waitq_t       poll_waiters;
 } sock_t;
 
+/* Expose the socket-table lock for short atomic multi-field updates by
+ * callers outside socket.c (sys_accept's queue pop). Keep sections tiny. */
+irqflags_t sock_lock_acquire(void);
+void       sock_lock_release(irqflags_t fl);
+
 /* sock_alloc: find a free slot, mark it in-use, set type. Returns sock_id >= 0 or -1. */
 int sock_alloc(uint8_t type);
 

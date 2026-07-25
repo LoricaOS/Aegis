@@ -40,6 +40,14 @@ typedef struct {
 
 static arp_entry_t s_arp_table[ARP_TABLE_SIZE];
 
+/* Guards s_arp_table itself. arp_lock (above) only ever protected the ARP TX
+ * buffer, so the table was mutated from the RX path (arp_rx_pkt, ISR context)
+ * while arp_resolve read it from process context with nothing between them —
+ * a 6-byte mac_addr_t copied field-by-field can tear, and a send then goes out
+ * to half of one MAC and half of another. Short critical sections only: never
+ * transmit while holding this. */
+static spinlock_t arp_table_lock = SPINLOCK_INIT;
+
 /* Shared static TX buffer — callers are sequential (no concurrent sends). */
 static uint8_t s_tx_buf[1514];
 static spinlock_t arp_lock = SPINLOCK_INIT;
@@ -185,10 +193,12 @@ static void arp_rx_pkt(netdev_t *dev, const arp_pkt_t *pkt)
              * on a fresh ARP resolve, which is what caused a brief reply
              * storm on the very first inbound exchange. */
             arp_entry_t *e;
+            irqflags_t afl = spin_lock_irqsave(&arp_table_lock);
             arp_insert_pending(pkt->spa);
             e = arp_find(pkt->spa);
             if (e) { e->mac = pkt->sha; e->last_used = (uint32_t)arch_get_ticks(); e->resolved = 1; }
-            arp_send_reply(dev, &pkt->sha, pkt->spa);
+            spin_unlock_irqrestore(&arp_table_lock, afl);
+            arp_send_reply(dev, &pkt->sha, pkt->spa);   /* TX outside the lock */
         }
         return;
     }
@@ -198,11 +208,16 @@ static void arp_rx_pkt(netdev_t *dev, const arp_pkt_t *pkt)
     /* S5: Only update ARP cache for entries with pending requests.
      * Reject unsolicited ARP replies to prevent cache poisoning. */
     {
+        irqflags_t afl = spin_lock_irqsave(&arp_table_lock);
         arp_entry_t *e = arp_find(pkt->spa);
-        if (!e) return;  /* no pending entry — unsolicited reply, drop */
+        if (!e) {        /* no pending entry — unsolicited reply, drop */
+            spin_unlock_irqrestore(&arp_table_lock, afl);
+            return;
+        }
         e->mac       = pkt->sha;
         e->last_used = (uint32_t)arch_get_ticks();
         e->resolved  = 1;
+        spin_unlock_irqrestore(&arp_table_lock, afl);
     }
 }
 
@@ -265,6 +280,8 @@ extern volatile int g_in_netdev_poll;
 
 int arp_resolve(netdev_t *dev, ip4_addr_t ip, mac_addr_t *mac_out)
 {
+    /* Snapshot under the table lock; any send happens after the unlock. */
+    irqflags_t rfl = spin_lock_irqsave(&arp_table_lock);
     arp_entry_t *e = arp_find(ip);
     if (e && e->resolved) {
         uint32_t now = (uint32_t)arch_get_ticks();
@@ -277,8 +294,13 @@ int arp_resolve(netdev_t *dev, ip4_addr_t ip, mac_addr_t *mac_out)
             arp_send_request(dev, ip);
         e->last_used = now;
         *mac_out = e->mac;
+        spin_unlock_irqrestore(&arp_table_lock, rfl);
         return 0;
     }
+
+    /* Drop the table lock BEFORE transmitting — arp_send_request goes through
+     * the netdev TX path and must not run in a spinlocked section. */
+    spin_unlock_irqrestore(&arp_table_lock, rfl);
 
     /* Send ARP request regardless of context. */
     arp_send_request(dev, ip);
@@ -319,12 +341,18 @@ int arp_resolve(netdev_t *dev, ip4_addr_t ip, mac_addr_t *mac_out)
             arch_wait_for_irq();
             if (dev->poll)
                 dev->poll(dev);
+            /* Copy the MAC out under the table lock: the RX path that fills
+             * this entry runs from the ISR and writes mac field-by-field, so
+             * an unlocked read here can see a half-updated address. */
+            irqflags_t wfl = spin_lock_irqsave(&arp_table_lock);
             e = arp_find(ip);
             if (e && e->resolved) {
-                arch_enable_irq();
                 *mac_out = e->mac;
+                spin_unlock_irqrestore(&arp_table_lock, wfl);
+                arch_enable_irq();
                 return 0;
             }
+            spin_unlock_irqrestore(&arp_table_lock, wfl);
         }
     }
     arch_enable_irq();

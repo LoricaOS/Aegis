@@ -256,6 +256,21 @@ static int sock_vfs_stat(void *priv, k_stat_t *st)
 
 /* ── Public API ─────────────────────────────────────────────────────────── */
 
+/* sock_lock_acquire/release — expose the socket table lock so callers outside
+ * this file can make a short multi-field update atomic. sys_accept needs it to
+ * pop accept_head/accept_tail as one step; without it two threads accepting
+ * the same listener could read the same head and receive the SAME connection
+ * on two fds. Keep the critical sections tiny: sock_lock is a leaf. */
+irqflags_t sock_lock_acquire(void)
+{
+    return spin_lock_irqsave(&sock_lock);
+}
+
+void sock_lock_release(irqflags_t fl)
+{
+    spin_unlock_irqrestore(&sock_lock, fl);
+}
+
 int sock_alloc(uint8_t type)
 {
     /* A DGRAM socket gets its UDP rx ring off-slot (kva), so TCP sockets and

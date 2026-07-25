@@ -248,6 +248,13 @@ sys_bind(uint64_t fd, uint64_t addr, uint64_t addrlen)
 
     /* Register with TCP or UDP binding layer */
     if (s->type == SOCK_TYPE_DGRAM) {
+        /* Release any previous binding first. Rebinding used to leak the old
+         * port registration, so after this socket closed and its slot was
+         * recycled the stale entry still pointed at the same sid — and the new
+         * owner of that slot received datagrams addressed to a port it never
+         * bound. */
+        if (s->local_port != 0 && s->local_port != port)
+            udp_unbind(s->local_port);
         return udp_bind(port, sid) == 0 ? 0 : SYS_ERR(EADDRINUSE);
     }
     /* TCP: binding is stored in sock_t; actual listen registration happens in sys_listen */
@@ -309,9 +316,24 @@ sys_accept(uint64_t fd, uint64_t addr, uint64_t addrlen)
 
     for (;;) {
         /* Check accept queue */
-        if (ls->accept_head != ls->accept_tail) {
-            uint32_t conn_id = ls->accept_queue[ls->accept_head];
-            ls->accept_head = (ls->accept_head + 1) & 7;
+        /* Pop the queue ATOMICALLY. head/tail were read and advanced with no
+         * lock, so two threads accept()ing the same listener could both read
+         * the same accept_head and receive the SAME connection on two
+         * different fds — two processes then reading and writing one TCP
+         * stream. sock_lock is the listener's own lock and this is a couple of
+         * loads and a store. */
+        uint32_t conn_id;
+        int have_conn = 0;
+        {
+            irqflags_t afl = sock_lock_acquire();
+            if (ls->accept_head != ls->accept_tail) {
+                conn_id = ls->accept_queue[ls->accept_head];
+                ls->accept_head = (ls->accept_head + 1) & 7;
+                have_conn = 1;
+            }
+            sock_lock_release(afl);
+        }
+        if (have_conn) {
 
             /* Allocate a new sock_t for this connected peer */
             int new_sid = sock_alloc(SOCK_TYPE_STREAM);
