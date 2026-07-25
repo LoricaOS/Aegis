@@ -591,11 +591,48 @@ cap_apply_policy(cap_slot_t *caps, const char *path, int authenticated,
                  *     the instant a second user exists. It now requires the same
                  *     admin elevation as INSTALL (security review 05 finding 1).
                  *
-                 * NOTE: POWER (reboot) deliberately stays `authenticated`-tier so
-                 * a normal user can still reboot their own machine; it is a noted
-                 * follow-up, not part of this change. */
+                 *   - AUTH       — read/write the credential files themselves
+                 *     (/etc/shadow, /etc/aegis/admin are inode-gated on AUTH in
+                 *     vfs_open). Same argument as DISK_ADMIN, one cap over:
+                 *     `authenticated` is set by login for ANY successful login
+                 *     and inherited by the whole session tree, so granting AUTH
+                 *     on it meant every logged-in user's useradd/usermod/userdel/
+                 *     groupadd (all `admin AUTH`) could rewrite every OTHER
+                 *     user's credentials — a user→admin privesc the instant a
+                 *     second account exists. Those tools do check
+                 *     acct_admin_active() in userland, but that is a request,
+                 *     not an authority: the cap was already in the process's
+                 *     table, so any control-flow bug in them reached shadow.
+                 *     Now the kernel enforces what userland was merely asking
+                 *     for. No workflow changes — they already required `admin`.
+                 *
+                 * NOT gated (deliberate): /bin/passwd is SERVICE-tier AUTH, so a
+                 * normal user can still change their OWN password unelevated;
+                 * passwd self-restricts (another user's password needs an admin
+                 * session, your own needs the current one) and is trusted-path
+                 * anchored + install-protected, so it cannot be swapped. login
+                 * and bastion are likewise SERVICE-tier — they must authenticate
+                 * before any session, hence any elevation, can exist.
+                 *
+                 *   - POWER      — reboot/poweroff, sethostname, and signalling
+                 *     PID 1. ADMIN-tier POWER (aegisctl, hostname, settings, the
+                 *     shell itself) now needs elevation like the rest.
+                 *
+                 *     Note this does NOT make reboot an admin-only operation, and
+                 *     is not meant to: /bin/reboot and /bin/shutdown declare
+                 *     SERVICE-tier POWER, as does lumen for the desktop's own
+                 *     shutdown UI, so an ordinary user can still power off the
+                 *     machine in front of them (the Linux/polkit behaviour). What
+                 *     this closes is the ambient case — a merely-logged-in shell
+                 *     holding POWER for sethostname and kill(1) without asking.
+                 *     If reboot itself should require admin, that is a caps.d
+                 *     change (service -> admin on reboot/shutdown/lumen), not a
+                 *     kernel one, and it costs a desktop user the ability to shut
+                 *     down their own laptop. */
                 int ok = (pol->caps[ci].kind == CAP_KIND_INSTALL ||
-                          pol->caps[ci].kind == CAP_KIND_DISK_ADMIN)
+                          pol->caps[ci].kind == CAP_KIND_DISK_ADMIN ||
+                          pol->caps[ci].kind == CAP_KIND_AUTH ||
+                          pol->caps[ci].kind == CAP_KIND_POWER)
                              ? admin_session
                              : authenticated;
                 if (ok)
