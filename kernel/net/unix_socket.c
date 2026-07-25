@@ -3,6 +3,8 @@
 #include "../lib/string.h"
 #include "trace.h"
 #include "proc.h"
+#include "sched.h"
+#include "cap.h"   /* cap_path_is_protected — AF_UNIX name squatting gate */
 #include "printk.h"
 #include "kva.h"
 #include "spinlock.h"
@@ -22,6 +24,7 @@ static spinlock_t  unix_lock = SPINLOCK_INIT;
 typedef struct {
     char     path[UNIX_PATH_MAX];
     uint32_t sock_id;
+    uint32_t owner_uid;   /* uid that bound this name */
     uint8_t  in_use;
 } unix_name_t;
 
@@ -55,17 +58,57 @@ static uint16_t ring_free(unix_sock_t *s)
 
 /* ── Name table ────────────────────────────────────────────────────────── */
 
+/* name_register — claim `path` for sock_id.
+ *
+ * AF_UNIX names live in this flat table and NEVER touch the filesystem: there
+ * is no directory-write check, no DAC, and no protected-path gate (grep for
+ * cap_ in this file used to return nothing). So any CAP_KIND_IPC holder — i.e.
+ * every GUI client — could bind the compositor's or the authentication
+ * service's well-known path during a boot-order or restart window. Clients
+ * connecting by path then reach the squatter, and SO_PEERCRED tells the SERVER
+ * about the client, not the client about the server, so the client cannot
+ * detect the swap.
+ *
+ * Two gates, both cheap:
+ *   - a path under an install-protected tree needs CAP_KIND_INSTALL, which is
+ *     the same authority required to create a real file there;
+ *   - the binder's uid is recorded, and a name may only be re-bound by the uid
+ *     that owned it, so a name freed by a crashing service cannot be picked up
+ *     by a different user.
+ *
+ * PARTIAL. The real fix is to back these names with the filesystem so the
+ * ordinary directory permissions apply — that is an architectural change, not
+ * a batch item. Until then a same-uid squatter is still possible, which on a
+ * system where everything runs as uid 0 means most of the value here is the
+ * protected-tree gate. Said plainly so nobody reads this as solved. */
 static int name_register(const char *path, uint32_t sock_id)
 {
+    aegis_process_t *proc = sched_current()->is_user ? current_proc()
+                                                     : (aegis_process_t *)0;
+    uint32_t uid = proc ? proc->uid : 0u;
+
+    if (proc && cap_path_is_protected(path) &&
+        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
+                  CAP_RIGHTS_READ) != 0)
+        return -EACCES;
+
     for (int i = 0; i < UNIX_NAME_MAX; i++) {
         if (s_names[i].in_use && _streq(s_names[i].path, path))
             return -EADDRINUSE;
     }
+    /* A previously-owned (now free) slot for this path keeps its owner_uid, so
+     * check the historical owner before handing the name to someone else. */
+    for (int i = 0; i < UNIX_NAME_MAX; i++) {
+        if (!s_names[i].in_use && s_names[i].path[0] &&
+            _streq(s_names[i].path, path) && s_names[i].owner_uid != uid)
+            return -EACCES;
+    }
     for (int i = 0; i < UNIX_NAME_MAX; i++) {
         if (!s_names[i].in_use) {
             _strcpy(s_names[i].path, path, UNIX_PATH_MAX);
-            s_names[i].sock_id = sock_id;
-            s_names[i].in_use  = 1;
+            s_names[i].sock_id   = sock_id;
+            s_names[i].owner_uid = uid;
+            s_names[i].in_use    = 1;
             return 0;
         }
     }
