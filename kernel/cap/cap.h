@@ -124,6 +124,15 @@ void cap_policy_detect_first_boot(void);
  * Returns pointer to entry, or NULL if no policy found. */
 const cap_policy_entry_t *cap_policy_lookup(const char *exe_path);
 
+/* True iff the first-boot exception is live (g_first_boot) AND this binary's
+ * policy declares a firstboot-tier cap — i.e. this exec is the anchored setup
+ * program running on an unconfigured system. The caller grants it an
+ * admin_session so it can seed the account DB (/etc/passwd, /etc/group) and the
+ * /etc/aegis tree, which are otherwise admin_session-gated and there is no admin
+ * to elevate yet. Bounded: g_first_boot is one-shot (the marker the setup writes
+ * flips it off), and only caps.d/configure declares the firstboot tier. */
+int cap_policy_is_firstboot(const char *exe_path);
+
 /* cap_apply_policy — reset `caps` (CAP_TABLE_SIZE slots) and grant the baseline
  * caps plus the per-binary policy caps for `path` (SERVICE-tier always,
  * ADMIN-tier only when `authenticated`, EXCEPT CAP_KIND_INSTALL and

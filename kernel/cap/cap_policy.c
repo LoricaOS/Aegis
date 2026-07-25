@@ -515,6 +515,37 @@ cap_policy_lookup(const char *exe_path)
     return (const cap_policy_entry_t *)0;
 }
 
+int
+cap_policy_is_firstboot(const char *exe_path)
+{
+    if (!g_first_boot)
+        return 0;
+    /* Re-check the marker instead of trusting the boot-time latch. g_first_boot
+     * was computed once in cap_policy_detect_first_boot, so the exception
+     * stayed live for the WHOLE boot even after `configure` finished and wrote
+     * /etc/aegis/configured — and since the setup flow ends by launching the
+     * desktop rather than rebooting, that left the exception armed underneath a
+     * running desktop. Close it the moment the marker appears. One extra
+     * vfs_open per exec of an anchored firstboot binary (i.e. `configure`, and
+     * only while unconfigured) — not a hot path. */
+    {
+        vfs_file_t mf;
+        if (vfs_open("/etc/aegis/configured", VFS_O_RDONLY, 0, &mf) == 0) {
+            if (mf.ops && mf.ops->close) mf.ops->close(mf.priv);
+            g_first_boot = 0;
+            printk("[CAP] first-boot exception: closed (marker written)\n");
+            return 0;
+        }
+    }
+    const cap_policy_entry_t *pol = cap_policy_lookup(exe_path);
+    if (!pol)
+        return 0;
+    for (uint32_t ci = 0; ci < pol->count; ci++)
+        if (pol->caps[ci].tier == CAP_TIER_FIRSTBOOT)
+            return 1;
+    return 0;
+}
+
 void
 cap_apply_policy(cap_slot_t *caps, const char *path, int authenticated,
                  int admin_session)

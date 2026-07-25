@@ -329,7 +329,39 @@ reload_binary:
      * capability boundary. Login's AUTH/SETUID caps must not propagate to the
      * exec'd shell. Policy caps come from /etc/aegis/caps.d/ (see
      * cap_apply_policy — shared with sys_spawn / proc_spawn). */
+    /* FIRST-BOOT elevation does not survive exec; credential-backed elevation
+     * does. The distinction matters both ways:
+     *
+     *  - Keeping it for the credential case is the sudo model working as
+     *    designed. `admin` in stsh elevates the shell, and the commands that
+     *    shell then fork+execs (herald install, the installer) must inherit it,
+     *    or elevation would be useless. Clearing unconditionally here breaks
+     *    every admin workflow.
+     *  - Dropping it for the first-boot case closes the leak: `configure` runs
+     *    elevated before any credential exists, g_first_boot is latched for the
+     *    whole boot, and the setup flow ends by LAUNCHING THE DESKTOP rather
+     *    than rebooting — so the elevation rode exec into the entire desktop
+     *    session tree and stayed there. Nothing verified a credential to earn
+     *    that, so it stops at the binary the exception was granted to.
+     *
+     * The firstboot re-grant below re-establishes both flags if this exec is
+     * itself the anchored setup program. */
+    if (proc->admin_session_firstboot) {
+        proc->admin_session = 0;
+        proc->admin_session_firstboot = 0;
+    }
     cap_apply_policy(proc->caps, path, proc->authenticated, proc->admin_session);
+
+    /* First-boot exception: the anchored setup program (caps.d/configure) runs
+     * before any login on an unconfigured system, so it has no admin_session to
+     * write the account DB it is there to create. Grant it one here — bounded to
+     * g_first_boot (one-shot; the marker it writes flips the exception off) and
+     * to the firstboot-tier policy (only configure declares it). This is the
+     * session half of the same exception that hands it the AUTH/INSTALL caps. */
+    if (cap_policy_is_firstboot(path)) {
+        proc->admin_session = 1;
+        proc->admin_session_firstboot = 1;   /* not credential-backed */
+    }
 
     /* C2: Reset signal state across exec — pending signals, mask, and all
      * signal dispositions must be cleared.  Matches POSIX exec semantics:
@@ -1157,6 +1189,7 @@ sys_spawn(uint64_t path_uptr, uint64_t argv_uptr,
         /* Inherit authenticated flag + bound identity from parent */
         child->authenticated = parent->authenticated;
         child->admin_session = parent->admin_session;
+        child->admin_session_firstboot = parent->admin_session_firstboot;
         child->auth_uid      = parent->auth_uid;
         child->auth_gid      = parent->auth_gid;
     }
