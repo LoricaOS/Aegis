@@ -43,6 +43,20 @@ poll_source_register(poll_fn_t fn, int priority, const char *name)
     return 0;
 }
 
+/* NOTE: on arm64 the timer PPI is per-core, so this runs on ALL cores at 100 Hz
+ * — x86 is deliberately the opposite (pit.c: "Must NOT run concurrently").
+ * Every poll source that walks shared device state must therefore be
+ * individually SMP-safe. xhci_poll and gem_poll each take a single-flight
+ * trylock; netdev_poll_all is serialised by netdev_lock.
+ *
+ * (This comment previously asserted xhci_poll's trylock as existing fact when
+ * it did not — the change had been reverted and the comment left behind. It is
+ * true now. If you revert one of those guards, fix this comment in the same
+ * commit: a false claim here is worse than no comment, because it stops the
+ * next person looking.)
+ *
+ * Do NOT add a global lock here: it would serialise a slow source (netdev
+ * during DHCP) against the fast ones and starve them. */
 void
 poll_sources_run(void)
 {
