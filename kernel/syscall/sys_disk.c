@@ -114,6 +114,16 @@ sys_blkdev_io(uint64_t arg1, uint64_t arg2, uint64_t arg3,
     static spinlock_t blkdev_io_lock = SPINLOCK_INIT;
     irqflags_t io_fl = spin_lock_irqsave(&blkdev_io_lock);
     uint32_t bs = dev->block_size ? dev->block_size : 512u;
+    /* Fail closed rather than clamping the chunk count UP. With bs > 65536
+     * the division floors to 0, and forcing it to 1 made a single chunk
+     * overrun s_bounce by bs-65536 device-supplied bytes, after which
+     * copy_to_user(..., bs) handed the adjacent .bss to userspace. The block
+     * layer's contract is bs <= 4096 (see the NVMe LBA clamp); if a driver
+     * ever presents more, refuse the transfer instead of corrupting memory. */
+    if (bs > sizeof(s_bounce)) {
+        spin_unlock_irqrestore(&blkdev_io_lock, io_fl);
+        return SYS_ERR(EIO);
+    }
     uint32_t max_chunk = (uint32_t)(sizeof(s_bounce) / bs);
     if (max_chunk < 1u) max_chunk = 1u;
     uint64_t done = 0;

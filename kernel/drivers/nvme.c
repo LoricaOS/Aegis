@@ -586,7 +586,22 @@ nvme_init(void)
         /* LBAF[flbas] (offset 128 + flbas*4): bits[23:16] = log2(LBA size) */
         __builtin_memcpy(&lbaf_entry, id_buf + 128u + (uint32_t)flbas * 4u, 4u);
         lbads = (lbaf_entry >> 16) & 0xFFu;
-        lba_size = (lbads >= 9u) ? (1u << lbads) : 512u;
+        /* Bound the exponent the DEVICE chose. lbads is 8 bits straight off
+         * the controller: >= 32 is undefined shift, and anything in 13..31
+         * yields 8 KiB .. 2 GiB. The block layer's contract is <= 4096 —
+         * gpt.c sizes its statics for exactly one 4 K sector, and boot runs
+         * gpt_scan("nvme0") -> dev->read(dev, 1, 1, s_sector) into a
+         * `static uint8_t s_sector[4096]` before any userland exists, so a
+         * rogue M.2, reflashed firmware or an emulated controller could write
+         * up to 128 KiB of its own bytes through it. Every other block driver
+         * already clamps (storvsc.c, xhci.c). 9..12 == 512 B .. 4 KiB. */
+        if (lbads < 9u || lbads > 12u) {
+            printk("[NVME] WARN: device reports LBA exponent %u (out of "
+                   "9..12) — using 512\n", (uint32_t)lbads);
+            lba_size = 512u;
+        } else {
+            lba_size = 1u << lbads;
+        }
 
         /* Step 8: Create I/O CQ (queue ID=1) then I/O SQ (queue ID=1) */
         {
