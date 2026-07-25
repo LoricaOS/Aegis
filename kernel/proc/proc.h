@@ -124,6 +124,15 @@ void proc_spawn_init(void);
  * Returns NULL if no matching process found. */
 aegis_process_t *proc_find_by_pid(uint32_t pid);
 
+/* thread_group_teardown — SIGKILL every other thread in the caller's group and
+ * block until each has run its own exit path and left its kernel stack.
+ * Required before destroying anything the group shares (exit_group's teardown,
+ * execve's address-space and capability-table reset). Never returns without
+ * the group reduced to this thread — but MAY not return at all: if a
+ * concurrent teardown already killed us it calls sched_exit().
+ * Defined in kernel/syscall/sys_process.c. */
+void thread_group_teardown(void);
+
 
 /* Demand-paging: populate a lazy user page (anon mmap). 0=present, -1=fault.
  * Defined in kernel/syscall/sys_memory.c. */

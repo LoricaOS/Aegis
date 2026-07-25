@@ -60,15 +60,30 @@ typedef enum {
     BLOCK_ETIMEDOUT = -110,   /* deadline reached (-ETIMEDOUT) */
 } block_result_t;
 
-/* Block until cond is true. Uninterruptible: a signal does not break the wait
- * (it is noticed after the wait completes, the way an uninterruptible kernel
- * sleep behaves). */
+/* Block until cond is true. Uninterruptible: an ordinary signal does not break
+ * the wait (it is noticed after the wait completes, the way an uninterruptible
+ * kernel sleep behaves).
+ *
+ * A pending SIGKILL DOES break it — "uninterruptible" must never mean
+ * "unkillable". __we lives on this task's kernel stack, so a task that is
+ * killed while parked here has to unwind through waitq_remove() itself; the
+ * alternative (zombifying it in place) leaves the entry linked into a shared
+ * waitq that the reaper is about to free — the exit_group use-after-free.
+ * See signal_fatal_pending() and thread_group_teardown().
+ *
+ * CALLER CONTRACT: because of that early break, cond may still be FALSE when
+ * this returns. Every call site sits in a re-check loop already; each one must
+ * also test signal_fatal_pending() and bail with an error, or it will spin in
+ * kernel mode (no sched_block) until the tick that delivers the kill — which
+ * never comes while the task stays in the kernel. */
 #define wait_event(wqp, cond)                                             \
     do {                                                                  \
         waitq_entry_t __we = { .task = sched_current() };                 \
         waitq_add((wqp), &__we);                                          \
-        while (!(cond))                                                   \
+        while (!(cond)) {                                                 \
+            if (signal_fatal_pending()) break;                            \
             sched_block();                                                \
+        }                                                                 \
         waitq_remove((wqp), &__we);                                       \
     } while (0)
 

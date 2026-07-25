@@ -55,6 +55,11 @@ eventfd_read_fn(void *priv, void *buf, uint64_t off, uint64_t len)
             if (sched_current()->read_nonblock)
                 return -EAGAIN;
             wait_event(&e->read_waiters, e->count > 0);
+            /* Killed while parked: wait_event broke out without the condition
+             * (see wait_event.h) — return so the kill is delivered instead of
+             * spinning in kernel mode. */
+            if (signal_fatal_pending())
+                return -EINTR;
             continue;
         }
         uint64_t val;

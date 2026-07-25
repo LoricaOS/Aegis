@@ -119,6 +119,11 @@ mouse_read_blocking(mouse_event_t *out)
         if (mouse_poll(out))
             break;
         wait_event(&g_mouse_waiters, mouse_has_data());
+        /* Killed while parked (wait_event.h): give up rather than spin in
+         * kernel mode.  *out keeps whatever mouse_poll left — the caller is
+         * about to die on the return path, so it is never consumed. */
+        if (signal_fatal_pending())
+            break;
     }
     arch_disable_irq();
 }

@@ -508,6 +508,11 @@ kbd_read(void)
         if (kbd_poll(&c))
             return c;
         wait_event(&g_console_waiters, kbd_has_data());
+        /* Killed while parked (wait_event.h): stop looping so the kill can be
+         * delivered.  '\0' is what kbd_read_interruptible already returns on
+         * an interrupted read, so callers see nothing new. */
+        if (signal_fatal_pending())
+            return '\0';
     }
 }
 

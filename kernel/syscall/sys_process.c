@@ -165,6 +165,95 @@ sys_exit(uint64_t arg1)
     __builtin_unreachable();
 }
 
+/*
+ * thread_group_teardown — kill every OTHER thread in the caller's thread group
+ * and do not return until each one is really, verifiably gone.
+ *
+ * Both callers (sys_exit_group and sys_execve) are about to destroy state the
+ * whole group shares, so POSIX requires the group to be a single thread first.
+ *
+ * WHY NOT ZOMBIFY IN PLACE (what this replaces): flipping a sibling to
+ * TASK_ZOMBIE + sched_dequeue_locked stops it being *scheduled*, but it does
+ * not unwind anything the sibling left behind:
+ *   - a thread parked in wait_event*() has a STACK-ALLOCATED waitq_entry_t
+ *     still linked into a pipe/PTY/socket waitq;
+ *   - a thread in FUTEX_WAIT still owns a pool slot pointing at its TCB.
+ * waitpid then frees both the stack and the PCB (kva_free_pages), so the next
+ * waitq_wake_all/futex_wake_addr over that queue walks freed memory and hands
+ * sched_wake() whatever now occupies it — a run-list splice into an
+ * attacker-shaped "task" whose ->sp ctx_switch loads. Ring 0 from baseline
+ * caps (THREAD_CREATE is baseline). It also freed the kernel stack of a
+ * sibling still executing on another CPU.
+ *
+ * INSTEAD: set SIGKILL and WAKE each sibling, then wait. SIGKILL is unmaskable
+ * and uncatchable, so every blocking primitive's own exit path runs —
+ * waitq_remove, futex slot release, fd_table_unref — and the sibling reaches
+ * sched_exit() by itself. That is the only way those unwinds can happen: the
+ * waitq an entry is linked into is known to the blocked task and to nobody
+ * else (sys_poll registers on many queues at once, so there is no single
+ * back-pointer we could chase from here).
+ *
+ * The wait is on TASK_ZOMBIE **and** on_cpu < 0: a task publishes ZOMBIE in
+ * sched_exit while still running on its own kernel stack, and does not leave
+ * it until the final ctx_switch (which is where on_cpu = -1 is published).
+ * Same invariant sys_waitpid's reaper spins on before freeing a stack.
+ *
+ * TIE-BREAK: if another thread is concurrently tearing the same group down, it
+ * has set SIGKILL on US. Rather than two threads waiting on each other
+ * forever, whoever sees its own kill first stops and dies. Two threads racing
+ * into exit_group both die, which is the requested outcome; a thread racing
+ * execve against exit_group dies, which is also correct (the exit wins). Two
+ * threads racing execve against each other can both lose, killing the process
+ * — a legitimate outcome for a program with that bug, and fail-closed.
+ */
+void
+thread_group_teardown(void)
+{
+    aegis_task_t *cur = sched_current();
+    if (!cur->is_user)
+        return;
+    uint32_t my_tgid = ((aegis_process_t *)cur)->tgid;
+
+    for (;;) {
+        /* Lost the race to a concurrent teardown — die instead of deadlocking.
+         * sched_exit() does not return. */
+        if (signal_fatal_pending())
+            sched_exit();
+
+        int live = 0;
+        irqflags_t fl = spin_lock_irqsave(&sched_lock);
+        aegis_task_t *t = cur->next;
+        while (t != cur) {
+            if (t->is_user && ((aegis_process_t *)t)->tgid == my_tgid) {
+                aegis_process_t *tp = (aegis_process_t *)t;
+                if (t->state != TASK_ZOMBIE) {
+                    live = 1;
+                    /* RMW-atomic: another CPU may be setting bits too. */
+                    (void)__atomic_or_fetch(&tp->pending_signals,
+                                            1ULL << SIGKILL, __ATOMIC_RELAXED);
+                    /* Closes the check→block window the same way
+                     * signal_send_pid does: a sibling between its condition
+                     * check and sched_block() records the wake instead of
+                     * sleeping through it. */
+                    t->wake_pending = 1;
+                    if (t->state == TASK_BLOCKED || t->state == TASK_STOPPED)
+                        sched_wake_locked(t);
+                } else if (__atomic_load_n(&t->on_cpu, __ATOMIC_ACQUIRE) >= 0) {
+                    live = 1;   /* zombie, but still on its own kernel stack */
+                }
+            }
+            t = t->next;
+        }
+        spin_unlock_irqrestore(&sched_lock, fl);
+
+        if (!live)
+            return;
+        /* Give the marked siblings CPU time to run their own exit paths. They
+         * are RUNNING now, so this terminates. */
+        sched_yield_to_next();
+    }
+}
+
 /* ── exit_group ────────────────────────────────────────────────────────── */
 uint64_t sys_exit_group(uint64_t arg1)
 {
@@ -173,53 +262,11 @@ uint64_t sys_exit_group(uint64_t arg1)
         aegis_process_t *proc = (aegis_process_t *)cur;
         proc->exit_status = arg1 & 0xFF;
 
-        /* Kill all other threads in the same thread group.
-         *
-         * The walk and the ZOMBIE flips run under sched_lock: the list
-         * mutates concurrently on SMP, and the run-queue unlink must be
-         * atomic with the state flip (a bare state write would leave the
-         * zombie in the RUNNING-only run list, which sched_tick would
-         * happily keep scheduling).  clear_child_tid writes and futex
-         * wakes are deferred until after the unlock — futex_wake_addr
-         * calls sched_wake, which re-acquires the non-recursive
-         * sched_lock (self-deadlock), and vmm_write_user_bytes is too
-         * heavyweight for a sched_lock critical section.  Only captured
-         * values (pml4 phys, ctid VA) are used after the unlock: a
-         * sibling zombie can be reaped and freed the instant the lock
-         * drops, so the task pointers must not be dereferenced again. */
-        uint32_t my_tgid = proc->tgid;
-        struct { uint64_t pml4; uint64_t ctid; } tid_clears[MAX_PROCESSES];
-        uint32_t n_clears = 0;
-        {
-            irqflags_t fl = spin_lock_irqsave(&sched_lock);
-            aegis_task_t *t = cur->next;
-            while (t != cur) {
-                if (t->is_user) {
-                    aegis_process_t *tp = (aegis_process_t *)t;
-                    if (tp->tgid == my_tgid) {
-                        t->state = TASK_ZOMBIE;
-                        sched_dequeue_locked(t);
-                        /* Do clear_child_tid for killed threads too */
-                        if (t->clear_child_tid &&
-                            n_clears < MAX_PROCESSES) {
-                            tid_clears[n_clears].pml4 = tp->pml4_phys;
-                            tid_clears[n_clears].ctid = t->clear_child_tid;
-                            n_clears++;
-                        }
-                    }
-                }
-                t = t->next;
-            }
-            spin_unlock_irqrestore(&sched_lock, fl);
-        }
-        for (uint32_t k = 0; k < n_clears; k++) {
-            uint32_t zero = 0;
-            /* Same address space (CLONE_VM); fault in the lazy TLS page. */
-            if (user_ptr_valid(tid_clears[k].ctid, sizeof(zero)))
-                vmm_write_user_bytes(tid_clears[k].pml4, tid_clears[k].ctid,
-                                     &zero, sizeof(zero));
-            futex_wake_addr(tid_clears[k].ctid, 1, tid_clears[k].pml4);
-        }
+        /* Kill all other threads in the group and wait for them to unwind.
+         * The clear_child_tid writes the old in-place zombification did here
+         * are gone with it: they existed so a pthread_join'er would wake, and
+         * after this call there is no thread left in the group to join. */
+        thread_group_teardown();
 
         /* Session leader exit: SIGHUP + SIGCONT to foreground group */
         if (proc->pid == proc->sid) {

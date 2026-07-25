@@ -1648,4 +1648,13 @@ vmm_free_user_pages(uint64_t pml4_phys)
         }
     }
     spin_unlock_irqrestore(&vmm_window_lock, fl);
+    /* Every frame above is back in the PMM and will be reissued as a page
+     * table / kernel stack / TCB. Any CPU still holding a writable TLB entry
+     * for one of them can spray kernel memory. execve's caller now reduces the
+     * thread group to one thread first, so in practice nobody else is in this
+     * address space — but that is an invariant enforced elsewhere, and this
+     * function frees physical memory, so it invalidates unconditionally.
+     * AFTER the unlock: tlb_flush_all_cpus IPI-waits for every other CPU to
+     * ack, and a CPU spinning for vmm_window_lock with IF=0 could not (tlb.c). */
+    tlb_flush_all_cpus();
 }

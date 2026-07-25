@@ -147,6 +147,12 @@ pipe_read_fn(void *priv, void *buf, uint64_t off, uint64_t len)
             spin_unlock_irqrestore(&p->lock, fl);
             wait_event(&p->read_waiters,
                        p->count > 0 || refcount_read(&p->write_refs) == 0);
+            /* wait_event breaks early on a pending SIGKILL (see wait_event.h):
+             * return so the kill is delivered on the syscall return path.
+             * Without this the loop re-blocks-and-breaks forever in kernel
+             * mode and `kill -9` could not reap a pipe-blocked reader. */
+            if (signal_fatal_pending())
+                return (pipe_read_close_fn(priv), -EINTR);
             continue;
         }
 
@@ -242,6 +248,9 @@ pipe_write_fn(void *priv, const void *buf, uint64_t len)
             wait_event(&p->write_waiters,
                        p->count < PIPE_BUF_SIZE ||
                        refcount_read(&p->read_refs) == 0);
+            /* Killed while parked — see the matching note in pipe_read_fn. */
+            if (signal_fatal_pending())
+                return (pipe_write_close_fn(priv), -EINTR);
             continue;
         }
 
@@ -253,7 +262,14 @@ pipe_write_fn(void *priv, const void *buf, uint64_t len)
         /* Copy n bytes from user space via staging buffer (SMAP guard).
          * n is already clamped to avail above, so copy_from_user never stages
          * more than the ring can take. */
-        copy_from_user(staging, buf, n);
+        /* A faulting copy must NOT push the staging buffer: it still holds
+         * uninitialised kernel stack, which rb_push_n would deposit into the
+         * ring for the reader to collect. Nothing has been pushed yet this
+         * call (the ring update is below), so EFAULT is the whole answer. */
+        if (copy_from_user(staging, buf, n) != 0) {
+            spin_unlock_irqrestore(&p->lock, fl);
+            return (pipe_write_close_fn(priv), -EFAULT);
+        }
 
         /* Push the staged bytes through the modulo view (head = write_pos /
          * producer, tail = read_pos / consumer); rb_push_n handles the wrap

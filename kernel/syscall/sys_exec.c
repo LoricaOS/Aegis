@@ -250,6 +250,30 @@ reload_binary:
         goto reload_binary;
     }
 
+    /* 3b. POSIX: execve reduces the thread group to the calling thread BEFORE
+     * anything shared is touched (Linux de_thread in flush_old_exec). Three
+     * separate defects close here, all of which needed a live sibling:
+     *
+     *  - CLONE_VM siblings share pml4_phys VERBATIM. vmm_free_user_pages below
+     *    clears PTEs and pmm_free_page()s the frames with no invalidation at
+     *    all, and vmm_switch_to only flushes the calling CPU — so a sibling on
+     *    another core kept WRITABLE TLB entries for frames already back in the
+     *    PMM and about to be reissued as page tables, kernel stacks and TCBs.
+     *    (sys_fork already shoots down on thread_count > 1; exec, which is
+     *    strictly more destructive, did not.)
+     *  - cap_apply_policy below resets only OUR cap table. Each CLONE_THREAD
+     *    sibling holds its own copy (sys_clone step 4), so a thread of a
+     *    privileged binary kept its caps after the leader exec'd something
+     *    unprivileged — and an unprivileged thread survived into the address
+     *    space of a newly-exec'd policy-privileged binary with write access to
+     *    its stack. "ptrace a setuid binary", without a debugger.
+     *  - the signal-state and clear_child_tid resets are likewise per-thread.
+     *
+     * This is irreversible, so a failure after it (a bad ELF at step 6) leaves
+     * a single-threaded process rather than restoring the group — permitted,
+     * and the same thing Linux does. */
+    thread_group_teardown();
+
     /* 4. Install a fresh address space for the new image.
      *
      * vfork child (CLONE_VM|CLONE_VFORK): our PML4 + vma_table are BORROWED

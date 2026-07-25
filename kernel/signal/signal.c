@@ -625,3 +625,17 @@ signal_check_pending(void)
     }
     return 0;
 }
+
+int
+signal_fatal_pending(void)
+{
+    aegis_task_t *task = sched_current();
+    if (!task || !task->is_user) return 0;
+    aegis_process_t *proc = (aegis_process_t *)task;
+    /* No mask / disposition consultation on purpose — SIGKILL is unmaskable
+     * and uncatchable, so a pending bit here is a guaranteed death sentence.
+     * RELAXED load pairs with the RELAXED or in signal_send_*; the wake that
+     * follows it goes through sched_lock, which supplies the ordering. */
+    return (__atomic_load_n(&proc->pending_signals, __ATOMIC_RELAXED)
+            & (1ULL << SIGKILL)) != 0;
+}

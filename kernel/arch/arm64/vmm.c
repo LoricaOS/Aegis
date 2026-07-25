@@ -36,6 +36,7 @@
 #include "pmm.h"
 #include "printk.h"
 #include "spinlock.h"
+#include "tlb.h"      /* tlb_flush_all_cpus — teardown invalidation */
 #include "fb.h"       /* panic_halt lives here */
 #include "sched.h"
 #include "proc.h"
@@ -844,6 +845,9 @@ vmm_free_user_pages(uint64_t pml4_phys)
         }
     }
     spin_unlock_irqrestore(&vmm_lock, fl);
+    /* See the x86 twin in kernel/mm/vmm.c: these frames are back in the PMM
+     * and will be reissued, so no CPU may keep a writable TLB entry for them. */
+    tlb_flush_all_cpus();
 }
 
 void

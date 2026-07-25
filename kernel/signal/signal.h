@@ -199,4 +199,18 @@ void signal_send_pgrp(uint32_t pgid, int signum);
 /* Return 1 if current process has deliverable pending signals. */
 int signal_check_pending(void);
 
+/* Return 1 if a FATAL kill is queued on the current task — i.e. SIGKILL is
+ * pending.  Unlike signal_check_pending this ignores the signal mask and the
+ * disposition table, because SIGKILL can be neither blocked, caught nor
+ * ignored (sys_sigaction rejects it; every mask write clears it).  A task that
+ * observes this WILL die on its next return to user mode.
+ *
+ * Exists so UNINTERRUPTIBLE waits can still bail: a thread parked in
+ * wait_event() holds a STACK-ALLOCATED waitq_entry_t linked into a shared
+ * waitq, so it must unwind through waitq_remove() itself.  If the group-exit
+ * path zombified it in place instead, waitpid would free that stack while the
+ * entry was still linked and the next waitq_wake_all would walk freed memory.
+ * See thread_group_teardown() in sys_process.c. */
+int signal_fatal_pending(void);
+
 #endif /* AEGIS_SIGNAL_H */
