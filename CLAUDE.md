@@ -60,4 +60,4 @@ a clean boot ends at the "no init found" panic. Real boots happen in LoricaOS.
 - Kernel references that are legitimately "Aegis" (the name `aegis.elf`, the
   `/etc/aegis/*` capability paths, "the Aegis kernel") stay — the OS on top is
   "LoricaOS"; do not rebrand kernel identifiers.
-- Commit trailer: `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`.
+- Commit trailer: `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`.

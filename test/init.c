@@ -83,6 +83,9 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
 #define SYS_close        57
 #define SYS_readlinkat   78
 #define SYS_newfstatat   79
+#define SYS_pipe2        59
+#define SYS_read         63
+#define SYS_exit_group   94
 #else
 #define SYS_getpid       39
 #define SYS_mount        165
@@ -108,6 +111,9 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
 #define SYS_unlink       87
 #define SYS_symlink      88
 #define SYS_readlink     89
+#define SYS_pipe2        293
+#define SYS_read         0
+#define SYS_exit_group   231
 #endif
 
 #define AT_FDCWD             -100
@@ -187,6 +193,11 @@ static void out(const char *s) { sys3(SYS_write, 2, (long)s, slen(s)); }
  * restore the interrupted context. */
 static volatile int g_sig_got = 0;
 static void sig_handler(int signum) { g_sig_got = signum; }
+
+/* Globals for the exit_group teardown case (14). The cloned THREAD lands on a
+ * fresh stack, so it must not read anything off its creator's frame — every
+ * value it needs lives here. */
+static volatile long g_tg_rfd = -1;
 static volatile long g_cow = 0;   /* dedicated COW test page (data, not stack) */
 
 /* sigaltstack test: a SA_ONSTACK handler records the stack region it ran on
@@ -567,6 +578,122 @@ void _start(void)
     {
         if (sys3(SYS_sched_yield, 0, 0, 0) == 0) { pass++; out("[KTEST] PASS sched_yield\n"); }
         else out("[KTEST] FAIL sched_yield\n");
+    }
+
+    /* 13. uaccess boundary: a stat-family destination in the KERNEL half must be
+     *     refused, not written. emit_stat used to hand its raw arg2 to
+     *     copy_to_user with no user_ptr_valid, so stat/fstat/lstat wrote 144
+     *     attacker-influenced bytes (st_size is a chosen qword) anywhere in the
+     *     kernel — and since the physmap aliases all RAM writable, that was an
+     *     arbitrary PHYSICAL write from an unprivileged process. sys_utimensat
+     *     had the mirror bug on the read side: 32 bytes copied FROM an
+     *     unvalidated pointer into inode timestamps you read back with stat(),
+     *     i.e. an arbitrary kernel read oracle.
+     *
+     *     The address must be one that is actually MAPPED in the kernel half —
+     *     an unmapped or non-canonical one returns EFAULT through copy_to_user's
+     *     fixup whether or not the range check exists, which would make this
+     *     test pass spuriously. The physmap base is mapped, so this is
+     *     discriminating on x86-64. (On arm64 it may be unmapped, in which case
+     *     the check still passes but proves less.) If the range check is ever
+     *     removed, the failure is loud: this writes into low physical memory. */
+    total++;
+    {
+        volatile long kdst = (long)0xFFFF800010000000UL;  /* physmap + 256 MB */
+        int ok = 1;
+
+        /* stat() and lstat() into kernel memory → must fail */
+        ok &= (k_stat_at("/", (void *)kdst, 0) < 0);
+        ok &= (k_stat_at("/", (void *)kdst, 1) < 0);
+#ifndef __aarch64__
+        /* fstat(fd 1) into kernel memory → must fail. Nothing gates fstat at
+         * all (not even an fd capability), so this was the cheapest route to
+         * the primitive. x86 only: aarch64 reaches fstat via newfstatat and
+         * would need AT_EMPTY_PATH, which this kernel does not implement. */
+        ok &= (sys3(5 /*SYS_fstat*/, 1, kdst, 0) < 0);
+#endif
+        /* A valid destination must still work — this is a range check, not a
+         * blanket refusal. Guards against "fixing" it by breaking stat. */
+        {
+            char st[256];
+            ok &= (k_stat_at("/", st, 0) == 0);
+        }
+
+        if (ok) { pass++; out("[KTEST] PASS uaccess-stat-dest (kernel ptr refused)\n"); }
+        else out("[KTEST] FAIL uaccess-stat-dest (ARBITRARY KERNEL WRITE!)\n");
+    }
+
+    /* 14. exit_group must UNWIND a blocked sibling thread, not zombify it where
+     *     it stands. A thread parked in a pipe read owns a waitq_entry_t on its
+     *     KERNEL stack, linked into that pipe's read_waiters. The old
+     *     sys_exit_group flipped siblings to TASK_ZOMBIE + dequeued them
+     *     without waking them, so the entry stayed linked; waitpid then
+     *     kva_free_pages'd the stack, and the next waitq_wake_all on that pipe
+     *     walked freed memory and handed sched_wake() whatever had been
+     *     reissued there — a run-list splice into an attacker-shaped task whose
+     *     ->sp ctx_switch loads. Ring 0, from baseline caps only
+     *     (THREAD_CREATE is baseline).
+     *
+     *     Shape: child clones a thread that blocks reading an empty pipe, then
+     *     exit_group()s. We reap it and then WRITE to that pipe, which is what
+     *     walks read_waiters. Three things are asserted: the reap completes at
+     *     all (a leader is not reapable while a sibling is non-zombie, so a
+     *     teardown that fails to kill the sibling HANGS here), the status is
+     *     the one exit_group passed, and the post-reap pipe traffic survives.
+     *
+     *     This is a "does not corrupt" test, so a regression shows up as a
+     *     panic/hang rather than a clean FAIL — which is exactly what the old
+     *     behaviour deserved. */
+    total++;
+    {
+        int  ok = 1;
+        int  pfd[2] = { -1, -1 };   /* pipe2 writes two ints, not two longs */
+        if (sys3(SYS_pipe2, (long)pfd, 0, 0) != 0) ok = 0;
+        if (ok) {
+            g_tg_rfd = pfd[0];
+            long pid = sys6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);
+            if (pid == 0) {
+                /* ---- child (group leader) ---- */
+                long stk = sys6(SYS_mmap, 0, 65536, PROT_RW, MAP_ANON_PRIV, -1, 0);
+                if (stk > 0) {
+                    /* CLONE_VM|FS|FILES|SIGHAND|THREAD == a real thread: shares
+                     * our address space AND our tgid, which is what makes it a
+                     * sibling exit_group has to tear down. Stack grows down, so
+                     * hand clone the TOP, 16-aligned. */
+                    long top = (stk + 65536) & ~15L;
+                    long t = sys6(SYS_clone, 0x100 | 0x200 | 0x400 | 0x800 | 0x10000,
+                                  top, 0, 0, 0, 0);
+                    if (t == 0) {
+                        /* ---- sibling thread, on the fresh stack ---- */
+                        char b;
+                        for (;;)
+                            sys3(SYS_read, g_tg_rfd, (long)&b, 1);  /* parks */
+                    }
+                }
+                /* Let the sibling reach the blocking read before we exit. */
+                struct { long s, ns; } ts = { 0, 150000000L };  /* 150 ms */
+                sys6(SYS_clock_nanosleep, 0, 0, (long)&ts, 0, 0, 0);
+                sys3(SYS_exit_group, 77, 0, 0);
+                sys3(SYS_exit, 98, 0, 0);   /* unreachable */
+            }
+            int status = 0;
+            long w = sys6(SYS_wait4, pid, (long)&status, 0, 0, 0, 0);
+            if (w != pid || ((status >> 8) & 0xff) != 77) ok = 0;
+            /* Drain any reparented sibling zombie so it does not leak into the
+             * later cases (exit_group reparents orphans to init == us). */
+            { int st2 = 0; while (sys6(SYS_wait4, -1, (long)&st2, 1 /*WNOHANG*/,
+                                       0, 0, 0) > 0) { } }
+            /* THE PROBE: this walks the pipe's read_waiters. If the dead
+             * thread's entry is still linked, it points at a freed kernel
+             * stack. */
+            if (sys3(SYS_write, pfd[1], (long)"x", 1) != 1) ok = 0;
+            { char b = 0;
+              if (sys3(SYS_read, pfd[0], (long)&b, 1) != 1 || b != 'x') ok = 0; }
+            sys3(SYS_close, pfd[0], 0, 0);
+            sys3(SYS_close, pfd[1], 0, 0);
+        }
+        if (ok) { pass++; out("[KTEST] PASS exit_group-blocked-sibling (unwound)\n"); }
+        else out("[KTEST] FAIL exit_group-blocked-sibling\n");
     }
 
     if (pass == total) out("[KTEST] DONE all-pass\n");
