@@ -164,15 +164,27 @@ sys_admin_session(uint64_t on)
      * cap_apply_policy, which reads /etc/aegis/caps.d; if the parent exited and
      * was reaped in that window, this wrote admin_session = 1 and a full
      * 64-slot capability table into a freed, likely-recycled page. */
+    /* Refuse to elevate init, or a parent in a different session.
+     *
+     * This elevates "whatever process currently holds my ppid". If the shell
+     * that ran `login -elevate` exits first, login is reparented to init — and
+     * the elevation lands on PID 1, so every service vigil spawns afterwards
+     * inherits admin_session for the rest of the boot. It still takes
+     * CAP_KIND_ADMIN_AUTH and a verified credential to get here, so this is
+     * blast radius and persistence rather than escalation, but "the shell I was
+     * launched from" is the only thing this was ever meant to elevate.
+     * Requiring a matching sid pins it to the caller's own session. */
     uint32_t parent_pid = proc->ppid;
+    if (parent_pid <= 1)
+        return SYS_ERR(EPERM);
     char     parent_exe[256];
     int      parent_auth;
     {
         irqflags_t fl = spin_lock_irqsave(&sched_lock);
         parent = proc_find_by_pid_locked(parent_pid);
-        if (!parent) {
+        if (!parent || parent->sid != proc->sid) {
             spin_unlock_irqrestore(&sched_lock, fl);
-            return SYS_ERR(EPERM);
+            return SYS_ERR(EPERM);   /* gone, or not our session */
         }
         parent->admin_session = 1u;
         /* Credential-backed: /bin/login -elevate verified a separate admin
