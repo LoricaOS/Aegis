@@ -285,6 +285,24 @@ void _start(void)
             /* one-way: widening the scope must be refused */
             if (sys3(SYS_vfs_confine, (long)"/", 0, 0) == 0)
                 ok = 0;
+            /* The METADATA syscalls must honour the scope too. symlink, link,
+             * readlink, chmod, chown, lchown and utimensat all resolve through
+             * resolve_path(), which used to only prepend cwd — it never
+             * consulted the scope, so all seven ignored confinement outright.
+             * Creating a symlink in /etc from a process confined to /tmp must
+             * be refused. */
+            if (k_symlink("t", "/etc/ktest_escape") == 0)
+                ok = 0;
+            /* Same syscall, but escaping via "..". This is the divergence
+             * between the two path resolvers: the lexical canonicalizer behind
+             * the scope check pops ONE component per "..", while ext2_walk used
+             * to CLAMP ".." to the filesystem root. So the checker saw
+             * "/etc/..." only if it canonicalized -- and the version that
+             * didn't handed ext2 the raw string, which walked ".." to root and
+             * created the link outside the scope anyway. Both resolvers agree
+             * now, and the path is canonicalized before it is checked. */
+            if (k_symlink("t", "/tmp/../etc/ktest_escape2") == 0)
+                ok = 0;
             /* descendants inherit confinement: a grandchild must ALSO be denied
              * "/" (it inherited /tmp scope across fork). */
             long gpid = sys6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);
@@ -299,8 +317,25 @@ void _start(void)
         }
         long cstatus = -1;
         sys6(SYS_wait4, cpid, (long)&cstatus, 0, 0, 0, 0);
-        if (((cstatus >> 8) & 0xff) == 0) { pass++; out("[KTEST] PASS vfs-confine\n"); }
-        else out("[KTEST] FAIL vfs-confine\n");
+        int cok = (((cstatus >> 8) & 0xff) == 0);
+        /* Belt and braces, from the UNCONFINED parent: neither escape may have
+         * left anything behind in /etc. If the child's syscall "failed" but the
+         * link exists, the deny was cosmetic. */
+        {
+            char st[256];
+            if (k_stat_at("/etc/ktest_escape",  st, 1) == 0) cok = 0;
+            if (k_stat_at("/etc/ktest_escape2", st, 1) == 0) cok = 0;
+            /* Positive control: ".." must still RESOLVE for an unconfined
+             * process. ext2_walk no longer special-cases it (it clamped ".."
+             * to the fs root, which is why the two resolvers disagreed) and
+             * instead looks it up as the ordinary directory entry it is. This
+             * is the check that the replacement lookup actually works — and
+             * note the old clamp was plainly wrong for real paths too:
+             * "/a/b/../c" resolved to "/c". */
+            if (k_stat_at("/bin/../bin/exectest", st, 0) != 0) cok = 0;
+        }
+        if (cok) { pass++; out("[KTEST] PASS vfs-confine\n"); }
+        else out("[KTEST] FAIL vfs-confine (confinement escapable!)\n");
     }
 
     /* 5. FP/SIMD state survives a context switch (arm64 only — this

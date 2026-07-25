@@ -7,29 +7,60 @@
 #include "arch.h"
 #include "../lib/string.h"
 
-/* ── Helper: resolve relative path against cwd ──────────────────────── */
-
+/* ── Helper: resolve a user path to a canonical, in-scope absolute path ──
+ *
+ * Every path-taking syscall in this file routes through here, so this is the
+ * one place the two confinement bugs had to be fixed:
+ *
+ *  1. It only prepended cwd — it never consulted the VFS scope. symlink, link,
+ *     readlink, chmod, chown, lchown and utimensat therefore ignored
+ *     sys_vfs_confine entirely: from a confined process,
+ *     link("/etc/shadow", "/home/u/copy") simply worked. (Only sys_open was
+ *     immune, because it pre-normalizes and calls vfs_scope_allows itself.)
+ *
+ *  2. It emitted the path with ".." still in it. path_canonicalize (what the
+ *     scope check uses) pops ONE component per "..", but ext2_walk CLAMPED ".."
+ *     to the filesystem root — so the string that was checked and the string
+ *     that was walked could differ. A process confined to /home/u asking for
+ *     "/home/u/x/../etc/shadow" got "/home/u/etc/shadow" approved by the
+ *     checker while ext2 walked ".." to root and opened the real /etc/shadow.
+ *     Canonicalizing HERE means the bytes checked are byte-for-byte the bytes
+ *     walked, and no ".." ever reaches the filesystem. (ext2_walk's clamp is
+ *     removed as well, so the two can no longer diverge.)
+ *
+ * Returns 0, or -ENAMETOOLONG / -EACCES (out of scope). Fails closed.
+ */
 int
 resolve_path(const char *kpath, const char *cwd, char *out, uint32_t outsz)
 {
+    char abs[256];
+    if (outsz > sizeof(abs))
+        outsz = sizeof(abs);
+
     if (kpath[0] == '/') {
         uint32_t i;
         for (i = 0; i < outsz - 1 && kpath[i]; i++)
-            out[i] = kpath[i];
-        out[i] = '\0';
-        return 0;
+            abs[i] = kpath[i];
+        if (kpath[i] != '\0')
+            return -ENAMETOOLONG;
+        abs[i] = '\0';
+    } else {
+        uint32_t cwdlen = 0;
+        while (cwd[cwdlen]) cwdlen++;
+        uint32_t pathlen = 0;
+        while (kpath[pathlen]) pathlen++;
+        uint32_t sep = (cwdlen > 0 && cwd[cwdlen - 1] == '/') ? 0u : 1u;
+        if (cwdlen + sep + pathlen >= outsz)
+            return -ENAMETOOLONG;
+        __builtin_memcpy(abs, cwd, cwdlen);
+        if (sep) abs[cwdlen] = '/';
+        __builtin_memcpy(abs + cwdlen + sep, kpath, pathlen + 1);
     }
-    uint32_t cwdlen = 0;
-    while (cwd[cwdlen]) cwdlen++;
-    uint32_t pathlen = 0;
-    while (kpath[pathlen]) pathlen++;
-    uint32_t sep = (cwdlen > 0 && cwd[cwdlen - 1] == '/') ? 0u : 1u;
-    if (cwdlen + sep + pathlen >= outsz)
-        return -ENAMETOOLONG;
-    __builtin_memcpy(out, cwd, cwdlen);
-    if (sep) out[cwdlen] = '/';
-    __builtin_memcpy(out + cwdlen + sep, kpath, pathlen + 1);
-    return 0;
+
+    /* Canonicalize BEFORE the scope check, and hand the caller the canonical
+     * form — the filesystem must walk exactly what was approved. */
+    path_canonicalize(abs, out, outsz);
+    return vfs_scope_allows(out) ? 0 : -EACCES;
 }
 
 /* ── Sensitive-inode mutation gate ──────────────────────────────────────

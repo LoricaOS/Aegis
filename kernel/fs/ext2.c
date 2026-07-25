@@ -1230,11 +1230,18 @@ restart_walk:
 
             int is_final = (*p == '\0');
 
-            /* ".." — clamp to root */
-            if (component[0] == '.' && component[1] == '.' && component[2] == '\0') {
-                current_ino = EXT2_ROOT_INODE;
-                continue;
-            }
+            /* ".." is NOT special-cased here. It used to be clamped to
+             * EXT2_ROOT_INODE, which silently disagreed with the lexical
+             * canonicalizer the VFS confinement check uses (that one pops a
+             * single component), so the path that was approved and the path
+             * that was walked could differ and confinement was escapable —
+             * see resolve_path() in sys_meta.c. ".." is a real directory
+             * entry in ext2, so the ordinary lookup below resolves it
+             * correctly, and in the root directory it points at root itself,
+             * which preserves the old "cannot climb above /" behaviour.
+             * Syscall paths are canonicalized at the boundary now, so a ".."
+             * should not reach here at all; this just makes it harmless if
+             * one does. */
 
             /* Read current directory inode */
             ext2_inode_t dir_inode;
