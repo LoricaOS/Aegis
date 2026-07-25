@@ -4,6 +4,7 @@
 #include "proc.h"
 #include "vfs.h"
 #include "ext2.h"
+#include "../fs/ext2_internal.h"   /* ext2_lock_acquire/release — TOCTOU gate */
 #include "arch.h"
 #include "../lib/string.h"
 
@@ -61,6 +62,44 @@ resolve_path(const char *kpath, const char *cwd, char *out, uint32_t outsz)
      * form — the filesystem must walk exactly what was approved. */
     path_canonicalize(abs, out, outsz);
     return vfs_scope_allows(out) ? 0 : -EACCES;
+}
+
+/* meta_gate_locked — owner + sensitive-inode authority for a path mutation.
+ *
+ * CALLER MUST ALREADY HOLD ext2_lock, and must perform the mutation before
+ * releasing it. That is the whole point: these checks used to run as separate
+ * ext2 walks that each took and dropped the lock, and then the mutator
+ * (ext2_chmod / ext2_chown / …) re-walked the path under a FRESH lock. Three or
+ * four independent resolutions of the same string is a textbook check-then-act:
+ * swap a component in between — rename a directory, or repoint a symlink — and
+ * the walk that gets validated is not the walk that gets mutated. `chmod 0666
+ * /etc/shadow` was reachable that way. ext2_open_protected exists precisely to
+ * fix this split for open(), and its own comment calls it "a genuine TOCTOU on
+ * SMP"; it was never extended to the metadata mutators.
+ *
+ * ext2_lock is recursive, so the ext2_* calls here and the caller's mutator
+ * just bump the depth counter — one hold covers resolve + validate + mutate.
+ *
+ * `follow` = 0 checks the link itself (lchown), 1 the target.
+ * Returns 0 to proceed, or a negative errno. */
+static int
+meta_gate_locked(const char *resolved, aegis_process_t *proc, int follow)
+{
+    uint32_t ino;
+    if (ext2_open_ex(resolved, &ino, follow) != 0)
+        return 0;   /* not an ext2 path (or absent) — mutator reports it */
+
+    ext2_inode_t inode;
+    if (ext2_read_inode(ino, &inode) == 0) {
+        /* No uid=0 bypass — uid 0 is cosmetic in Aegis; only the file owner may
+         * chmod/chown (authority comes from capabilities, not ambient root).
+         * The installer owns the files it creates+chowns. */
+        if (proc->uid != inode.i_uid)
+            return -EACCES;
+    }
+    /* Sensitive-inode gate: mutating /etc/shadow or the account DB needs the
+     * same authority as any other mutation of it (owner-uid-0 DAC is not it). */
+    return sensitive_write_gate(ino);
 }
 
 /* ── Sensitive-inode mutation gate ──────────────────────────────────────
@@ -172,14 +211,16 @@ sys_symlink(uint64_t arg1, uint64_t arg2)
                                  CAP_RIGHTS_READ) == 0);
     /* Sensitive-inode mutation gate (shadow/admin → AUTH, passwd/group → admin
      * session). Keyed on the resolved inode so a symlink alias cannot bypass. */
+    irqflags_t fl = ext2_lock_acquire();   /* gate + create in ONE hold */
+    int r = 0;
     {
         uint32_t sino;
-        if (ext2_open(resolved, &sino) == 0) {
-            int g = sensitive_write_gate(sino);
-            if (g != 0) return (uint64_t)(int64_t)g;
-        }
+        if (ext2_open(resolved, &sino) == 0)
+            r = sensitive_write_gate(sino);
     }
-    int r = ext2_symlink(resolved, target, has_install);
+    if (r == 0)
+        r = ext2_symlink(resolved, target, has_install);
+    ext2_lock_release(fl);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }
 
@@ -211,18 +252,18 @@ sys_link(uint64_t arg1, uint64_t arg2)
                                  CAP_RIGHTS_READ) == 0);
     /* Sensitive-inode gate on BOTH ends: hard-linking /etc/shadow to an alias
      * (source) or clobbering a sensitive target both require the authority. */
+    irqflags_t fl = ext2_lock_acquire();   /* gate BOTH ends + link in ONE hold */
+    int r = 0;
     {
         uint32_t sino;
-        if (ext2_open(rold, &sino) == 0) {
-            int g = sensitive_write_gate(sino);
-            if (g != 0) return (uint64_t)(int64_t)g;
-        }
-        if (ext2_open(rnew, &sino) == 0) {
-            int g = sensitive_write_gate(sino);
-            if (g != 0) return (uint64_t)(int64_t)g;
-        }
+        if (ext2_open(rold, &sino) == 0)
+            r = sensitive_write_gate(sino);
+        if (r == 0 && ext2_open(rnew, &sino) == 0)
+            r = sensitive_write_gate(sino);
     }
-    int r = ext2_link(rold, rnew, has_install);
+    if (r == 0)
+        r = ext2_link(rold, rnew, has_install);
+    ext2_lock_release(fl);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }
 
@@ -303,31 +344,12 @@ sys_chmod(uint64_t arg1, uint64_t arg2)
     int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
                                  CAP_RIGHTS_READ) == 0);
 
-    /* Ownership check: only file owner (or uid 0) may chmod */
-    {
-        uint32_t ino;
-        if (ext2_open(resolved, &ino) == 0) {
-            ext2_inode_t inode;
-            if (ext2_read_inode(ino, &inode) == 0) {
-                /* No uid=0 bypass — uid 0 is cosmetic in Aegis; only the file
-                 * owner may chmod/chown (authority comes from capabilities, not
-                 * ambient root). The installer owns the files it creates+chowns. */
-                if (proc->uid != inode.i_uid)
-                    return SYS_ERR(EACCES);
-            }
-        }
-    }
-
-    /* Sensitive-inode gate: chmod'ing /etc/shadow or the account DB needs the
-     * same authority as any other mutation of it (owner-uid-0 DAC is not it). */
-    {
-        uint32_t sino;
-        if (ext2_open(resolved, &sino) == 0) {
-            int g = sensitive_write_gate(sino);
-            if (g != 0) return (uint64_t)(int64_t)g;
-        }
-    }
-    int r = ext2_chmod(resolved, (uint16_t)arg2, has_install);
+    /* Validate and mutate under ONE ext2_lock hold — see meta_gate_locked. */
+    irqflags_t fl = ext2_lock_acquire();
+    int r = meta_gate_locked(resolved, proc, 1 /* follow */);
+    if (r == 0)
+        r = ext2_chmod(resolved, (uint16_t)arg2, has_install);
+    ext2_lock_release(fl);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }
 
@@ -395,31 +417,15 @@ sys_chown(uint64_t arg1, uint64_t arg2, uint64_t arg3)
     if (resolve_path(path, proc->cwd, resolved, sizeof(resolved)) != 0)
         return SYS_ERR(ENAMETOOLONG);
 
-    /* Ownership check: only file owner (or uid 0) may chown */
-    {
-        uint32_t ino;
-        if (ext2_open(resolved, &ino) == 0) {
-            ext2_inode_t inode;
-            if (ext2_read_inode(ino, &inode) == 0) {
-                /* No uid=0 bypass — uid 0 is cosmetic in Aegis; only the file
-                 * owner may chmod/chown (authority comes from capabilities, not
-                 * ambient root). The installer owns the files it creates+chowns. */
-                if (proc->uid != inode.i_uid)
-                    return SYS_ERR(EACCES);
-            }
-        }
-    }
-
     int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
                                  CAP_RIGHTS_READ) == 0);
-    {
-        uint32_t sino;
-        if (ext2_open(resolved, &sino) == 0) {
-            int g = sensitive_write_gate(sino);
-            if (g != 0) return (uint64_t)(int64_t)g;
-        }
-    }
-    int r = ext2_chown(resolved, (uint16_t)arg2, (uint16_t)arg3, 1, has_install);
+
+    /* Validate and mutate under ONE ext2_lock hold — see meta_gate_locked. */
+    irqflags_t fl = ext2_lock_acquire();
+    int r = meta_gate_locked(resolved, proc, 1 /* follow */);
+    if (r == 0)
+        r = ext2_chown(resolved, (uint16_t)arg2, (uint16_t)arg3, 1, has_install);
+    ext2_lock_release(fl);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }
 
@@ -533,16 +539,17 @@ sys_utimensat(uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4)
               :                          (uint32_t)ts[2];
     }
 
-    {
-        uint32_t sino;
-        if (ext2_open(resolved, &sino) == 0) {
-            int g = sensitive_write_gate(sino);
-            if (g != 0) return (uint64_t)(int64_t)g;
-        }
-    }
-
     int follow = (arg4 & 0x100) ? 0 : 1;  /* AT_SYMLINK_NOFOLLOW */
-    int r = ext2_utimes(resolved, atime, mtime, follow, has_install);
+
+    /* Validate and mutate under ONE ext2_lock hold — see meta_gate_locked. The
+     * copy_from_user above deliberately happens BEFORE the acquire: it can
+     * fault, and faulting under the lock is a needless hazard when the value is
+     * not needed until now. */
+    irqflags_t fl = ext2_lock_acquire();
+    int r = meta_gate_locked(resolved, proc, follow);
+    if (r == 0)
+        r = ext2_utimes(resolved, atime, mtime, follow, has_install);
+    ext2_lock_release(fl);
     if (r == -EPERM) return SYS_ERR(EPERM);   /* protected-tree without INSTALL */
     return (r < 0) ? SYS_ERR(ENOENT) : 0;
 }
@@ -566,30 +573,15 @@ sys_lchown(uint64_t arg1, uint64_t arg2, uint64_t arg3)
     if (resolve_path(path, proc->cwd, resolved, sizeof(resolved)) != 0)
         return SYS_ERR(ENAMETOOLONG);
 
-    /* Ownership check: only file owner (or uid 0) may lchown */
-    {
-        uint32_t ino;
-        if (ext2_open(resolved, &ino) == 0) {
-            ext2_inode_t inode;
-            if (ext2_read_inode(ino, &inode) == 0) {
-                /* No uid=0 bypass — uid 0 is cosmetic in Aegis; only the file
-                 * owner may chmod/chown (authority comes from capabilities, not
-                 * ambient root). The installer owns the files it creates+chowns. */
-                if (proc->uid != inode.i_uid)
-                    return SYS_ERR(EACCES);
-            }
-        }
-    }
-
     int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
                                  CAP_RIGHTS_READ) == 0);
-    {
-        uint32_t sino;
-        if (ext2_open(resolved, &sino) == 0) {
-            int g = sensitive_write_gate(sino);
-            if (g != 0) return (uint64_t)(int64_t)g;
-        }
-    }
-    int r = ext2_chown(resolved, (uint16_t)arg2, (uint16_t)arg3, 0, has_install);
+
+    /* Validate and mutate under ONE ext2_lock hold — see meta_gate_locked.
+     * follow = 0: lchown operates on the link itself. */
+    irqflags_t fl = ext2_lock_acquire();
+    int r = meta_gate_locked(resolved, proc, 0 /* no follow */);
+    if (r == 0)
+        r = ext2_chown(resolved, (uint16_t)arg2, (uint16_t)arg3, 0, has_install);
+    ext2_lock_release(fl);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }

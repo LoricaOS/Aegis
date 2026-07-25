@@ -4,6 +4,7 @@
 #include "proc.h"
 #include "vfs.h"
 #include "ext2.h"
+#include "../fs/ext2_internal.h"   /* ext2_lock_acquire/release — TOCTOU gate */
 
 /*
  * sys_getdents64 — syscall 217
@@ -201,14 +202,21 @@ sys_unlink(uint64_t arg1)
     }
     /* Sensitive-inode gate: unlinking /etc/shadow (→ recreate with attacker
      * hashes) or the account DB needs the mutation authority, not owner-uid-0. */
+    /* Gate + mutate under ONE ext2_lock hold: the gate below and ext2_unlink
+     * each resolved `kpath` independently, so a component swapped in between
+     * meant the inode that was checked was not the inode that was unlinked
+     * (see meta_gate_locked in sys_meta.c). ext2_lock is recursive, so the
+     * nested ext2_* calls just bump its depth. */
+    irqflags_t fl = ext2_lock_acquire();
+    int r = 0;
     {
         uint32_t sino;
-        if (ext2_open(kpath, &sino) == 0) {
-            int g = sensitive_write_gate(sino);
-            if (g != 0) return (uint64_t)(int64_t)g;
-        }
+        if (ext2_open(kpath, &sino) == 0)
+            r = sensitive_write_gate(sino);
     }
-    int r = ext2_unlink(kpath, has_install);
+    if (r == 0)
+        r = ext2_unlink(kpath, has_install);
+    ext2_lock_release(fl);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }
 
@@ -262,17 +270,20 @@ sys_rename(uint64_t arg1, uint64_t arg2)
      * crafted file OVER /etc/shadow (target) — the reported break — needs
      * CAP_KIND_AUTH; renaming the account DB away (source) needs an admin
      * session.  Keyed on the resolved inode so symlink/".." cannot bypass. */
+    /* Gate BOTH ends and rename under ONE ext2_lock hold — the check-then-act
+     * split is exactly the reported "rename a crafted file over /etc/shadow"
+     * break. See the note in sys_unlink. */
+    irqflags_t fl = ext2_lock_acquire();
+    int r = 0;
     {
         uint32_t sino;
-        if (ext2_open(kold, &sino) == 0) {
-            int g = sensitive_write_gate(sino);
-            if (g != 0) return (uint64_t)(int64_t)g;
-        }
-        if (ext2_open(knew, &sino) == 0) {
-            int g = sensitive_write_gate(sino);
-            if (g != 0) return (uint64_t)(int64_t)g;
-        }
+        if (ext2_open(kold, &sino) == 0)
+            r = sensitive_write_gate(sino);
+        if (r == 0 && ext2_open(knew, &sino) == 0)
+            r = sensitive_write_gate(sino);
     }
-    int r = ext2_rename(kold, knew, has_install);
+    if (r == 0)
+        r = ext2_rename(kold, knew, has_install);
+    ext2_lock_release(fl);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }
