@@ -384,6 +384,13 @@ sys_clone(syscall_frame_t *frame, uint64_t flags, uint64_t child_stack,
     aegis_process_t *child = kva_alloc_pages(2);
     if (!child)
         return SYS_ERR(ENOMEM);  /* -ENOMEM */
+    /* kva_alloc_pages does NOT zero. Every field below is assigned explicitly,
+     * but several never were — clear_child_tid, altstack_sp/size,
+     * sleep_deadline, and thread_count on the CLONE_THREAD path — so the child
+     * inherited whatever the recycled page held. sys_spawn and proc_spawn
+     * already memset; fork/clone did not. One memset kills the whole class
+     * (and any field added later that someone forgets to assign). */
+    __builtin_memset(child, 0, sizeof(*child));
 
     /* 2. Share address space — same PML4, no page copy. */
     child->pml4_phys = parent->pml4_phys;
@@ -721,6 +728,9 @@ sys_fork(syscall_frame_t *frame, uint64_t u_rdi, uint64_t u_rsi, uint64_t u_rdx)
     aegis_process_t *child = kva_alloc_pages(2);
     if (!child)
         return SYS_ERR(ENOMEM);   /* -ENOMEM */
+    /* See sys_clone: kva_alloc_pages does not zero, and not every field below
+     * is assigned. */
+    __builtin_memset(child, 0, sizeof(*child));
 
     /* 2. Copy parent fd table (allocates new table, bumps driver refs) */
     child->fd_table = fd_table_copy(parent->fd_table);
@@ -872,7 +882,18 @@ sys_fork(syscall_frame_t *frame, uint64_t u_rdi, uint64_t u_rsi, uint64_t u_rdx)
      * CPU only, where the local invlpg already took effect. Done here with no
      * lock held (shootdown rule). Eager copy never write-protects, so it is
      * unaffected. */
-    if (g_cow_fork && parent->thread_count > 1)
+    /* Shoot down unconditionally when COW is on, rather than gating on
+     * parent->thread_count > 1. Two things were wrong with the gate: the field
+     * was uninitialised on the CLONE_THREAD path (read garbage), and even when
+     * correct only the GROUP LEADER accumulates the count — so a fork from a
+     * worker thread read 1 and skipped the flush while its siblings still held
+     * writable TLB entries for pages this fork just marked copy-on-write. A
+     * missed shootdown there means a sibling writes through a stale writable
+     * entry and silently diverges from the COW copy. The flush is a broadcast
+     * IPI on a path that already walks the whole address space; correctness
+     * first, and it can be narrowed later off the CLONE_VM sharer count
+     * (vma_hdr_t.rc) if fork latency ever matters. */
+    if (g_cow_fork)
         tlb_flush_all_cpus();
 
     /* 5. Allocate child kernel stack (4 pages / 16 KB — same as proc_spawn).

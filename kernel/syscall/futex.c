@@ -121,11 +121,28 @@ uint64_t sys_futex(uint64_t addr, uint64_t op, uint64_t val,
         irqflags_t fl = spin_lock_irqsave(&futex_lock);
         uint32_t i;
         futex_waiter_t *w = (futex_waiter_t *)0;
+        uint64_t my_mm = current_proc()->pml4_phys;
+        uint32_t mine  = 0;
         for (i = 0; i < FUTEX_MAX_WAIT; i++) {
-            if (!s_pool[i].in_use) {
-                w = &s_pool[i];
-                break;
+            if (s_pool[i].in_use) {
+                if (s_pool[i].mm == my_mm)
+                    mine++;
+                continue;
             }
+            if (!w)
+                w = &s_pool[i];
+        }
+        /* Per-address-space quota. The pool is global, so one process that
+         * parks FUTEX_MAX_WAIT threads used to starve every OTHER process:
+         * their pthread_mutex_lock got ENOMEM, which musl does not expect and
+         * does not handle. Charging per pml4_phys (threads of a process share
+         * it, so it is exactly "this process") bounds the damage to the
+         * offender — it hits its own ceiling while everyone else keeps
+         * working. FUTEX_MAX_WAIT/2 still allows far more blocked threads than
+         * any real program holds. */
+        if (mine >= FUTEX_MAX_WAIT / 2) {
+            spin_unlock_irqrestore(&futex_lock, fl);
+            return SYS_ERR(ENOMEM);
         }
         if (!w) {
             spin_unlock_irqrestore(&futex_lock, fl);
