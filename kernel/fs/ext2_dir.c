@@ -103,7 +103,11 @@ int ext2_dir_add_entry(uint32_t dir_ino, uint32_t child_ino,
         if (!data)
             return -1;
         uint32_t block_pos = 0;
-        while (block_pos < s_block_size) {
+        /* + 8 <=, not <: a dirent header is 8 bytes, so a block_pos in the
+         * last 7 bytes of the slot let the read of de->rec_len/name_len run
+         * past the 4096-byte cache slot. The other three walkers in this file
+         * already guard it this way. Corrupt/crafted image only. */
+        while (block_pos + 8 <= s_block_size) {
             ext2_dirent_t *de = (ext2_dirent_t *)(data + block_pos);
             if (de->rec_len < 8 || block_pos + de->rec_len > s_block_size)
                 break;
@@ -189,7 +193,11 @@ int ext2_dir_remove_entry(uint32_t dir_ino, const char *name)
             return -1;
         uint32_t block_pos = 0;
         ext2_dirent_t *prev = (void *)0;
-        while (block_pos < s_block_size) {
+        /* + 8 <=, not <: a dirent header is 8 bytes, so a block_pos in the
+         * last 7 bytes of the slot let the read of de->rec_len/name_len run
+         * past the 4096-byte cache slot. The other three walkers in this file
+         * already guard it this way. Corrupt/crafted image only. */
+        while (block_pos + 8 <= s_block_size) {
             ext2_dirent_t *de = (ext2_dirent_t *)(data + block_pos);
             if (de->rec_len < 8 || block_pos + de->rec_len > s_block_size)
                 break;

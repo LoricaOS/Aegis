@@ -124,9 +124,18 @@ elf_load(struct aegis_process *proc, uint64_t pml4_phys, const uint8_t *data,
                 printk("[ELF] FAIL: PT_INTERP path too long\n");
                 return -1;
             }
+            /* p_filesz == 0 passes both bounds checks above trivially, and
+             * the old code then PROMOTED it to 255 — reading up to 255 bytes
+             * past the end of the ELF buffer. On a file that is an exact
+             * multiple of 4096 there is no slack after it, so that is either a
+             * kernel #PF with no fixup (panic) or 255 bytes of adjacent kernel
+             * heap becoming the interpreter path. An empty PT_INTERP is
+             * malformed; reject it. */
+            if (ph->p_filesz == 0) {
+                printk("[ELF] FAIL: PT_INTERP with zero length\n");
+                return -1;
+            }
             uint64_t plen = ph->p_filesz;
-            if (plen == 0 || plen > 255)
-                plen = 255;
             const char *src = (const char *)(data + ph->p_offset);
             uint64_t ci;
             for (ci = 0; ci < plen && src[ci] != '\0'; ci++)
