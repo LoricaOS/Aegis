@@ -223,7 +223,7 @@ int ip_send(netdev_t *dev, ip4_addr_t dst_ip, uint8_t proto,
  * pings assemble into each other. 1480 B == the IP payload ceiling. */
 #define ICMP_REPLY_MAX 1480
 
-static void icmp_rx(netdev_t *dev, ip4_addr_t src_ip,
+static void icmp_rx(netdev_t *dev, ip4_addr_t src_ip, ip4_addr_t dst_ip,
                     const icmp_hdr_t *icmp, uint16_t len)
 {
     if (icmp->type == 0) {
@@ -244,8 +244,26 @@ static void icmp_rx(netdev_t *dev, ip4_addr_t src_ip,
             if (s == 0 || s == 0xFFFFFFFFu) return;  /* 0.0.0.0 / limited bcast */
             if ((s >> 28) == 0xE) return;            /* 224.0.0.0/4 multicast   */
         }
+        /* And guard the DESTINATION, which the source check above does not
+         * cover. Answering an echo sent to a broadcast or multicast address
+         * makes this host a smurf REFLECTOR: one packet from the attacker,
+         * addressed to the subnet broadcast with the victim as source, becomes
+         * a reply from every machine that answers — here with a fully
+         * attacker-chosen 1472-byte payload. Only reply to echoes addressed to
+         * us specifically. (s_my_ip == 0 during DHCP bootstrap: reply to
+         * nothing rather than to everything.) */
+        {
+            ip4_addr_t me;
+            net_get_config(&me, (ip4_addr_t *)0, (ip4_addr_t *)0);
+            if (me == 0 || dst_ip != me)
+                return;
+        }
         uint8_t icmp_buf[ICMP_REPLY_MAX];
         if (len > (uint16_t)sizeof(icmp_buf)) return;
+        /* Verify the checksum before acting on the packet — TCP and UDP both
+         * do, ICMP did not, so a corrupted echo was answered as if valid. */
+        if (net_checksum_finish(net_checksum(icmp, len)) != 0)
+            return;
         kmemcpy(icmp_buf, icmp, len);
         icmp_hdr_t *reply = (icmp_hdr_t *)icmp_buf;
         reply->type     = 0;
@@ -317,7 +335,8 @@ void ip_rx(netdev_t *dev, const void *frame,
     switch (hdr->proto) {
     case IP_PROTO_ICMP:
         if (data_len >= (uint16_t)sizeof(icmp_hdr_t))
-            icmp_rx(dev, hdr->src, (const icmp_hdr_t *)proto_data, data_len);
+            icmp_rx(dev, hdr->src, hdr->dst,
+                    (const icmp_hdr_t *)proto_data, data_len);
         break;
     case IP_PROTO_TCP:
         if (data_len >= 20u)   /* minimum TCP header is 20 bytes */
