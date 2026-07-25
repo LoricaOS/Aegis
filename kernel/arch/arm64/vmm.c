@@ -49,8 +49,15 @@
 /* Table descriptor (levels 0-2 pointing at a next-level table). */
 #define A64_TABLE (3UL)                 /* valid | table */
 /* Block descriptor bits (level 1 = 1GB, level 2 = 2MB). */
+/* PXN as well as UXN: this attribute backs the whole-RAM direct map, which
+ * aliases every physical page kernel-writable. Without PXN it aliases them
+ * kernel-EXECUTABLE too, so a write primitive anywhere becomes code execution
+ * by jumping to the alias — the arm64 twin of the x86 physmap NX in
+ * kernel/mm/vmm.c. The kernel image is mapped separately (step 1 of vmm_init)
+ * and is unaffected; nothing legitimately executes out of the direct map. */
 #define A64_BLOCK_NORMAL (A64_PTE_VALID | A64_PTE_AF | A64_PTE_SH_IS | \
-                          A64_PTE_ATTR(A64_ATTR_NORMAL_WB) | A64_PTE_UXN)
+                          A64_PTE_ATTR(A64_ATTR_NORMAL_WB) | \
+                          A64_PTE_UXN | A64_PTE_PXN)
 #define A64_BLOCK_DEVICE (A64_PTE_VALID | A64_PTE_AF | \
                           A64_PTE_ATTR(A64_ATTR_DEVICE) | \
                           A64_PTE_UXN | A64_PTE_PXN)
@@ -557,7 +564,8 @@ vmm_set_user_prot(uint64_t pml4_phys, uint64_t virt, uint64_t flags)
     }
 
     uint64_t phys   = ARCH_PTE_ADDR(old);
-    uint64_t old_sw = old & (A64_PTE_SW_COW | A64_PTE_SW_SHARED);
+    uint64_t old_sw = old & (A64_PTE_SW_COW | A64_PTE_SW_SHARED |
+                             A64_PTE_SW_OWNED);
 
     if (!(old & A64_PTE_VALID)) {
         /* PROT_NONE-stored page: phys retained with VALID clear. */
@@ -738,11 +746,23 @@ vmm_cow_user_pages(uint64_t src_pml4, uint64_t dst_pml4)
                     uint64_t aflags = arch_pte_to_flags(pte) &
                                       ~0x0000FFFFFFFFF000UL;
 
-                    if (aflags & VMM_FLAG_SHARED) {
-                        /* Driver-owned shared RAM: inherit as-is, no ref,
-                         * no COW (see the x86 vmm.c rationale). */
+                    if (aflags & (VMM_FLAG_SHARED | VMM_FLAG_SHARED_OWNED)) {
+                        /* Shared RAM: inherit the mapping AS-IS — never
+                         * COW-break it, or the child stops sharing.
+                         * VMM_FLAG_SHARED is driver-owned (fb) and takes no
+                         * reference; VMM_FLAG_SHARED_OWNED is a refcounted
+                         * memfd frame and the child's mapping is a new
+                         * reference. This whole branch used to test SHARED
+                         * only — and arch_pte_to_flags could not even report
+                         * SHARED_OWNED — so memfd MAP_SHARED pages fell into
+                         * the COW branch below and a compositor client that
+                         * forked after mapping its window silently de-shared
+                         * it. Mirrors x86 vmm.c. */
                         if (map_page_in(dst_pml4, va, phys, aflags, 0) < 0)
                             goto oom;
+                        if ((aflags & VMM_FLAG_SHARED_OWNED) &&
+                            pmm_ref_page(phys) < 0)
+                            goto oom;          /* refcount saturated */
                     } else if (aflags & VMM_FLAG_WRITABLE) {
                         uint64_t cow = (aflags & ~VMM_FLAG_WRITABLE)
                                        | VMM_FLAG_COW;

@@ -318,9 +318,20 @@ vmm_init(void)
         for (uint64_t g = 0; g < ngb; g++) {
             uint64_t pd_phys = alloc_table_early();
             uint64_t *pd = early_pv(pd_phys);
+            /* NX on every physmap page. The direct map aliases ALL of RAM
+             * supervisor-writable, so without NX it also aliases it
+             * supervisor-EXECUTABLE — which defeats SMEP entirely: write
+             * shellcode into a page you legitimately own, then jump to its
+             * physmap alias, which is a kernel address SMEP is happy to
+             * execute. Nothing legitimately executes through this window; the
+             * kernel image has its own mapping. This does not make the kernel
+             * W^X on its own (.text is still mapped writable, which needs a
+             * linker-script split), but it removes the alias that turns any
+             * write primitive into code execution. */
             for (uint64_t e = 0; e < 512; e++)
                 pd[e] = ((g << 30) + (e << 21))
-                        | arch_pte_from_flags(VMM_FLAG_PRESENT | VMM_FLAG_WRITABLE)
+                        | arch_pte_from_flags(VMM_FLAG_PRESENT | VMM_FLAG_WRITABLE
+                                              | VMM_FLAG_NX)
                         | (1UL << 7);                 /* PS: 2MB huge page */
             pm_pdpt[g] = pd_phys
                          | arch_pte_from_flags(VMM_FLAG_PRESENT | VMM_FLAG_WRITABLE);

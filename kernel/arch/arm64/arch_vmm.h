@@ -38,6 +38,14 @@
 #define A64_PTE_UXN     (1UL << 54)
 #define A64_PTE_SW_COW    (1UL << 55)
 #define A64_PTE_SW_SHARED (1UL << 56)
+/* Software bit for VMM_FLAG_SHARED_OWNED. arm64 had NO bit for it, so the flag
+ * was silently DROPPED in both directions of the translation below — which
+ * meant a memfd MAP_SHARED page was not recognised as shared-and-refcounted at
+ * fork, got COW-broken like private memory, and a compositor client that forks
+ * after mapping its window silently stopped sharing it. That is the exact bug
+ * x86's bit 11 was introduced to fix, live on the primary hardware target.
+ * Bit 57 is IGNORED by the architecture for software use, like 55/56. */
+#define A64_PTE_SW_OWNED  (1UL << 57)
 
 /* MAIR_EL1 attribute indices programmed by entry.S (see MAIR_VALUE there). */
 #define A64_ATTR_NORMAL_WB 0
@@ -75,6 +83,8 @@ arch_pte_from_flags(uint64_t flags)
         pte |= A64_PTE_SW_COW;
     if (flags & (1UL << 10))                  /* VMM_FLAG_SHARED */
         pte |= A64_PTE_SW_SHARED;
+    if (flags & (1UL << 11))                  /* VMM_FLAG_SHARED_OWNED */
+        pte |= A64_PTE_SW_OWNED;
     return pte;
 }
 
@@ -100,6 +110,8 @@ arch_pte_to_flags(uint64_t pte)
         f |= (1UL << 9);
     if (pte & A64_PTE_SW_SHARED)
         f |= (1UL << 10);
+    if (pte & A64_PTE_SW_OWNED)
+        f |= (1UL << 11);                      /* VMM_FLAG_SHARED_OWNED */
     if (pte & A64_PTE_UXN)
         f |= (1UL << 63);
     return f;
