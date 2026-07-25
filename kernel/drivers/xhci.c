@@ -3182,10 +3182,21 @@ xhci_poll(void)
              * mouse moved. Per-report diagnostics belong behind a debug flag, not
              * unconditionally on the hot input path. */
             if (!s_hid_buf[slot]) goto next_trb;  /* alloc failure guard */
+            /* Actual bytes transferred = requested - residual. The Transfer
+             * Event's status low 24 bits carry the residual, and this used to
+             * pass a hardcoded 8: a short report (fewer than 8 bytes moved)
+             * then had the TAIL OF THE PREVIOUS REPORT parsed as live key or
+             * button state, because the buffer is reused and never cleared.
+             * Stuck/duplicated keys are exactly that shape. Clamp defensively —
+             * a device may report a residual larger than the request. */
+            uint32_t resid  = (uint32_t)(trb->status & 0x00FFFFFFu);
+            uint32_t got    = (resid >= 8u) ? 0u : (8u - resid);
+            if (got == 0) goto rearm_hid;    /* nothing transferred */
             if (s_hid_slot_type[slot] == USB_DEV_KBD)
-                usb_hid_process_report(s_hid_buf[slot], 8u);
+                usb_hid_process_report(s_hid_buf[slot], got);
             else if (s_hid_slot_type[slot] == USB_DEV_MOUSE)
-                usb_mouse_process_report(s_hid_buf[slot], 8u);
+                usb_mouse_process_report(s_hid_buf[slot], got);
+rearm_hid:;
             /* Re-arm: schedule the next interrupt IN */
             xhci_schedule_interrupt_in(slot, XHCI_EP1_IN_DCI,
                                        s_hid_buf_phys[slot], 8u);

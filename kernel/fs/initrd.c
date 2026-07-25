@@ -569,6 +569,9 @@ static vfs_file_t s_audio_file = {
 /* ── /dev/mouse VFS device ──────────────────────────────────────────────── */
 
 #include "usb_mouse.h"
+#include "sched.h"
+#include "proc.h"
+#include "cap.h"
 #include "../sched/waitq.h"
 
 extern waitq_t g_mouse_waiters;
@@ -584,6 +587,26 @@ static int
 mouse_read_fn(void *priv, void *buf, uint64_t off, uint64_t len)
 {
     (void)priv; (void)off;
+    /* Pointer input is privileged. /dev/mouse was mode 0444 with NO capability
+     * check at all, so any process could tap every mouse event system-wide —
+     * enough to reconstruct on-screen PIN or password entry — and, because
+     * mouse_poll CONSUMES from a shared ring, could starve the compositor of
+     * its own input by draining it first. Compare /dev/console at 0600 and the
+     * framebuffer behind CAP_KIND_FB.
+     *
+     * CAP_KIND_FB is the right gate rather than a new kind: whoever drives
+     * scanout is exactly who should be reading pointer input, and lumen
+     * already holds it. Mode also tightened to 0400 so the DAC agrees with the
+     * capability. */
+    {
+        aegis_task_t *t = sched_current();
+        if (t && t->is_user) {
+            aegis_process_t *p = (aegis_process_t *)t;
+            if (cap_check(p->caps, CAP_TABLE_SIZE, CAP_KIND_FB,
+                          CAP_RIGHTS_READ) != 0)
+                return -EACCES;
+        }
+    }
     uint32_t count = 0;
     uint32_t max_events = (uint32_t)(len / sizeof(mouse_event_t));
 
@@ -612,7 +635,7 @@ mouse_stat_fn(void *priv, k_stat_t *st)
 {
     (void)priv;
     __builtin_memset(st, 0, sizeof(*st));
-    st->st_mode  = S_IFCHR | 0444;
+    st->st_mode  = S_IFCHR | 0400;   /* pointer input is privileged */
     st->st_ino   = 8;
     st->st_rdev  = makedev(13, 0);
     st->st_dev   = 1;
@@ -666,7 +689,7 @@ static const dev_special_t s_dev_table[] = {
     { "/dev/random",   "random",  &s_urandom_file, S_IFCHR|0666, 5, makedev(1,9)  },
     { "/dev/null",     "null",    &s_null_file,    S_IFCHR|0666, 4, makedev(1,3)  },
     { "/dev/audio",    "audio",   &s_audio_file,   S_IFCHR|0666, 9, makedev(14,4) },
-    { "/dev/mouse",    "mouse",   &s_mouse_file,   S_IFCHR|0444, 8, makedev(13,0) },
+    { "/dev/mouse",    "mouse",   &s_mouse_file,   S_IFCHR|0400, 8, makedev(13,0) },
     /* console family: shared singleton via kbd_vfs_open — file=NULL because
      * the singleton is a dynamic pointer (returned by kbd_vfs_open at open
      * time, not a stable static address).  Open handled before the walk.

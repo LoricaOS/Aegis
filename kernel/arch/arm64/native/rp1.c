@@ -346,8 +346,15 @@ gem_send(netdev_t *dev, const void *pkt, uint16_t len)
     (void)dev;
     if (len < 14 || len > RX_BUFSZ) return -1;
     uint32_t i = s_gem.tx_prod;
+    int freed = 0;
     for (int t = 0; t < 200000; t++)               /* this slot free (USED set)? */
-        if (s_gem.tx_ring[i*4 + 1] & (1u << 31)) break;
+        if (s_gem.tx_ring[i*4 + 1] & (1u << 31)) { freed = 1; break; }
+    /* The loop used to fall through on timeout and transmit anyway, so a slot
+     * the GEM still owned was overwritten mid-DMA — the previous frame goes out
+     * corrupted or truncated. Drop this frame instead; the upper layers
+     * retransmit. */
+    if (!freed)
+        return -1;
     uint8_t *buf = s_gem.tx_bufs + (uint64_t)i * RX_BUFSZ;
     __builtin_memcpy(buf, pkt, len);
     uint64_t bd = kva_page_phys(buf) + RP1_DMA_OFFSET;

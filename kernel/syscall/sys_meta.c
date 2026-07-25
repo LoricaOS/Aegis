@@ -420,6 +420,17 @@ sys_chown(uint64_t arg1, uint64_t arg2, uint64_t arg3)
     int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
                                  CAP_RIGHTS_READ) == 0);
 
+    /* No GIVE-AWAY chown. meta_gate_locked already requires the caller to own
+     * the file, but owning it did not stop handing it to somebody else — and
+     * "chown it to the account I want to attack, then let them run it" is the
+     * classic setup. An unprivileged caller may only chown to itself (a no-op
+     * on uid, useful for gid); anything else needs INSTALL, which is the
+     * authority the installer legitimately uses to place files for a service.
+     * (uint32_t)-1 means "unchanged", per POSIX. */
+    if (!has_install && (uint32_t)arg2 != 0xFFFFFFFFu &&
+        (uint32_t)arg2 != proc->uid)
+        return SYS_ERR(EPERM);
+
     /* Validate and mutate under ONE ext2_lock hold — see meta_gate_locked. */
     irqflags_t fl = ext2_lock_acquire();
     int r = meta_gate_locked(resolved, proc, 1 /* follow */);
@@ -575,6 +586,11 @@ sys_lchown(uint64_t arg1, uint64_t arg2, uint64_t arg3)
 
     int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
                                  CAP_RIGHTS_READ) == 0);
+
+    /* No give-away chown — see sys_chown. */
+    if (!has_install && (uint32_t)arg2 != 0xFFFFFFFFu &&
+        (uint32_t)arg2 != proc->uid)
+        return SYS_ERR(EPERM);
 
     /* Validate and mutate under ONE ext2_lock hold — see meta_gate_locked.
      * follow = 0: lchown operates on the link itself. */
