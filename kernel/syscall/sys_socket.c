@@ -1395,6 +1395,11 @@ sys_ppoll(uint64_t fds_ptr, uint64_t nfds, uint64_t ts_ptr,
         timeout_ms = (uint64_t)-1;    /* NULL timespec → block indefinitely */
     } else {
         struct { int64_t tv_sec; int64_t tv_nsec; } ts;
+        /* Validate before copying — sys_select and pselect6 both do. Without
+         * it the copy's success or failure is a mapped/unmapped probe, and the
+         * fault-fixup path a timing oracle. */
+        if (!user_ptr_valid(ts_ptr, sizeof(ts)))
+            return SYS_ERR(EFAULT);
         if (copy_from_user(&ts, (const void *)(uintptr_t)ts_ptr, sizeof(ts)) != 0)
             return SYS_ERR(EFAULT);
         int64_t ms = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;

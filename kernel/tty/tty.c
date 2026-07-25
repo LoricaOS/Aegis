@@ -546,6 +546,18 @@ int tty_ioctl(tty_t *tty, uint32_t cmd, uint64_t arg)
         return 0;
     }
 
+    /* Pre-validate (and therefore pre-fault) the termios buffer BEFORE taking
+     * tty_global_lock. user_ptr_valid falls through to mm_populate_fault,
+     * which for a lazy file-backed page does a full ext2 read through the
+     * block layer — so `ioctl(0, TCGETS, untouched_lazy_page)` used to force a
+     * disk read inside an IF=0 critical section every other CPU spins on. The
+     * check inside the switch stays as the authoritative one; this just makes
+     * it hit a page that is already present. */
+    if (cmd == TCGETS || cmd == TCSETS || cmd == TCSETSW || cmd == TCSETSF) {
+        if (!user_ptr_valid(arg, sizeof(k_termios_t)))
+            return -14;   /* -EFAULT */
+    }
+
     irqflags_t fl = spin_lock_irqsave(&tty_global_lock);
     int rc;
     switch (cmd) {

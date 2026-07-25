@@ -112,6 +112,21 @@ sys_blkdev_io(uint64_t arg1, uint64_t arg2, uint64_t arg3,
      * one-page bounce. */
     static uint8_t s_bounce[65536];
     static spinlock_t blkdev_io_lock = SPINLOCK_INIT;
+
+    /* Validate — and thereby pre-fault — the ENTIRE user range before taking
+     * the lock. The per-chunk checks below stay, but they must not be the
+     * first touch: user_ptr_valid falls through to mm_populate_fault, which
+     * for a lazy file-backed page issues a full ext2 read through the block
+     * layer. Doing that while holding blkdev_io_lock with interrupts off (and
+     * while the block device is mid-transfer) is a lock-order inversion into
+     * the very layer this call is driving. */
+    {
+        uint32_t vbs = dev->block_size ? dev->block_size : 512u;
+        uint64_t total = count * (uint64_t)vbs;
+        if (total && !user_ptr_valid(arg4, total))
+            return SYS_ERR(EFAULT);
+    }
+
     irqflags_t io_fl = spin_lock_irqsave(&blkdev_io_lock);
     uint32_t bs = dev->block_size ? dev->block_size : 512u;
     /* Fail closed rather than clamping the chunk count UP. With bs > 65536

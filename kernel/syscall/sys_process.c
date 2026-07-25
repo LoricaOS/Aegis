@@ -1054,6 +1054,20 @@ sys_waitpid(uint64_t pid_arg, uint64_t wstatus_ptr, uint64_t options)
     aegis_process_t *caller = current_proc();
     int32_t          pid    = (int32_t)(uint32_t)pid_arg;
 
+    /* Validate the status pointer HERE, outside sched_lock.
+     *
+     * user_ptr_valid is not the cheap range check its name suggests: it falls
+     * through to mm_populate_fault, which takes the PMM lock and, for a lazy
+     * VMA_FILE mapping (the default), performs a FULL ext2 READ through the
+     * block layer. Doing that inside the sched_lock critical section — which
+     * every other CPU spins on with interrupts off — turns a waitpid on an
+     * untouched page into a multi-millisecond global stall, plus a lock-order
+     * inversion (sched_lock above the fs and block layers). Calling it here
+     * also pre-faults the page, so the checks that remain under the lock are
+     * pure range tests against a present mapping. */
+    if (wstatus_ptr && !user_ptr_valid(wstatus_ptr, 4))
+        return SYS_ERR(EFAULT);
+
 retry:;
     /* Scan the task list for a matching child (stopped or zombie).
      *

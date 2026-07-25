@@ -548,7 +548,14 @@ vfs_stat_path(const char *path, k_stat_t *out)
         if (ext2_open(path, &ino) == 0) {
             int sz = ext2_file_size(ino);
             if (sz < 0) sz = 0;
+            /* Zero the inode BEFORE the read: on failure the six fields
+             * copied out below (links_count, uid, gid, atime, mtime, ctime)
+             * were read from an uninitialised stack struct and handed to
+             * userspace. Narrow — the open has to succeed while the inode read
+             * fails — but vfs_stat_path_ex already does it correctly, so this
+             * just mirrors it. */
             ext2_inode_t inode;
+            __builtin_memset(&inode, 0, sizeof(inode));
             uint32_t mode;
             if (ext2_read_inode(ino, &inode) == 0)
                 mode = (uint32_t)inode.i_mode;

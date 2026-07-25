@@ -400,7 +400,11 @@ sys_stat(uint64_t arg1, uint64_t arg2)
     if (stat_copy_path(arg1, path, sizeof(path)) != 0)
         return SYS_ERR(EFAULT);
 
+    /* Zero-init like sys_lstat and sys_fstat already do: padding inside
+     * k_stat_t, and any field a VFS backend forgets to populate, must not
+     * leak kernel stack to userspace. sys_stat was the odd one out. */
     k_stat_t ks;
+    __builtin_memset(&ks, 0, sizeof(ks));
     int rc = vfs_stat_path(path, &ks);
     if (rc != 0) return SYS_ERR(ENOENT);
 
