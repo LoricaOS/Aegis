@@ -71,8 +71,11 @@ void net_get_config(ip4_addr_t *ip, ip4_addr_t *mask, ip4_addr_t *gw)
 
 /* ---- IP send ----------------------------------------------------------- */
 
-/* Static IP packet assembly buffer (1480 bytes payload max: 1500 MTU - 20 IP hdr). */
-static uint8_t s_ip_buf[1500];
+/* s_ip_id — IP identification counter. Shared, so it is bumped under ip_lock.
+ * (The 1500-byte static assembly buffer that used to live here is gone: the
+ * packet was built in it under ip_lock and then memcpy'd to a stack buffer
+ * before the lock was dropped, so it was pure indirection — one static and one
+ * copy. Build straight into the stack buffer instead.) */
 static uint16_t s_ip_id;
 
 /* ── Loopback queue ──────────────────────────────────────────────────────
@@ -88,13 +91,37 @@ static uint32_t s_lo_head;   /* next write slot */
 static uint32_t s_lo_tail;   /* next read slot */
 static netdev_t *s_lo_dev;   /* device context for ip_rx callback */
 
+/* Single-flight guard for the drain below. netdev_poll_all is serialised by
+ * netdev_lock; loopback never was, and poll sources run on EVERY core (the
+ * arm64 timer PPI is per-core). Two cores in the loop below raced the
+ * non-atomic s_lo_tail++: the same slot got delivered twice, or tail moved
+ * BACKWARDS and replayed up to 8 stale packets into ip_rx. */
+static volatile uint32_t s_lo_draining;
+
 void ip_loopback_poll(void)
 {
-    while (s_lo_tail != s_lo_head) {
-        uint32_t idx = s_lo_tail & (LO_RING_SIZE - 1);
+    /* Claim the drain. A CPU that loses just returns — the winner is already
+     * draining the ring, including anything queued since. This is a flag and
+     * not ip_lock because ip_rx re-enters the stack (ip_rx -> tcp_rx ->
+     * ip_send) and would deadlock on the non-recursive ip_lock. */
+    if (__atomic_exchange_n(&s_lo_draining, 1u, __ATOMIC_ACQUIRE))
+        return;
+
+    /* Only this CPU touches s_lo_tail while the claim is held, so the
+     * increment needs no atomic; the store is RELEASE-ordered so ip_send's
+     * ring-full test (under ip_lock) sees the slot freed. Producers only ever
+     * advance s_lo_head, so re-reading it each pass picks up new work.
+     * The slot stays counted as occupied across ip_rx — tail advances only
+     * after delivery — so a producer cannot overwrite what we are reading. */
+    while (__atomic_load_n(&s_lo_tail, __ATOMIC_RELAXED) !=
+           __atomic_load_n(&s_lo_head, __ATOMIC_ACQUIRE)) {
+        uint32_t tail = __atomic_load_n(&s_lo_tail, __ATOMIC_RELAXED);
+        uint32_t idx  = tail & (LO_RING_SIZE - 1);
         ip_rx(s_lo_dev, (void *)0, s_lo_ring[idx], s_lo_len[idx]);
-        s_lo_tail++;
+        __atomic_store_n(&s_lo_tail, tail + 1, __ATOMIC_RELEASE);
     }
+
+    __atomic_store_n(&s_lo_draining, 0u, __ATOMIC_RELEASE);
 }
 
 int ip_send(netdev_t *dev, ip4_addr_t dst_ip, uint8_t proto,
@@ -140,8 +167,12 @@ int ip_send(netdev_t *dev, ip4_addr_t dst_ip, uint8_t proto,
         return -1;
     }
 
-    /* Build 20-byte IPv4 header in shared buffer under ip_lock. */
-    ip_hdr_t *hdr   = (ip_hdr_t *)s_ip_buf;
+    /* Build the packet directly in the stack buffer, under ip_lock (s_ip_id
+     * and the address config are shared). The lock must be dropped before
+     * arp_resolve/eth_send, which take arp_lock: the order is arp_lock >
+     * ip_lock, so holding ip_lock into them would invert it. */
+    uint8_t   local_pkt[1500];
+    ip_hdr_t *hdr   = (ip_hdr_t *)local_pkt;
     uint16_t  total = (uint16_t)(sizeof(ip_hdr_t) + len);
 
     hdr->ver_ihl    = 0x45;
@@ -156,14 +187,9 @@ int ip_send(netdev_t *dev, ip4_addr_t dst_ip, uint8_t proto,
     hdr->dst        = dst_ip;
     hdr->checksum   = net_checksum_finish(net_checksum(hdr, sizeof(ip_hdr_t)));
 
-    kmemcpy(s_ip_buf + sizeof(ip_hdr_t), payload, len);
+    kmemcpy(local_pkt + sizeof(ip_hdr_t), payload, len);
 
-    /* Copy assembled packet to stack-local buffer and snapshot config so we
-     * can release ip_lock before calling arp_resolve/eth_send (which acquire
-     * arp_lock).  Lock ordering: arp_lock > ip_lock — holding ip_lock while
-     * acquiring arp_lock would be an inversion. */
-    uint8_t local_pkt[1500];
-    kmemcpy(local_pkt, s_ip_buf, total);
+    /* Snapshot the config we need after the unlock. */
     ip4_addr_t my_ip   = s_my_ip;
     ip4_addr_t netmask = s_netmask;
     ip4_addr_t gateway = s_gateway;
@@ -192,7 +218,10 @@ int ip_send(netdev_t *dev, ip4_addr_t dst_ip, uint8_t proto,
 
 /* ---- ICMP -------------------------------------------------------------- */
 
-static uint8_t s_icmp_buf[1480];
+/* ICMP echo replies are built on the caller's stack, not in a shared static:
+ * icmp_rx runs from ip_rx on every core, so a shared buffer let two concurrent
+ * pings assemble into each other. 1480 B == the IP payload ceiling. */
+#define ICMP_REPLY_MAX 1480
 
 static void icmp_rx(netdev_t *dev, ip4_addr_t src_ip,
                     const icmp_hdr_t *icmp, uint16_t len)
@@ -215,13 +244,14 @@ static void icmp_rx(netdev_t *dev, ip4_addr_t src_ip,
             if (s == 0 || s == 0xFFFFFFFFu) return;  /* 0.0.0.0 / limited bcast */
             if ((s >> 28) == 0xE) return;            /* 224.0.0.0/4 multicast   */
         }
-        if (len > (uint16_t)sizeof(s_icmp_buf)) return;
-        kmemcpy(s_icmp_buf, icmp, len);
-        icmp_hdr_t *reply = (icmp_hdr_t *)s_icmp_buf;
+        uint8_t icmp_buf[ICMP_REPLY_MAX];
+        if (len > (uint16_t)sizeof(icmp_buf)) return;
+        kmemcpy(icmp_buf, icmp, len);
+        icmp_hdr_t *reply = (icmp_hdr_t *)icmp_buf;
         reply->type     = 0;
         reply->checksum = 0;
-        reply->checksum = net_checksum_finish(net_checksum(s_icmp_buf, len));
-        ip_send(dev, src_ip, IP_PROTO_ICMP, s_icmp_buf, len);
+        reply->checksum = net_checksum_finish(net_checksum(icmp_buf, len));
+        ip_send(dev, src_ip, IP_PROTO_ICMP, icmp_buf, len);
     }
     /* All other ICMP types: drop silently. */
 }

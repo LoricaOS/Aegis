@@ -67,7 +67,13 @@ static tcp_conn_t s_tcp[TCP_MAX_CONNS];
  * Leaves the majority of the table for completed/outbound use. */
 #define TCP_SYN_BACKLOG_MAX 32
 
-static uint8_t s_tcp_buf[1480];
+/* TCP_TX_BUF — one segment's worth of TX scratch (20B header + 1460B MSS).
+ * Deliberately NOT a shared static any more: the three builders below run with
+ * tcp_lock RELEASED (ip_send -> arp_resolve can block, and holding tcp_lock
+ * across it deadlocks tcp_tick), so on SMP two senders interleaved in one
+ * buffer and connection B's payload went out to connection A's peer. 1480 B is
+ * ~9% of the 16 KB kernel stack, and these are the leaves of the TX path. */
+#define TCP_TX_BUF 1480
 /* RST template — used by tcp_rx to send RST|ACK for unknown ports.
  * File-static to avoid placing a 16KB tcp_conn_t on the ISR stack. */
 static tcp_conn_t s_rst_conn;
@@ -168,7 +174,7 @@ static int tcp_parse_wscale(const uint8_t *opts, uint32_t optlen, uint8_t *shift
 /* TCP send-side fallback MSS: the conservative IPv4 default (576-byte MTU →
  * 536-byte MSS, RFC 879/1122), used only when the peer's SYN carried no MSS
  * option.  Normally sends chunk to conn->snd_mss (peer MSS, ≤ TCP_ADVMSS;
- * s_tcp_buf is 1480 so a full 1460 segment fits). */
+ * txbuf is 1480 so a full 1460 segment fits). */
 #define TCP_DEFAULT_MSS  536
 
 /* tcp_snd_mss — the segment size to use for conn's outbound data. */
@@ -178,7 +184,7 @@ static inline uint16_t tcp_snd_mss(const tcp_conn_t *c)
 }
 
 /* tcp_parse_mss — same option walk, for the MSS option (RFC 793, kind 2,
- * len 4).  Returns the peer's MSS clamped to TCP_ADVMSS (s_tcp_buf holds one
+ * len 4).  Returns the peer's MSS clamped to TCP_ADVMSS (txbuf holds one
  * full-size segment), or TCP_DEFAULT_MSS if absent/malformed. */
 static uint16_t tcp_parse_mss(const uint8_t *opts, uint32_t optlen)
 {
@@ -222,10 +228,11 @@ static int tcp_send_syn(netdev_t *dev, tcp_conn_t *conn, uint8_t flags)
         opts[olen++] = conn->rcv_wscale;
     }
 
+    uint8_t  txbuf[TCP_TX_BUF];
     uint16_t tcp_len = (uint16_t)(sizeof(tcp_hdr_t) + olen);
-    if (tcp_len > (uint16_t)sizeof(s_tcp_buf)) return -1;
+    if (tcp_len > (uint16_t)sizeof(txbuf)) return -1;
 
-    tcp_hdr_t *hdr = (tcp_hdr_t *)s_tcp_buf;
+    tcp_hdr_t *hdr = (tcp_hdr_t *)txbuf;
     hdr->src_port = htons(conn->local_port);
     hdr->dst_port = htons(conn->remote_port);
     hdr->seq      = htonl(conn->snd_nxt);
@@ -235,7 +242,7 @@ static int tcp_send_syn(netdev_t *dev, tcp_conn_t *conn, uint8_t flags)
     hdr->window   = tcp_adv_window(conn, 1 /* is_syn */);
     hdr->checksum = 0;
     hdr->urgent   = 0;
-    kmemcpy(s_tcp_buf + sizeof(tcp_hdr_t), opts, olen);
+    kmemcpy(txbuf + sizeof(tcp_hdr_t), opts, olen);
 
     tcp_pseudo_hdr_t ph;
     ph.src     = conn->local_ip;
@@ -245,20 +252,21 @@ static int tcp_send_syn(netdev_t *dev, tcp_conn_t *conn, uint8_t flags)
     ph.tcp_len = htons(tcp_len);
     uint32_t sum = 0;
     sum += net_checksum(&ph, sizeof(ph));
-    sum += net_checksum(s_tcp_buf, tcp_len);
+    sum += net_checksum(txbuf, tcp_len);
     hdr->checksum = net_checksum_finish(sum);
 
-    return ip_send(dev, conn->remote_ip, IP_PROTO_TCP, s_tcp_buf, tcp_len);
+    return ip_send(dev, conn->remote_ip, IP_PROTO_TCP, txbuf, tcp_len);
 }
 
 int tcp_send_segment(netdev_t *dev, tcp_conn_t *conn,
                      uint8_t flags, const void *payload, uint16_t len)
 {
     /* dev may be NULL for loopback — ip_send handles it */
+    uint8_t  txbuf[TCP_TX_BUF];
     uint16_t tcp_len = (uint16_t)(sizeof(tcp_hdr_t) + len);
-    if (tcp_len > (uint16_t)sizeof(s_tcp_buf)) return -1;
+    if (tcp_len > (uint16_t)sizeof(txbuf)) return -1;
 
-    tcp_hdr_t *hdr = (tcp_hdr_t *)s_tcp_buf;
+    tcp_hdr_t *hdr = (tcp_hdr_t *)txbuf;
     hdr->src_port = htons(conn->local_port);
     hdr->dst_port = htons(conn->remote_port);
     hdr->seq      = htonl(conn->snd_nxt);
@@ -269,7 +277,7 @@ int tcp_send_segment(netdev_t *dev, tcp_conn_t *conn,
     hdr->checksum = 0;
     hdr->urgent   = 0;
     if (payload && len > 0)
-        __builtin_memcpy(s_tcp_buf + sizeof(tcp_hdr_t), payload, len);
+        __builtin_memcpy(txbuf + sizeof(tcp_hdr_t), payload, len);
 
     tcp_pseudo_hdr_t ph;
     ph.src      = conn->local_ip;
@@ -279,10 +287,10 @@ int tcp_send_segment(netdev_t *dev, tcp_conn_t *conn,
     ph.tcp_len  = htons(tcp_len);
     uint32_t sum = 0;
     sum += net_checksum(&ph, sizeof(ph));
-    sum += net_checksum(s_tcp_buf, tcp_len);
+    sum += net_checksum(txbuf, tcp_len);
     hdr->checksum = net_checksum_finish(sum);
 
-    return ip_send(dev, conn->remote_ip, IP_PROTO_TCP, s_tcp_buf, tcp_len);
+    return ip_send(dev, conn->remote_ip, IP_PROTO_TCP, txbuf, tcp_len);
 }
 
 /* tcp_send_at_seq — like tcp_send_segment but stamps an explicit sequence
@@ -293,10 +301,11 @@ int tcp_send_segment(netdev_t *dev, tcp_conn_t *conn,
 static int tcp_send_at_seq(netdev_t *dev, tcp_conn_t *conn, uint8_t flags,
                            uint32_t seq, const void *payload, uint16_t len)
 {
+    uint8_t  txbuf[TCP_TX_BUF];
     uint16_t tcp_len = (uint16_t)(sizeof(tcp_hdr_t) + len);
-    if (tcp_len > (uint16_t)sizeof(s_tcp_buf)) return -1;
+    if (tcp_len > (uint16_t)sizeof(txbuf)) return -1;
 
-    tcp_hdr_t *hdr = (tcp_hdr_t *)s_tcp_buf;
+    tcp_hdr_t *hdr = (tcp_hdr_t *)txbuf;
     hdr->src_port = htons(conn->local_port);
     hdr->dst_port = htons(conn->remote_port);
     hdr->seq      = htonl(seq);
@@ -307,7 +316,7 @@ static int tcp_send_at_seq(netdev_t *dev, tcp_conn_t *conn, uint8_t flags,
     hdr->checksum = 0;
     hdr->urgent   = 0;
     if (payload && len > 0)
-        __builtin_memcpy(s_tcp_buf + sizeof(tcp_hdr_t), payload, len);
+        __builtin_memcpy(txbuf + sizeof(tcp_hdr_t), payload, len);
 
     tcp_pseudo_hdr_t ph;
     ph.src     = conn->local_ip;
@@ -317,10 +326,10 @@ static int tcp_send_at_seq(netdev_t *dev, tcp_conn_t *conn, uint8_t flags,
     ph.tcp_len = htons(tcp_len);
     uint32_t sum = 0;
     sum += net_checksum(&ph, sizeof(ph));
-    sum += net_checksum(s_tcp_buf, tcp_len);
+    sum += net_checksum(txbuf, tcp_len);
     hdr->checksum = net_checksum_finish(sum);
 
-    return ip_send(dev, conn->remote_ip, IP_PROTO_TCP, s_tcp_buf, tcp_len);
+    return ip_send(dev, conn->remote_ip, IP_PROTO_TCP, txbuf, tcp_len);
 }
 
 /* tcp_unacked — bytes in sbuf awaiting ACK == SND.NXT - SND.UNA. */
