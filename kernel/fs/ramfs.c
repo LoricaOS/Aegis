@@ -8,6 +8,8 @@
 #include "uaccess.h"
 #include "syscall_util.h"
 #include "spinlock.h"
+#include "sched.h"
+#include "proc.h"
 #include "../include/aegis_errno.h"
 #include <stdint.h>
 
@@ -27,6 +29,49 @@ rfs_strcpy(char *dst, const char *src, uint32_t max)
     for (i = 0; i < max - 1 && src[i]; i++)
         dst[i] = src[i];
     dst[i] = '\0';
+}
+
+/* rfs_name_ok — reject a name that would not fit the dentry.
+ *
+ * rfs_strcpy TRUNCATES, and these are flat relative paths ("a/b/c"), so two
+ * long paths sharing a 127-byte prefix collapsed onto ONE dentry: the second
+ * create silently returned the first file. Refuse instead of aliasing. */
+static int
+rfs_name_ok(const char *name)
+{
+    uint32_t i = 0;
+    while (name[i]) {
+        if (i >= RAMFS_MAX_NAMELEN - 1)
+            return 0;
+        i++;
+    }
+    return 1;
+}
+
+/* rfs_caller_uid — identity of the calling process, or a sentinel for
+ * kernel-internal work (ramfs_populate at boot), which is unrestricted. */
+#define RFS_KERNEL_UID 0xFFFFFFFFu
+static uint32_t
+rfs_caller_uid(void)
+{
+    aegis_task_t *t = sched_current();
+    if (!t || !t->is_user)
+        return RFS_KERNEL_UID;
+    return current_proc()->uid;
+}
+
+/* rfs_may — DAC check against an inode. want: 4=read, 2=write.
+ * No uid-0 bypass: authority in Aegis comes from capabilities, not from being
+ * root. Kernel-internal callers pass through. */
+static int
+rfs_may(const ramfs_inode_t *n, uint32_t want)
+{
+    uint32_t uid = rfs_caller_uid();
+    if (uid == RFS_KERNEL_UID)
+        return 1;
+    uint32_t bits = (uid == n->uid) ? (uint32_t)((n->mode >> 6) & 7)
+                                    : (uint32_t)(n->mode & 7);
+    return (bits & want) == want;
 }
 
 /* ── inode / dentry helpers (caller holds inst->lock) ─────────────────── */
@@ -100,6 +145,14 @@ create_named(ramfs_t *inst, const char *name)
     rfs_strcpy(inst->dents[di].name, name, RAMFS_MAX_NAMELEN);
     inst->dents[di].inode = (uint32_t)ii;
     inst->inodes[ii].nlink = 1;
+    /* Stamp the creator's identity. Kernel-internal creates (ramfs_populate at
+     * boot) land as uid 0 with the same default mode. */
+    {
+        uint32_t uid = rfs_caller_uid();
+        inst->inodes[ii].uid  = (uid == RFS_KERNEL_UID) ? 0u : uid;
+        inst->inodes[ii].gid  = inst->inodes[ii].uid;
+        inst->inodes[ii].mode = inst->inodes[ii].is_dir ? 0755 : 0644;
+    }
     return &inst->inodes[ii];
 }
 
@@ -203,9 +256,13 @@ ramfs_stat_fn(void *priv, k_stat_t *st)
     ramfs_inode_t *n = (ramfs_inode_t *)priv;
     __builtin_memset(st, 0, sizeof(*st));
     st->st_dev   = 3;
-    st->st_ino   = 1;
-    st->st_nlink = 1;
-    st->st_mode  = n->is_dir ? (S_IFDIR | 0755) : (S_IFREG | 0644);
+    /* Real, distinct inode number (index+1). Every ramfs file used to report
+     * st_ino == 1, so nothing could tell two /tmp files apart by identity. */
+    st->st_ino   = (uint64_t)(n - n->owner->inodes) + 1;
+    st->st_nlink = n->nlink ? n->nlink : 1;
+    st->st_mode  = (n->is_dir ? S_IFDIR : S_IFREG) | (n->mode & 07777);
+    st->st_uid   = n->uid;
+    st->st_gid   = n->gid;
     st->st_size  = (int64_t)n->size;
     return 0;
 }
@@ -264,6 +321,24 @@ static const vfs_ops_t s_ramfs_dir_ops = {
 };
 
 /* ── Public API ───────────────────────────────────────────────────────── */
+/* ramfs_busy — 1 if any inode in this instance still has an open fd.
+ *
+ * umount frees the whole ramfs_t, and an open fd's vfs priv points INTO it, so
+ * tearing down a busy instance hands the freed pages back to the kva pool while
+ * a live fd can still write through them. Checked by sys_umount. */
+int
+ramfs_busy(ramfs_t *inst)
+{
+    if (!inst) return 0;
+    irqflags_t fl = spin_lock_irqsave(&inst->lock);
+    int busy = 0;
+    for (uint32_t i = 0; i < RAMFS_MAX_INODES; i++) {
+        if (inst->inodes[i].in_use && inst->inodes[i].open_count) { busy = 1; break; }
+    }
+    spin_unlock_irqrestore(&inst->lock, fl);
+    return busy;
+}
+
 
 void
 ramfs_init(ramfs_t *inst)
@@ -281,6 +356,10 @@ int
 ramfs_open(ramfs_t *inst, const char *name, int flags, vfs_file_t *out)
 {
     irqflags_t fl = spin_lock_irqsave(&inst->lock);
+    if (!rfs_name_ok(name)) {
+        spin_unlock_irqrestore(&inst->lock, fl);
+        return -ENAMETOOLONG;   /* would truncate onto another file's dentry */
+    }
     ramfs_dent_t  *d = dent_find(inst, name);
     ramfs_inode_t *n;
     if (!d) {
@@ -302,6 +381,17 @@ ramfs_open(ramfs_t *inst, const char *name, int flags, vfs_file_t *out)
             return -EEXIST;
         }
         n = &inst->inodes[d->inode];
+        /* DAC on an EXISTING file (a fresh create is owned by us by
+         * construction). VFS_O_* has no separate read/write bit here, so gate
+         * on what the open can do: any write intent needs write permission. */
+        {
+            uint32_t want = (flags & (int)(VFS_O_WRONLY | VFS_O_RDWR |
+                                           VFS_O_TRUNC | VFS_O_APPEND)) ? 2u : 4u;
+            if (!rfs_may(n, want)) {
+                spin_unlock_irqrestore(&inst->lock, fl);
+                return -EACCES;
+            }
+        }
     }
     if (flags & (int)VFS_O_TRUNC) {
         uint32_t k;
@@ -410,6 +500,16 @@ ramfs_unlink(ramfs_t *inst, const char *name)
     ramfs_dent_t *d = dent_find(inst, name);
     if (!d) { spin_unlock_irqrestore(&inst->lock, fl); return -ENOENT; }
     ramfs_inode_t *n = &inst->inodes[d->inode];
+    /* Sticky semantics, as /tmp has had since forever elsewhere: only the
+     * owner may remove a name. Without this any process could unlink another's
+     * lockfile or runtime state. */
+    {
+        uint32_t uid = rfs_caller_uid();
+        if (uid != RFS_KERNEL_UID && uid != n->uid) {
+            spin_unlock_irqrestore(&inst->lock, fl);
+            return -EACCES;
+        }
+    }
     d->in_use = 0;                                /* drop the name             */
     if (n->nlink) n->nlink--;
     inode_release(n);                             /* frees only if no open fd  */
@@ -421,12 +521,25 @@ int
 ramfs_rename(ramfs_t *inst, const char *oldname, const char *newname)
 {
     irqflags_t fl = spin_lock_irqsave(&inst->lock);
+    if (!rfs_name_ok(newname)) {
+        spin_unlock_irqrestore(&inst->lock, fl);
+        return -ENAMETOOLONG;
+    }
     ramfs_dent_t *src = dent_find(inst, oldname);
     if (!src) { spin_unlock_irqrestore(&inst->lock, fl); return -ENOENT; }
+    uint32_t ruid = rfs_caller_uid();
+    if (ruid != RFS_KERNEL_UID && ruid != inst->inodes[src->inode].uid) {
+        spin_unlock_irqrestore(&inst->lock, fl);
+        return -EACCES;                 /* not yours to move */
+    }
     /* POSIX replace: if the destination name exists, drop its inode ref. */
     ramfs_dent_t *dst = dent_find(inst, newname);
     if (dst && dst != src) {
         ramfs_inode_t *dn = &inst->inodes[dst->inode];
+        if (ruid != RFS_KERNEL_UID && ruid != dn->uid) {
+            spin_unlock_irqrestore(&inst->lock, fl);
+            return -EACCES;             /* would clobber someone else's file */
+        }
         dst->in_use = 0;
         if (dn->nlink) dn->nlink--;
         inode_release(dn);

@@ -34,6 +34,15 @@ typedef struct {
     uint32_t       nlink;       /* # dentries naming this inode                */
     uint32_t       open_count;  /* # open fds (unlink-while-open keeps it live) */
     uint32_t       size;        /* byte count                                  */
+    /* Ownership + mode. /tmp and /run had NONE of this: every file reported a
+     * fixed S_IFREG|0644 and nothing was checked on any path, so any process
+     * with baseline VFS caps could read, overwrite, unlink or rename any other
+     * process's files there — a daemon's runtime state or a lockfile included.
+     * Recorded from the creating process; enforced in ramfs_open/unlink/rename.
+     * uid 0 gets NO bypass (uid 0 is cosmetic in Aegis). */
+    uint32_t       uid;
+    uint32_t       gid;
+    uint16_t       mode;        /* permission bits only (type comes from is_dir) */
     uint16_t       npages;      /* allocated data pages                        */
     uint8_t       *pages[RAMFS_PAGES_PER_FILE]; /* kva page ptrs; NULL = hole  */
     struct ramfs  *owner;       /* back-pointer for the close path             */
@@ -54,6 +63,11 @@ typedef struct ramfs {
 
 /* ramfs_init — reset all inodes/dentries. Call from vfs_init() before any open. */
 void ramfs_init(ramfs_t *inst);
+
+/* 1 if any file in this instance still has an open fd. umount must refuse in
+ * that case: it frees the whole ramfs_t, and an open fd's vfs priv points INTO
+ * it. */
+int ramfs_busy(ramfs_t *inst);
 
 /* ramfs_open — open or create (if flags & VFS_O_CREAT) a named file.
  * name: flat relative path without the mount prefix (e.g. "vigil.pid", "lb/o.png").

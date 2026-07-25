@@ -201,7 +201,7 @@ vmm_init(void)
 
     uint64_t slide = arch_kern_phys_slide();
     uint64_t root  = alloc_table_or_panic();
-    pr_dbg("[VMM] diagnostic: root table allocated (native-boot bring-up)\n");
+    printk("[VMM] diagnostic: root table allocated (native-boot bring-up)\n");
 
     /* 1. Kernel image: KERN_VMA+PHYS_BASE .. _kernel_end → slide'd phys,
      *    4K pages (Limine guarantees contiguity, not 2MB alignment).
@@ -225,7 +225,7 @@ vmm_init(void)
                 A64_PTE_ATTR(A64_ATTR_NORMAL_WB) | A64_PTE_UXN;
         }
     }
-    pr_dbg("[VMM] diagnostic: step 1 (kernel image) done\n");
+    printk("[VMM] diagnostic: step 1 (kernel image) done\n");
 
     /* 2. Device window: PA [0 .. 1GB) → DMAP_BASE, one 1GB Device block.
      *    Covers the QEMU-virt MMIO space (GICv3 0x080xxxxx, PL011
@@ -250,7 +250,7 @@ vmm_init(void)
         l1[(va >> 30) & 0x1FF] = 0UL | A64_BLOCK_DEVICE;
     }
 #endif
-    pr_dbg("[VMM] diagnostic: step 2 (device window) done\n");
+    printk("[VMM] diagnostic: step 2 (device window) done\n");
 
     /* 2b. Extra device block for the platform UART, if it falls outside
      *    the PA[0,1GB) window above -- real Pi 5 doesn't: its PL011 sits
@@ -271,7 +271,7 @@ vmm_init(void)
             l1[(va >> 30) & 0x1FF] = block | A64_BLOCK_DEVICE;
         }
     }
-    pr_dbg("[VMM] diagnostic: step 2b (UART device block) done\n");
+    printk("[VMM] diagnostic: step 2b (UART device block) done\n");
 
     /* 3. RAM direct map: every usable/reserved-RAM region (incl. the
      *    kernel image and boot modules) → DMAP_BASE + PA, 2MB Normal-WB
@@ -298,14 +298,14 @@ vmm_init(void)
             panic_halt("[VMM] FAIL: no RAM regions");
         lo &= ~0x1FFFFFUL;
         hi  = (hi + 0x1FFFFF) & ~0x1FFFFFUL;
-        pr_dbg("[VMM] diagnostic: step 3 direct-map loop lo=0x%lx hi=0x%lx\n", lo, hi);
+        printk("[VMM] diagnostic: step 3 direct-map loop lo=0x%lx hi=0x%lx\n", lo, hi);
         uint64_t iter = 0;
         for (uint64_t pa = lo; pa < hi; pa += 0x200000UL) {
             /* DIAGNOSTIC (temporary, native-boot bring-up): this loop hangs
              * somewhere on real hardware with no fault/exception visible --
              * periodic checkpoint to narrow down which pa it stalls at. */
             if ((iter & 0xFF) == 0)
-                pr_dbg("[VMM] diagnostic:   iter=%lu pa=0x%lx\n", iter, pa);
+                printk("[VMM] diagnostic:   iter=%lu pa=0x%lx\n", iter, pa);
             iter++;
             uint64_t va  = ARCH_DMAP_BASE + pa;
             uint64_t l1p = ensure_table(root, (va >> 39) & 0x1FF);
@@ -316,12 +316,12 @@ vmm_init(void)
             l2[(va >> 21) & 0x1FF] = pa | A64_BLOCK_NORMAL;
         }
     }
-    pr_dbg("[VMM] diagnostic: step 3 (RAM direct map) done\n");
+    printk("[VMM] diagnostic: step 3 (RAM direct map) done\n");
 
     /* 4. Empty user table — the "master pml4" loaded while no user task
      *    runs (fail closed: kernel-only context has NO user mappings). */
     s_empty_user = alloc_table_or_panic();
-    pr_dbg("[VMM] diagnostic: step 4 (empty user table) done, about to load ttbr1\n");
+    printk("[VMM] diagnostic: step 4 (empty user table) done, about to load ttbr1\n");
 
     /* 5. Go live: load TTBR1, nuke every stale entry. TTBR0 is left on
      * start.c's early device idmap — the PL011 printks below still go

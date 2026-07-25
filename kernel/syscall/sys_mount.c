@@ -107,6 +107,23 @@ sys_umount(uint64_t target_u, uint64_t flags)
     if (copy_path_from_user(target, target_u, sizeof(target)) != 0)
         return SYS_ERR(EFAULT);
 
+    /* Refuse while anything still has the filesystem open. umount used to
+     * unconditionally kva_free_pages the ramfs_t, but an open fd's vfs priv is
+     * a pointer INTO that struct (ramfs.c: the node it opened), so the freed
+     * ~553 KB went straight back to the kva pool that fd_table_alloc and
+     * pipe_t draw from — and further writes through the still-open fd landed
+     * in a freshly allocated fd table, i.e. controlled writes over vfs_ops_t
+     * function pointers. Deterministic, not a race. Needs CAP_KIND_MOUNT to
+     * reach, but "unmount my own tmpfs" is not supposed to be a write-anything
+     * primitive. Check BEFORE unlinking the mount so a busy fs stays usable. */
+    {
+        void *bctx = (void *)0;
+        const char *brel = (const char *)0;
+        if (mount_resolve(target, &bctx, &brel) == MOUNT_FS_TMPFS && bctx &&
+            ramfs_busy((ramfs_t *)bctx))
+            return SYS_ERR(EBUSY);
+    }
+
     void *ctx = (void *)0;
     int ft = mount_remove(target, &ctx);
     if (ft < 0)
