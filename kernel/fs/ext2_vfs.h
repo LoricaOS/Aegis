@@ -7,6 +7,7 @@
 #define EXT2_VFS_H
 
 #include "vfs.h"
+#include "../lib/refcount.h"
 #include <stdint.h>
 
 /* ── ext2 fd private state ────────────────────────────────────────────── */
@@ -24,10 +25,13 @@
  * Allocated from s_ext2_pool[] (32 slots); freed on close.
  */
 typedef struct {
-    uint32_t ino;           /* ext2 inode number */
-    uint32_t write_offset;  /* current sequential write position */
-    uint32_t in_use;        /* 1 if slot is occupied */
-    uint32_t ref_count;     /* number of open fds sharing this slot */
+    uint32_t   ino;           /* ext2 inode number */
+    uint32_t   write_offset;  /* current sequential write position */
+    /* Slot-claim flag. Only ever moved 0->1 by an atomic CAS in
+     * ext2_pool_alloc (a plain test-then-set let two CPUs claim the same
+     * slot), and 1->0 by the last ext2_pool_free. */
+    uint32_t   in_use;
+    refcount_t ref_count;     /* open fds sharing this slot */
 } ext2_fd_priv_t;
 
 /* Allocate a pool slot for the given inode.

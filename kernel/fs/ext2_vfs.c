@@ -5,7 +5,9 @@
 
 #include "ext2_vfs.h"
 #include "ext2.h"
+#include "ext2_internal.h"   /* ext2_lock_acquire/release — bounce-buffer guard */
 #include "uaccess.h"
+#include "../include/aegis_errno.h"
 #include <stdint.h>
 
 /* ── ext2 fd pool ────────────────────────────────────────────────────── */
@@ -22,11 +24,20 @@ ext2_pool_alloc(uint32_t ino)
 {
     uint32_t i;
     for (i = 0; i < EXT2_FD_POOL; i++) {
-        if (!s_ext2_pool[i].in_use) {
+        /* CAS the claim, don't test-then-set. vfs_open_ex calls this holding
+         * no lock, so on SMP two CPUs both read in_use == 0 for the same slot
+         * and both returned it — A's fd then read and wrote B's inode, with
+         * the DAC/AUTH decision that was made for A's path. The CAS makes
+         * exactly one of them win; the loser keeps scanning. */
+        uint32_t expected = 0;
+        if (__atomic_compare_exchange_n(&s_ext2_pool[i].in_use, &expected, 1u,
+                                        0 /* strong */, __ATOMIC_ACQUIRE,
+                                        __ATOMIC_RELAXED)) {
+            /* The slot is exclusively ours now, so these are plain stores —
+             * nothing else can observe it until we hand the pointer back. */
             s_ext2_pool[i].ino          = ino;
             s_ext2_pool[i].write_offset = 0;
-            s_ext2_pool[i].in_use       = 1;
-            s_ext2_pool[i].ref_count    = 1;
+            refcount_init(&s_ext2_pool[i].ref_count, 1);
             return &s_ext2_pool[i];
         }
     }
@@ -37,10 +48,13 @@ void
 ext2_pool_free(ext2_fd_priv_t *p)
 {
     if (!p) return;
-    if (p->ref_count > 0)
-        p->ref_count--;
-    if (p->ref_count == 0)
-        p->in_use = 0;
+    /* The decrement and the "was I last?" test must be one atomic step: the
+     * old read-modify-write could drop two references to 0 concurrently and
+     * release the slot twice, handing one inode to two unrelated fds.
+     * RELEASE pairs with ext2_pool_alloc's ACQUIRE so the next claimer sees
+     * our writes. */
+    if (refcount_dec_and_test(&p->ref_count))
+        __atomic_store_n(&p->in_use, 0u, __ATOMIC_RELEASE);
 }
 
 /* ext2_vfs_ino_of — if (ops,priv) is an ext2 file, return its inode number;
@@ -84,12 +98,22 @@ ext2_vfs_write_fn(void *priv, const void *buf, uint64_t len)
      * ext2_write accesses it in kernel mode, which SMAP forbids.  Copy into
      * a kernel bounce buffer first.  Loop in EXT2_WRITE_CHUNK slices to keep
      * the stack frame bounded. */
-    /* Static bounce buffer — was stack-allocated, which put 4 KB (25% of
-     * the 16 KB per-task kernel stack) in one frame with interrupts on
-     * the same stack.  A single static is safe today: scheduling is
-     * single-core (APs halt) and syscalls run with IF=0 (IA32_SFMASK),
-     * so two tasks are never inside this function concurrently.
-     * Revisit (lock or per-CPU buffer) if SMP scheduling lands. */
+    /* Shared bounce buffer — it is a static (not a 4 KB stack frame, which
+     * was 25% of the 16 KB per-task kernel stack), so the copy INTO it and
+     * the ext2_write OUT of it must be one critical section.
+     *
+     * The old comment here said a single static was safe because "scheduling
+     * is single-core (APs halt)… revisit if SMP scheduling lands". It landed,
+     * and is default-on. IF=0 stops preemption on ONE CPU; it does nothing
+     * about a second CPU, so two cores writing different files interleaved in
+     * this buffer and file A received file B's bytes.
+     *
+     * ext2_lock is the natural fix rather than a new lock: ext2_write already
+     * runs under it, so the added critical section is one memcpy long, and the
+     * lock is recursive, so ext2_write's own acquire is just a depth bump.
+     * Faulting inside copy_from_user while holding it is safe — the lazy-page
+     * fault path (mm_populate_fault) calls into ext2 holding no vmm lock, and
+     * if it reads a file page it re-enters this same lock on this same CPU. */
     static uint8_t s_kbuf[EXT2_WRITE_CHUNK];
     uint64_t done = 0;
     while (done < len) {
@@ -104,8 +128,15 @@ ext2_vfs_write_fn(void *priv, const void *buf, uint64_t len)
             if (chunk > to_end)
                 chunk = to_end;
         }
-        copy_from_user(s_kbuf, (const uint8_t *)buf + done, (uint32_t)chunk);
-        int n = ext2_write(p->ino, s_kbuf, p->write_offset, (uint32_t)chunk);
+        irqflags_t fl = ext2_lock_acquire();
+        /* A faulting copy must not be written out: s_kbuf still holds the
+         * previous chunk (or another file's bytes). */
+        int n;
+        if (copy_from_user(s_kbuf, (const uint8_t *)buf + done, (uint32_t)chunk) != 0)
+            n = -EFAULT;
+        else
+            n = ext2_write(p->ino, s_kbuf, p->write_offset, (uint32_t)chunk);
+        ext2_lock_release(fl);
         if (n <= 0)
             return (done > 0) ? (int)done : n;
         p->write_offset += (uint32_t)n;
@@ -136,7 +167,7 @@ ext2_vfs_dup_fn(void *priv)
 {
     ext2_fd_priv_t *p = (ext2_fd_priv_t *)priv;
     if (p)
-        p->ref_count++;
+        refcount_inc(&p->ref_count);
 }
 
 static int
