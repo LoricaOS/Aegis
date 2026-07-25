@@ -1203,8 +1203,11 @@ vmm_copy_user_pages(uint64_t src_pml4, uint64_t dst_pml4)
                             spin_unlock_irqrestore(&vmm_window_lock, fl);
                             return -1;
                         }
-                        if (flags & VMM_FLAG_SHARED_OWNED)
-                            pmm_ref_page(src_phys);
+                        if ((flags & VMM_FLAG_SHARED_OWNED) &&
+                            pmm_ref_page(src_phys) < 0) {
+                            spin_unlock_irqrestore(&vmm_window_lock, fl);
+                            return -1;          /* refcount saturated */
+                        }
                         if (++batch >= FORK_BATCH_SIZE) {
                             batch = 0;
                             spin_unlock_irqrestore(&vmm_window_lock, fl);
@@ -1335,8 +1338,11 @@ vmm_cow_user_pages(uint64_t src_pml4, uint64_t dst_pml4)
                             spin_unlock_irqrestore(&vmm_window_lock, fl);
                             return -1;
                         }
-                        if (flags & VMM_FLAG_SHARED_OWNED)
-                            pmm_ref_page(phys);
+                        if ((flags & VMM_FLAG_SHARED_OWNED) &&
+                            pmm_ref_page(phys) < 0) {
+                            spin_unlock_irqrestore(&vmm_window_lock, fl);
+                            return -1;          /* refcount saturated */
+                        }
                     } else if (flags & VMM_FLAG_WRITABLE) {
                         /* Writable → RO + COW for both parent and child.
                          * Write-protect the parent first so any concurrent
@@ -1364,14 +1370,20 @@ vmm_cow_user_pages(uint64_t src_pml4, uint64_t dst_pml4)
                             return -1;
                         }
                         /* Now the frame has two sharers. */
-                        pmm_ref_page(phys);
+                        if (pmm_ref_page(phys) < 0) {
+                            spin_unlock_irqrestore(&vmm_window_lock, fl);
+                            return -1;          /* refcount saturated */
+                        }
                     } else {
                         /* Read-only → share as-is. */
                         if (vmm_map_user_page_nolock(dst_pml4, va, phys, flags) < 0) {
                             spin_unlock_irqrestore(&vmm_window_lock, fl);
                             return -1;
                         }
-                        pmm_ref_page(phys);
+                        if (pmm_ref_page(phys) < 0) {
+                            spin_unlock_irqrestore(&vmm_window_lock, fl);
+                            return -1;          /* refcount saturated */
+                        }
                     }
 
                     /* Drop and re-take the window lock periodically so

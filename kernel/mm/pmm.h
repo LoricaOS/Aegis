@@ -63,7 +63,11 @@ void pmm_free_page(uint64_t addr);
  * below that, so the overflow guard is unreachable in practice (secfix M1 — it
  * was uint8_t, which an unprivileged fork-without-exec bomb could overflow into
  * panic_halt). */
-void pmm_ref_page(uint64_t addr);
+/* Take an extra reference on an allocated frame. Returns 0, or -1 if the
+ * 16-bit count is SATURATED — callers must fail and roll back rather than
+ * silently over-share (it used to panic the kernel, which an unprivileged
+ * process could trigger with ~65k mmaps of one memfd page). */
+int pmm_ref_page(uint64_t addr);
 
 /* Read the refcount of an allocated page: 1 for a singly-owned page, the
  * stored count (>= 2) for a shared page, 0 for an address outside managed RAM.

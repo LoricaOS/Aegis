@@ -36,6 +36,27 @@ int g_lazyfile = 1;
  * the index is always in bounds. */
 static uint8_t *s_filebuf[AEGIS_MAX_CPUS];
 
+/* MM_MAX_RANGE_PAGES — hard ceiling on the per-page work ONE syscall may do.
+ *
+ * munmap/mprotect/brk validate only the range ENDPOINTS and then walk it a page
+ * at a time. Syscalls run with IF=0 (arch_syscall.c clears it via IA32_SFMASK),
+ * so `munmap(0x1000, 0x7ffffffff000)` is ~3.4e10 iterations of a four-level
+ * page walk that cannot be preempted, interrupted or killed — a permanent wedge
+ * of that core from any process, no capability required. It cascades: the next
+ * tlb_shootdown_kernel from any other core IPIs ALL cores and spins for an ack
+ * the wedged one will never send, itself with IF=0, so every core that touches
+ * KVA wedges behind it.
+ *
+ * 4 GiB of address space per call is far beyond anything real — the machine has
+ * 8 GB of RAM and userland only ever unmaps what it mapped — while capping the
+ * walk at ~1M iterations (single-digit ms). Ranges above it get EINVAL, which
+ * POSIX permits for an unreasonable len.
+ *
+ * This is the auditor's own stopgap and it is honestly that: the principled fix
+ * is to drive these loops off the VMA table so the cost tracks what is actually
+ * mapped rather than the size of the request. */
+#define MM_MAX_RANGE_PAGES  (1UL << 20)   /* 4 GiB of VA */
+
 /* MM_FAULT_CLUSTER — pages populated per file-backed fault (fault-time
  * readahead).  One #PF on a sequential mmap read used to mean one 4 KiB ext2
  * read (one device round-trip) per page; clustering reads 64 KiB in one ext2
@@ -76,6 +97,14 @@ sys_brk(uint64_t arg1)
 
     /* Page-align upward so proc->brk is always page-aligned */
     arg1 = (arg1 + 4095UL) & ~4095UL;
+
+    /* Same unpreemptible-walk ceiling as munmap/mprotect (see
+     * MM_MAX_RANGE_PAGES): brk's grow path loops [brk, arg1) twice, once to
+     * pre-scan for collisions and once to map. brk reports failure by returning
+     * the UNCHANGED break rather than an errno. */
+    if (arg1 > proc->brk &&
+        (arg1 - proc->brk) / 4096UL > MM_MAX_RANGE_PAGES)
+        return proc->brk;
 
     uint64_t old_brk = proc->brk;
 
@@ -833,6 +862,9 @@ sys_munmap(uint64_t arg1, uint64_t arg2)
         arg1 + len < arg1)
         return SYS_ERR(EINVAL);
 
+    if (len / 4096UL > MM_MAX_RANGE_PAGES)
+        return SYS_ERR(EINVAL);   /* unpreemptible per-page walk — see above */
+
     aegis_process_t *proc = current_proc();
 
     /* Update the VMA table FIRST. vma_remove only touches the table, so doing
@@ -967,6 +999,8 @@ sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
         return SYS_ERR(EINVAL);   /* -EINVAL: not page-aligned */
 
     uint64_t rlen = (len + 4095UL) & ~4095UL;
+    if (rlen / 4096UL > MM_MAX_RANGE_PAGES)
+        return SYS_ERR(EINVAL);   /* unpreemptible per-page walk — see above */
     if (rlen == 0)
         return 0;  /* zero-length is a no-op */
 

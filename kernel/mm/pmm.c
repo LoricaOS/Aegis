@@ -640,13 +640,13 @@ uint64_t pmm_alloc_contig_low(uint64_t n)
  * fork-without-exec bomb to the 256-process cap drove the 255th ref into
  * panic_halt — CVE-class DoS from a baseline-cap process. See secfix M1.)
  */
-void pmm_ref_page(uint64_t addr)
+int pmm_ref_page(uint64_t addr)
 {
     if (addr & (PAGE_SIZE - 1))
         panic_halt("[PMM] FAIL: pmm_ref_page called with unaligned addr");
     uint64_t idx = addr / PAGE_SIZE;
     if (idx >= s_scan_max_pages)
-        return;    /* MMIO / outside PMM-managed RAM — refcounting N/A */
+        return 0;  /* MMIO / outside PMM-managed RAM — refcounting N/A */
 
     irqflags_t fl  = spin_lock_irqsave(&pmm_lock);
     uint8_t    bit = (uint8_t)(1U << (idx % 8));
@@ -657,12 +657,19 @@ void pmm_ref_page(uint64_t addr)
     uint16_t cur = refcount_get(idx);
     if (cur == 0) cur = 1;                      /* implicit single owner */
     if (cur == 0xFFFF) {
+        /* Saturated. This used to panic_halt on the reasoning that the VMA
+         * count bounds the sharer count — but vma_can_merge coalesces adjacent
+         * same-prot VMA_SHARED entries, so ONE VMA can back an unbounded number
+         * of mmaps of the same memfd page. ~65k mmap calls (256 MB of VA) from
+         * any CAP_KIND_IPC holder — i.e. every GUI app — halted the machine.
+         * Fail the caller instead; every caller has a rollback path. */
         spin_unlock_irqrestore(&pmm_lock, fl);
-        panic_halt("[PMM] FAIL: pmm_ref_page refcount overflow");
+        return -1;
     }
     refcount_set(idx, (uint16_t)(cur + 1));     /* now >= 2 → stored */
     if (s_pmm_acct) s_acct_refs++;              /* T1 accounting (pmm_lock held) */
     spin_unlock_irqrestore(&pmm_lock, fl);
+    return 0;
 }
 
 /*

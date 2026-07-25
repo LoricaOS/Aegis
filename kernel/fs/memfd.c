@@ -53,7 +53,10 @@ static int memfd_vfs_read(void *priv, void *buf, uint64_t off, uint64_t len)
              * we drop it after the copy. (pmm_free under memfd_lock is already
              * the shrink path's pattern, so no new lock inversion.) */
             uint64_t phys = mf->phys_pages[page_idx];
-            pmm_ref_page(phys);
+            if (pmm_ref_page(phys) < 0) {       /* refcount saturated */
+                spin_unlock_irqrestore(&memfd_lock, fl);
+                return -ENOMEM;
+            }
             spin_unlock_irqrestore(&memfd_lock, fl);
 
             /* Copy under vmm_window_lock — the window VA is a single global
@@ -294,7 +297,10 @@ int memfd_get_page_ref(uint32_t id, uint32_t pi, uint64_t *phys_out)
         return -1;
     }
     uint64_t phys = mf->phys_pages[pi];
-    pmm_ref_page(phys);
+    if (pmm_ref_page(phys) < 0) {   /* refcount saturated — caller rolls back */
+        spin_unlock_irqrestore(&memfd_lock, fl);
+        return -1;
+    }
     spin_unlock_irqrestore(&memfd_lock, fl);
     *phys_out = phys;
     return 0;
