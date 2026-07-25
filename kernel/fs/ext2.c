@@ -1214,6 +1214,10 @@ restart_walk:
         }
 
         while (*p != '\0') {
+            /* Start of this component within `resolved` — the bytes before it
+             * are the directory the component lives in, which is what a
+             * RELATIVE symlink target must be resolved against. */
+            const char *comp_begin = p;
             /* Extract next component */
             char component[256];
             uint32_t clen = 0;
@@ -1351,10 +1355,33 @@ restart_walk:
                 if (tlen < 0)
                     return tlen;
 
-                /* Build new path: target + "/" + remaining */
+                /* Build new path: [link's dir +] target + "/" + remaining.
+                 *
+                 * A target that does not start with '/' is relative to the
+                 * directory holding the LINK, not to the filesystem root. This
+                 * used to drop the prefix and restart the walk from root, so
+                 * "/bin/sh -> busybox" loaded /busybox. That is not just wrong,
+                 * it is an escalation: an ordinary session can create entries in
+                 * / (the ancestor guard blocks rename/unlink of root, not
+                 * creates in it) and ext2_path_under_protected("/busybox") is
+                 * false — so an unprivileged process could plant the target
+                 * while cap_policy_lookup still handed it /bin's trusted-path
+                 * capabilities. The shipped rootfs happens to have no symlinks
+                 * under /bin,/sbin,/apps,/lib, so nothing was live; the resolver
+                 * bug was unconditional. */
                 char newpath[512];
                 uint32_t np = 0;
                 uint32_t ti;
+
+                if (target[0] != '/') {
+                    uint32_t plen_pfx = (uint32_t)(comp_begin - resolved);
+                    for (ti = 0; ti < plen_pfx && np < 510; ti++)
+                        newpath[np++] = resolved[ti];
+                    /* comp_begin points just past a '/' except at the very
+                     * start of the path, where the prefix is empty. */
+                    if (np == 0 && np < 510)
+                        newpath[np++] = '/';
+                }
 
                 for (ti = 0; ti < (uint32_t)tlen && np < 510; ti++)
                     newpath[np++] = target[ti];
@@ -2544,8 +2571,18 @@ int ext2_rename(const char *old_path, const char *new_path, int has_install)
         return -EPERM;
     }
 
+    /* follow_final = 0: rename operates on the LINK, never on what it points
+     * at (POSIX, and what unlink/rmdir here already do). ext2_open follows the
+     * final symlink, so renaming a symlink used to add a dirent naming the
+     * TARGET inode and remove the dirent naming the SYMLINK, adjusting no
+     * i_links_count either way. The target then had two names with
+     * links_count == 1 and the symlink inode was orphaned — so unlinking the
+     * original name freed the target's inode and blocks while a live dirent
+     * still named it, and the next allocation handed those blocks to a new
+     * (possibly privileged) file reachable through a path that is not
+     * install-gated. */
     uint32_t ino;
-    if (ext2_open(old_path, &ino) != 0) {
+    if (ext2_open_ex(old_path, &ino, 0) != 0) {
         ext2_lock_release(fl);
         return -1;
     }
