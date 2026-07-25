@@ -138,7 +138,7 @@ pi5_fb_init(void)
                w, h);
         w = 1920; h = 1080;
     } else {
-        printk("[VCFB] firmware display size %ux%u (from EDID)\n", w, h);
+        pr_dbg("[VCFB] firmware display size %ux%u (from EDID)\n", w, h);
     }
 
     /* Build the allocate request: set physical + virtual size, 32bpp, BGR,

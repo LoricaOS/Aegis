@@ -430,7 +430,7 @@ xhci_bios_handoff(void)
 {
     uint32_t legsup_off = xhci_find_ext_cap(XHCI_EXT_CAP_LEGACY);
     if (legsup_off == 0) {
-        printk("[XHCI] no USBLEGSUP cap (QEMU or already handed-off)\n");
+        pr_dbg("[XHCI] no USBLEGSUP cap (QEMU or already handed-off)\n");
         return 0;
     }
     volatile uint32_t *legsup =
@@ -439,7 +439,7 @@ xhci_bios_handoff(void)
         (volatile uint32_t *)(s_bar0_va + legsup_off + 4u);
 
     uint32_t val = *legsup;
-    printk("[XHCI] USBLEGSUP at 0x%x = 0x%x\n",
+    pr_dbg("[XHCI] USBLEGSUP at 0x%x = 0x%x\n",
            (unsigned)legsup_off, (unsigned)val);
 
     if (val & XHCI_LEGSUP_BIOS_OWNED) {
@@ -459,7 +459,7 @@ xhci_bios_handoff(void)
             printk("[XHCI] WARN: BIOS never released, forcing ownership\n");
             *legsup = (*legsup) & ~XHCI_LEGSUP_BIOS_OWNED;
         } else {
-            printk("[XHCI] BIOS released ownership cleanly\n");
+            pr_dbg("[XHCI] BIOS released ownership cleanly\n");
         }
     }
 
@@ -507,7 +507,7 @@ xhci_walk_supported_protocols(void)
             uint8_t  major  = (uint8_t)((dw0 >> 24) & 0xFFu);
             uint8_t  port_offset = (uint8_t)(dw2 & 0xFFu);   /* 1-based */
             uint8_t  port_count  = (uint8_t)((dw2 >> 8) & 0xFFu);
-            printk("[XHCI] supp proto: major=0x%x ports %u..%u\n",
+            pr_dbg("[XHCI] supp proto: major=0x%x ports %u..%u\n",
                    (unsigned)major, (unsigned)port_offset,
                    (unsigned)(port_offset + port_count - 1));
             uint32_t i;
@@ -976,9 +976,18 @@ issue_control_transfer(uint8_t slot_id, uint64_t setup_pkt, int data_dir)
     db[slot_id] = 1u;   /* DCI=1 for EP0 */
 
     /* DIAG: post-doorbell controller + event-ring pointer state */
-    printk("[XHCI] ctrl post-db: usbsts=0x%x evt_deq=%u evt_cyc=%u wlen=%u\n",
-           (unsigned)op_read32(XHCI_OP_USBSTS_OFF),
+    /* Read USBSTS OUTSIDE the pr_dbg arguments: pr_dbg compiles to
+     * `if (0) printk(...)`, so an MMIO access in its argument list is
+     * type-checked but never executed in a release build. This one sits
+     * immediately after the EP0 doorbell, where a read-back is exactly the
+     * kind of thing that shapes controller timing — release and -DAEGIS_DEBUG
+     * builds were issuing different hardware sequences on the Pi 5 USB path,
+     * which is the path with the open keystroke-drop bug. See printk.h. */
+    uint32_t usbsts_postdb = op_read32(XHCI_OP_USBSTS_OFF);
+    pr_dbg("[XHCI] ctrl post-db: usbsts=0x%x evt_deq=%u evt_cyc=%u wlen=%u\n",
+           (unsigned)usbsts_postdb,
            (unsigned)s_evt_dequeue, (unsigned)s_evt_cycle, (unsigned)wlen);
+    (void)usbsts_postdb;
 
     /* Poll for Transfer Event completion. Skip non-transfer events
      * (port status changes, leftover CMD_COMPLETIONs from earlier
@@ -1015,12 +1024,12 @@ issue_control_transfer(uint8_t slot_id, uint64_t setup_pkt, int data_dir)
                     /* cc=1: Success, cc=13: Short Packet (normal) */
                     return (int)((uint32_t)wlen - residual);
                 }
-                printk("[XHCI] ctrl_xfer transfer event cc=%u\n",
+                pr_dbg("[XHCI] ctrl_xfer transfer event cc=%u\n",
                        (unsigned)cc);
                 return -1;
             }
             /* Other event types (PSC, leftover CMD_COMPLETION) — skip */
-            printk("[XHCI] ctrl_xfer skip etype=%u\n", (unsigned)etype);
+            pr_dbg("[XHCI] ctrl_xfer skip etype=%u\n", (unsigned)etype);
         }
     }
     printk("[XHCI] ctrl_xfer TIMEOUT usbsts=0x%x evt_deq=%u evt_cyc=%u\n",
@@ -1031,7 +1040,7 @@ issue_control_transfer(uint8_t slot_id, uint64_t setup_pkt, int data_dir)
         uint32_t k;
         for (k = 0; k < XHCI_EVT_RING_SIZE; k++) {
             if (s_evt_ring[k].control != 0u || s_evt_ring[k].status != 0u)
-                printk("[XHCI]   evt[%u] type=%u cc=%u cyc=%u ctrl=0x%x sts=0x%x\n",
+                pr_dbg("[XHCI]   evt[%u] type=%u cc=%u cyc=%u ctrl=0x%x sts=0x%x\n",
                        (unsigned)k,
                        (unsigned)((s_evt_ring[k].control >> 10) & 0x3Fu),
                        (unsigned)((s_evt_ring[k].status >> 24) & 0xFFu),
@@ -1045,12 +1054,12 @@ issue_control_transfer(uint8_t slot_id, uint64_t setup_pkt, int data_dir)
         volatile uint32_t *sc  = (volatile uint32_t *)s_dev_ctx[slot_id];
         volatile uint32_t *ep0 = (volatile uint32_t *)
             (s_dev_ctx[slot_id] + XHCI_CTX_ENTRY_SIZE);
-        printk("[XHCI]   octx slot d0=0x%x d3=0x%x(state=%u) | ep0 d0=0x%x(state=%u) d1=0x%x deq=0x%x:%x\n",
+        pr_dbg("[XHCI]   octx slot d0=0x%x d3=0x%x(state=%u) | ep0 d0=0x%x(state=%u) d1=0x%x deq=0x%x:%x\n",
                (unsigned)sc[0], (unsigned)sc[3], (unsigned)(sc[3] >> 27),
                (unsigned)ep0[0], (unsigned)(ep0[0] & 7u),
                (unsigned)ep0[1], (unsigned)ep0[3], (unsigned)ep0[2]);
     }
-    printk("[XHCI]   usbcmd=0x%x ring_pa=0x%x tr[0]c=0x%x s=0x%x p=0x%x tr[1]c=0x%x tr[2]c=0x%x\n",
+    pr_dbg("[XHCI]   usbcmd=0x%x ring_pa=0x%x tr[0]c=0x%x s=0x%x p=0x%x tr[1]c=0x%x tr[2]c=0x%x\n",
            (unsigned)op_read32(XHCI_OP_USBCMD_OFF),
            (unsigned)s_xfer_ring_phys[slot_id],
            (unsigned)ring[0].control, (unsigned)ring[0].status,
@@ -1080,7 +1089,7 @@ detect_hid_protocol(uint8_t slot_id)
     int off;
 
     got = issue_control_transfer(slot_id, setup, 1);
-    printk("[XHCI] slot %u GET_DESCRIPTOR(Config) got=0x%x\n",
+    pr_dbg("[XHCI] slot %u GET_DESCRIPTOR(Config) got=0x%x\n",
            (unsigned)slot_id, (unsigned)got);
     if (got < 4)
         return 0;
@@ -1088,12 +1097,12 @@ detect_hid_protocol(uint8_t slot_id)
     buf = s_hid_buf[slot_id];
     /* Dump 36 bytes of config descriptor — enough to see config + iface 0
      * + HID descriptor + EP1 IN endpoint descriptor for the boot kbd. */
-    printk("[XHCI] cfg desc 0-15: %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x\n",
+    pr_dbg("[XHCI] cfg desc 0-15: %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x\n",
            (unsigned)buf[0],  (unsigned)buf[1],  (unsigned)buf[2],  (unsigned)buf[3],
            (unsigned)buf[4],  (unsigned)buf[5],  (unsigned)buf[6],  (unsigned)buf[7],
            (unsigned)buf[8],  (unsigned)buf[9],  (unsigned)buf[10], (unsigned)buf[11],
            (unsigned)buf[12], (unsigned)buf[13], (unsigned)buf[14], (unsigned)buf[15]);
-    printk("[XHCI] cfg desc 16-31: %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x\n",
+    pr_dbg("[XHCI] cfg desc 16-31: %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x\n",
            (unsigned)buf[16], (unsigned)buf[17], (unsigned)buf[18], (unsigned)buf[19],
            (unsigned)buf[20], (unsigned)buf[21], (unsigned)buf[22], (unsigned)buf[23],
            (unsigned)buf[24], (unsigned)buf[25], (unsigned)buf[26], (unsigned)buf[27],
@@ -1795,7 +1804,7 @@ usb_eth_poll(netdev_t *dev)
      * without a userland shell. Remove once the data path is solid. */
     static uint32_t hb;
     if (s_eth.present && (++hb & 0xFF) == 0)
-        printk("[USBETH] rx=%u txsub=%u txdone=%u int=%u linkI=%u intd1=%x | rxctl=%x med=%x burst=%u plink=%x\n",
+        pr_dbg("[USBETH] rx=%u txsub=%u txdone=%u int=%u linkI=%u intd1=%x | rxctl=%x med=%x burst=%u plink=%x\n",
                (unsigned)s_eth.rx_count, (unsigned)s_eth.tx_count,
                (unsigned)s_eth.tx_done, (unsigned)s_eth.int_count,
                (unsigned)s_eth.link_up_intr, (unsigned)s_eth.intdata1,
@@ -2221,7 +2230,7 @@ probe_usb_ethernet(uint8_t slot_id, uint8_t port_num, uint8_t speed)
     if (issue_control_transfer(slot_id, setup, 1) >= 0) {
         int k;
         for (k = 0; k < 6; k++) s_eth.mac[k] = buf[k];
-        printk("[XHCI] ax88179 MAC %x:%x:%x:%x:%x:%x\n",
+        pr_dbg("[XHCI] ax88179 MAC %x:%x:%x:%x:%x:%x\n",
                (unsigned)buf[0], (unsigned)buf[1], (unsigned)buf[2],
                (unsigned)buf[3], (unsigned)buf[4], (unsigned)buf[5]);
     }
@@ -2248,7 +2257,7 @@ probe_usb_ethernet(uint8_t slot_id, uint8_t port_num, uint8_t speed)
     if (bint_mps > 4096u) bint_mps = 4096u;
     s_eth.int_mps       = bint_mps;
 
-    printk("[XHCI] slot %u ASIX AX88179 vid=%x pid=%x cfg=%u "
+    pr_dbg("[XHCI] slot %u ASIX AX88179 vid=%x pid=%x cfg=%u "
            "in=0x%x(dci%u mps%u) out=0x%x(dci%u mps%u)\n",
            (unsigned)slot_id, (unsigned)vid, (unsigned)pid, (unsigned)cfg_val,
            (unsigned)bin,  (unsigned)s_eth.bulk_in_dci,  (unsigned)bin_mps,
@@ -2310,7 +2319,7 @@ probe_usb_ethernet(uint8_t slot_id, uint8_t port_num, uint8_t speed)
         xhci_busy_wait_ms(50);
         s_eth.medium_rb = (uint16_t)ax_read_mac(slot_id, 0x22, 2);
         s_eth.link_up   = 1u;
-        printk("[XHCI] ax88179 speed=%u med=%x (gig_rb=%x 100_rb=%x) "
+        pr_dbg("[XHCI] ax88179 speed=%u med=%x (gig_rb=%x 100_rb=%x) "
                "in_dci=%u out_dci=%u int_dci=%u\n",
                (unsigned)s_eth.det_speed, (unsigned)s_eth.medium_rb,
                (unsigned)s_eth.med_gig_rb, (unsigned)s_eth.med_100_rb,
@@ -2325,12 +2334,12 @@ probe_usb_ethernet(uint8_t slot_id, uint8_t port_num, uint8_t speed)
                 (s_dev_ctx[slot_id] + (uint32_t)s_eth.bulk_in_dci * XHCI_CTX_ENTRY_SIZE);
             volatile uint32_t *eo = (volatile uint32_t *)
                 (s_dev_ctx[slot_id] + (uint32_t)s_eth.bulk_out_dci * XHCI_CTX_ENTRY_SIZE);
-            printk("[XHCI] eth EP states: in d0=%x(state=%u) out d0=%x(state=%u)\n",
+            pr_dbg("[XHCI] eth EP states: in d0=%x(state=%u) out d0=%x(state=%u)\n",
                    (unsigned)ei[0], (unsigned)(ei[0] & 7u),
                    (unsigned)eo[0], (unsigned)(eo[0] & 7u));
         }
         xhci_eth_submit_rx();
-        printk("[XHCI] eth bulk configured (in dci%u out dci%u), RX armed\n",
+        pr_dbg("[XHCI] eth bulk configured (in dci%u out dci%u), RX armed\n",
                (unsigned)s_eth.bulk_in_dci, (unsigned)s_eth.bulk_out_dci);
 
         /* Register the netdev so the IP stack + DHCP use the adapter. The IP
@@ -2414,7 +2423,7 @@ enumerate_port(uint32_t port_num)
         uint32_t s;
         for (s = 1; s < XHCI_MAX_SLOTS; s++) {
             if (s_hid_slots[s] && s_slot_port[s] == (uint8_t)port_num) {
-                printk("[XHCI] port %u already enumerated as slot %u, skip\n",
+                pr_dbg("[XHCI] port %u already enumerated as slot %u, skip\n",
                        (unsigned)port_num, (unsigned)s);
                 return;
             }
@@ -2432,7 +2441,7 @@ enumerate_port(uint32_t port_num)
     uint8_t  speed;
 
     portsc = *portsc_reg;
-    printk("[XHCI] enum port %u portsc=0x%x ccs=%u pr=%u prc=%u\n",
+    pr_dbg("[XHCI] enum port %u portsc=0x%x ccs=%u pr=%u prc=%u\n",
            (unsigned)port_num, (unsigned)portsc,
            (portsc & XHCI_PORTSC_CCS) ? 1u : 0u,
            (portsc & XHCI_PORTSC_PR)  ? 1u : 0u,
@@ -2463,7 +2472,7 @@ enumerate_port(uint32_t port_num)
     if (port_num <= XHCI_MAX_PORTS && s_port_is_usb3[port_num] &&
         (portsc & XHCI_PORTSC_PED)) {
         if (!s_post_boot)
-            printk("[XHCI] port %u: USB3 already enabled (portsc=0x%x), skipping hot reset\n",
+            pr_dbg("[XHCI] port %u: USB3 already enabled (portsc=0x%x), skipping hot reset\n",
                    (unsigned)port_num, (unsigned)portsc);
     } else {
         /* USB2 (or not-yet-enabled) port: hot reset via PORTSC.PR.
@@ -2500,7 +2509,7 @@ enumerate_port(uint32_t port_num)
     speed = (uint8_t)((portsc >> 10) & 0xFu);
     if (speed == 0)
         speed = XHCI_SPEED_HS;
-    printk("[XHCI] port %u speed=%u (1=FS,2=LS,3=HS,4=SS) post-reset\n",
+    pr_dbg("[XHCI] port %u speed=%u (1=FS,2=LS,3=HS,4=SS) post-reset\n",
            (unsigned)port_num, (unsigned)speed);
 
     /* USB 2.0 spec §7.1.7.5 TRSTRCY: device needs ≥10ms after reset
@@ -2512,7 +2521,7 @@ enumerate_port(uint32_t port_num)
     {
         uint32_t usbsts = op_read32(XHCI_OP_USBSTS_OFF);
         uint32_t usbcmd = op_read32(XHCI_OP_USBCMD_OFF);
-        printk("[XHCI] before EnableSlot: usbcmd=0x%x usbsts=0x%x s_cmd_enq=%u s_cmd_cyc=%u s_evt_deq=%u s_evt_cyc=%u\n",
+        pr_dbg("[XHCI] before EnableSlot: usbcmd=0x%x usbsts=0x%x s_cmd_enq=%u s_cmd_cyc=%u s_evt_deq=%u s_evt_cyc=%u\n",
                (unsigned)usbcmd, (unsigned)usbsts,
                (unsigned)s_cmd_enqueue, (unsigned)s_cmd_cycle,
                (unsigned)s_evt_dequeue, (unsigned)s_evt_cycle);
@@ -2524,7 +2533,7 @@ enumerate_port(uint32_t port_num)
     /* Post-Enable-Slot diagnostic dump */
     {
         uint32_t usbsts = op_read32(XHCI_OP_USBSTS_OFF);
-        printk("[XHCI] after EnableSlot: slot_id=%u usbsts=0x%x evt_ring[0].ctrl=0x%x evt_ring[0].status=0x%x\n",
+        pr_dbg("[XHCI] after EnableSlot: slot_id=%u usbsts=0x%x evt_ring[0].ctrl=0x%x evt_ring[0].status=0x%x\n",
                (unsigned)slot_id, (unsigned)usbsts,
                (unsigned)s_evt_ring[0].control,
                (unsigned)s_evt_ring[0].status);
@@ -2575,7 +2584,7 @@ enumerate_port(uint32_t port_num)
                    (unsigned)op_read32(XHCI_OP_USBSTS_OFF));
         return;
     }
-    printk("[XHCI] slot %u Address Device OK\n", (unsigned)slot_id);
+    pr_dbg("[XHCI] slot %u Address Device OK\n", (unsigned)slot_id);
 
     /* Classify the device via its Configuration Descriptor over EP0 FIRST.
      * EP0 is set up by Address Device, so this needs no Configure-Endpoint.
@@ -2585,7 +2594,7 @@ enumerate_port(uint32_t port_num)
      * the old code returned here and the ethernet probe never ran. */
     {
         uint8_t proto = detect_hid_protocol(slot_id);
-        printk("[XHCI] slot %u detect_hid_protocol returned %u\n",
+        pr_dbg("[XHCI] slot %u detect_hid_protocol returned %u\n",
                (unsigned)slot_id, (unsigned)proto);
 
         if (proto != 1 && proto != 2) {
@@ -2627,7 +2636,7 @@ enumerate_port(uint32_t port_num)
                        (unsigned)port_num);
             return;
         }
-        printk("[XHCI] slot %u Configure EP OK\n", (unsigned)slot_id);
+        pr_dbg("[XHCI] slot %u Configure EP OK\n", (unsigned)slot_id);
 
         s_hid_slots[slot_id]     = 1;
         s_hid_slot_type[slot_id] = (proto == 1) ? USB_DEV_KBD : USB_DEV_MOUSE;
@@ -2636,13 +2645,13 @@ enumerate_port(uint32_t port_num)
 
     if (port_num <= XHCI_MAX_PORTS) s_enum_stage[port_num] = XHCI_ENUM_HID_OK;
 
-    /* Schedule the first interrupt IN transfer.
-     * Note: we only queue ONE TRB and re-arm after each completion.
-     * This is fine for keyboards (typing rate << polling rate). If
-     * report drops are observed under load, increase the queue depth. */
+    /* Schedule the first interrupt IN transfer; xhci_poll re-arms after each
+     * completion. One TRB outstanding is correct; the graphical-desktop
+     * keystroke drops were the concurrent-poll + kbd-ring races (now locked),
+     * not a re-arm gap. */
     xhci_schedule_interrupt_in(slot_id, XHCI_EP1_IN_DCI,
                                s_hid_buf_phys[slot_id], 8u);
-    printk("[XHCI] slot %u HID %s ready, first interrupt-in scheduled\n",
+    pr_dbg("[XHCI] slot %u HID %s ready, first interrupt-in scheduled\n",
            (unsigned)slot_id,
            s_hid_slot_type[slot_id] == USB_DEV_MOUSE ? "mouse" : "kbd");
 }
@@ -2689,7 +2698,7 @@ xhci_init(void)
         if (d->class_code != 0x0C || d->subclass != 0x03 || d->progif != 0x30)
             continue;
         n_xhci++;
-        printk("[XHCI] trying controller #%u at %x:%x.%x (vendor=%x device=%x)\n",
+        pr_dbg("[XHCI] trying controller #%u at %x:%x.%x (vendor=%x device=%x)\n",
                (unsigned)n_xhci, (unsigned)d->bus, (unsigned)d->dev, (unsigned)d->fn,
                (unsigned)d->vendor_id, (unsigned)d->device_id);
         int rc = xhci_init_one(d);
@@ -2705,7 +2714,7 @@ xhci_init(void)
             s_hdiag_count++;
         }
         if (rc > 0) {
-            printk("[XHCI] controller #%u has connected device(s) — adopting\n",
+            pr_dbg("[XHCI] controller #%u has connected device(s) — adopting\n",
                    (unsigned)n_xhci);
             /* This PCI-scan path (x86) adopts a single controller into s_hc[0]
              * (s_cur's default); mark one controller live so xhci_poll iterates
@@ -2714,7 +2723,7 @@ xhci_init(void)
             return;
         }
         if (rc == 0) {
-            printk("[XHCI] controller #%u empty, trying next\n",
+            pr_dbg("[XHCI] controller #%u empty, trying next\n",
                    (unsigned)n_xhci);
             /* Reset state for next controller. */
             s_xhci_active = 0;
@@ -2764,7 +2773,7 @@ xhci_init_at(uint64_t bar0_phys)
     d.class_code = 0x0Cu; d.subclass = 0x03u; d.progif = 0x30u;
     d.bar[0] = bar0_phys;
     int rc = xhci_init_one(&d);
-    printk("[XHCI] init_at 0x%lx (hc%u) -> rc=%d\n",
+    pr_dbg("[XHCI] init_at 0x%lx (hc%u) -> rc=%d\n",
            bar0_phys, (unsigned)s_hc_count, rc);
     /* Keep any controller that initialised (rc 0=empty or 1=has device) so
      * xhci_poll iterates it; the per-controller `active` guard skips empties.
@@ -2828,7 +2837,7 @@ xhci_init_one(const pcie_device_t *dev)
 
     /* HCCPARAMS1.CSZ (bit 2) — 0 = 32-byte contexts, 1 = 64-byte. */
     s_ctx_entry_size = (s_cap->hccparams1 & (1u << 2)) ? 64u : 32u;
-    printk("[XHCI] hccparams1=0x%x ctx_size=%u\n",
+    pr_dbg("[XHCI] hccparams1=0x%x ctx_size=%u\n",
            (unsigned)s_cap->hccparams1, (unsigned)s_ctx_entry_size);
 
     /* Step 2.5: BIOS handoff (USBLEGSUP).
@@ -2857,9 +2866,11 @@ xhci_init_one(const pcie_device_t *dev)
         return -1;
     }
 
-    printk("[XHCI] pre-HCRST usbsts=0x%x usbcmd=0x%x\n",
-           (unsigned)op_read32(XHCI_OP_USBSTS_OFF),
-           (unsigned)op_read32(XHCI_OP_USBCMD_OFF));
+    uint32_t sts_pre = op_read32(XHCI_OP_USBSTS_OFF);   /* hoisted, see above */
+    uint32_t cmd_pre = op_read32(XHCI_OP_USBCMD_OFF);
+    pr_dbg("[XHCI] pre-HCRST usbsts=0x%x usbcmd=0x%x\n",
+           (unsigned)sts_pre, (unsigned)cmd_pre);
+    (void)sts_pre; (void)cmd_pre;
 
     /* Step 4: Reset controller — set USBCMD.HCRST, wait for it to clear. */
     op_write32(XHCI_OP_USBCMD_OFF,
@@ -2868,8 +2879,9 @@ xhci_init_one(const pcie_device_t *dev)
         printk("[XHCI] FAIL: controller reset timeout\n");
         return -1;
     }
-    printk("[XHCI] post-HCRST usbsts=0x%x\n",
-           (unsigned)op_read32(XHCI_OP_USBSTS_OFF));
+    uint32_t sts_posthcrst = op_read32(XHCI_OP_USBSTS_OFF);   /* hoisted */
+    pr_dbg("[XHCI] post-HCRST usbsts=0x%x\n", (unsigned)sts_posthcrst);
+    (void)sts_posthcrst;
 
     /* xHCI spec §4.2: software shall not write any operational/runtime
      * register (other than USBSTS) until USBSTS.CNR is '0'. */
@@ -2877,14 +2889,16 @@ xhci_init_one(const pcie_device_t *dev)
         printk("[XHCI] FAIL: CNR did not clear after reset\n");
         return -1;
     }
-    printk("[XHCI] post-CNR-clear usbsts=0x%x\n",
-           (unsigned)op_read32(XHCI_OP_USBSTS_OFF));
+    uint32_t sts_postcnr = op_read32(XHCI_OP_USBSTS_OFF);     /* hoisted */
+    pr_dbg("[XHCI] post-CNR-clear usbsts=0x%x\n", (unsigned)sts_postcnr);
+    (void)sts_postcnr;
 
     /* Clear any sticky RW1C bits in USBSTS so we start with a clean slate. */
     op_write32(XHCI_OP_USBSTS_OFF,
                XHCI_STS_HSE | XHCI_STS_EINT | XHCI_STS_HCE);
-    printk("[XHCI] post-RW1C-clear usbsts=0x%x\n",
-           (unsigned)op_read32(XHCI_OP_USBSTS_OFF));
+    uint32_t sts_postrw1c = op_read32(XHCI_OP_USBSTS_OFF);    /* hoisted */
+    pr_dbg("[XHCI] post-RW1C-clear usbsts=0x%x\n", (unsigned)sts_postrw1c);
+    (void)sts_postrw1c;
 
     /* Step 5: Allocate DCBAA (Device Context Base Address Array).
      * DCBAA[0] is reserved for the Scratchpad Buffer Array pointer
@@ -2910,7 +2924,7 @@ xhci_init_one(const pcie_device_t *dev)
         uint32_t hcsp2 = s_cap->hcsparams2;
         uint32_t max_sp = (((hcsp2 >> 21) & 0x1Fu) << 5) |
                           ((hcsp2 >> 27) & 0x1Fu);
-        printk("[XHCI] hcsparams2=0x%x max_scratchpad_bufs=%u\n",
+        pr_dbg("[XHCI] hcsparams2=0x%x max_scratchpad_bufs=%u\n",
                (unsigned)hcsp2, (unsigned)max_sp);
         if (max_sp > 0) {
             uint64_t  sp_array_phys;
@@ -2922,7 +2936,7 @@ xhci_init_one(const pcie_device_t *dev)
                 sp_array[i] = sp_buf_phys;
             }
             s_dcbaa[0] = sp_array_phys;
-            printk("[XHCI] scratchpad: allocated %u bufs, array PA=0x%x\n",
+            pr_dbg("[XHCI] scratchpad: allocated %u bufs, array PA=0x%x\n",
                    (unsigned)max_sp, (unsigned)sp_array_phys);
         }
 
@@ -3023,7 +3037,7 @@ xhci_init_one(const pcie_device_t *dev)
         uint32_t usbcmd = op_read32(XHCI_OP_USBCMD_OFF);
         volatile uint64_t *crcr =
             (volatile uint64_t *)((volatile uint8_t *)s_op + 0x18u);
-        printk("[XHCI] running: usbcmd=0x%x usbsts=0x%x crcr=0x%x cmd_ring_phys=0x%x\n",
+        pr_dbg("[XHCI] running: usbcmd=0x%x usbsts=0x%x crcr=0x%x cmd_ring_phys=0x%x\n",
                (unsigned)usbcmd, (unsigned)usbsts,
                (unsigned)*crcr, (unsigned)s_cmd_ring_phys);
     }
@@ -3054,7 +3068,7 @@ xhci_init_one(const pcie_device_t *dev)
      * power-good (~20ms) PLUS USB connect debounce (~100ms) before CCS is
      * meaningful, or the pre-scan below would miss a real device. */
     if (powered_any) {
-        printk("[XHCI] powered ports (PPC controller); waiting for connect\n");
+        pr_dbg("[XHCI] powered ports (PPC controller); waiting for connect\n");
         xhci_busy_wait_ms(150);
     }
 
@@ -3069,7 +3083,7 @@ xhci_init_one(const pcie_device_t *dev)
         if (*portsc_reg & XHCI_PORTSC_CCS)
             connected_ports++;
     }
-    printk("[XHCI] %u port(s) have CCS=1\n", (unsigned)connected_ports);
+    pr_dbg("[XHCI] %u port(s) have CCS=1\n", (unsigned)connected_ports);
     if (connected_ports == 0) {
         /* No devices on this controller — caller will try the next. */
         return 0;
@@ -3095,10 +3109,44 @@ xhci_init_one(const pcie_device_t *dev)
  * xhci_poll — called from PIT ISR at 100 Hz
  * ---------------------------------------------------------------------- */
 
+/* Single-flight guard for xhci_poll.
+ *
+ * poll.c's comment already ASSERTS this exists ("xhci_poll takes its own
+ * single-flight trylock") — it did not; that comment documented a change that
+ * was reverted. Meanwhile gicv2_cpu_init enables the banked timer PPI on EVERY
+ * core, and timer_irq calls poll_sources_run() unconditionally, so on native
+ * Pi 5 this function runs on all four cores at 100 Hz. (x86 is deliberately the
+ * opposite: pit.c says "Must NOT run concurrently".)
+ *
+ * Concurrency here is not merely dropped input. s_cur is a plain global written
+ * inside the loop below, and EVERY s_* name is a macro for s_cur->…, so a core
+ * reassigning it while another is mid-enumerate_port — which busy-waits 140 ms
+ * and can spin a second more — makes the first write s_dcbaa[slot] /
+ * s_dev_ctx[slot] / s_xfer_ring_phys[slot] into the OTHER controller's tables,
+ * publishing a device-context physical address into a DCBAA that the second
+ * controller is actively DMA-reading. The non-atomic s_evt_dequeue++ /
+ * s_evt_cycle ^= 1 also let two cores dispatch the same TRB and desync the
+ * cycle bit, after which stale ring entries read as live events.
+ *
+ * A trylock (not a spinlock) because this runs from the timer ISR: a core that
+ * loses simply skips this tick, which is exactly right — the work is polling
+ * and the next tick is 10 ms away. Blocking would serialise four cores behind
+ * an enumerate_port that can hold the ring for over a second.
+ *
+ * NOT the whole fix: threading s_cur through as a local parameter is the
+ * structural repair, and usb_eth_send still reads s_bar0_va/dboff from process
+ * context while this may be mutating s_cur. Both are larger refactors of this
+ * file; this closes the ISR-vs-ISR race, which is the one that runs 100 times
+ * a second on four cores. */
+static volatile uint32_t s_poll_inflight;
+
 void
 xhci_poll(void)
 {
     volatile xhci_trb_t *trb;
+
+    if (__atomic_exchange_n(&s_poll_inflight, 1u, __ATOMIC_ACQUIRE))
+        return;                 /* another core is already servicing */
 
     /* Service EVERY brought-up controller. RP1 has two independent xHCIs, so
      * the keyboard and mouse can live on different ones; s_cur redirects all
@@ -3210,7 +3258,7 @@ xhci_poll(void)
                         uint32_t s;
                         for (s = 1; s < XHCI_MAX_SLOTS; s++) {
                             if (s_slot_port[s] == port_id && s_hid_slots[s]) {
-                                printk("[XHCI] port %u disconnect, freeing slot %u\n",
+                                pr_dbg("[XHCI] port %u disconnect, freeing slot %u\n",
                                        (unsigned)port_id, (unsigned)s);
                                 issue_disable_slot((uint8_t)s);
                                 s_hid_slots[s]     = 0;
@@ -3256,6 +3304,8 @@ xhci_poll(void)
     }
 
     }   /* end for (hc) — service the next controller */
+
+    __atomic_store_n(&s_poll_inflight, 0u, __ATOMIC_RELEASE);
 }
 
 /* -------------------------------------------------------------------------

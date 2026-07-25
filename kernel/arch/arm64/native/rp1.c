@@ -77,7 +77,7 @@ rp1_fan_full(void)
     rp1_w(RP1_PADS2 + 4 + FAN_PIN * 4, pad & ~RP1_PAD_OUT_DIS);
     rp1_w(RP1_RIO2 + RP1_ATOM_SET + 0x04, 1u << FAN_PIN);   /* output-enable */
     rp1_w(RP1_RIO2 + RP1_ATOM_CLR + 0x00, 1u << FAN_PIN);   /* drive LOW = full */
-    printk("[RP1] fan: GPIO45 low (full speed, inverted line)\n");
+    pr_dbg("[RP1] fan: GPIO45 low (full speed, inverted line)\n");
 }
 
 /* ── RP1 PWM1 fan speed control ─────────────────────────────────────────
@@ -173,7 +173,7 @@ static void
 rp1_dwc3_host_init(uint32_t base)
 {
     uint32_t snpsid = rp1_r(base + DWC3_GSNPSID);
-    printk("[RP1] dwc3@0x%x: GSNPSID=0x%x  xhci CAPLENGTH=0x%x\n",
+    pr_dbg("[RP1] dwc3@0x%x: GSNPSID=0x%x  xhci CAPLENGTH=0x%x\n",
            base, snpsid, rp1_r(base + 0x00) & 0xffu);
 
     /* Core + USB2/USB3 PHY soft reset, then release. */
@@ -190,7 +190,16 @@ rp1_dwc3_host_init(uint32_t base)
     uint32_t g = rp1_r(base + DWC3_GCTL);
     g = (g & ~DWC3_GCTL_PRTCAP_MASK) | DWC3_GCTL_PRTCAP_HOST;
     rp1_w(base + DWC3_GCTL, g);
-    printk("[RP1] dwc3@0x%x: host mode (GCTL=0x%x)\n", base, rp1_r(base + DWC3_GCTL));
+    /* Read back OUTSIDE the pr_dbg argument list. pr_dbg compiles to
+     * `if (0) printk(...)` in release builds, so anything in its arguments is
+     * type-checked but never executed — and this particular read is not
+     * diagnostic, it forces the posted GCTL write above to complete before the
+     * controller is used. In the argument list it happened only in
+     * -DAEGIS_DEBUG builds, so release and debug issued different hardware
+     * sequences on exactly the Pi 5 USB path. */
+    uint32_t gctl_back = rp1_r(base + DWC3_GCTL);
+    pr_dbg("[RP1] dwc3@0x%x: host mode (GCTL=0x%x)\n", base, gctl_back);
+    (void)gctl_back;
 }
 
 /* rp1_usb_init — bring up BOTH RP1 dwc3 controllers (USB0 @ 0x200000 + USB1 @
@@ -299,10 +308,21 @@ static struct {
 
 /* gem_poll — deliver received frames to the stack + re-arm descriptors. Called
  * from the PIT tick (100 Hz). Rings are Normal-NC, so no cache maintenance. */
+/* Single-flight guard — identical shape to xhci_poll's (see xhci.c). The
+ * arm64 timer PPI is banked per core, so poll_sources_run and therefore this
+ * function execute on all four Pi 5 cores at 100 Hz, and s_gem.rx_head is a
+ * plain global advanced inside the loop: two cores would hand the same
+ * descriptor to netdev_rx_deliver and then re-arm it twice. Trylock, not a
+ * lock: this is ISR context and the next tick is 10 ms away, so a core that
+ * loses should skip rather than queue up behind the winner. */
+static volatile uint32_t s_gem_poll_inflight;
+
 static void
 gem_poll(netdev_t *dev)
 {
     (void)dev;
+    if (__atomic_exchange_n(&s_gem_poll_inflight, 1u, __ATOMIC_ACQUIRE))
+        return;
     for (int n = 0; n < RX_DESCS; n++) {
         uint32_t i = s_gem.rx_head;
         if (!(s_gem.rx_ring[i*4] & 0x1u))          /* USED not set → no frame */
@@ -315,6 +335,7 @@ gem_poll(netdev_t *dev)
         s_gem.rx_ring[i*4] = (uint32_t)bd | (i == RX_DESCS - 1 ? 0x2u : 0u); /* USED=0 */
         s_gem.rx_head = (i + 1) % RX_DESCS;
     }
+    __atomic_store_n(&s_gem_poll_inflight, 0u, __ATOMIC_RELEASE);
 }
 
 /* gem_send — transmit one Ethernet frame. Waits (bounded) for the previous TX
@@ -414,7 +435,7 @@ rp1_eth_probe(void)
 {
     rp1_w(RP1_CLOCKS + CLK_ETH_CTRL,     rp1_r(RP1_CLOCKS + CLK_ETH_CTRL)     | CLK_CTRL_ENABLE);
     rp1_w(RP1_CLOCKS + CLK_ETH_TSU_CTRL, rp1_r(RP1_CLOCKS + CLK_ETH_TSU_CTRL) | CLK_CTRL_ENABLE);
-    printk("[RP1] eth: MID=0x%x NCR=0x%x NCFGR=0x%x DCFG1=0x%x\n",
+    pr_dbg("[RP1] eth: MID=0x%x NCR=0x%x NCFGR=0x%x DCFG1=0x%x\n",
            rp1_r(RP1_ETH_BASE + GEM_MID),   rp1_r(RP1_ETH_BASE + GEM_NCR),
            rp1_r(RP1_ETH_BASE + GEM_NCFGR), rp1_r(RP1_ETH_BASE + GEM_DCFG1));
     uint16_t id1 = gem_mdio_read(ETH_PHY_ADDR, 2);   /* PHYID1 */
@@ -426,7 +447,7 @@ rp1_eth_probe(void)
     rp1_delay_ms(4000);
     (void)gem_mdio_read(ETH_PHY_ADDR, 1);            /* BMSR link bit latches low */
     uint16_t bmsr = gem_mdio_read(ETH_PHY_ADDR, 1);
-    printk("[RP1] eth: PHY@%u id=0x%x%x BMSR=0x%x link=%u autoneg_done=%u\n",
+    pr_dbg("[RP1] eth: PHY@%u id=0x%x%x BMSR=0x%x link=%u autoneg_done=%u\n",
            ETH_PHY_ADDR, id1, id2, bmsr, (bmsr >> 2) & 1u, (bmsr >> 5) & 1u);
     if (bmsr & (1u << 2))              /* link up → bring up the netdev */
         gem_setup();

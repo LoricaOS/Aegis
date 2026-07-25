@@ -14,6 +14,7 @@
 #include "arch.h"
 #include "kbd.h"
 #include "printk.h"
+#include "spinlock.h"
 #include "../../sched/waitq.h"
 #include <stdint.h>
 
@@ -88,6 +89,19 @@ static uint32_t s_head, s_tail;         /* head = write, tail = read */
 static uint32_t s_tty_pgrp;
 static uint32_t s_rx_count;             /* /proc/kbdstat serial counter */
 
+/* Serializes every access to the RX ring (s_head/s_tail/s_ring). Two producers
+ * push here — the USB keyboard via kbd_inject() from the timer ISR, and the
+ * serial FIFO via drain_fifo() — and the console read path drains it. Without
+ * this lock, a userland reader spinning on kbd_poll()→drain_fifo() (which the
+ * graphical bastion/lumen input loops do) races the ISR's kbd_inject() on
+ * s_head and they clobber each other's writes → dropped keystrokes, but ONLY
+ * under active polling (text-mode readers block on arch_wait_for_irq, so they
+ * almost never overlap). IRQ-saving because kbd_inject runs in ISR context;
+ * a plain spinlock would deadlock a same-core ISR against a lock-holding
+ * thread. (This is the "add a lock if the RX IRQ and a concurrent poll both run
+ * hot" the ring comment flagged — they do, on the graphical desktop.) */
+static spinlock_t s_kbd_lock = SPINLOCK_INIT;
+
 #ifdef AEGIS_BOOT_NATIVE
 /* Serial "reboot at will": on the real Pi 5 there is no reset button, so watch
  * the console input for an SSH-style, line-anchored escape — "<newline>~~~" —
@@ -114,9 +128,22 @@ reboot_escape_watch(char c)
 }
 #endif
 
-/* drain_fifo — move any bytes waiting in the PL011 RX FIFO into the ring. */
+/* ring_push_locked — append one char to the RX ring. Caller MUST hold s_kbd_lock. */
 static void
-drain_fifo(void)
+ring_push_locked(char c)
+{
+    uint32_t next = (s_head + 1) % RX_RING;
+    if (next != s_tail) {               /* drop on overflow */
+        s_ring[s_head] = c;
+        s_head = next;
+    }
+    s_rx_count++;
+}
+
+/* drain_fifo_locked — move any bytes waiting in the PL011 RX FIFO into the ring.
+ * Caller MUST hold s_kbd_lock (serializes with kbd_inject's ISR pushes). */
+static void
+drain_fifo_locked(void)
 {
     while (!(rd(UART_FR) & FR_RXFE)) {
         char c = (char)rd(UART_DR);
@@ -125,12 +152,7 @@ drain_fifo(void)
 #ifdef AEGIS_BOOT_NATIVE
         reboot_escape_watch(c);
 #endif
-        uint32_t next = (s_head + 1) % RX_RING;
-        if (next != s_tail) {           /* drop on overflow */
-            s_ring[s_head] = c;
-            s_head = next;
-        }
-        s_rx_count++;
+        ring_push_locked(c);
     }
 }
 
@@ -139,7 +161,9 @@ drain_fifo(void)
 void
 uart_rx_irq(void)
 {
-    drain_fifo();
+    irqflags_t fl = spin_lock_irqsave(&s_kbd_lock);
+    drain_fifo_locked();
+    spin_unlock_irqrestore(&s_kbd_lock, fl);
     wr(UART_ICR, 1u << 4);
     waitq_wake_all(&g_console_waiters);
 }
@@ -159,19 +183,26 @@ kbd_poll(char *out)
      * interrupt isn't being delivered. ponytail: no IRQ-vs-poll lock -- the
      * FIFO is tiny and this is the console; add one if the RX IRQ and a
      * concurrent poll ever both run hot. */
-    drain_fifo();
-    if (s_tail == s_head)
+    irqflags_t fl = spin_lock_irqsave(&s_kbd_lock);
+    drain_fifo_locked();
+    if (s_tail == s_head) {
+        spin_unlock_irqrestore(&s_kbd_lock, fl);
         return 0;
+    }
     *out = s_ring[s_tail];
     s_tail = (s_tail + 1) % RX_RING;
+    spin_unlock_irqrestore(&s_kbd_lock, fl);
     return 1;
 }
 
 int
 kbd_has_data(void)
 {
-    drain_fifo();
-    return s_tail != s_head;
+    irqflags_t fl = spin_lock_irqsave(&s_kbd_lock);
+    drain_fifo_locked();
+    int r = (s_tail != s_head);
+    spin_unlock_irqrestore(&s_kbd_lock, fl);
+    return r;
 }
 
 char
@@ -191,12 +222,9 @@ kbd_inject(char c)
 #ifdef AEGIS_BOOT_NATIVE
     reboot_escape_watch(c);   /* USB-keyboard input also arms the ~~~ reboot escape */
 #endif
-    uint32_t next = (s_head + 1) % RX_RING;
-    if (next != s_tail) {
-        s_ring[s_head] = c;
-        s_head = next;
-    }
-    s_rx_count++;
+    irqflags_t fl = spin_lock_irqsave(&s_kbd_lock);
+    ring_push_locked(c);
+    spin_unlock_irqrestore(&s_kbd_lock, fl);
     waitq_wake_all(&g_console_waiters);
 }
 

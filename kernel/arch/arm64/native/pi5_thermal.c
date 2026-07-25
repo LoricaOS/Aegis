@@ -40,10 +40,10 @@ pi5_thermal_report(void)
 {
     int32_t m = pi5_temp_millicelsius();
     if (m == INT32_MIN) {
-        printk("[TEMP] SoC sensor not ready\n");
+        pr_dbg("[TEMP] SoC sensor not ready\n");
         return;
     }
-    printk("[TEMP] SoC %d.%d C\n", m / 1000, (m % 1000) / 100);
+    pr_dbg("[TEMP] SoC %d.%d C\n", m / 1000, (m % 1000) / 100);
 }
 
 /* rp1_fan_set — native/rp1.c: fan speed, per-mille (0 = off .. 1000 = full). */

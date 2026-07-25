@@ -180,17 +180,21 @@ arch_mm_init_native(uint64_t dtb_phys)
     s_dtb_phys        = dtb_phys;
     s_uart_phys       = 0x107D001000UL; /* real Pi 5 PL011 (block index 65)      */
 
-    /* Native netboot has no bootloader-supplied cmdline. Bake the live-desktop
-     * defaults so a bare boot comes up straight into the graphical session,
-     * mirroring the live ISO's cmdline (see loricaos gen-limine-conf.sh):
-     *   boot=graphical        -> vigil runs the bastion greeter, not getty
-     *   bastion_autologin=live -> bastion skips the password (live-boot bypass)
-     *   aegis_live=1          -> vigil keeps the live state (no first-boot strip)
+    /* Native netboot has no bootloader-supplied cmdline. Bake the graphical
+     * boot mode so a bare boot comes up into the desktop:
+     *   boot=graphical -> vigil runs the bastion greeter, not getty
+     * NOTE: deliberately NO bastion_autologin/aegis_live here. Those were a
+     * live-demo bypass that force-autologs `live` and marks the system "live";
+     * that fights the first-boot flow (a fresh Pi runs `configure` to create a
+     * real account, then must show the GREETER for it — not autolog a `live`
+     * user that configure has just replaced). Autologin is now a ROOTFS choice
+     * (/etc/aegis/autologin), which bastion honors, so a hands-free dev image
+     * can still opt in without the kernel forcing it on every board.
      * ponytail: hardcoded for this single board; read /chosen/bootargs from the
      * DTB if a second native target ever needs a different cmdline. */
     {
         static const char def[] =
-            "boot=graphical bastion_autologin=live aegis_live=1"
+            "boot=graphical"
 #ifdef AEGIS_NATIVE_KVATEST
             /* Diagnostic build (NATIVE_KVATEST=1): run the kernel VA allocator
              * integrity stress early in boot. Real hardware is the ONLY place

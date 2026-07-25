@@ -205,12 +205,16 @@ rescal_deassert(void)
      * actually told us WHERE it failed. Raw readbacks before touching the
      * sequence again, per advisor guidance, rather than guessing a third
      * time. */
-    printk("[PCIE-BRCM] diag: rescal START(before)=0x%x STATUS(before)=0x%x\n",
-           (unsigned)*start, (unsigned)*status);
+    /* MMIO reads hoisted out of the pr_dbg arguments — see rp1.c. */
+    uint32_t rescal_start_before  = *start;
+    uint32_t rescal_status_before = *status;
+    pr_dbg("[PCIE-BRCM] diag: rescal START(before)=0x%x STATUS(before)=0x%x\n",
+           (unsigned)rescal_start_before, (unsigned)rescal_status_before);
+    (void)rescal_start_before; (void)rescal_status_before;
 
     *start = *start | RESCAL_START_BIT;
     uint32_t start_after = *start;
-    printk("[PCIE-BRCM] diag: rescal START(after-write)=0x%x\n", (unsigned)start_after);
+    pr_dbg("[PCIE-BRCM] diag: rescal START(after-write)=0x%x\n", (unsigned)start_after);
     if (!(start_after & RESCAL_START_BIT))
         return -1;
 
@@ -226,11 +230,11 @@ rescal_deassert(void)
         if (s & RESCAL_STATUS_BIT)
             break;
         if (i == 0 || i == 100 || i == 500 || i == 1000 || i == 1999)
-            printk("[PCIE-BRCM] diag: rescal poll i=%d STATUS=0x%x\n", i, (unsigned)s);
+            pr_dbg("[PCIE-BRCM] diag: rescal poll i=%d STATUS=0x%x\n", i, (unsigned)s);
         busy_wait_us(100);
     }
     uint32_t status_final = *status;
-    printk("[PCIE-BRCM] diag: rescal STATUS(final)=0x%x\n", (unsigned)status_final);
+    pr_dbg("[PCIE-BRCM] diag: rescal STATUS(final)=0x%x\n", (unsigned)status_final);
     if (!(status_final & RESCAL_STATUS_BIT))
         return -1;
 
@@ -452,14 +456,18 @@ pcie_rp1_map_window(void)
         program_bridge_bus_numbers(0, 1, 1);
 
         uint32_t id = cfg_read32(1, 0, 0x00);
-        printk("[PCIE-BRCM] RP1: bus1 id=0x%x class=0x%x\n",
-               id, cfg_read32(1, 0, 0x08));
+        uint32_t cls = cfg_read32(1, 0, 0x08);   /* hoisted out of pr_dbg args */
+        pr_dbg("[PCIE-BRCM] RP1: bus1 id=0x%x class=0x%x\n", id, cls);
+        (void)cls;
         if ((id & 0xFFFFu) != 0xFFFFu) {
             uint32_t bar1_raw = cfg_read32(1, 0, 0x14);
             uint64_t bar1 = bar1_raw & ~0xFULL;   /* RP1's 4MB register window */
-            printk("[PCIE-BRCM] RP1: BAR0=0x%x BAR1=0x%x BAR2=0x%x BAR3=0x%x\n",
-                   cfg_read32(1, 0, 0x10), bar1_raw,
-                   cfg_read32(1, 0, 0x18), cfg_read32(1, 0, 0x1c));
+            uint32_t bar0 = cfg_read32(1, 0, 0x10);   /* hoisted — see rp1.c */
+            uint32_t bar2 = cfg_read32(1, 0, 0x18);
+            uint32_t bar3 = cfg_read32(1, 0, 0x1c);
+            pr_dbg("[PCIE-BRCM] RP1: BAR0=0x%x BAR1=0x%x BAR2=0x%x BAR3=0x%x\n",
+                   bar0, bar1_raw, bar2, bar3);
+            (void)bar0; (void)bar2; (void)bar3;
 
             /* Firmware put BAR1 at ~0x80000000, not 0x0 — aim both the outbound
              * window (CPU 0x1f_00000000 -> PCIe bar1, 8MB covers BAR1/2/0) and
@@ -471,7 +479,7 @@ pcie_rp1_map_window(void)
             uint32_t fwd_limit = fwd_base + 7;                 /* +8MB */
             cfg_write32(0, 0, 0x20, (fwd_limit << 20) | (fwd_base << 4));
             cfg_write32(0, 0, 0x04, cfg_read32(0, 0, 0x04) | 0x6u);
-            printk("[PCIE-BRCM] RP1: window CPU 0x1f00000000 -> PCIe 0x%lx "
+            pr_dbg("[PCIE-BRCM] RP1: window CPU 0x1f00000000 -> PCIe 0x%lx "
                    "(link 0x%x)\n", bar1, st);
             ok = 1;
         } else {
@@ -494,7 +502,7 @@ print_found(uint8_t bus, uint8_t dev)
         return;
     uint16_t device = (uint16_t)(idreg >> 16);
     uint32_t cls = cfg_read32(bus, dev, 0x08);
-    printk("[PCIE-BRCM] found %x:%x class=%x at bus %u dev %u\n",
+    pr_dbg("[PCIE-BRCM] found %x:%x class=%x at bus %u dev %u\n",
            (unsigned)vendor, (unsigned)device, (unsigned)(cls >> 24),
            (unsigned)bus, (unsigned)dev);
 }
@@ -511,13 +519,13 @@ pcie_brcmstb_init(void)
      * before this flash -- expect 0x1000110000/0x9310 for pcie1. Also dump
      * node_index 0/2 to independently confirm fdt_reg_by_compat_nth's
      * node-counting isn't off by one (real DTB order: pcie0, pcie1, pcie2). */
-    printk("[PCIE-BRCM] diag: pcie1 base_phys=0x%lx base_sz=0x%lx\n", base_phys, base_sz);
+    pr_dbg("[PCIE-BRCM] diag: pcie1 base_phys=0x%lx base_sz=0x%lx\n", base_phys, base_sz);
     {
         uint64_t a, s;
         if (fdt_reg_by_compat_nth(PCIE_BRCMSTB_COMPAT, 0, &a, &s))
-            printk("[PCIE-BRCM] diag: node0 base=0x%lx sz=0x%lx\n", a, s);
+            pr_dbg("[PCIE-BRCM] diag: node0 base=0x%lx sz=0x%lx\n", a, s);
         if (fdt_reg_by_compat_nth(PCIE_BRCMSTB_COMPAT, 2, &a, &s))
-            printk("[PCIE-BRCM] diag: node2 base=0x%lx sz=0x%lx\n", a, s);
+            pr_dbg("[PCIE-BRCM] diag: node2 base=0x%lx sz=0x%lx\n", a, s);
     }
 
     /* 10 pages covers the DTB's own 0x9310-byte reg size with margin.
@@ -543,7 +551,7 @@ pcie_brcmstb_init(void)
     {
         uint64_t freq;
         __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
-        printk("[PCIE-BRCM] diag: cntfrq_el0=%lu pcie1[0x0]=0x%x\n",
+        pr_dbg("[PCIE-BRCM] diag: cntfrq_el0=%lu pcie1[0x0]=0x%x\n",
                freq, (unsigned)r32(0x00));
     }
 
@@ -577,7 +585,7 @@ pcie_brcmstb_init(void)
             (volatile uint8_t *)kva_map_mmio(uart_phys & ~0xFFFUL, 1)
             + (uart_phys & 0xFFFUL);
         uint32_t via_kva = *(volatile uint32_t *)(uart_kva + 0xFE0);
-        printk("[PCIE-BRCM] diag: UART PeriphID0 via arch_dmap=0x%x "
+        pr_dbg("[PCIE-BRCM] diag: UART PeriphID0 via arch_dmap=0x%x "
                "via kva_map_mmio=0x%x (both should read 0x11, same phys 0x%lx)\n",
                via_dmap, via_kva, uart_phys);
 
@@ -588,15 +596,15 @@ pcie_brcmstb_init(void)
             (volatile uint8_t *)kva_map_mmio(gicd_phys & ~0xFFFUL, 1)
             + (gicd_phys & 0xFFFUL);
         uint32_t gicd_kva_val = *(volatile uint32_t *)(gicd_kva + 0x8);
-        printk("[PCIE-BRCM] diag: GICD_IIDR (sub-4GB) via arch_dmap=0x%x "
+        pr_dbg("[PCIE-BRCM] diag: GICD_IIDR (sub-4GB) via arch_dmap=0x%x "
                "via kva_map_mmio=0x%x (should match each other)\n",
                gicd_dmap, gicd_kva_val);
 
         uint64_t raw_pte = vmm_debug_raw_kernel_pte((uint64_t)(uintptr_t)uart_kva & ~0xFFFUL);
-        printk("[PCIE-BRCM] diag: raw kernel PTE for uart_kva mapping = 0x%lx\n", raw_pte);
+        pr_dbg("[PCIE-BRCM] diag: raw kernel PTE for uart_kva mapping = 0x%lx\n", raw_pte);
 
         uint32_t reset_val = *(volatile uint32_t *)s_bcm_reset;
-        printk("[PCIE-BRCM] diag: s_bcm_reset[0x0]=0x%x (want 0x0, real-Linux "
+        pr_dbg("[PCIE-BRCM] diag: s_bcm_reset[0x0]=0x%x (want 0x0, real-Linux "
                "devmem baseline at phys 0x%lx)\n", reset_val, BCM_RESET_PHYS);
     }
 
@@ -618,13 +626,13 @@ pcie_brcmstb_init(void)
      * if the vendor ID (or anything else) flips to the expected value on
      * its own, this is a settling-time issue and needs a readiness poll
      * instead of more reset-ordering guesses. */
-    printk("[PCIE-BRCM] diag: pre-wait  vendorid=0x%x misc_ctrl=0x%x "
+    pr_dbg("[PCIE-BRCM] diag: pre-wait  vendorid=0x%x misc_ctrl=0x%x "
            "hard_debug=0x%x pcie_ctrl=0x%x pcie_status=0x%x\n",
            (unsigned)r32(0x00), (unsigned)r32(PCIE_MISC_MISC_CTRL),
            (unsigned)r32(PCIE_MISC_HARD_DEBUG), (unsigned)r32(PCIE_MISC_PCIE_CTRL),
            (unsigned)r32(PCIE_MISC_PCIE_STATUS));
     busy_wait_us(2000000);
-    printk("[PCIE-BRCM] diag: post-wait vendorid=0x%x misc_ctrl=0x%x "
+    pr_dbg("[PCIE-BRCM] diag: post-wait vendorid=0x%x misc_ctrl=0x%x "
            "hard_debug=0x%x pcie_ctrl=0x%x pcie_status=0x%x\n",
            (unsigned)r32(0x00), (unsigned)r32(PCIE_MISC_MISC_CTRL),
            (unsigned)r32(PCIE_MISC_HARD_DEBUG), (unsigned)r32(PCIE_MISC_PCIE_CTRL),
@@ -642,7 +650,7 @@ pcie_brcmstb_init(void)
      * exactly, the PTE is wrong and that's the bug; if it matches, the
      * mapping is fine and the fault is downstream (hardware enable
      * sequencing, or a wrong assumption about what's at this offset). */
-    printk("[PCIE-BRCM] diag: kva_page_phys(s_base)=0x%lx (want 0x%lx) "
+    pr_dbg("[PCIE-BRCM] diag: kva_page_phys(s_base)=0x%lx (want 0x%lx) "
            "kva_page_phys(s_rescal)=0x%lx (want 0x%lx)\n",
            kva_page_phys((void *)((uint64_t)(uintptr_t)s_base & ~0xFFFUL)),
            base_phys,
@@ -693,7 +701,7 @@ pcie_brcmstb_init(void)
      * remaining bug is downstream (rescal completion / PERST# / link
      * training); if it's still garbage, the reset sequence itself isn't
      * reaching hardware and that's the next place to look. */
-    printk("[PCIE-BRCM] diag: post-reset pcie1[0x0]=0x%x rescal STATUS=0x%x\n",
+    pr_dbg("[PCIE-BRCM] diag: post-reset pcie1[0x0]=0x%x rescal STATUS=0x%x\n",
            (unsigned)r32(0x00),
            (unsigned)(*(volatile uint32_t *)(s_rescal + RESCAL_STATUS)));
 
@@ -882,7 +890,7 @@ pcie_brcmstb_init(void)
             volatile uint8_t *bar = (volatile uint8_t *)kva_map_mmio(bar_cpu & ~0xFFFUL, 4)
                                     + (bar_cpu & 0xFFFUL);
             uint32_t cap_lo = *(volatile uint32_t *)bar;
-            printk("[PCIE-BRCM] diag: device BAR0 @ cpu 0x%lx, first reg (NVMe CAP[31:0])=0x%x\n",
+            pr_dbg("[PCIE-BRCM] diag: device BAR0 @ cpu 0x%lx, first reg (NVMe CAP[31:0])=0x%x\n",
                    bar_cpu, cap_lo);
         }
 
@@ -898,7 +906,7 @@ pcie_brcmstb_init(void)
         d.bus = 1; d.dev = 0; d.fn = 0;
         d.bar[0] = bar_cpu;
         if (pcie_register_device(&d) == 0)
-            printk("[PCIE-BRCM] registered %x:%x class=%x.%x.%x for driver bind\n",
+            pr_dbg("[PCIE-BRCM] registered %x:%x class=%x.%x.%x for driver bind\n",
                    (unsigned)d.vendor_id, (unsigned)d.device_id,
                    (unsigned)d.class_code, (unsigned)d.subclass, (unsigned)d.progif);
     }
