@@ -1128,24 +1128,35 @@ procfs_dir_readdir(void *priv, uint64_t index, char *name_out, uint8_t *type_out
 
     if (dp->is_fd) {
         /* /proc/[pid]/fd/ — enumerate open fds */
-        aegis_process_t *proc = proc_find_by_pid(dp->pid);
-        if (!proc || !proc->fd_table)
+        /* Whole enumeration under sched_lock: the PCB and its fd_table have
+         * no refcount here, so a pointer taken and then used after the lock
+         * dropped would read a page the reaper had already freed. The loop is
+         * bounded by PROC_MAX_FDS and does no I/O, so holding the lock across
+         * it is cheap. */
+        irqflags_t pfl = spin_lock_irqsave(&sched_lock);
+        aegis_process_t *proc = proc_find_by_pid_locked(dp->pid);
+        if (!proc || !proc->fd_table) {
+            spin_unlock_irqrestore(&sched_lock, pfl);
             return -1;
+        }
         uint64_t found = 0;
         uint32_t i;
+        int      hit = -1;
         for (i = 0; i < PROC_MAX_FDS; i++) {
             if (!proc->fd_table->fds[i].ops)
                 continue;
-            if (found == index) {
-                /* write decimal fd number into name_out */
-                char *p = pfs_u64_dec(name_out, i);
-                *p = '\0';
-                *type_out = 8; /* DT_REG */
-                return 0;
-            }
+            if (found == index) { hit = (int)i; break; }
             found++;
         }
-        return -1;
+        spin_unlock_irqrestore(&sched_lock, pfl);
+        if (hit < 0)
+            return -1;
+        {   /* write decimal fd number into name_out */
+            char *p = pfs_u64_dec(name_out, (uint64_t)hit);
+            *p = '\0';
+            *type_out = 8; /* DT_REG */
+        }
+        return 0;
     }
 
     if (dp->pid != 0) {
@@ -1263,14 +1274,32 @@ pfs_parse_pid(const char **pp)
  * Allocates a kva page for the buffer, calls the generator, sets up the fd. */
 static int
 procfs_open_file(uint32_t (*gen)(char *, uint32_t, aegis_process_t *),
-                 aegis_process_t *proc, vfs_file_t *out)
+                 uint32_t pid, vfs_file_t *out)
 {
     procfs_file_priv_t *fp = (procfs_file_priv_t *)kva_alloc_pages(1);
     char *buf = (char *)kva_alloc_pages(1);
     if (!fp || !buf)
         return -ENOMEM;
     fp->buf = buf;
+    /* Resolve the PCB and run the generator inside ONE sched_lock hold. PCBs
+     * carry no refcount, so a pointer resolved by the caller and passed in here
+     * could already have been freed by sys_waitpid's reaper — every gen_*
+     * dereferences it. The generators only format from PCB fields (no user
+     * memory, no I/O, no allocation — the buffers above are allocated first,
+     * deliberately outside the lock), so holding it across the call is safe.
+     * kva_alloc_pages must NOT run under sched_lock: it can trigger a cross-CPU
+     * TLB shootdown that spins for CPUs which cannot ack while blocked on this
+     * very lock. */
+    irqflags_t fl = spin_lock_irqsave(&sched_lock);
+    aegis_process_t *proc = proc_find_by_pid_locked(pid);
+    if (!proc) {
+        spin_unlock_irqrestore(&sched_lock, fl);
+        kva_free_pages(buf, 1);
+        kva_free_pages(fp, 1);
+        return -ENOENT;
+    }
     fp->len = gen(buf, 4096, proc);
+    spin_unlock_irqrestore(&sched_lock, fl);
     fp->refs = 1;
 
     out->ops    = &s_procfs_file_ops;
@@ -1334,8 +1363,9 @@ procfs_open_pid(uint32_t pid, const char *path, vfs_file_t *out)
     if (rc != 0)
         return -(int)ENOCAP;
 
-    aegis_process_t *proc = proc_find_by_pid(pid);
-    if (!proc)
+    /* Existence check only — the PCB is never dereferenced here, so do not
+     * hold a pointer to it past the lock. */
+    if (!proc_pid_exists(pid))
         return -ENOENT;
 
     /* /proc/<pid> or /proc/<pid>/ → directory */
@@ -1347,15 +1377,15 @@ procfs_open_pid(uint32_t pid, const char *path, vfs_file_t *out)
         path++;
 
     if (pfs_streq(path, "maps"))
-        return procfs_open_file(gen_maps, proc, out);
+        return procfs_open_file(gen_maps, pid, out);
     if (pfs_streq(path, "status"))
-        return procfs_open_file(gen_status, proc, out);
+        return procfs_open_file(gen_status, pid, out);
     if (pfs_streq(path, "stat"))
-        return procfs_open_file(gen_stat, proc, out);
+        return procfs_open_file(gen_stat, pid, out);
     if (pfs_streq(path, "exe"))
-        return procfs_open_file(gen_exe, proc, out);
+        return procfs_open_file(gen_exe, pid, out);
     if (pfs_streq(path, "cmdline"))
-        return procfs_open_file(gen_cmdline, proc, out);
+        return procfs_open_file(gen_cmdline, pid, out);
     if (pfs_streq(path, "fd") || pfs_streq(path, "fd/"))
         return procfs_open_dir(pid, 1, out);
 
@@ -1493,9 +1523,9 @@ procfs_stat(const char *path, k_stat_t *out)
         if (pid == 0)
             return -ENOENT;
 
-        /* Check process exists */
-        aegis_process_t *proc = proc_find_by_pid(pid);
-        if (!proc)
+        /* Check process exists (pointer deliberately not kept — see
+         * proc_find_by_pid_locked). */
+        if (!proc_pid_exists(pid))
             return -ENOENT;
 
         /* /proc/<pid> → directory */

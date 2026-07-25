@@ -4,6 +4,10 @@
 #include "proc.h"
 #include "cap.h"    /* cap_policy_load (install-commit reload) */
 #include "ext2.h"   /* ext2_anchors_reload (install-commit reload) */
+#include "spinlock.h"
+
+/* Guards the task list; PCBs found by walking it are only valid while held. */
+extern spinlock_t sched_lock;
 
 /*
  * sys_auth_session — syscall 364
@@ -59,18 +63,26 @@ sys_cap_query(uint64_t pid_arg, uint64_t buf_uptr, uint64_t buflen)
     if (!sched_current()->is_user)
         return SYS_ERR(EPERM);
 
-    aegis_process_t *target;
+    /* Snapshot of the target's table. The PCB has no refcount, so it must not
+     * be dereferenced once sched_lock is dropped — and copy_to_user below can
+     * fault, so it cannot run under the lock. Copy, then publish. */
+    cap_slot_t snapshot[CAP_TABLE_SIZE];
 
     if (pid_arg == 0) {
-        target = caller;
+        __builtin_memcpy(snapshot, caller->caps, sizeof(snapshot));
     } else {
         if (cap_check(caller->caps, CAP_TABLE_SIZE,
                       CAP_KIND_CAP_QUERY, CAP_RIGHTS_READ) != 0)
             return SYS_ERR(ENOCAP);
 
-        target = proc_find_by_pid((uint32_t)pid_arg);
-        if (!target)
+        irqflags_t fl = spin_lock_irqsave(&sched_lock);
+        aegis_process_t *target = proc_find_by_pid_locked((uint32_t)pid_arg);
+        if (!target) {
+            spin_unlock_irqrestore(&sched_lock, fl);
             return SYS_ERR(ESRCH);
+        }
+        __builtin_memcpy(snapshot, target->caps, sizeof(snapshot));
+        spin_unlock_irqrestore(&sched_lock, fl);
     }
 
     uint64_t copy_bytes = CAP_TABLE_SIZE * sizeof(cap_slot_t);
@@ -85,7 +97,7 @@ sys_cap_query(uint64_t pid_arg, uint64_t buf_uptr, uint64_t buflen)
 
     if (!user_ptr_valid(buf_uptr, copy_bytes))
         return SYS_ERR(EFAULT);
-    copy_to_user((void *)buf_uptr, target->caps, copy_bytes);
+    copy_to_user((void *)buf_uptr, snapshot, copy_bytes);
 
     return nslots;
 }
@@ -138,6 +150,7 @@ sys_admin_session(uint64_t on)
 
     if (!on) {
         proc->admin_session = 0;
+        proc->admin_session_firstboot = 0;
         return 0;
     }
 
@@ -145,10 +158,30 @@ sys_admin_session(uint64_t on)
                   CAP_KIND_ADMIN_AUTH, CAP_RIGHTS_WRITE) != 0)
         return SYS_ERR(EPERM);
 
-    parent = proc_find_by_pid(proc->ppid);
-    if (!parent)
-        return SYS_ERR(EPERM);
-    parent->admin_session = 1u;
+    /* Snapshot the parent's identity under sched_lock, set the flag there, and
+     * do the (file-reading) policy derivation OUTSIDE the lock on a stack copy
+     * — then re-find and publish. The old code kept the PCB pointer across
+     * cap_apply_policy, which reads /etc/aegis/caps.d; if the parent exited and
+     * was reaped in that window, this wrote admin_session = 1 and a full
+     * 64-slot capability table into a freed, likely-recycled page. */
+    uint32_t parent_pid = proc->ppid;
+    char     parent_exe[256];
+    int      parent_auth;
+    {
+        irqflags_t fl = spin_lock_irqsave(&sched_lock);
+        parent = proc_find_by_pid_locked(parent_pid);
+        if (!parent) {
+            spin_unlock_irqrestore(&sched_lock, fl);
+            return SYS_ERR(EPERM);
+        }
+        parent->admin_session = 1u;
+        /* Credential-backed: /bin/login -elevate verified a separate admin
+         * credential before calling us. This elevation DOES survive exec. */
+        parent->admin_session_firstboot = 0u;
+        __builtin_memcpy(parent_exe, parent->exe_path, sizeof(parent_exe));
+        parent_auth = (int)parent->authenticated;
+        spin_unlock_irqrestore(&sched_lock, fl);
+    }
 
     /* Re-derive the parent's cap table so the freshly granted admin session
      * takes effect IN-PROCESS, immediately. The admin_session-gated kinds
@@ -165,8 +198,22 @@ sys_admin_session(uint64_t on)
      * caps re-derived are exactly the parent binary's own trusted-path-anchored
      * policy — nothing more than it would have received had it been exec'd from
      * an already-elevated session. */
-    cap_apply_policy(parent->caps, parent->exe_path,
-                     (int)parent->authenticated, (int)parent->admin_session);
+    cap_slot_t newcaps[CAP_TABLE_SIZE];
+    cap_apply_policy(newcaps, parent_exe, parent_auth, 1 /* admin_session */);
+
+    /* Re-find before publishing: the parent may have exited while we read the
+     * policy files. Same pid is required, and a pid is not reused while its
+     * PCB is still linked, so this cannot land on an unrelated process. */
+    {
+        irqflags_t fl = spin_lock_irqsave(&sched_lock);
+        parent = proc_find_by_pid_locked(parent_pid);
+        if (!parent) {
+            spin_unlock_irqrestore(&sched_lock, fl);
+            return SYS_ERR(EPERM);
+        }
+        __builtin_memcpy(parent->caps, newcaps, sizeof(newcaps));
+        spin_unlock_irqrestore(&sched_lock, fl);
+    }
     return 0;
 }
 

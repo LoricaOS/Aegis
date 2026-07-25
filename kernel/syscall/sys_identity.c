@@ -156,14 +156,25 @@ sys_setpgid(uint64_t pid_arg, uint64_t pgid_arg)
     uint32_t pid  = (uint32_t)pid_arg;
     uint32_t pgid = (uint32_t)pgid_arg;
 
+    /* Everything that touches the target PCB happens inside ONE sched_lock
+     * hold: the target has no refcount, so a pointer that outlived the lock
+     * could be freed by sys_waitpid's reaper before the pgid store below —
+     * writing an attacker-influenced word into a recycled page. The whole body
+     * is a bounded list walk with no I/O, so one critical section is fine. */
+    irqflags_t fl = spin_lock_irqsave(&sched_lock);
+
     aegis_process_t *target = caller;
     if (pid != 0 && pid != caller->pid) {
-        target = proc_find_by_pid(pid);
-        if (!target)
+        target = proc_find_by_pid_locked(pid);
+        if (!target) {
+            spin_unlock_irqrestore(&sched_lock, fl);
             return SYS_ERR(ESRCH);
+        }
         /* Can only setpgid on self or direct child */
-        if (target->ppid != caller->pid)
+        if (target->ppid != caller->pid) {
+            spin_unlock_irqrestore(&sched_lock, fl);
             return SYS_ERR(EPERM);
+        }
     }
 
     if (pgid == 0)
@@ -171,10 +182,8 @@ sys_setpgid(uint64_t pid_arg, uint64_t pgid_arg)
 
     /* Always allow: pgid == target->pid (create own group) */
     if (pgid != target->pid) {
-        /* Verify pgid belongs to a process in the same session.
-         * Walk under sched_lock — the list mutates concurrently on SMP. */
+        /* Verify pgid belongs to a process in the same session. */
         int found = 0;
-        irqflags_t fl = spin_lock_irqsave(&sched_lock);
         aegis_task_t *t = sched_current();
         aegis_task_t *start = t;
         do {
@@ -187,12 +196,14 @@ sys_setpgid(uint64_t pid_arg, uint64_t pgid_arg)
             }
             t = t->next;
         } while (t != start);
-        spin_unlock_irqrestore(&sched_lock, fl);
-        if (!found)
+        if (!found) {
+            spin_unlock_irqrestore(&sched_lock, fl);
             return SYS_ERR(EPERM);
+        }
     }
 
     target->pgid = pgid;
+    spin_unlock_irqrestore(&sched_lock, fl);
     return 0;
 }
 

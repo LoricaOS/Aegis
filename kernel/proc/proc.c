@@ -507,24 +507,34 @@ void arch_save_current_fs_base(uint64_t val) {
         t->fs_base = val;
 }
 
+/*
+ * proc_find_by_pid_locked — walk the task list for `pid`. THE CALLER MUST HOLD
+ * sched_lock, AND MUST NOT DEREFERENCE THE RESULT AFTER DROPPING IT.
+ *
+ * There is no refcount or pin on a PCB. sys_waitpid's reaper unlinks a zombie
+ * under sched_lock and then kva_free_pages() the PCB, so a pointer handed out
+ * by the old lock-internally-then-return version was stale the instant the
+ * lock dropped. Callers wrote through it: setpgid stored a pgid, sys_exit
+ * decremented the leader's thread_count, and worst, sys_admin_session set
+ * admin_session = 1 and then blitted a full 64-slot cap_apply_policy result
+ * into what could already be a recycled page. That is an attacker-timed
+ * capability-table write.
+ *
+ * Hence the _locked suffix and the contract: do the whole operation inside the
+ * critical section, or snapshot what you need and re-find afterwards.
+ */
 aegis_process_t *
-proc_find_by_pid(uint32_t pid)
+proc_find_by_pid_locked(uint32_t pid)
 {
-    irqflags_t fl = spin_lock_irqsave(&sched_lock);
-
     aegis_task_t *cur = sched_current();
-    if (!cur) {
-        spin_unlock_irqrestore(&sched_lock, fl);
+    if (!cur)
         return (aegis_process_t *)0;
-    }
 
     /* Check current task first */
     if (cur->is_user) {
         aegis_process_t *p = (aegis_process_t *)cur;
-        if (p->pid == pid) {
-            spin_unlock_irqrestore(&sched_lock, fl);
+        if (p->pid == pid)
             return p;
-        }
     }
 
     /* Walk the circular list */
@@ -532,13 +542,22 @@ proc_find_by_pid(uint32_t pid)
     while (t != cur) {
         if (t->is_user) {
             aegis_process_t *p = (aegis_process_t *)t;
-            if (p->pid == pid) {
-                spin_unlock_irqrestore(&sched_lock, fl);
+            if (p->pid == pid)
                 return p;
-            }
         }
         t = t->next;
     }
-    spin_unlock_irqrestore(&sched_lock, fl);
     return (aegis_process_t *)0;
+}
+
+/* proc_pid_exists — "is there a live process with this pid right now?" for
+ * callers that only need an existence check and never touch the PCB. Safe
+ * because nothing escapes the lock. */
+int
+proc_pid_exists(uint32_t pid)
+{
+    irqflags_t fl = spin_lock_irqsave(&sched_lock);
+    int found = proc_find_by_pid_locked(pid) != (aegis_process_t *)0;
+    spin_unlock_irqrestore(&sched_lock, fl);
+    return found;
 }

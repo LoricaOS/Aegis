@@ -108,12 +108,16 @@ sys_exit(uint64_t arg1)
          * matching decrement here every thread exit silently inflates it for the
          * leader's lifetime. Advisory only (the waitpid leader-reap guard scans
          * task state directly, not this counter), so the unlocked read/modify is
-         * acceptable. proc_find_by_pid takes sched_lock internally — call it
-         * here, before this function acquires any lock. */
+         * acceptable. */
         if (proc->tgid != proc->pid) {
-            aegis_process_t *leader = proc_find_by_pid(proc->tgid);
+            /* Find AND decrement inside one critical section: the leader PCB
+             * has no refcount, so a pointer that outlives sched_lock can be
+             * freed by the reaper before we write through it. */
+            irqflags_t lfl = spin_lock_irqsave(&sched_lock);
+            aegis_process_t *leader = proc_find_by_pid_locked(proc->tgid);
             if (leader && leader->thread_count > 0)
                 leader->thread_count--;
+            spin_unlock_irqrestore(&sched_lock, lfl);
         }
 
         /* clear_child_tid: write 0 and futex wake (for pthread_join) */
@@ -403,6 +407,7 @@ sys_clone(syscall_frame_t *frame, uint64_t flags, uint64_t child_stack,
         child->caps[ci] = parent->caps[ci];
     child->authenticated = parent->authenticated;
     child->admin_session = parent->admin_session;
+    child->admin_session_firstboot = parent->admin_session_firstboot;
     child->auth_uid      = parent->auth_uid;
     child->auth_gid      = parent->auth_gid;
 
@@ -729,6 +734,7 @@ sys_fork(syscall_frame_t *frame, uint64_t u_rdi, uint64_t u_rsi, uint64_t u_rdx)
         child->caps[ci] = parent->caps[ci];
     child->authenticated = parent->authenticated;
     child->admin_session = parent->admin_session;
+    child->admin_session_firstboot = parent->admin_session_firstboot;
     child->auth_uid      = parent->auth_uid;
     child->auth_gid      = parent->auth_gid;
 
