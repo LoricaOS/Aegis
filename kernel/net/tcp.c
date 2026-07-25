@@ -565,7 +565,17 @@ void tcp_rx(netdev_t *dev, ip4_addr_t src_ip, ip4_addr_t dst_ip,
      * is still 0 — correct, because a SYN-ACK's own window field is unscaled.
      * From the first post-handshake segment onward snd_wscale is set and the
      * peer's windows are left-shifted into the real 32-bit value. */
-    conn->snd_wnd = ((uint32_t)ntohs(seg->window)) << conn->snd_wscale;
+    /* Only adopt the peer's advertised window from a segment carrying an ACK
+     * whose number is inside our send window. This was adopted unconditionally
+     * from ANY segment matching the 4-tuple, so one spoofed packet with
+     * window=0 stalled the connection indefinitely — a blind off-path DoS
+     * strictly cheaper than the RST the code below already defends against.
+     * A SYN-ACK is covered: it carries an ACK of our SYN. */
+    if (flags & TCP_ACK) {
+        uint32_t a = ntohl(seg->ack);
+        if (seq_ge(a, conn->snd_una) && seq_le(a, conn->snd_nxt))
+            conn->snd_wnd = ((uint32_t)ntohs(seg->window)) << conn->snd_wscale;
+    }
 
     switch (conn->state) {
     case TCP_SYN_RCVD:
@@ -786,6 +796,21 @@ void tcp_rx(netdev_t *dev, ip4_addr_t src_ip, ip4_addr_t dst_ip,
             break;
         }
         if (flags & TCP_FIN) {
+            /* The FIN occupies the sequence right after this segment's
+             * payload, so it is in-order iff seq + payload_len == rcv_nxt
+             * (rcv_nxt has already advanced above if the data was accepted).
+             *
+             * There was NO sequence check here at all — while the RST path
+             * directly above implements RFC 5961 in-window validation. One
+             * spoofed FIN with any sequence number half-closed the connection
+             * AND desynced rcv_nxt by one, so every subsequent legitimate
+             * segment failed the in-order test and was silently dropped
+             * forever. Strictly cheaper for an off-path attacker than the
+             * blind RST that was already defended against. */
+            if (seq + payload_len != conn->rcv_nxt) {
+                tcp_send_segment(dev, conn, TCP_ACK, NULL, 0);  /* dup ACK */
+                break;
+            }
             conn->rcv_nxt++;
             conn->state = TCP_CLOSE_WAIT;
             tcp_send_segment(dev, conn, TCP_ACK, NULL, 0);
@@ -1129,11 +1154,67 @@ void tcp_tick(void)
 /* ── Socket-layer helpers (Phase 26) ─────────────────────────────────────── */
 
 /* tcp_listen: register a listening socket at port. */
+/* tcp_pick_local_port — an ephemeral local port that forms a 4-tuple no live
+ * connection already uses. Caller holds tcp_lock.
+ *
+ * This was `49152 + (arch_get_ticks() & 0x3FFF)` with no collision check: at
+ * 100 Hz two connect()s in the same tick to the same destination produced
+ * IDENTICAL 4-tuples, so the second hung and both then delivered into the
+ * first connection's ring. It also made the source port trivially predictable
+ * off-path, which is precisely what makes a blind FIN/RST injection practical
+ * — so the cursor is seeded from the CSPRNG rather than from the clock.
+ * (sys_socket.c has an ephem_port_next with a comment describing this exact
+ * bug being fixed for UDP; TCP never got it.) */
+#define TCP_EPHEM_BASE  49152u
+#define TCP_EPHEM_COUNT 0x4000u
+static uint16_t s_tcp_ephem;      /* seeded on first use */
+
+static uint16_t
+tcp_pick_local_port(ip4_addr_t dst_ip, uint16_t dst_port)
+{
+    if (s_tcp_ephem == 0) {
+        uint16_t r = 0;
+        random_get_bytes(&r, sizeof(r));
+        s_tcp_ephem = (uint16_t)(TCP_EPHEM_BASE + (r & (TCP_EPHEM_COUNT - 1u)));
+    }
+    for (uint32_t tries = 0; tries < TCP_EPHEM_COUNT; tries++) {
+        uint16_t port = s_tcp_ephem;
+        uint16_t off  = (uint16_t)((port - TCP_EPHEM_BASE + 1u)
+                                   & (TCP_EPHEM_COUNT - 1u));
+        s_tcp_ephem = (uint16_t)(TCP_EPHEM_BASE + off);
+
+        int taken = 0;
+        for (uint32_t k = 0; k < TCP_MAX_CONNS; k++) {
+            if (s_tcp[k].state == TCP_CLOSED) continue;
+            if (s_tcp[k].local_port != port) continue;
+            /* A LISTEN on the port, or the exact same 4-tuple, collides. */
+            if (s_tcp[k].state == TCP_LISTEN ||
+                (s_tcp[k].remote_ip == dst_ip &&
+                 s_tcp[k].remote_port == dst_port)) { taken = 1; break; }
+        }
+        if (!taken)
+            return port;
+    }
+    return 0;   /* range exhausted — caller fails the connect */
+}
+
 int
 tcp_listen(uint16_t port, uint32_t sock_id)
 {
     irqflags_t fl = spin_lock_irqsave(&tcp_lock);
     uint32_t i;
+    /* Refuse a duplicate listener. There was no scan at all (udp_bind has
+     * one), so EADDRINUSE was unreachable for TCP and two processes could
+     * listen on the same port — tcp_find_listener returns the FIRST table
+     * match, so whichever landed lower in the table silently received the
+     * other's connections. NET_LISTEN only gates ports < 1024, so any
+     * NET_SOCKET holder could squat a high-port service this way. */
+    for (i = 0; i < TCP_MAX_CONNS; i++) {
+        if (s_tcp[i].state == TCP_LISTEN && s_tcp[i].local_port == port) {
+            spin_unlock_irqrestore(&tcp_lock, fl);
+            return -1;                       /* -> EADDRINUSE */
+        }
+    }
     for (i = 0; i < TCP_MAX_CONNS; i++) {
         if (s_tcp[i].state == TCP_CLOSED) {
             tcp_claim_slot(i);
@@ -1168,7 +1249,12 @@ tcp_connect(uint32_t sock_id, ip4_addr_t dst_ip, uint16_t dst_port,
                 s_tcp[i].local_ip = dst_ip;  /* 127.0.0.1 */
             else if (s_tcp[i].local_ip == 0 && dst_ip == s_tcp[i].local_ip)
                 s_tcp[i].local_ip = dst_ip;  /* self-connect */
-            s_tcp[i].local_port  = (uint16_t)(49152u + (arch_get_ticks() & 0x3FFFu));
+            s_tcp[i].local_port  = tcp_pick_local_port(dst_ip, dst_port);
+            if (s_tcp[i].local_port == 0) {      /* no free 4-tuple */
+                s_tcp[i].state = TCP_CLOSED;
+                spin_unlock_irqrestore(&tcp_lock, fl);
+                return -1;
+            }
             s_tcp[i].remote_ip   = dst_ip;
             s_tcp[i].remote_port = dst_port;
             s_tcp[i].sock_id     = sock_id;
