@@ -225,6 +225,21 @@ DRIVER_SRCS    := $(filter-out \
     kernel/drivers/virtio_vsock.c kernel/drivers/iwl_ax200.c, $(DRIVER_SRCS))
 endif
 
+ifneq ($(CONFIG_AUDIO_HDA),y)
+DRIVER_SRCS := $(filter-out kernel/drivers/hda.c, $(DRIVER_SRCS)) kernel/drivers/hda_stub.c
+endif
+
+# Hyper-V guest support: VMBus + all synthetic devices. netvsc also appears in
+# the NET block — it needs both NET and HYPERV, so it drops if either is off.
+ifneq ($(CONFIG_HYPERV),y)
+ARCH_SRCS   := $(filter-out kernel/arch/x86_64/hyperv.c, $(ARCH_SRCS)) kernel/arch/x86_64/hyperv_stub.c
+DRIVER_SRCS := $(filter-out \
+    kernel/drivers/vmbus.c kernel/drivers/storvsc.c kernel/drivers/netvsc.c \
+    kernel/drivers/hv_kbd.c kernel/drivers/hv_timesync.c kernel/drivers/hv_mouse.c \
+    kernel/drivers/hv_heartbeat.c kernel/drivers/hv_ic.c kernel/drivers/hv_shutdown.c \
+    kernel/drivers/hv_kvp.c, $(DRIVER_SRCS))
+endif
+
 # ── Object file lists ───────────���────────────────────────────────��───────────
 ARCH_OBJS      = $(patsubst kernel/%.c,$(BUILD)/%.o,$(ARCH_SRCS))
 CORE_OBJS      = $(patsubst kernel/%.c,$(BUILD)/%.o,$(CORE_SRCS))

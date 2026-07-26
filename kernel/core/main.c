@@ -398,7 +398,9 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     acpi_init();            /* parse MCFG+MADT — [ACPI] OK                   */
     bph("acpi");
     fw_cfg_init();          /* QEMU/Proxmox fw_cfg host-injected config; silent */
+#ifdef CONFIG_HYPERV
     hyperv_init();          /* Hyper-V hypercall + SynIC foundation; silent off-HV */
+#endif
     lapic_init();           /* Local APIC — [LAPIC] OK or silent skip        */
     ioapic_init();          /* I/O APIC — [IOAPIC] OK or silent skip         */
     bph("apic");
@@ -440,10 +442,11 @@ kernel_main(uint32_t mb_magic, void *mb_info)
 #endif
     virtio_balloon_init();  /* virtio-balloon — [BALLOON] OK or silent skip  */
     virtio_input_init();    /* virtio-input kbd/tablet — [VINPUT] OK or skip  */
+#ifdef CONFIG_HYPERV
     vmbus_init();           /* Hyper-V VMBus connect + offer enumeration; silent off-HV */
     storvsc_init();         /* Hyper-V synthetic SCSI → hvdisk0; silent if absent */
 #ifdef CONFIG_NET
-    netvsc_init();          /* Hyper-V synthetic NIC → eth0; silent if absent */
+    netvsc_init();          /* Hyper-V synthetic NIC → eth0 (needs NET+HYPERV); silent if absent */
 #endif
     hv_kbd_init();          /* Hyper-V synthetic keyboard (Gen 2 has no i8042); silent if absent */
     hv_timesync_init();     /* Hyper-V time-sync IC → wall clock; silent if absent */
@@ -451,6 +454,7 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     hv_heartbeat_init();    /* Hyper-V heartbeat IC → guest reports healthy; silent if absent */
     hv_shutdown_init();     /* Hyper-V shutdown IC → host-initiated graceful stop; silent if absent */
     hv_kvp_init();          /* Hyper-V KVP/data-exchange IC → guest OS info to host; silent if absent */
+#endif
     bph("dev-probe");
     gpt_scan("nvme0");      /* GPT partitions — [GPT] OK or silent (no NVMe) */
     gpt_scan("sata0");      /* GPT on AHCI/SATA — silent if absent           */
@@ -507,7 +511,9 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     vmxnet3_init();         /* VMware vmxnet3 NIC — [NET] OK or silent skip  */
     iwl_ax200_init();       /* Intel Wi-Fi 6 AX200 — Phase 1 bring-up or skip */
 #endif
+#ifdef CONFIG_AUDIO_HDA
     hda_init();             /* Intel HD Audio — [HDA] OK or silent skip      */
+#endif
     pvpanic_init();         /* pvpanic guest→host notify — [PVPANIC] or skip */
 #ifdef CONFIG_NET
     net_init();             /* Phase 25: protocol stack init + ICMP self-test ping */

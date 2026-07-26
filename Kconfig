@@ -44,3 +44,38 @@ config NET
 	  Required by the "workstation" tier. Off in "tiny".
 
 endmenu
+
+menu "Device drivers"
+
+config HYPERV
+	bool "Hyper-V guest support (VMBus + synthetic devices)"
+	default y
+	help
+	  Microsoft Hyper-V paravirtual guest support: the VMBus transport and
+	  the synthetic SCSI (storvsc), NIC (netvsc), keyboard, mouse, and the
+	  time-sync / heartbeat / shutdown / KVP integration components. Only
+	  useful when running as a Hyper-V / Azure guest; pure ballast anywhere
+	  else. The synthetic NIC (netvsc) additionally needs CONFIG_NET.
+
+config AUDIO_HDA
+	bool "Intel HD Audio"
+	default y
+	help
+	  The Intel HDA controller driver. A text-only or headless build has no
+	  use for it.
+
+endmenu
+
+menu "Kernel diagnostics"
+
+config TRACE
+	bool "Lockless flight-recorder trace ring"
+	default y
+	help
+	  A fixed 16384-entry ring (~640 KB of static BSS) appended locklessly
+	  from any context and dumped on demand (SysRq, /proc/trace, panic). A
+	  race-hunting instrument — invaluable while developing, dead weight on a
+	  constrained target. When off, trace_emit()/trace_dump() become no-ops
+	  and the ring is reclaimed.
+
+endmenu

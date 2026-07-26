@@ -2,3 +2,6 @@
 # This is the default seeded when no .config exists.
 CONFIG_MMU=y
 CONFIG_NET=y
+CONFIG_HYPERV=y
+CONFIG_AUDIO_HDA=y
+CONFIG_TRACE=y

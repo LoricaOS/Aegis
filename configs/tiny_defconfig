@@ -3,3 +3,6 @@
 # everything optional is off.
 CONFIG_MMU=y
 # CONFIG_NET is not set
+# CONFIG_AUDIO_HDA is not set
+# CONFIG_HYPERV is not set
+# CONFIG_TRACE is not set

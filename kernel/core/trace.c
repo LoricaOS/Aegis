@@ -8,6 +8,8 @@
 /* Ring size — power of two so the index masks.  16384 records (~512 KB BSS)
  * holds enough IPC history to catch an early event (e.g. a URL passed
  * frontend->RequestServer) before a busy render wraps it. */
+#ifdef CONFIG_TRACE
+
 #define TRACE_N 16384u
 
 typedef struct {
@@ -80,6 +82,18 @@ trace_dump(const char *reason)
     }
     printk("[TRACE] ==== end ====\n");
 }
+
+#else /* !CONFIG_TRACE — flight recorder compiled out; reclaims the 640 KB ring.
+       * trace_emit()/trace_dump() stay defined (as no-ops) so the ~dozen
+       * call-sites across the tree link unchanged — the Linux tracepoint model. */
+
+void trace_emit(uint16_t event, uint64_t a, uint64_t b, uint64_t c)
+{
+    (void)event; (void)a; (void)b; (void)c;
+}
+void trace_dump(const char *reason) { (void)reason; }
+
+#endif /* CONFIG_TRACE */
 
 /* ── Process-lifecycle tracing ────────────────────────────────────────────── */
 

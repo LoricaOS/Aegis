@@ -4,4 +4,7 @@
 # the drivers a headless text workstation needs.
 CONFIG_MMU=y
 CONFIG_NET=y
-# (fs/console/driver knobs land here as they are gated; audio/trace stay off)
+# text-only, minimal bloat: no audio, no Hyper-V ballast, no debug trace ring
+# CONFIG_AUDIO_HDA is not set
+# CONFIG_HYPERV is not set
+# CONFIG_TRACE is not set
