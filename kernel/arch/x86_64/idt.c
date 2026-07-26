@@ -398,7 +398,9 @@ isr_dispatch(cpu_state_t *s)
          * to the LAPIC (edge-triggered), so EOI before servicing. The handler
          * drains the RX ring with IF=0; it must not block. */
         lapic_eoi();
+#ifdef CONFIG_NET
         virtio_net_irq();
+#endif
     } else if (s->vector >= 0x20 && s->vector < 0x30) {
         /* Hardware IRQ: send EOI BEFORE the handler.
          * pit_handler calls sched_tick which calls ctx_switch — if we

@@ -1,0 +1,7 @@
+# workstation — a text-only, networked system with minimal bloat.
+# The feature contract for the eventual PicoCalc (Pico 2 W) spin: full network
+# stack + persistent fs + text console, but no audio, no debug trace, and only
+# the drivers a headless text workstation needs.
+CONFIG_MMU=y
+CONFIG_NET=y
+# (fs/console/driver knobs land here as they are gated; audio/trace stay off)

@@ -1,0 +1,46 @@
+# Aegis kernel configuration.
+#
+# Consumed by `kconf` (github.com/LoricaOS/kconfig): resolves a .config and
+# generates build/generated/autoconf.h (#define CONFIG_*) + build/auto.conf
+# (Make vars). Pick a tier with `make <name>_defconfig` (see configs/).
+#
+# INVARIANT: the security core has NO config symbol. cap/, the syscall-boundary
+# cap_check, and uaccess are the product and are always compiled in — there is
+# deliberately no knob to remove them. Minification only ever exposes knobs for
+# genuinely optional code.
+
+mainmenu "Aegis kernel configuration"
+
+config MMU
+	bool "Paging-based memory model (MMU)"
+	default y
+	help
+	  The virtual-memory model: page tables, per-process address spaces,
+	  demand paging, fork COW, and copy_to/from_user backed by a page-fault
+	  exception table.
+
+	  Say N only for MCU-class targets with no MMU (e.g. RP2350 / Pico 2),
+	  which select a flat, MPU-isolated memory model instead. That backend
+	  is a FUTURE port and is not yet present, so N does not build today —
+	  the symbol exists so the no-MMU world is a first-class config axis
+	  rather than a fork.
+
+	  Security note: N trades away hardware memory isolation (a memory bug
+	  can cross process boundaries). Capability *authority* is unaffected —
+	  cap_check does not depend on the MMU — but defence-in-depth weakens.
+	  This is why N is expert-only.
+
+menu "Networking"
+
+config NET
+	bool "Networking stack (IPv4 / TCP / UDP / sockets)"
+	default y
+	help
+	  The in-kernel protocol stack: netdev layer, Ethernet, IPv4, TCP, UDP,
+	  the BSD socket API and AF_UNIX sockets. Disabling removes the stack,
+	  the socket syscalls, and every NIC driver (they are useless without
+	  it), reclaiming both code and the static socket buffers.
+
+	  Required by the "workstation" tier. Off in "tiny".
+
+endmenu

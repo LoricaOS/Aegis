@@ -1,0 +1,4 @@
+# full — everything on. Equivalent to the historical bare `make` build.
+# This is the default seeded when no .config exists.
+CONFIG_MMU=y
+CONFIG_NET=y

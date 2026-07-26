@@ -39,10 +39,14 @@ poll_sources_init(void)
     poll_source_register(hv_heartbeat_poll,   POLL_PRIO_HV_IC,       "hv_heartbeat");
     poll_source_register(hv_shutdown_poll,    POLL_PRIO_HV_IC,       "hv_shutdown");
     poll_source_register(hv_kvp_poll,         POLL_PRIO_HV_IC,       "hv_kvp");
+#ifdef CONFIG_NET
     poll_source_register(netdev_poll_all,     POLL_PRIO_NETDEV,      "netdev");
+#endif
     poll_source_register(hda_poll,            POLL_PRIO_AUDIO,       "hda");
     poll_source_register(virtio_balloon_poll, POLL_PRIO_VIRTIO_MISC, "virtio_balloon");
     poll_source_register(virtio_input_poll,   POLL_PRIO_VIRTIO_MISC, "virtio_input");
+#ifdef CONFIG_NET
     poll_source_register(ip_loopback_poll,    POLL_PRIO_LOOPBACK,    "ip_loopback");
     poll_source_register(tcp_tick,            POLL_PRIO_TCP_TIMER,   "tcp_tick");
+#endif
 }

@@ -17,6 +17,21 @@ AEGIS_VERSION := $(shell cat VERSION 2>/dev/null || echo 0.0.0)
 
 BUILD = build
 
+# ── Configuration (kconf / Kconfig) ─────────────────────────────────────────
+# `make <tier>_defconfig` (see configs/) writes .config; syncconfig turns it
+# into the two artifacts the build consumes: build/generated/autoconf.h
+# (#define CONFIG_* for source #ifdef guards) and build/auto.conf (Make vars,
+# -include'd below so CONFIG_* gate the source lists). A bare `make` with no
+# .config seeds configs/full_defconfig, preserving the historical build.
+KCONF        ?= kconf
+AUTOCONF_H   := $(BUILD)/generated/autoconf.h
+AUTOCONF_MK  := $(BUILD)/auto.conf
+export KCONFIG_CONFIG := .config
+# Don't drag in config generation for clean/menuconfig/defconfig goals.
+ifeq ($(filter clean distclean %config,$(MAKECMDGOALS)),)
+-include $(AUTOCONF_MK)
+endif
+
 GCC_INCLUDE := $(shell $(CC) -print-file-name=include)
 CFLAGS = \
     -ffreestanding -nostdlib -nostdinc \
@@ -30,6 +45,7 @@ CFLAGS = \
     -g \
     -Wall -Wextra -Werror \
     -DAEGIS_VERSION=\"$(AEGIS_VERSION)\" \
+    $(if $(wildcard $(AUTOCONF_H)),-include $(AUTOCONF_H)) \
     -Ikernel/arch/x86_64 -Ikernel/core -Ikernel/cap -Ikernel/mm \
     -Ikernel/sched -Ikernel/proc -Ikernel/syscall -Ikernel/fs \
     -Ikernel/tty -Ikernel/signal -Ikernel/drivers -Ikernel/net \
@@ -179,7 +195,7 @@ USERSPACE_SRCS = \
     kernel/syscall/sys_file.c kernel/syscall/sys_dir.c \
     kernel/syscall/sys_mount.c \
     kernel/syscall/sys_meta.c kernel/syscall/sys_signal.c \
-    kernel/syscall/sys_socket.c kernel/syscall/sys_random.c \
+    kernel/syscall/sys_socket.c kernel/syscall/sys_poll.c kernel/syscall/sys_random.c \
     kernel/syscall/sys_disk.c kernel/syscall/futex.c \
     kernel/syscall/fd_waitq.c \
     kernel/syscall/uaccess_check.c \
@@ -192,6 +208,22 @@ ARCH_ASMS = \
     kernel/arch/x86_64/ctx_switch.asm \
     kernel/arch/x86_64/syscall_entry.asm \
     kernel/arch/x86_64/ap_trampoline.asm
+
+# ── Config-gated subsystems ─────────────────────────────────────────────────
+# Exclude optional sources when their CONFIG_ is off. Uses the same ifeq idiom
+# as the KASAN/UBSAN knobs above. NET pulls in the whole protocol stack, the
+# socket syscall, and every NIC driver (all useless without the stack).
+ifneq ($(CONFIG_NET),y)
+# Keep epoll.c — it provides the general poll/select/epoll syscalls (no net
+# deps). net_stub.c satisfies the socket-syscall / fd-lookup / NIC symbols the
+# core still references. Everything else net drops out.
+NET_SRCS       := kernel/net/epoll.c kernel/net/net_stub.c
+USERSPACE_SRCS := $(filter-out kernel/syscall/sys_socket.c,$(USERSPACE_SRCS))
+DRIVER_SRCS    := $(filter-out \
+    kernel/drivers/virtio_net.c kernel/drivers/rtl8169.c kernel/drivers/rtl8139.c \
+    kernel/drivers/e1000.c kernel/drivers/vmxnet3.c kernel/drivers/netvsc.c \
+    kernel/drivers/virtio_vsock.c kernel/drivers/iwl_ax200.c, $(DRIVER_SRCS))
+endif
 
 # ── Object file lists ───────────���────────────────────────────────��───────────
 ARCH_OBJS      = $(patsubst kernel/%.c,$(BUILD)/%.o,$(ARCH_SRCS))
@@ -241,7 +273,33 @@ ALL_OBJS = $(BOOT_OBJ) $(ARCH_OBJS) $(ARCH_ASM_OBJS) $(CORE_OBJS) $(SIGNAL_OBJS)
 
 
 .PHONY: all iso test clean version sym dist arm64 arm64-iso test-arm64
+.PHONY: syncconfig allnoconfig allyesconfig oldconfig
 all: $(BUILD)/aegis.elf
+
+# ── Config generation ───────────────────────────────────────────────────────
+# Every object depends on the generated header, so `make` with no .config first
+# seeds configs/full_defconfig (historical everything-on build), then compiles.
+$(ALL_OBJS): | $(AUTOCONF_H)
+
+.config:
+	@echo "  [config] no .config — seeding configs/full_defconfig"
+	@$(KCONF) defconfig configs/full_defconfig Kconfig
+
+$(AUTOCONF_MK): .config Kconfig
+	@mkdir -p $(dir $(AUTOCONF_H))
+	@KCONFIG_AUTOHEADER=$(AUTOCONF_H) KCONFIG_AUTOCONF=$(AUTOCONF_MK) $(KCONF) syncconfig Kconfig
+$(AUTOCONF_H): $(AUTOCONF_MK) ;   # same syncconfig run emits both
+
+# `make <tier>_defconfig` selects a tier; make allnoconfig/allyesconfig/oldconfig.
+%_defconfig:
+	$(KCONF) defconfig configs/$@ Kconfig
+	@$(MAKE) --no-print-directory syncconfig
+allnoconfig allyesconfig oldconfig:
+	$(KCONF) $@ Kconfig
+	@$(MAKE) --no-print-directory syncconfig
+syncconfig: .config
+	@mkdir -p $(dir $(AUTOCONF_H))
+	@KCONFIG_AUTOHEADER=$(AUTOCONF_H) KCONFIG_AUTOCONF=$(AUTOCONF_MK) $(KCONF) syncconfig Kconfig
 
 # ── Unity rule bodies (after all: so targets don't become the default goal) ──
 ifeq ($(UNITY),1)

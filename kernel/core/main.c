@@ -387,7 +387,12 @@ kernel_main(uint32_t mb_magic, void *mb_info)
         const char *q = arch_get_cmdline();
         for (; *q; q++)
             if (q[0]=='s'&&q[1]=='o'&&q[2]=='c'&&q[3]=='k'&&q[4]=='t'&&
-                q[5]=='e'&&q[6]=='s'&&q[7]=='t') { sock_selftest(); break; }
+                q[5]=='e'&&q[6]=='s'&&q[7]=='t') {
+#ifdef CONFIG_NET
+                    sock_selftest();
+#endif
+                    break;
+                }
     }
     bph("fs-base");
     acpi_init();            /* parse MCFG+MADT — [ACPI] OK                   */
@@ -430,12 +435,16 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     virtio_pmem_init();     /* virtio-pmem disk — [PMEM] OK or silent skip   */
     virtio_console_init();  /* virtio-console — [VCON] OK or silent skip     */
     virtio_9p_init();       /* virtio-9p host share — [9P] OK or silent skip */
+#ifdef CONFIG_NET
     virtio_vsock_init();    /* virtio-vsock host↔guest socket — silent skip  */
+#endif
     virtio_balloon_init();  /* virtio-balloon — [BALLOON] OK or silent skip  */
     virtio_input_init();    /* virtio-input kbd/tablet — [VINPUT] OK or skip  */
     vmbus_init();           /* Hyper-V VMBus connect + offer enumeration; silent off-HV */
     storvsc_init();         /* Hyper-V synthetic SCSI → hvdisk0; silent if absent */
+#ifdef CONFIG_NET
     netvsc_init();          /* Hyper-V synthetic NIC → eth0; silent if absent */
+#endif
     hv_kbd_init();          /* Hyper-V synthetic keyboard (Gen 2 has no i8042); silent if absent */
     hv_timesync_init();     /* Hyper-V time-sync IC → wall clock; silent if absent */
     hv_mouse_init();        /* Hyper-V synthetic mouse (Gen 2 has no PS/2 mouse); silent if absent */
@@ -490,15 +499,19 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     bph("mount+cap");
     xhci_init();            /* xHCI USB host — [XHCI] OK or silent skip     */
     gpt_scan("usb0");       /* GPT on a USB mass-storage device — silent if absent */
+#ifdef CONFIG_NET
     virtio_net_init();      /* virtio-net NIC — [NET] OK or silent skip      */
     rtl8169_init();         /* RTL8168/8169 NIC — [NET] OK or silent skip   */
     rtl8139_init();         /* RTL8139 NIC — [NET] OK or silent skip        */
     e1000_init();           /* Intel e1000 NIC — [NET] OK or silent skip    */
     vmxnet3_init();         /* VMware vmxnet3 NIC — [NET] OK or silent skip  */
     iwl_ax200_init();       /* Intel Wi-Fi 6 AX200 — Phase 1 bring-up or skip */
+#endif
     hda_init();             /* Intel HD Audio — [HDA] OK or silent skip      */
     pvpanic_init();         /* pvpanic guest→host notify — [PVPANIC] or skip */
+#ifdef CONFIG_NET
     net_init();             /* Phase 25: protocol stack init + ICMP self-test ping */
+#endif
     bph("usb+net");
     smp_start_aps();        /* wake APs via INIT-SIPI-SIPI — [SMP] OK       */
     bph("smp");

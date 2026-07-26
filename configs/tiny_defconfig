@@ -1,0 +1,5 @@
+# tiny — smallest bootable kernel: boots to the "no init found" smoke panic.
+# The minification floor; the security core is present (it has no knob), but
+# everything optional is off.
+CONFIG_MMU=y
+# CONFIG_NET is not set
