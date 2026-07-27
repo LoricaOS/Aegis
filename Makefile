@@ -602,6 +602,18 @@ test: $(BUILD)/aegis-test.iso iso $(BUILD)/aegis-mb2.iso
 	bash tools/ktest.sh $(BUILD)/aegis.iso
 	bash tools/ktest.sh $(BUILD)/aegis-mb2.iso
 
+# Full userspace in a microVM: build the microvm tier (PVH, no PCI/ACPI,
+# virtio-mmio) and a test rootfs, then boot it in QEMU's `microvm` machine with
+# the rootfs as a virtio-blk-device and check the ring-3 test suite all-passes.
+# Reconfigures to microvm_defconfig — run `make <tier>_defconfig` afterwards to
+# switch back. Needs a local qemu-system-x86_64 with the `microvm` machine.
+.PHONY: test-microvm
+test-microvm:
+	$(MAKE) microvm_defconfig
+	$(MAKE) $(BUILD)/test-rootfs.img
+	$(MAKE)
+	bash tools/captest-microvm.sh $(BUILD)/aegis.elf $(BUILD)/test-rootfs.img
+
 # Resolve a kernel address (e.g. from a [PANIC] backtrace) to source:line.
 sym:
 	@test -n "$(ADDR)" || { echo "usage: make sym ADDR=0x..."; exit 1; }

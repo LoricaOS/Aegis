@@ -14,6 +14,7 @@
 #include "printk.h"
 #include "hyperv.h"
 #include "pit.h"
+#include "acpi.h"    /* g_ioapic_addr — 0 when no I/O APIC (ACPI-less microVM) */
 
 #include <stdint.h>
 
@@ -352,10 +353,14 @@ void
 lapic_timer_handler(void)
 {
     sched_tick();
-    /* On Hyper-V Gen 2 there is no 8254 PIT, so the LAPIC timer is also the
-     * device-poll + timekeeping source.  Run that work on the BSP only (the
-     * pollers are single-producer); the AP timers do preemption only.  On real
-     * hardware / QEMU the PIT does this and hyperv_present() is false here. */
-    if (hyperv_present() && lapic_id() == 0)
+    /* When the 8254 PIT does not deliver a periodic IRQ, the LAPIC timer is
+     * also the device-poll + timekeeping source (it drives timer_bsp_tick, which
+     * advances the tick counter nanosleep waits on). Two cases: Hyper-V Gen 2
+     * has no PIT at all, and an ACPI-less microVM (Firecracker / QEMU microvm)
+     * has no I/O APIC to route IRQ0 — detected by g_ioapic_addr == 0. Run it on
+     * the BSP only (the pollers are single-producer); AP timers do preemption
+     * only. On real hardware / QEMU-pc the PIT does this, the I/O APIC is
+     * present, and hyperv_present() is false, so neither condition fires. */
+    if ((hyperv_present() || g_ioapic_addr == 0) && lapic_id() == 0)
         timer_bsp_tick();
 }
