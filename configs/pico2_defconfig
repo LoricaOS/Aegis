@@ -49,3 +49,5 @@ CONFIG_PMM_BOOT_GB=1              # coarsest the current (GB-granular) knob allo
 #                          FAT yet) — one 512 B sector buffer + FAT state (~4 KB).
 #   CONFIG_WIFI_CYW43      CYW43439 over SPI (Pico 2 W). Firmware blob lives in
 #                          flash / the chip's RAM; SRAM cost is TX/RX buffers only.
+# smaller code over speed on this constrained target
+CONFIG_CC_OPTIMIZE_FOR_SIZE=y

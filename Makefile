@@ -41,7 +41,8 @@ CFLAGS = \
     -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
     -fno-stack-protector \
     -fno-omit-frame-pointer \
-    -O2 -fno-strict-aliasing \
+    -O$(if $(CONFIG_CC_OPTIMIZE_FOR_SIZE),s,2) -fno-strict-aliasing \
+    -ffunction-sections -fdata-sections \
     -g \
     -Wall -Wextra -Werror \
     -DAEGIS_VERSION=\"$(AEGIS_VERSION)\" \
@@ -59,7 +60,11 @@ ASFLAGS = -f elf64
 # It also makes the segment layout DETERMINISTIC: without this, a tiny .text size
 # change (e.g. one added symbol shifting the two-pass ksym blob) flips ld's
 # auto-segment grouping and silently produces a non-booting image.
-LDFLAGS = -T tools/linker.ld -nostdlib -z noseparate-code
+# --gc-sections drops every unreferenced function/data section (paired with
+# -ffunction-sections/-fdata-sections above). The linker script KEEP()s all the
+# boot roots (.multiboot, .limine_requests, __ex_table, .init_array), so only
+# genuinely-dead code is removed — nano .text drops ~20% and still boots.
+LDFLAGS = -T tools/linker.ld --gc-sections -nostdlib -z noseparate-code
 
 # ── Kernel source lists ─────────────────────────────────��───────────────────
 ARCH_SRCS = \

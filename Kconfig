@@ -210,6 +210,15 @@ config TRACE
 	  constrained target. When off, trace_emit()/trace_dump() become no-ops
 	  and the ring is reclaimed.
 
+config CC_OPTIMIZE_FOR_SIZE
+	bool "Optimize for size (-Os)"
+	default n
+	help
+	  Compile with -Os instead of -O2: the compiler favours smaller code over
+	  speed. Typically trims a further chunk of .text on top of --gc-sections
+	  (which is always on), at some runtime cost. Want it on for a constrained
+	  target (nano/pico2), off for a performance build.
+
 config KERNEL_TESTS
 	bool "In-tree boot self-tests"
 	default y
