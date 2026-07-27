@@ -75,6 +75,18 @@ endmenu
 
 menu "Device drivers"
 
+config PCI
+	bool "PCI/PCIe bus"
+	default y
+	help
+	  PCIe ECAM enumeration (from the ACPI MCFG table) and config-space access
+	  — the bus almost every emulated and real machine puts its devices on
+	  (NVMe, AHCI, xHCI, HD-audio, PCI NICs, and virtio-pci). Turn it OFF for a
+	  microVM target that speaks only virtio-mmio (Firecracker, QEMU microvm):
+	  the enumeration + ECAM path is replaced by a stub, and virtio devices are
+	  found over mmio instead (CONFIG_VIRTIO_MMIO). Every PCI-only device below
+	  depends on this, so they turn off with it.
+
 config HYPERV
 	bool "Hyper-V guest support (VMBus + synthetic devices)"
 	default y
@@ -87,6 +99,7 @@ config HYPERV
 
 config AUDIO_HDA
 	bool "Intel HD Audio"
+	depends on PCI
 	default y
 	help
 	  The Intel HDA controller driver. A text-only or headless build has no
@@ -102,14 +115,17 @@ config FB
 
 config NVME
 	bool "NVMe block device"
+	depends on PCI
 	default y
 
 config AHCI
 	bool "AHCI / SATA block device"
+	depends on PCI
 	default y
 
 config USB
 	bool "USB host (xHCI) + HID"
+	depends on PCI
 	default y
 	help
 	  The xHCI USB host controller and USB HID (keyboard/mouse). A device with
@@ -117,6 +133,7 @@ config USB
 
 config VMWARE
 	bool "VMware PVSCSI"
+	depends on PCI
 	default y
 	help
 	  VMware's paravirtual SCSI HBA. Only useful under ESXi/Workstation.

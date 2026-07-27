@@ -1,0 +1,47 @@
+# microvm — a Firecracker / cloud-hypervisor / QEMU-microvm target.
+#
+# PVH direct boot (no bootloader; the ELF note + hvm_start_info path), no PCI bus
+# (virtio-mmio only), serial console, networking, and an ext2 root on a
+# virtio-blk disk. The smallest *useful* Aegis: a real networked text system that
+# boots straight into a microVM. Boot it with e.g.
+#   qemu-system-x86_64 -machine microvm,acpi=on -global virtio-mmio.force-legacy=false \
+#     -kernel aegis.elf -append "boot=text" \
+#     -drive id=r,file=root.img,format=raw,if=none -device virtio-blk-device,drive=r
+CONFIG_MMU=y
+CONFIG_NET=y
+CONFIG_FS_EXT2=y
+
+# No PCI bus — microVMs speak virtio-mmio. This also forces off every PCI-only
+# device (NVMe, AHCI, xHCI/USB, PVSCSI, HD-audio) via `depends on PCI`.
+# CONFIG_PCI is not set
+# CONFIG_HYPERV is not set
+# CONFIG_FB is not set
+# CONFIG_PVPANIC is not set
+# CONFIG_TRACE is not set
+# CONFIG_KERNEL_TESTS is not set
+
+# virtio over mmio: block + net only.
+CONFIG_VIRTIO=y
+CONFIG_VIRTIO_MMIO=y
+CONFIG_VIRTIO_BLK=y
+CONFIG_VIRTIO_NET=y
+# CONFIG_VIRTIO_SCSI is not set
+# CONFIG_VIRTIO_GPU is not set
+# CONFIG_VIRTIO_INPUT is not set
+# CONFIG_VIRTIO_RNG is not set
+# CONFIG_VIRTIO_BALLOON is not set
+# CONFIG_VIRTIO_PMEM is not set
+# CONFIG_VIRTIO_CONSOLE is not set
+# CONFIG_VIRTIO_9P is not set
+# CONFIG_VIRTIO_VSOCK is not set
+
+# Lean static sizing for a microVM.
+CONFIG_MAX_CPUS=4
+CONFIG_RAMFS_MAX_INODES=64
+CONFIG_RAMFS_MAX_DENTS=64
+CONFIG_RAMFS_PAGES_PER_FILE=64
+CONFIG_PTY_MAX_PAIRS=4
+CONFIG_KLOG_SIZE_KB=16
+CONFIG_EXT2_CACHE_SLOTS=8
+CONFIG_PMM_BOOT_GB=2
+CONFIG_CC_OPTIMIZE_FOR_SIZE=y

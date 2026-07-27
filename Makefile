@@ -290,6 +290,13 @@ endif
 ifneq ($(CONFIG_PVPANIC),y)
 DRIVER_SRCS := $(filter-out kernel/drivers/pvpanic.c, $(DRIVER_SRCS))
 endif
+# CONFIG_PCI off (microVM, virtio-mmio only): swap pcie.c for a stub reporting an
+# empty bus, and drop the virtio PCI transport. Any PCI driver left in still
+# links against the stub and simply finds no devices.
+ifneq ($(CONFIG_PCI),y)
+ARCH_SRCS := $(filter-out kernel/arch/x86_64/pcie.c, $(ARCH_SRCS)) kernel/arch/x86_64/pcie_stub.c
+DRIVER_SRCS := $(filter-out kernel/drivers/virtio_pci.c, $(DRIVER_SRCS))
+endif
 ifneq ($(CONFIG_KERNEL_TESTS),y)
 FS_SRCS := $(filter-out kernel/fs/poll_test.c, $(FS_SRCS))
 endif

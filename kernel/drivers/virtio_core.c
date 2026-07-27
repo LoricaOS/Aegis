@@ -67,8 +67,12 @@ int
 virtio_find_nth(uint16_t modern_id, uint16_t legacy_id, int skip,
                 virtio_dev_t *out)
 {
+#ifdef CONFIG_PCI
     if (virtio_pci_find_nth(modern_id, legacy_id, skip, out) == 0)
         return 0;
+#else
+    (void)legacy_id;
+#endif
 #ifdef CONFIG_VIRTIO_MMIO
     if (virtio_mmio_find_nth((uint16_t)(modern_id - 0x1040u), skip, out) == 0)
         return 0;
