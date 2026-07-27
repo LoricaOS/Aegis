@@ -1,5 +1,6 @@
 /* sys_dir.c — Directory syscalls: getdents64, mkdir, unlink, rename */
 #include "sys_impl.h"
+#include "fs_ops.h"
 #include "sched.h"
 #include "proc.h"
 #include "vfs.h"
@@ -101,21 +102,21 @@ sys_mkdir(uint64_t arg1, uint64_t arg2)
      * these checks entirely.) Creation below still requires parent W+X. */
     {
         uint32_t existing;
-        if (ext2_open(kpath, &existing) == 0)
+        if (g_rootfs->open(kpath, &existing) == 0)
             return SYS_ERR(EEXIST);
     }
     /* Check W+X permission on parent directory */
     {
         uint32_t parent_ino;
         const char *bname;
-        if (ext2_lookup_parent(kpath, &parent_ino, &bname) == 0) {
-            int pperm = ext2_check_perm(parent_ino,
+        if (g_rootfs->lookup_parent(kpath, &parent_ino, &bname) == 0) {
+            int pperm = g_rootfs->check_perm(parent_ino,
                 (uint16_t)proc->uid, (uint16_t)proc->gid, 2 | 1);
             if (pperm != 0)
                 return SYS_ERR(EACCES);
         }
     }
-    int r = ext2_mkdir(kpath, 0755, has_install);
+    int r = g_rootfs->mkdir(kpath, 0755, has_install);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }
 
@@ -149,8 +150,8 @@ sys_rmdir(uint64_t arg1)
     {
         uint32_t parent_ino;
         const char *bname;
-        if (ext2_lookup_parent(kpath, &parent_ino, &bname) == 0) {
-            int pperm = ext2_check_perm(parent_ino,
+        if (g_rootfs->lookup_parent(kpath, &parent_ino, &bname) == 0) {
+            int pperm = g_rootfs->check_perm(parent_ino,
                 (uint16_t)proc->uid, (uint16_t)proc->gid, 2 | 1);
             if (pperm != 0)
                 return SYS_ERR(EACCES);
@@ -158,7 +159,7 @@ sys_rmdir(uint64_t arg1)
     }
     int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
                                  CAP_RIGHTS_READ) == 0);
-    int r = ext2_rmdir(kpath, has_install);
+    int r = g_rootfs->rmdir(kpath, has_install);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }
 
@@ -193,8 +194,8 @@ sys_unlink(uint64_t arg1)
     {
         uint32_t parent_ino;
         const char *bname;
-        if (ext2_lookup_parent(kpath, &parent_ino, &bname) == 0) {
-            int pperm = ext2_check_perm(parent_ino,
+        if (g_rootfs->lookup_parent(kpath, &parent_ino, &bname) == 0) {
+            int pperm = g_rootfs->check_perm(parent_ino,
                 (uint16_t)proc->uid, (uint16_t)proc->gid, 2 | 1);
             if (pperm != 0)
                 return SYS_ERR(EACCES);
@@ -207,16 +208,16 @@ sys_unlink(uint64_t arg1)
      * meant the inode that was checked was not the inode that was unlinked
      * (see meta_gate_locked in sys_meta.c). ext2_lock is recursive, so the
      * nested ext2_* calls just bump its depth. */
-    irqflags_t fl = ext2_lock_acquire();
+    irqflags_t fl = g_rootfs->lock();
     int r = 0;
     {
         uint32_t sino;
-        if (ext2_open(kpath, &sino) == 0)
+        if (g_rootfs->open(kpath, &sino) == 0)
             r = sensitive_write_gate(sino);
     }
     if (r == 0)
-        r = ext2_unlink(kpath, has_install);
-    ext2_lock_release(fl);
+        r = g_rootfs->unlink(kpath, has_install);
+    g_rootfs->unlock(fl);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }
 
@@ -253,14 +254,14 @@ sys_rename(uint64_t arg1, uint64_t arg2)
     {
         uint32_t parent_ino;
         const char *bname;
-        if (ext2_lookup_parent(kold, &parent_ino, &bname) == 0) {
-            int pperm = ext2_check_perm(parent_ino,
+        if (g_rootfs->lookup_parent(kold, &parent_ino, &bname) == 0) {
+            int pperm = g_rootfs->check_perm(parent_ino,
                 (uint16_t)proc->uid, (uint16_t)proc->gid, 2 | 1);
             if (pperm != 0)
                 return SYS_ERR(EACCES);
         }
-        if (ext2_lookup_parent(knew, &parent_ino, &bname) == 0) {
-            int pperm = ext2_check_perm(parent_ino,
+        if (g_rootfs->lookup_parent(knew, &parent_ino, &bname) == 0) {
+            int pperm = g_rootfs->check_perm(parent_ino,
                 (uint16_t)proc->uid, (uint16_t)proc->gid, 2 | 1);
             if (pperm != 0)
                 return SYS_ERR(EACCES);
@@ -273,17 +274,17 @@ sys_rename(uint64_t arg1, uint64_t arg2)
     /* Gate BOTH ends and rename under ONE ext2_lock hold — the check-then-act
      * split is exactly the reported "rename a crafted file over /etc/shadow"
      * break. See the note in sys_unlink. */
-    irqflags_t fl = ext2_lock_acquire();
+    irqflags_t fl = g_rootfs->lock();
     int r = 0;
     {
         uint32_t sino;
-        if (ext2_open(kold, &sino) == 0)
+        if (g_rootfs->open(kold, &sino) == 0)
             r = sensitive_write_gate(sino);
-        if (r == 0 && ext2_open(knew, &sino) == 0)
+        if (r == 0 && g_rootfs->open(knew, &sino) == 0)
             r = sensitive_write_gate(sino);
     }
     if (r == 0)
-        r = ext2_rename(kold, knew, has_install);
-    ext2_lock_release(fl);
+        r = g_rootfs->rename(kold, knew, has_install);
+    g_rootfs->unlock(fl);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }

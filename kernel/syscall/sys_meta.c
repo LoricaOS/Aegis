@@ -1,5 +1,6 @@
 /* sys_meta.c — File metadata syscalls: lstat, symlink, readlink, chmod, chown */
 #include "sys_impl.h"
+#include "fs_ops.h"
 #include "sched.h"
 #include "proc.h"
 #include "vfs.h"
@@ -86,11 +87,11 @@ static int
 meta_gate_locked(const char *resolved, aegis_process_t *proc, int follow)
 {
     uint32_t ino;
-    if (ext2_open_ex(resolved, &ino, follow) != 0)
+    if (g_rootfs->open_ex(resolved, &ino, follow) != 0)
         return 0;   /* not an ext2 path (or absent) — mutator reports it */
 
     ext2_inode_t inode;
-    if (ext2_read_inode(ino, &inode) == 0) {
+    if (g_rootfs->read_inode(ino, &inode) == 0) {
         /* No uid=0 bypass — uid 0 is cosmetic in Aegis; only the file owner may
          * chmod/chown (authority comes from capabilities, not ambient root).
          * The installer owns the files it creates+chowns. */
@@ -134,8 +135,8 @@ sensitive_write_gate(uint32_t ino)
 
     aegis_process_t *proc = current_proc();
 
-    uint32_t shadow_ino = ext2_get_shadow_ino();
-    uint32_t admin_ino  = ext2_get_admin_ino();
+    uint32_t shadow_ino = g_rootfs->get_shadow_ino();
+    uint32_t admin_ino  = g_rootfs->get_admin_ino();
     if ((shadow_ino != 0 && ino == shadow_ino) ||
         (admin_ino  != 0 && ino == admin_ino)) {
         if (cap_check(proc->caps, CAP_TABLE_SIZE,
@@ -143,8 +144,8 @@ sensitive_write_gate(uint32_t ino)
             return -EACCES;
     }
 
-    uint32_t passwd_ino = ext2_get_passwd_ino();
-    uint32_t group_ino  = ext2_get_group_ino();
+    uint32_t passwd_ino = g_rootfs->get_passwd_ino();
+    uint32_t group_ino  = g_rootfs->get_group_ino();
     if ((passwd_ino != 0 && ino == passwd_ino) ||
         (group_ino  != 0 && ino == group_ino)) {
         if (proc->admin_session == 0)
@@ -211,16 +212,16 @@ sys_symlink(uint64_t arg1, uint64_t arg2)
                                  CAP_RIGHTS_READ) == 0);
     /* Sensitive-inode mutation gate (shadow/admin → AUTH, passwd/group → admin
      * session). Keyed on the resolved inode so a symlink alias cannot bypass. */
-    irqflags_t fl = ext2_lock_acquire();   /* gate + create in ONE hold */
+    irqflags_t fl = g_rootfs->lock();   /* gate + create in ONE hold */
     int r = 0;
     {
         uint32_t sino;
-        if (ext2_open(resolved, &sino) == 0)
+        if (g_rootfs->open(resolved, &sino) == 0)
             r = sensitive_write_gate(sino);
     }
     if (r == 0)
-        r = ext2_symlink(resolved, target, has_install);
-    ext2_lock_release(fl);
+        r = g_rootfs->symlink(resolved, target, has_install);
+    g_rootfs->unlock(fl);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }
 
@@ -252,18 +253,18 @@ sys_link(uint64_t arg1, uint64_t arg2)
                                  CAP_RIGHTS_READ) == 0);
     /* Sensitive-inode gate on BOTH ends: hard-linking /etc/shadow to an alias
      * (source) or clobbering a sensitive target both require the authority. */
-    irqflags_t fl = ext2_lock_acquire();   /* gate BOTH ends + link in ONE hold */
+    irqflags_t fl = g_rootfs->lock();   /* gate BOTH ends + link in ONE hold */
     int r = 0;
     {
         uint32_t sino;
-        if (ext2_open(rold, &sino) == 0)
+        if (g_rootfs->open(rold, &sino) == 0)
             r = sensitive_write_gate(sino);
-        if (r == 0 && ext2_open(rnew, &sino) == 0)
+        if (r == 0 && g_rootfs->open(rnew, &sino) == 0)
             r = sensitive_write_gate(sino);
     }
     if (r == 0)
-        r = ext2_link(rold, rnew, has_install);
-    ext2_lock_release(fl);
+        r = g_rootfs->link(rold, rnew, has_install);
+    g_rootfs->unlock(fl);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }
 
@@ -311,7 +312,7 @@ sys_readlink(uint64_t arg1, uint64_t arg2, uint64_t arg3)
     char kbuf[256];
     if (bufsiz > sizeof(kbuf)) bufsiz = sizeof(kbuf);
 
-    int n = ext2_readlink(resolved, kbuf, bufsiz);
+    int n = g_rootfs->readlink(resolved, kbuf, bufsiz);
     if (n < 0) return (uint64_t)(int64_t)n;
 
     if (!user_ptr_valid(arg2, (uint64_t)n))
@@ -345,11 +346,11 @@ sys_chmod(uint64_t arg1, uint64_t arg2)
                                  CAP_RIGHTS_READ) == 0);
 
     /* Validate and mutate under ONE ext2_lock hold — see meta_gate_locked. */
-    irqflags_t fl = ext2_lock_acquire();
+    irqflags_t fl = g_rootfs->lock();
     int r = meta_gate_locked(resolved, proc, 1 /* follow */);
     if (r == 0)
-        r = ext2_chmod(resolved, (uint16_t)arg2, has_install);
-    ext2_lock_release(fl);
+        r = g_rootfs->chmod(resolved, (uint16_t)arg2, has_install);
+    g_rootfs->unlock(fl);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }
 
@@ -432,11 +433,11 @@ sys_chown(uint64_t arg1, uint64_t arg2, uint64_t arg3)
         return SYS_ERR(EPERM);
 
     /* Validate and mutate under ONE ext2_lock hold — see meta_gate_locked. */
-    irqflags_t fl = ext2_lock_acquire();
+    irqflags_t fl = g_rootfs->lock();
     int r = meta_gate_locked(resolved, proc, 1 /* follow */);
     if (r == 0)
-        r = ext2_chown(resolved, (uint16_t)arg2, (uint16_t)arg3, 1, has_install);
-    ext2_lock_release(fl);
+        r = g_rootfs->chown(resolved, (uint16_t)arg2, (uint16_t)arg3, 1, has_install);
+    g_rootfs->unlock(fl);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }
 
@@ -517,9 +518,9 @@ sys_utimensat(uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4)
     /* Ownership check: only the file owner may set times. */
     {
         uint32_t ino;
-        if (ext2_open(resolved, &ino) == 0) {
+        if (g_rootfs->open(resolved, &ino) == 0) {
             ext2_inode_t inode;
-            if (ext2_read_inode(ino, &inode) == 0 && proc->uid != inode.i_uid)
+            if (g_rootfs->read_inode(ino, &inode) == 0 && proc->uid != inode.i_uid)
                 return SYS_ERR(EACCES);
         }
     }
@@ -556,11 +557,11 @@ sys_utimensat(uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4)
      * copy_from_user above deliberately happens BEFORE the acquire: it can
      * fault, and faulting under the lock is a needless hazard when the value is
      * not needed until now. */
-    irqflags_t fl = ext2_lock_acquire();
+    irqflags_t fl = g_rootfs->lock();
     int r = meta_gate_locked(resolved, proc, follow);
     if (r == 0)
-        r = ext2_utimes(resolved, atime, mtime, follow, has_install);
-    ext2_lock_release(fl);
+        r = g_rootfs->utimes(resolved, atime, mtime, follow, has_install);
+    g_rootfs->unlock(fl);
     if (r == -EPERM) return SYS_ERR(EPERM);   /* protected-tree without INSTALL */
     return (r < 0) ? SYS_ERR(ENOENT) : 0;
 }
@@ -594,10 +595,10 @@ sys_lchown(uint64_t arg1, uint64_t arg2, uint64_t arg3)
 
     /* Validate and mutate under ONE ext2_lock hold — see meta_gate_locked.
      * follow = 0: lchown operates on the link itself. */
-    irqflags_t fl = ext2_lock_acquire();
+    irqflags_t fl = g_rootfs->lock();
     int r = meta_gate_locked(resolved, proc, 0 /* no follow */);
     if (r == 0)
-        r = ext2_chown(resolved, (uint16_t)arg2, (uint16_t)arg3, 0, has_install);
-    ext2_lock_release(fl);
+        r = g_rootfs->chown(resolved, (uint16_t)arg2, (uint16_t)arg3, 0, has_install);
+    g_rootfs->unlock(fl);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }

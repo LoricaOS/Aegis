@@ -20,6 +20,7 @@
  * names (fs_inode_t, ...) is a later cosmetic pass.
  */
 #include <stdint.h>
+#include "spinlock.h"   /* irqflags_t                                      */
 #include "ext2.h"       /* ext2_inode_t — the shared inode type            */
 #include "ext2_vfs.h"   /* ext2_fd_priv_t — the shared fd-private type      */
 
@@ -32,6 +33,13 @@ typedef struct fs_ops {
     int      (*statfs)(uint64_t *total_kb, uint64_t *free_kb);
     void     (*mark_clean)(void);
     const char *(*devname)(void);
+
+    /* the backend's global lock, exposed so a caller can hold it across a
+     * compound op (resolve+classify, lookup+mutate) atomically */
+    irqflags_t (*lock)(void);
+    void       (*unlock)(irqflags_t fl);
+    /* reverse map: an open file's private data -> its inode number */
+    uint32_t   (*ino_of)(const void *file_ops, void *priv);
 
     /* path -> inode */
     int      (*open)(const char *path, uint32_t *ino_out);

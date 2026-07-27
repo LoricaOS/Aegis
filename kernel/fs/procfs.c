@@ -8,6 +8,7 @@
  * a different pid requires CAP_KIND_PROC_READ in the caller's cap table.
  */
 #include "procfs.h"
+#include "fs_ops.h"
 #include "vfs.h"
 #include "proc.h"
 #include "sched.h"
@@ -720,9 +721,9 @@ gen_mounts(char *buf, uint32_t bufsz)
     uint64_t total_kb = 0;
     uint64_t free_kb = 0;
 
-    if (ext2_statfs(&total_kb, &free_kb) == 0 &&
+    if (g_rootfs->statfs(&total_kb, &free_kb) == 0 &&
         (end - p) >= MOUNTS_MAX_LINE) {
-        const char *dev = ext2_devname();
+        const char *dev = g_rootfs->devname();
         p = pfs_strcpy(p, dev ? dev : "ext2root");
         p = pfs_strcpy(p, " / ext2 ");
         p = pfs_u64_dec(p, total_kb);

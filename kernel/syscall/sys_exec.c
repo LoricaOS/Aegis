@@ -1,5 +1,6 @@
 /* sys_exec.c — exec-related syscalls: execve, spawn */
 #include "sys_impl.h"
+#include "fs_ops.h"
 #include "trace.h"
 #include "sched.h"
 #include "proc.h"
@@ -178,8 +179,8 @@ reload_binary:
         /* ext2 path: check execute permission before loading */
         {
             uint32_t elf_ino;
-            if (ext2_open(path, &elf_ino) == 0) {
-                int xperm = ext2_check_perm(elf_ino,
+            if (g_rootfs->open(path, &elf_ino) == 0) {
+                int xperm = g_rootfs->check_perm(elf_ino,
                     (uint16_t)proc->uid, (uint16_t)proc->gid, 1);
                 if (xperm != 0)
                     { ret = SYS_ERR(EACCES); goto done; }
@@ -796,8 +797,8 @@ sys_spawn(uint64_t path_uptr, uint64_t argv_uptr,
             /* H1: ext2 path — check execute permission before loading. */
             {
                 uint32_t elf_ino;
-                if (ext2_open(path, &elf_ino) == 0) {
-                    int xperm = ext2_check_perm(elf_ino,
+                if (g_rootfs->open(path, &elf_ino) == 0) {
+                    int xperm = g_rootfs->check_perm(elf_ino,
                         (uint16_t)parent->uid, (uint16_t)parent->gid, 1);
                     if (xperm != 0)
                         { result = SYS_ERR(EACCES); goto fail_early; } /* EACCES */

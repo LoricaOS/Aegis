@@ -13,6 +13,7 @@
  * and returns the matching entry, or NULL.
  */
 #include "vfs.h"
+#include "fs_ops.h"
 #include "ext2.h"
 #include "cap.h"
 #include "printk.h"
@@ -142,7 +143,7 @@ anchor_path_trusted(const char *exe_path)
 int
 cap_path_is_protected(const char *path)
 {
-    return ext2_path_under_protected(path);
+    return g_rootfs->path_under_protected(path);
 }
 
 /* Substring test without libc: returns 1 if `needle` occurs anywhere in `s`. */
@@ -379,7 +380,7 @@ cap_policy_load(void)
  * looser — /etc/aegis is install-protected but is NOT a granting anchor (nothing
  * is exec'd from it), so a full set-equality check would false-WARN on it.
  *
- * MUST run AFTER ext2_anchors_reload() so the dynamic protected inodes
+ * MUST run AFTER g_rootfs->anchors_reload() so the dynamic protected inodes
  * (s_anchor_ino in ext2.c) are populated; main.c calls it there. */
 void
 cap_anchor_audit(void)
@@ -389,7 +390,7 @@ cap_anchor_audit(void)
     unsigned i;
 
     for (i = 0; i < sizeof(static_anchors) / sizeof(static_anchors[0]); i++) {
-        if (!ext2_path_under_protected(static_anchors[i])) {
+        if (!g_rootfs->path_under_protected(static_anchors[i])) {
             printk("[CAP_POLICY] WARN: granting anchor %s is NOT "
                    "install-protected — path-based authority is forgeable\n",
                    static_anchors[i]);
@@ -399,7 +400,7 @@ cap_anchor_audit(void)
     for (i = 0; i < (unsigned)s_anchor_path_count; i++) {
         if (!s_anchor_paths[i][0])
             continue;
-        if (!ext2_path_under_protected(s_anchor_paths[i])) {
+        if (!g_rootfs->path_under_protected(s_anchor_paths[i])) {
             printk("[CAP_POLICY] WARN: dynamic anchor %s is NOT "
                    "install-protected — path-based authority is forgeable\n",
                    s_anchor_paths[i]);
@@ -478,7 +479,7 @@ cap_policy_lookup(const char *exe_path)
      *
      * Fix: tie the grant to the SAME inode-based check the fs layer uses for
      * write-protection. Only derive policy caps from a path that is genuinely
-     * install-protected RIGHT NOW. ext2_path_under_protected() resolves the path
+     * install-protected RIGHT NOW. g_rootfs->path_under_protected() resolves the path
      * on the inode (following symlinks / ".." / "//"), so the grant decision and
      * the write-protection decision can no longer disagree (security review 04
      * finding 2 / 05 finding ... drift; subsumes the RAM-fallback hole too).
@@ -491,7 +492,7 @@ cap_policy_lookup(const char *exe_path)
      * requires an atomic resolve-and-create under a single ext2_lock in the
      * mutators (sys_open/sys_mkdir/sys_symlink/sys_rename); that is a larger
      * refactor left as follow-up. */
-    if (!ext2_path_under_protected(exe_path))
+    if (!g_rootfs->path_under_protected(exe_path))
         return (const cap_policy_entry_t *)0;
 
     /* Extract basename: everything after the last '/' */

@@ -1,5 +1,6 @@
 /* sys_memory.c — Memory management syscalls: brk, mmap, munmap, mprotect */
 #include "sys_impl.h"
+#include "fs_ops.h"
 #include "printk.h"
 #include "sched.h"
 #include "proc.h"
@@ -352,7 +353,7 @@ sys_mmap(uint64_t arg1, uint64_t arg2, uint64_t arg3,
     int      lazy_file = 0;
     if (file_backed && !is_shared && g_lazyfile &&
         (uint32_t)fd < PROC_MAX_FDS && proc->fd_table->fds[(uint32_t)fd].ops) {
-        uint32_t ino = ext2_vfs_ino_of(proc->fd_table->fds[(uint32_t)fd].ops,
+        uint32_t ino = g_rootfs->ino_of(proc->fd_table->fds[(uint32_t)fd].ops,
                                        proc->fd_table->fds[(uint32_t)fd].priv);
         if (ino) {
             lazy_file  = 1;
@@ -361,7 +362,7 @@ sys_mmap(uint64_t arg1, uint64_t arg2, uint64_t arg3,
             /* secfix M2: snapshot the inode generation now; the fault path
              * revalidates it so a recycled inode number cannot leak another
              * file's contents through this mapping. */
-            lazy_gen   = ext2_inode_gen(ino);
+            lazy_gen   = g_rootfs->inode_gen(ino);
         }
     }
     uint8_t vma_type = lazy_file ? VMA_FILE
@@ -779,7 +780,7 @@ mm_populate_fault(aegis_process_t *proc, uint64_t va)
              * number was recycled for a different file since mmap, fault
              * instead of leaking the new file's contents through this mapping
              * (the original open()'s DAC check no longer applies to it). */
-            int g = ext2_read_validated(fino, buf, fpos, (uint32_t)want, fgen);
+            int g = g_rootfs->read_validated(fino, buf, fpos, (uint32_t)want, fgen);
             if (g == EXT2_EGEN) {
                 pmm_free_page(phys);
                 return -1;               /* recycled inode → SIGSEGV */

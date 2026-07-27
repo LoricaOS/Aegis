@@ -1,5 +1,6 @@
 /* sys_file.c — File and filesystem syscalls */
 #include "sys_impl.h"
+#include "fs_ops.h"
 #include "sched.h"
 #include "proc.h"
 #include "vfs.h"
@@ -473,13 +474,13 @@ sys_access(uint64_t arg1, uint64_t arg2)
     /* For ext2 files, check permission bits via ext2_check_perm.
      * Non-ext2 files (procfs, /dev, initrd): just check existence. */
     uint32_t ino = 0;
-    if (ext2_open(path, &ino) == 0) {
+    if (g_rootfs->open(path, &ino) == 0) {
         aegis_process_t *proc = current_proc();
         int want = 0;
         if (arg2 & 4) want |= 4; /* R_OK */
         if (arg2 & 2) want |= 2; /* W_OK */
         if (arg2 & 1) want |= 1; /* X_OK */
-        int r = ext2_check_perm(ino, (uint16_t)proc->uid, (uint16_t)proc->gid, want);
+        int r = g_rootfs->check_perm(ino, (uint16_t)proc->uid, (uint16_t)proc->gid, want);
         if (r != 0) return SYS_ERR(EACCES);
     }
     return 0;
@@ -1050,7 +1051,7 @@ sys_vfs_confine(uint64_t path_u)
 uint64_t
 sys_sync(void)
 {
-    int err = ext2_sync();
+    int err = g_rootfs->sync();
 #ifdef __x86_64__
     nvme_flush();   /* no NVMe driver on arm64 yet */
 #endif

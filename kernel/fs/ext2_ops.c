@@ -7,6 +7,7 @@
  * g_rootfs is provided by nullfs instead (a future step). */
 #include "fs_ops.h"
 #include "ext2.h"
+#include "ext2_internal.h"   /* ext2_lock_acquire / ext2_lock_release */
 
 const fs_ops_t ext2_ops = {
     .name                 = "ext2",
@@ -16,6 +17,11 @@ const fs_ops_t ext2_ops = {
     .statfs               = ext2_statfs,
     .mark_clean           = ext2_mark_clean,
     .devname              = ext2_devname,
+    .lock                 = ext2_lock_acquire,
+    .unlock               = ext2_lock_release,
+    /* ext2_vfs_ino_of's first arg is const vfs_ops_t*; the vtable types it as
+     * const void* to stay filesystem-agnostic. */
+    .ino_of               = (uint32_t (*)(const void *, void *))ext2_vfs_ino_of,
 
     .open                 = ext2_open,
     .open_ex              = ext2_open_ex,
