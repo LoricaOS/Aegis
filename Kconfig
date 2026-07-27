@@ -75,8 +75,20 @@ endmenu
 
 menu "Device drivers"
 
+config ACPI
+	bool "ACPI table parser (MADT / MCFG)"
+	default y
+	help
+	  The minimal static ACPI parser (no AML): finds the MADT (CPU + I/O APIC
+	  topology, interrupt source overrides) and MCFG (PCIe ECAM base), and wires
+	  the power button. Turn it OFF for firmware that ships no ACPI at all —
+	  most notably Firecracker: a stub then reports no tables and the kernel
+	  falls back to BSP-only SMP on the LAPIC timer, no I/O APIC, no ECAM. PCI
+	  depends on this (x86 PCIe config space comes from MCFG).
+
 config PCI
 	bool "PCI/PCIe bus"
+	depends on ACPI
 	default y
 	help
 	  PCIe ECAM enumeration (from the ACPI MCFG table) and config-space access

@@ -11,8 +11,10 @@ CONFIG_MMU=y
 CONFIG_NET=y
 CONFIG_FS_EXT2=y
 
-# No PCI bus — microVMs speak virtio-mmio. This also forces off every PCI-only
-# device (NVMe, AHCI, xHCI/USB, PVSCSI, HD-audio) via `depends on PCI`.
+# No ACPI (Firecracker ships none) — BSP-only SMP on the LAPIC timer. PCI
+# depends on ACPI, so this also drops the whole PCI bus + every PCI-only device
+# (NVMe, AHCI, xHCI/USB, PVSCSI, HD-audio). virtio comes in over mmio.
+# CONFIG_ACPI is not set
 # CONFIG_PCI is not set
 # CONFIG_HYPERV is not set
 # CONFIG_FB is not set
