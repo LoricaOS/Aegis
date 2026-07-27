@@ -187,7 +187,7 @@ virtio_net_init(void)
 {
     virtio_net_priv_t *p = &s_priv;
 
-    if (virtio_pci_find(VIRTIO_NET_DEVICE_MODERN, VIRTIO_NET_DEVICE_LEGACY,
+    if (virtio_find(VIRTIO_NET_DEVICE_MODERN, VIRTIO_NET_DEVICE_LEGACY,
                         &p->dev) < 0)
         return;  /* silent: make test uses -machine pc, no virtio-net present */
 

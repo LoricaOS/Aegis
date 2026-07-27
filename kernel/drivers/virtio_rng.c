@@ -29,7 +29,7 @@ static virtq_t      s_rng_vq;
 void
 virtio_rng_init(void)
 {
-    if (virtio_pci_find(VIRTIO_RNG_MODERN, VIRTIO_RNG_LEGACY, &s_rng_dev) < 0)
+    if (virtio_find(VIRTIO_RNG_MODERN, VIRTIO_RNG_LEGACY, &s_rng_dev) < 0)
         return;  /* silent: no entropy device present */
 
     virtio_reset(&s_rng_dev);

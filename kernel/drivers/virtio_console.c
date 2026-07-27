@@ -48,7 +48,7 @@ vcon_write(const void *data, uint32_t len)
 void
 virtio_console_init(void)
 {
-    if (virtio_pci_find(VIRTIO_CONSOLE_MODERN, VIRTIO_CONSOLE_LEGACY, &s_dev) < 0)
+    if (virtio_find(VIRTIO_CONSOLE_MODERN, VIRTIO_CONSOLE_LEGACY, &s_dev) < 0)
         return;
 
     virtio_reset(&s_dev);

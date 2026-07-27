@@ -22,48 +22,6 @@
 /* Arch-neutral VMM flags for uncached MMIO mapping (same as the net driver). */
 #define VIRTIO_MAP_FLAGS (VMM_FLAG_WRITABLE | VMM_FLAG_WC | VMM_FLAG_UCMINUS)
 
-/* ── BAR mapping helper ─────────────────────────────────────────────────────
- * Map n_pages of a BAR region (physical base pa) into KVA as uncached MMIO. */
-static uintptr_t
-map_bar_region(uint64_t pa, uint32_t n_pages)
-{
-    uintptr_t va = (uintptr_t)kva_alloc_pages(n_pages);
-    if (!va)
-        return 0;
-    uint32_t i;
-    for (i = 0; i < n_pages; i++) {
-        uintptr_t page_va = va + (uint64_t)i * 4096;
-        /* kva_alloc_pages already mapped each page to a PMM frame; unmap before
-         * remapping to the BAR PA so vmm_map_page does not panic on a double-map.
-         * SAFETY: page_va is present (kva_alloc_pages guarantees it); unmap then
-         * map installs the BAR PA. */
-        vmm_unmap_page(page_va);
-        vmm_map_page(page_va, pa + (uint64_t)i * 4096, VIRTIO_MAP_FLAGS);
-    }
-    return va;
-}
-
-/* ── <4GB DMA-page allocator (shared) ───────────────────────────────────────
- * One PMM page from the guaranteed-below-4GB pool, KVA-mapped + zeroed. Returns
- * both phys and virt. 0 on success, -1 if the low pool is exhausted. */
-int
-virtio_alloc_dma_page(uint64_t *phys_out, uintptr_t *virt_out)
-{
-    void *p = kva_alloc_pages_low(1);
-    if (!p)
-        return -1;
-    uintptr_t va = (uintptr_t)p;
-    uint64_t  pa = kva_page_phys(p);
-    /* Page comes zeroed by kva_alloc_pages_low. */
-    uint8_t *z = (uint8_t *)va;
-    uint32_t i;
-    for (i = 0; i < 4096; i++)
-        z[i] = 0;
-    *phys_out = pa;
-    *virt_out = va;
-    return 0;
-}
-
 /* ── PCI capability walker ──────────────────────────────────────────────────
  * Walk the device's PCI capability list for virtio vendor caps (id 0x09) and
  * record the COMMON/NOTIFY/DEVICE cfg BAR + offset (+ notify multiplier).
@@ -148,9 +106,9 @@ virtio_pci_find_nth(uint16_t modern_id, uint16_t legacy_id, int skip,
     uint64_t notify_pa = found->bar[notify_bar] + notify_off;
     uint64_t device_pa = found->bar[device_bar] + device_off;
 
-    uintptr_t common_va = map_bar_region(common_pa & ~0xFFFULL, 1);
-    uintptr_t notify_va = map_bar_region(notify_pa & ~0xFFFULL, 1);
-    uintptr_t device_va = map_bar_region(device_pa & ~0xFFFULL, 1);
+    uintptr_t common_va = virtio_map_mmio(common_pa & ~0xFFFULL, 1);
+    uintptr_t notify_va = virtio_map_mmio(notify_pa & ~0xFFFULL, 1);
+    uintptr_t device_va = virtio_map_mmio(device_pa & ~0xFFFULL, 1);
     if (!common_va || !notify_va || !device_va)
         return -1;
     common_va += (common_pa & 0xFFFULL);
@@ -163,6 +121,8 @@ virtio_pci_find_nth(uint16_t modern_id, uint16_t legacy_id, int skip,
     out->notify_off_mult = notify_mult;
     out->devcfg          = (volatile uint8_t *)device_va;
     out->features        = 0;
+    out->is_mmio         = 0;
+    out->mmio            = 0;
     return 0;
 }
 
@@ -170,98 +130,4 @@ int
 virtio_pci_find(uint16_t modern_id, uint16_t legacy_id, virtio_dev_t *out)
 {
     return virtio_pci_find_nth(modern_id, legacy_id, 0, out);
-}
-
-/* ── status handshake ────────────────────────────────────────────────────── */
-void
-virtio_reset(virtio_dev_t *d)
-{
-    volatile virtio_pci_common_cfg_t *c = d->common;
-    c->device_status = VIRTIO_STATUS_RESET;
-    c->device_status = VIRTIO_STATUS_ACKNOWLEDGE;
-    c->device_status = (uint8_t)(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
-}
-
-int
-virtio_negotiate(virtio_dev_t *d, uint32_t want_features)
-{
-    volatile virtio_pci_common_cfg_t *c = d->common;
-
-    /* Read device features (low word) — informational; we only ever request the
-     * subset we actively support. */
-    c->device_feature_select = 0;
-    uint32_t dev_lo = c->device_feature;
-    (void)dev_lo;
-
-    /* Offer low-word features. */
-    c->driver_feature_select = 0;
-    c->driver_feature        = want_features;
-
-    /* Offer VIRTIO_F_VERSION_1 in the high word — mandatory on the modern path
-     * (QEMU rejects FEATURES_OK without it for non-transitional devices). */
-    c->driver_feature_select = 1;
-    c->driver_feature        = (1u << VIRTIO_F_VERSION_1_BIT);
-
-    c->device_status = (uint8_t)(VIRTIO_STATUS_ACKNOWLEDGE |
-                                 VIRTIO_STATUS_DRIVER |
-                                 VIRTIO_STATUS_FEATURES_OK);
-    if (!(c->device_status & VIRTIO_STATUS_FEATURES_OK)) {
-        c->device_status = VIRTIO_STATUS_FAILED;
-        return -1;
-    }
-    d->features = (uint64_t)want_features |
-                  ((uint64_t)(1u << VIRTIO_F_VERSION_1_BIT) << 32);
-    return 0;
-}
-
-void
-virtio_driver_ok(virtio_dev_t *d)
-{
-    d->common->device_status = (uint8_t)(VIRTIO_STATUS_ACKNOWLEDGE |
-                                         VIRTIO_STATUS_DRIVER |
-                                         VIRTIO_STATUS_FEATURES_OK |
-                                         VIRTIO_STATUS_DRIVER_OK);
-}
-
-/* ── virtqueue allocation ────────────────────────────────────────────────── */
-int
-virtio_setup_queue(virtio_dev_t *d, uint16_t qidx, virtq_t *vq)
-{
-    volatile virtio_pci_common_cfg_t *c = d->common;
-
-    c->queue_select = qidx;
-    uint16_t dev_max = c->queue_size;     /* device's maximum for this queue */
-    if (dev_max == 0)
-        return -1;                        /* queue not available */
-    uint16_t qsz = (dev_max < VIRTQ_SIZE) ? dev_max : (uint16_t)VIRTQ_SIZE;
-    c->queue_size = qsz;
-
-    uint64_t  desc_pa, avail_pa, used_pa;
-    uintptr_t desc_va, avail_va, used_va;
-    if (virtio_alloc_dma_page(&desc_pa,  &desc_va)  < 0 ||
-        virtio_alloc_dma_page(&avail_pa, &avail_va) < 0 ||
-        virtio_alloc_dma_page(&used_pa,  &used_va)  < 0)
-        return -1;
-
-    c->queue_desc   = desc_pa;
-    c->queue_driver = avail_pa;
-    c->queue_device = used_pa;
-
-    vq->dev        = d;
-    vq->index      = qidx;
-    vq->size       = qsz;
-    vq->desc       = (volatile virtq_desc_t  *)desc_va;
-    vq->avail      = (volatile virtq_avail_t *)avail_va;
-    vq->used       = (volatile virtq_used_t  *)used_va;
-    vq->notify_off = c->queue_notify_off;
-    vq->last_used  = 0;
-
-    uint16_t i;
-    for (i = 0; i < qsz; i++)
-        vq->free[i] = i;
-    vq->nfree = qsz;
-    vq->lock = (spinlock_t)SPINLOCK_INIT;
-
-    c->queue_enable = 1;
-    return 0;
 }

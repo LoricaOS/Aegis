@@ -170,6 +170,7 @@ FS_SRCS = \
 DRIVER_SRCS = \
     kernel/drivers/nvme.c kernel/drivers/ahci.c kernel/drivers/xhci.c \
     kernel/drivers/usb_hid.c kernel/drivers/usb_mouse.c \
+    kernel/drivers/virtio_core.c kernel/drivers/virtio_mmio.c \
     kernel/drivers/virtio_pci.c kernel/drivers/virtqueue.c \
     kernel/drivers/virtio_net.c kernel/drivers/virtio_blk.c \
     kernel/drivers/virtio_scsi.c kernel/drivers/virtio_balloon.c \
@@ -254,7 +255,8 @@ endif
 # (which depend on NET && VIRTIO).
 DRIVER_SRCS += kernel/drivers/virtio_stub.c
 DRIVER_SRCS := $(filter-out \
-    $(if $(CONFIG_VIRTIO),,kernel/drivers/virtio_pci.c kernel/drivers/virtqueue.c) \
+    $(if $(CONFIG_VIRTIO),,kernel/drivers/virtio_core.c kernel/drivers/virtio_pci.c kernel/drivers/virtqueue.c) \
+    $(if $(CONFIG_VIRTIO_MMIO),,kernel/drivers/virtio_mmio.c) \
     $(if $(CONFIG_VIRTIO_BLK),,kernel/drivers/virtio_blk.c) \
     $(if $(CONFIG_VIRTIO_SCSI),,kernel/drivers/virtio_scsi.c) \
     $(if $(CONFIG_VIRTIO_GPU),,kernel/drivers/virtio_gpu.c) \

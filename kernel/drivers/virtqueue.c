@@ -85,6 +85,13 @@ void
 virtq_notify(virtq_t *vq)
 {
     arch_wmb();                       /* idx visible before the notify MMIO */
+#ifdef CONFIG_VIRTIO_MMIO
+    if (vq->dev->is_mmio) {
+        /* mmio doorbell: write the queue index to the fixed QueueNotify reg. */
+        *(volatile uint32_t *)(vq->dev->mmio + VMMIO_QUEUE_NOTIFY) = vq->index;
+        return;
+    }
+#endif
     vq->dev->notify_base[vq->notify_off * vq->dev->notify_off_mult / 4u] =
         vq->index;
 }

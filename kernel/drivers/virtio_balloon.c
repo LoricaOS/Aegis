@@ -117,7 +117,7 @@ virtio_balloon_poll(void)
 void
 virtio_balloon_init(void)
 {
-    if (virtio_pci_find(VIRTIO_BALLOON_MODERN, VIRTIO_BALLOON_LEGACY, &s_dev) < 0)
+    if (virtio_find(VIRTIO_BALLOON_MODERN, VIRTIO_BALLOON_LEGACY, &s_dev) < 0)
         return;
 
     virtio_reset(&s_dev);

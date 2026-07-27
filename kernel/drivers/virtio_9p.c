@@ -75,7 +75,7 @@ p9_txn(void)
 void
 virtio_9p_init(void)
 {
-    if (virtio_pci_find(VIRTIO_9P_MODERN, VIRTIO_9P_LEGACY, &s_dev) < 0)
+    if (virtio_find(VIRTIO_9P_MODERN, VIRTIO_9P_LEGACY, &s_dev) < 0)
         return;
     virtio_reset(&s_dev);
     if (virtio_negotiate(&s_dev, 0) < 0)

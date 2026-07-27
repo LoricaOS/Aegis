@@ -158,7 +158,7 @@ vsock_wait_op(uint16_t want_op)
 void
 virtio_vsock_init(void)
 {
-    if (virtio_pci_find(VIRTIO_VSOCK_MODERN, VIRTIO_VSOCK_MODERN, &s_dev) < 0)
+    if (virtio_find(VIRTIO_VSOCK_MODERN, VIRTIO_VSOCK_MODERN, &s_dev) < 0)
         return;                              /* not present → silent */
 
     virtio_reset(&s_dev);

@@ -97,7 +97,32 @@ typedef struct virtio_dev {
     uint32_t           notify_off_mult;         /* notify_off_multiplier */
     volatile uint8_t  *devcfg;                  /* DEVICE_CFG MMIO (device-specific) */
     uint64_t           features;                /* negotiated features (low|high<<32) */
+    uint8_t            is_mmio;                  /* 1 = virtio-mmio transport, 0 = PCI */
+    volatile uint8_t  *mmio;                     /* mmio register block base (KVA) if is_mmio */
 } virtio_dev_t;
+
+/* ── virtio-mmio transport register offsets (v2, spec §4.2.2) ─────────────── */
+#define VIRTIO_MMIO_MAGIC          0x74726976u  /* "virt" — MagicValue @ 0x000  */
+#define VMMIO_MAGIC_VALUE          0x000u
+#define VMMIO_VERSION              0x004u        /* 2 = modern                   */
+#define VMMIO_DEVICE_ID            0x008u        /* virtio device *type* (2=blk) */
+#define VMMIO_DEVICE_FEATURES      0x010u
+#define VMMIO_DEVICE_FEATURES_SEL  0x014u
+#define VMMIO_DRIVER_FEATURES      0x020u
+#define VMMIO_DRIVER_FEATURES_SEL  0x024u
+#define VMMIO_QUEUE_SEL            0x030u
+#define VMMIO_QUEUE_NUM_MAX        0x034u
+#define VMMIO_QUEUE_NUM            0x038u
+#define VMMIO_QUEUE_READY          0x044u
+#define VMMIO_QUEUE_NOTIFY         0x050u
+#define VMMIO_STATUS               0x070u
+#define VMMIO_QUEUE_DESC_LOW       0x080u
+#define VMMIO_QUEUE_DESC_HIGH      0x084u
+#define VMMIO_QUEUE_DRIVER_LOW     0x090u
+#define VMMIO_QUEUE_DRIVER_HIGH    0x094u
+#define VMMIO_QUEUE_DEVICE_LOW     0x0A0u
+#define VMMIO_QUEUE_DEVICE_HIGH    0x0A4u
+#define VMMIO_CONFIG               0x100u        /* device-specific config space */
 
 /* ── A configured virtqueue ───────────────────────────────────────────────── */
 typedef struct virtq {
@@ -123,13 +148,26 @@ typedef struct virtq_buf {
 
 /* ── Transport core (virtio_pci.c) ────────────────────────────────────────── */
 
-/* Scan the PCI device list for a virtio device of modern_id (or legacy_id),
- * walk its capability list, map COMMON/NOTIFY/DEVICE cfg BARs into KVA, and fill
- * *out. Returns 0 on success, -1 if not found / un-mappable. Leaves the device
- * in RESET; caller drives negotiate → setup_queue → driver_ok. */
+/* Unified discovery (virtio_core.c): find a virtio device of the given identity
+ * over ANY available transport — PCI first, then virtio-mmio — and fill *out,
+ * leaving it in RESET for the caller to negotiate → setup_queue → driver_ok.
+ * Returns 0 on success, -1 if not found. `skip` selects the (skip+1)-th match
+ * (for the paired input keyboard/mouse). Device drivers call these and stay
+ * transport-oblivious; the mmio device *type* is derived as modern_id-0x1040. */
+int  virtio_find(uint16_t modern_id, uint16_t legacy_id, virtio_dev_t *out);
+int  virtio_find_nth(uint16_t modern_id, uint16_t legacy_id, int skip,
+                     virtio_dev_t *out);
+
+/* Map n_pages of physical MMIO (base pa) into KVA as uncached device memory.
+ * Shared by both transports for register/BAR windows. 0 on failure. */
+uintptr_t virtio_map_mmio(uint64_t pa, uint32_t n_pages);
+
+/* Per-transport discovery backends (virtio_pci.c / virtio_mmio.c). Prefer the
+ * unified virtio_find* above; these exist for it to dispatch to. */
 int  virtio_pci_find(uint16_t modern_id, uint16_t legacy_id, virtio_dev_t *out);
 int  virtio_pci_find_nth(uint16_t modern_id, uint16_t legacy_id, int skip,
                          virtio_dev_t *out);
+int  virtio_mmio_find_nth(uint16_t device_type, int skip, virtio_dev_t *out);
 
 /* RESET → ACKNOWLEDGE → DRIVER. */
 void virtio_reset(virtio_dev_t *d);

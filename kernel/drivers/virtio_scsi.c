@@ -211,7 +211,7 @@ virtio_scsi_write(blkdev_t *dev, uint64_t lba, uint32_t count, const void *buf)
 void
 virtio_scsi_init(void)
 {
-    if (virtio_pci_find(VIRTIO_SCSI_MODERN, VIRTIO_SCSI_LEGACY, &s_dev) < 0)
+    if (virtio_find(VIRTIO_SCSI_MODERN, VIRTIO_SCSI_LEGACY, &s_dev) < 0)
         return;
 
     virtio_reset(&s_dev);

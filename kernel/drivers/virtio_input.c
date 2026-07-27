@@ -152,7 +152,7 @@ virtio_input_poll(void)
 static int
 vinput_setup_one(int skip, vinput_dev_t *v)
 {
-    if (virtio_pci_find_nth(VIRTIO_INPUT_MODERN, 0, skip, &v->dev) < 0)
+    if (virtio_find_nth(VIRTIO_INPUT_MODERN, 0, skip, &v->dev) < 0)
         return -1;
 
     virtio_reset(&v->dev);

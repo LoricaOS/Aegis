@@ -172,7 +172,7 @@ gpu_cmd(uint32_t req_len, uint32_t resp_len)
 void
 virtio_gpu_init(void)
 {
-    if (virtio_pci_find(VIRTIO_GPU_MODERN, 0, &s_gpu) < 0)
+    if (virtio_find(VIRTIO_GPU_MODERN, 0, &s_gpu) < 0)
         return;  /* silent: no virtio-gpu present */
 
     virtio_reset(&s_gpu);

@@ -63,7 +63,7 @@ pmem_write(blkdev_t *dev, uint64_t lba, uint32_t count, const void *buf)
 void
 virtio_pmem_init(void)
 {
-    if (virtio_pci_find(VIRTIO_PMEM_MODERN, 0, &s_dev) < 0)
+    if (virtio_find(VIRTIO_PMEM_MODERN, 0, &s_dev) < 0)
         return;
 
     virtio_reset(&s_dev);

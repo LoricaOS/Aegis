@@ -201,7 +201,7 @@ virtio_blk_write(blkdev_t *dev, uint64_t lba, uint32_t count, const void *buf)
 void
 virtio_blk_init(void)
 {
-    if (virtio_pci_find(VIRTIO_BLK_MODERN, VIRTIO_BLK_LEGACY, &s_blk_dev) < 0)
+    if (virtio_find(VIRTIO_BLK_MODERN, VIRTIO_BLK_LEGACY, &s_blk_dev) < 0)
         return;  /* silent: no virtio-blk present */
 
     virtio_reset(&s_blk_dev);
