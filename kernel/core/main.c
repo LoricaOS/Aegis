@@ -133,7 +133,14 @@ bph(const char *name)
 void
 kernel_main(uint32_t mb_magic, void *mb_info)
 {
-    (void)mb_magic;
+    /* PVH direct boot (microVM): the entry forwarded hvm_start_info's magic +
+     * pointer. Translate it into arch_mm's statics via the shared ingest path,
+     * then clear mb_info so arch_mm_init() below takes its already-ingested
+     * branch (same as the Limine path). */
+    if (mb_magic == PVH_BOOT_MAGIC) {
+        pvh_boot_ingest(mb_info);
+        mb_info = NULL;
+    }
 
     /* Boot stopwatch: raw TSC at kernel entry, converted to ms once the TSC is
      * calibrated and reported just before init is spawned. A permanent baseline

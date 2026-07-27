@@ -61,4 +61,14 @@ extern int g_boot_limine;
  * returns. Called by limine_boot_entry on the kernel's own boot stack. */
 void kernel_main_limine(const aegis_bootinfo_t *bi);
 
+/* PVH (Xen HVM) direct-boot magic: hvm_start_info.magic, which the x86 PVH
+ * entry (boot.asm pvh_start) forwards to kernel_main as mb_magic so it can
+ * tell the PVH path from multiboot2. See kernel/arch/x86_64/pvh.c. */
+#define PVH_BOOT_MAGIC 0x336EC578u
+
+/* x86 PVH: translate the hvm_start_info at `start_info` (a physical pointer,
+ * identity-mapped at this point in boot) into an aegis_bootinfo_t and feed it
+ * to arch_mm_ingest — the same intake the Limine path uses. */
+void pvh_boot_ingest(void *start_info);
+
 #endif /* AEGIS_BOOTINFO_H */

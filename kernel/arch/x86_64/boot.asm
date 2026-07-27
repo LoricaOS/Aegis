@@ -30,6 +30,8 @@
 
 MULTIBOOT2_MAGIC  equ 0xE85250D6   ; identifies this as a multiboot2 header
 MULTIBOOT2_ARCH   equ 0             ; 0 = i386 (32-bit protected mode entry)
+PVH_BOOT_MAGIC    equ 0x336EC578    ; hvm_start_info.magic; forwarded to
+                                    ; kernel_main so it takes the PVH path
 
 KERN_VMA     equ 0xFFFFFFFF80000000
 PDPT_HI_IDX  equ ((KERN_VMA >> 30) & 0x1FF)   ; = 510
@@ -140,7 +142,24 @@ _start:
     ; EDI/ESI survive the mode transition — we don't clobber them below.
     mov edi, eax                ; mb_magic → RDI (first arg)
     mov esi, ebx                ; mb_info  → RSI (second arg)
+    jmp boot32_common
 
+; pvh_start — the Xen PVH entry: microVM direct boot (Firecracker,
+; cloud-hypervisor, QEMU `-machine microvm`). The VMM enters here in 32-bit
+; protected mode with paging off and EBX = physical address of hvm_start_info
+; (the PVH boot ABI). This entry is named by the XEN_ELFNOTE_PHYS32_ENTRY note
+; emitted in pvh.c. We forward a sentinel magic + the start_info pointer to
+; kernel_main through the shared long-mode trampoline; pvh_boot_ingest() parses
+; the struct C-side. Entry state matches _start's (protected mode, paging off,
+; flat segments), so the identical page-table + long-mode bring-up applies.
+global pvh_start
+pvh_start:
+    cli
+    mov edi, PVH_BOOT_MAGIC      ; mb_magic → RDI (PVH sentinel)
+    mov esi, ebx                 ; hvm_start_info phys → RSI
+    ; fall through to boot32_common
+
+boot32_common:
     ; ── Set up page tables ──────────────────────────────────────────────
     ; All .bss labels have higher-half VMAs after the linker split.
     ; Use (label - KERN_VMA) to compute their physical addresses at

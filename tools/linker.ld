@@ -26,6 +26,13 @@ SECTIONS
         *(.text.boot)
     }
 
+    /* PVH boot note (kernel/arch/x86_64/pvh.c). An SHT_NOTE section — with no
+       PHDRS command, ld auto-emits the PT_NOTE program header that PVH loaders
+       (Firecracker, cloud-hypervisor, QEMU microvm) scan for the phys32 entry.
+       KEEP so --gc-sections can't drop it; placed early so it sits in the
+       loaded image with a valid file offset. */
+    .note.Xen : AT(ADDR(.note.Xen) - KERN_VMA) { KEEP(*(.note.Xen)) }
+
     .text   : AT(ADDR(.text)   - KERN_VMA) { *(.text .text.*) }
     .rodata : AT(ADDR(.rodata) - KERN_VMA) {
         *(.rodata .rodata.*)
