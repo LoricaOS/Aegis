@@ -1,5 +1,6 @@
 #include "vfs.h"
 #include "ext2_vfs.h"
+#include "fs_ops.h"
 #include "initrd.h"
 #include "ext2.h"
 #include "ramfs.h"
@@ -43,7 +44,7 @@ vfs_init(void)
  *   7. initrd fallback (read-only boot files)
  *
  * flags: open flags forwarded from sys_open.  VFS_O_CREAT causes vfs_open
- *        to call ext2_create() if the file is not found on ext2.
+ *        to call g_rootfs->create() if the file is not found on ext2.
  *
  * Returns 0 on success, -2 (ENOENT) if not found, -12 (ENOMEM) if the
  * ext2 fd pool is exhausted.
@@ -290,7 +291,7 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
          * symlink-swap can't substitute a different target between the two — see
          * ext2_open_protected. This is the authoritative, atomic replacement for
          * sys_open's racy cap_path_is_protected() pre-check. */
-        if (ext2_open_protected(path, &ino, &is_protected) >= 0) {
+        if (g_rootfs->open_protected(path, &ino, &is_protected) >= 0) {
             /* O_CREAT|O_EXCL on an existing file: fail EEXIST (atomic create). */
             if ((flags & (int)VFS_O_CREAT) && (flags & (int)VFS_O_EXCL))
                 return -EEXIST;
@@ -300,7 +301,7 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
                 int want = 4;  /* R_OK by default (O_RDONLY=0) */
                 if (flags & 1) want = 2;       /* O_WRONLY */
                 if (flags & 2) want = 4 | 2;   /* O_RDWR */
-                int perm = ext2_check_perm(ino,
+                int perm = g_rootfs->check_perm(ino,
                     (uint16_t)pr->uid, (uint16_t)pr->gid, want);
                 if (perm != 0)
                     return -EACCES;
@@ -312,8 +313,8 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
              * The resolved inode is compared against the shadow/admin inodes
              * recorded at mount time. */
             {
-                uint32_t shadow_ino = ext2_get_shadow_ino();
-                uint32_t admin_ino  = ext2_get_admin_ino();
+                uint32_t shadow_ino = g_rootfs->get_shadow_ino();
+                uint32_t admin_ino  = g_rootfs->get_admin_ino();
                 if (sched_current()->is_user &&
                     ((shadow_ino != 0 && ino == shadow_ino) ||
                      (admin_ino  != 0 && ino == admin_ino))) {
@@ -334,8 +335,8 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
              * above; the same inodes are also gated in the sys_dir/sys_meta
              * mutators (rename-over/unlink/chmod/…). */
             {
-                uint32_t passwd_ino = ext2_get_passwd_ino();
-                uint32_t group_ino  = ext2_get_group_ino();
+                uint32_t passwd_ino = g_rootfs->get_passwd_ino();
+                uint32_t group_ino  = g_rootfs->get_group_ino();
                 if (sched_current()->is_user &&
                     ((passwd_ino != 0 && ino == passwd_ino) ||
                      (group_ino  != 0 && ino == group_ino))) {
@@ -372,10 +373,10 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
              * i_size = 0 alone (the old behaviour) leaked every data/indirect
              * block of the file on each truncate. */
             if (flags & (int)VFS_O_TRUNC)
-                ext2_truncate(ino);
-            ext2_fd_priv_t *p = ext2_pool_alloc(ino);
+                g_rootfs->truncate(ino);
+            ext2_fd_priv_t *p = g_rootfs->pool_alloc(ino);
             if (!p) return -ENOMEM;
-            int sz = ext2_file_size(ino);
+            int sz = g_rootfs->file_size(ino);
             if (sz < 0) sz = 0;
             /* O_APPEND: start writing at end of file */
             if (flags & (int)VFS_O_APPEND)
@@ -397,17 +398,17 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
         if (flags & (int)VFS_O_CREAT) {
             uint32_t parent_ino;
             const char *bname;
-            if (ext2_lookup_parent(path, &parent_ino, &bname) == 0 &&
+            if (g_rootfs->lookup_parent(path, &parent_ino, &bname) == 0 &&
                 sched_current()->is_user) {
                 aegis_process_t *pr = current_proc();
-                int pperm = ext2_check_perm(parent_ino,
+                int pperm = g_rootfs->check_perm(parent_ino,
                     (uint16_t)pr->uid, (uint16_t)pr->gid, 2 | 1); /* W+X */
                 if (pperm != 0)
                     return -EACCES;
             }
-            if (ext2_create(path, create_mode ? create_mode : 0644, has_install) == 0) {
-                if (ext2_open(path, &ino) >= 0) {
-                    ext2_fd_priv_t *p = ext2_pool_alloc(ino);
+            if (g_rootfs->create(path, create_mode ? create_mode : 0644, has_install) == 0) {
+                if (g_rootfs->open(path, &ino) >= 0) {
+                    ext2_fd_priv_t *p = g_rootfs->pool_alloc(ino);
                     if (!p) return -ENOMEM;
                     out->ops    = &s_ext2_ops;
                     out->priv   = (void *)p;
@@ -545,8 +546,8 @@ vfs_stat_path(const char *path, k_stat_t *out)
     /* ext2 primary */
     {
         uint32_t ino = 0;
-        if (ext2_open(path, &ino) == 0) {
-            int sz = ext2_file_size(ino);
+        if (g_rootfs->open(path, &ino) == 0) {
+            int sz = g_rootfs->file_size(ino);
             if (sz < 0) sz = 0;
             /* Zero the inode BEFORE the read: on failure the six fields
              * copied out below (links_count, uid, gid, atime, mtime, ctime)
@@ -557,7 +558,7 @@ vfs_stat_path(const char *path, k_stat_t *out)
             ext2_inode_t inode;
             __builtin_memset(&inode, 0, sizeof(inode));
             uint32_t mode;
-            if (ext2_read_inode(ino, &inode) == 0)
+            if (g_rootfs->read_inode(ino, &inode) == 0)
                 mode = (uint32_t)inode.i_mode;
             else
                 mode = S_IFREG | 0644;
@@ -626,15 +627,15 @@ vfs_stat_path_ex(const char *path, k_stat_t *out, int follow)
     /* ext2 primary — use ext2_open_ex for symlink control */
     {
         uint32_t ino = 0;
-        if (ext2_open_ex(path, &ino, follow) == 0) {
+        if (g_rootfs->open_ex(path, &ino, follow) == 0) {
             ext2_inode_t inode;
-            int sz = ext2_file_size(ino);
+            int sz = g_rootfs->file_size(ino);
             if (sz < 0) sz = 0;
             __builtin_memset(out, 0, sizeof(*out));
             out->st_dev     = 2;
             out->st_ino     = (uint64_t)ino;
             out->st_nlink   = 1;
-            if (ext2_read_inode(ino, &inode) == 0) {
+            if (g_rootfs->read_inode(ino, &inode) == 0) {
                 out->st_mode = (uint32_t)inode.i_mode;
                 out->st_uid  = (uint32_t)inode.i_uid;
                 out->st_gid  = (uint32_t)inode.i_gid;
@@ -669,10 +670,10 @@ vfs_fchmod(vfs_file_t *f, uint16_t mode)
     if (!f || f->ops != &s_ext2_ops) return -1;
     ext2_fd_priv_t *p = (ext2_fd_priv_t *)f->priv;
     ext2_inode_t inode;
-    if (ext2_read_inode(p->ino, &inode) != 0) return -1;
+    if (g_rootfs->read_inode(p->ino, &inode) != 0) return -1;
     /* Preserve file type bits, replace permission bits */
     inode.i_mode = (inode.i_mode & 0xF000) | (mode & 0x0FFF);
-    return ext2_write_inode(p->ino, &inode);
+    return g_rootfs->write_inode(p->ino, &inode);
 }
 
 /*
@@ -685,8 +686,8 @@ vfs_fchown(vfs_file_t *f, uint16_t uid, uint16_t gid)
     if (!f || f->ops != &s_ext2_ops) return -1;
     ext2_fd_priv_t *p = (ext2_fd_priv_t *)f->priv;
     ext2_inode_t inode;
-    if (ext2_read_inode(p->ino, &inode) != 0) return -1;
+    if (g_rootfs->read_inode(p->ino, &inode) != 0) return -1;
     inode.i_uid = uid;
     inode.i_gid = gid;
-    return ext2_write_inode(p->ino, &inode);
+    return g_rootfs->write_inode(p->ino, &inode);
 }
