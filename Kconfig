@@ -64,6 +64,76 @@ config AUDIO_HDA
 	  The Intel HDA controller driver. A text-only or headless build has no
 	  use for it.
 
+comment "VirtIO devices"
+
+config VIRTIO
+	bool "VirtIO paravirtual device support"
+	default y
+	help
+	  The virtio transport (virtio-pci + virtqueue) shared by all the
+	  paravirtual devices below. Turning this off removes the transport and,
+	  by dependency, every virtio device — a bare-metal build with no virtio
+	  hardware wants none of it. Each device is an independent knob so you can
+	  keep, say, virtio-blk while dropping virtio-gpu.
+
+config VIRTIO_BLK
+	bool "virtio-blk (block device)"
+	depends on VIRTIO
+	default y
+
+config VIRTIO_SCSI
+	bool "virtio-scsi (SCSI HBA)"
+	depends on VIRTIO
+	default y
+
+config VIRTIO_GPU
+	bool "virtio-gpu (2D scanout)"
+	depends on VIRTIO
+	default y
+	help
+	  The virtio-gpu 2D scanout device. A headless / text build has no use
+	  for it; the framebuffer screenshot path degrades gracefully without it.
+
+config VIRTIO_INPUT
+	bool "virtio-input (keyboard/tablet)"
+	depends on VIRTIO
+	default y
+
+config VIRTIO_RNG
+	bool "virtio-rng (entropy)"
+	depends on VIRTIO
+	default y
+
+config VIRTIO_BALLOON
+	bool "virtio-balloon (memory ballooning)"
+	depends on VIRTIO
+	default y
+
+config VIRTIO_PMEM
+	bool "virtio-pmem (persistent memory)"
+	depends on VIRTIO
+	default y
+
+config VIRTIO_CONSOLE
+	bool "virtio-console"
+	depends on VIRTIO
+	default y
+
+config VIRTIO_9P
+	bool "virtio-9p (host filesystem share)"
+	depends on VIRTIO
+	default y
+
+config VIRTIO_NET
+	bool "virtio-net (NIC)"
+	depends on VIRTIO && NET
+	default y
+
+config VIRTIO_VSOCK
+	bool "virtio-vsock (host<->guest sockets)"
+	depends on VIRTIO && NET
+	default y
+
 endmenu
 
 menu "Kernel diagnostics"

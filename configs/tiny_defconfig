@@ -6,3 +6,4 @@ CONFIG_MMU=y
 # CONFIG_AUDIO_HDA is not set
 # CONFIG_HYPERV is not set
 # CONFIG_TRACE is not set
+# CONFIG_VIRTIO is not set

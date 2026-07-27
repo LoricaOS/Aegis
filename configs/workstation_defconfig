@@ -8,3 +8,7 @@ CONFIG_NET=y
 # CONFIG_AUDIO_HDA is not set
 # CONFIG_HYPERV is not set
 # CONFIG_TRACE is not set
+# virtio kept (disk/console/entropy in a VM), minus graphics + tablet
+CONFIG_VIRTIO=y
+# CONFIG_VIRTIO_GPU is not set
+# CONFIG_VIRTIO_INPUT is not set

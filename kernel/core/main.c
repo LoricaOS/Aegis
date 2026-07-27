@@ -437,8 +437,8 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     virtio_pmem_init();     /* virtio-pmem disk — [PMEM] OK or silent skip   */
     virtio_console_init();  /* virtio-console — [VCON] OK or silent skip     */
     virtio_9p_init();       /* virtio-9p host share — [9P] OK or silent skip */
-#ifdef CONFIG_NET
-    virtio_vsock_init();    /* virtio-vsock host↔guest socket — silent skip  */
+#ifdef CONFIG_VIRTIO_VSOCK
+    virtio_vsock_init();    /* virtio-vsock host↔guest socket (NET+VIRTIO)   */
 #endif
     virtio_balloon_init();  /* virtio-balloon — [BALLOON] OK or silent skip  */
     virtio_input_init();    /* virtio-input kbd/tablet — [VINPUT] OK or skip  */
@@ -503,8 +503,10 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     bph("mount+cap");
     xhci_init();            /* xHCI USB host — [XHCI] OK or silent skip     */
     gpt_scan("usb0");       /* GPT on a USB mass-storage device — silent if absent */
+#ifdef CONFIG_VIRTIO_NET
+    virtio_net_init();      /* virtio-net NIC (NET+VIRTIO)                   */
+#endif
 #ifdef CONFIG_NET
-    virtio_net_init();      /* virtio-net NIC — [NET] OK or silent skip      */
     rtl8169_init();         /* RTL8168/8169 NIC — [NET] OK or silent skip   */
     rtl8139_init();         /* RTL8139 NIC — [NET] OK or silent skip        */
     e1000_init();           /* Intel e1000 NIC — [NET] OK or silent skip    */

@@ -220,9 +220,9 @@ ifneq ($(CONFIG_NET),y)
 NET_SRCS       := kernel/net/epoll.c kernel/net/net_stub.c
 USERSPACE_SRCS := $(filter-out kernel/syscall/sys_socket.c,$(USERSPACE_SRCS))
 DRIVER_SRCS    := $(filter-out \
-    kernel/drivers/virtio_net.c kernel/drivers/rtl8169.c kernel/drivers/rtl8139.c \
+    kernel/drivers/rtl8169.c kernel/drivers/rtl8139.c \
     kernel/drivers/e1000.c kernel/drivers/vmxnet3.c kernel/drivers/netvsc.c \
-    kernel/drivers/virtio_vsock.c kernel/drivers/iwl_ax200.c, $(DRIVER_SRCS))
+    kernel/drivers/iwl_ax200.c, $(DRIVER_SRCS))
 endif
 
 ifneq ($(CONFIG_AUDIO_HDA),y)
@@ -239,6 +239,27 @@ DRIVER_SRCS := $(filter-out \
     kernel/drivers/hv_heartbeat.c kernel/drivers/hv_ic.c kernel/drivers/hv_shutdown.c \
     kernel/drivers/hv_kvp.c, $(DRIVER_SRCS))
 endif
+
+# VirtIO: the transport (CONFIG_VIRTIO) plus an independent knob per device.
+# virtio_stub.c (always built) supplies a no-op init/API for every device left
+# out, so the call-sites stay edit-free. $(if $(CONFIG_X),,file) filters `file`
+# out exactly when CONFIG_X is unset. virtio-net/vsock gate on their own knobs
+# (which depend on NET && VIRTIO).
+DRIVER_SRCS += kernel/drivers/virtio_stub.c
+DRIVER_SRCS := $(filter-out \
+    $(if $(CONFIG_VIRTIO),,kernel/drivers/virtio_pci.c kernel/drivers/virtqueue.c) \
+    $(if $(CONFIG_VIRTIO_BLK),,kernel/drivers/virtio_blk.c) \
+    $(if $(CONFIG_VIRTIO_SCSI),,kernel/drivers/virtio_scsi.c) \
+    $(if $(CONFIG_VIRTIO_GPU),,kernel/drivers/virtio_gpu.c) \
+    $(if $(CONFIG_VIRTIO_INPUT),,kernel/drivers/virtio_input.c) \
+    $(if $(CONFIG_VIRTIO_RNG),,kernel/drivers/virtio_rng.c) \
+    $(if $(CONFIG_VIRTIO_BALLOON),,kernel/drivers/virtio_balloon.c) \
+    $(if $(CONFIG_VIRTIO_PMEM),,kernel/drivers/virtio_pmem.c) \
+    $(if $(CONFIG_VIRTIO_CONSOLE),,kernel/drivers/virtio_console.c) \
+    $(if $(CONFIG_VIRTIO_9P),,kernel/drivers/virtio_9p.c) \
+    $(if $(CONFIG_VIRTIO_NET),,kernel/drivers/virtio_net.c) \
+    $(if $(CONFIG_VIRTIO_VSOCK),,kernel/drivers/virtio_vsock.c) \
+    , $(DRIVER_SRCS))
 
 # ── Object file lists ───────────���────────────────────────────────��───────────
 ARCH_OBJS      = $(patsubst kernel/%.c,$(BUILD)/%.o,$(ARCH_SRCS))
