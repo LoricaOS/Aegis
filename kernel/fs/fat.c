@@ -1,0 +1,405 @@
+/* fat.c — a FAT32 disk-filesystem backend (read-only for now).
+ *
+ * Implements the fs_ops vtable so a build with CONFIG_FS_FAT mounts a FAT32
+ * volume as the VFS root/disk backend in place of ext2 — small (~third of
+ * ext2's code), and the on-disk format every SD card and PC already speaks.
+ * The tradeoff is no Unix ownership/permissions: FAT has none, so check_perm
+ * allows and get_*_ino report absent. Authority still comes from the capability
+ * layer at the syscall boundary, which is what actually gates access.
+ *
+ * FAT has no inodes; we synthesize a stable inode number from a directory
+ * entry's on-disk location:  ino = (entry_lba << 5) | entry_index  (index 0..15
+ * within a 512 B sector). The root directory, which has no parent entry, uses
+ * the sentinel FAT_ROOT_INO. read_inode/read re-fetch the entry from its
+ * encoded location — no in-memory inode table needed.
+ *
+ * Phase 4a: read only. create/write/mkdir/unlink return -EPERM; cluster
+ * allocation + FAT/FSInfo updates + LFN come in phase 4b. Short (8.3) names
+ * only for now; long-name entries are skipped.
+ */
+#include "fs_ops.h"
+#include "vfs.h"
+#include "blkdev.h"
+#include "printk.h"
+#include "../lib/string.h"
+#include "../include/aegis_errno.h"
+
+#define SECTOR       512u
+#define DIRENT_SIZE  32u
+#define FAT_ROOT_INO 1u
+#define FAT_EOC      0x0FFFFFF8u    /* >= this = end-of-chain              */
+#define ATTR_RO      0x01
+#define ATTR_HIDDEN  0x02
+#define ATTR_SYSTEM  0x04
+#define ATTR_VOLUME  0x08
+#define ATTR_DIR     0x10
+#define ATTR_LFN     0x0F           /* long-name entry (skip in phase 4a)  */
+#define S_IFDIR_M    0040000
+#define S_IFREG_M    0100000
+
+/* mounted-volume geometry (single mount) */
+static blkdev_t *s_dev;
+static uint16_t  s_bps;             /* bytes per sector (expect 512)       */
+static uint8_t   s_spc;             /* sectors per cluster                 */
+static uint32_t  s_fat_lba;         /* first FAT sector                    */
+static uint32_t  s_data_lba;        /* first data sector (cluster 2)       */
+static uint32_t  s_root_cluster;    /* FAT32 root dir start cluster        */
+static uint32_t  s_total_clusters;
+
+static irqflags_t s_lock_flags;     /* trivial big lock (single-threaded mount) */
+
+/* the kernel's shared string.h has no strcmp (only kmem*); one tiny helper */
+static int fat_streq(const char *a, const char *b) {
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+
+/* ---- low-level sector / FAT access ----------------------------------- */
+
+static int fat_read_lba(uint32_t lba, void *buf) {
+    if (!s_dev) return -1;
+    return s_dev->read(s_dev, s_dev->lba_offset + lba, 1, buf);
+}
+
+static uint32_t cluster_lba(uint32_t cl) {
+    return s_data_lba + (cl - 2) * s_spc;
+}
+
+/* next cluster in the chain (FAT32), or >= FAT_EOC at end */
+static uint32_t fat_next(uint32_t cl) {
+    uint8_t sec[SECTOR];
+    uint32_t off = cl * 4;
+    if (fat_read_lba(s_fat_lba + off / SECTOR, sec) != 0) return FAT_EOC;
+    uint32_t v;
+    kmemcpy(&v, sec + (off % SECTOR), 4);
+    return v & 0x0FFFFFFFu;
+}
+
+/* ---- directory-entry decode + inode synthesis ------------------------ */
+
+typedef struct {
+    uint32_t first_cluster;
+    uint32_t size;
+    uint8_t  attr;
+    uint16_t mtime, mdate;
+} fat_dirent_t;
+
+/* build "NAME.EXT" (lowercased) from an 8.3 raw entry; returns 0 if usable */
+static int decode_83(const uint8_t *e, char *out) {
+    if (e[0] == 0x00 || e[0] == 0xE5) return -1;      /* free / deleted     */
+    if ((e[11] & ATTR_LFN) == ATTR_LFN) return -1;    /* long-name fragment */
+    if (e[11] & ATTR_VOLUME) return -1;               /* volume label       */
+    int n = 0;
+    for (int i = 0; i < 8 && e[i] != ' '; i++) out[n++] = e[i];
+    if (e[8] != ' ') {
+        out[n++] = '.';
+        for (int i = 8; i < 11 && e[i] != ' '; i++) out[n++] = e[i];
+    }
+    out[n] = 0;
+    for (int i = 0; i < n; i++)
+        if (out[i] >= 'A' && out[i] <= 'Z') out[i] += 32;   /* FAT is upcased */
+    return 0;
+}
+
+static void fill_dirent(const uint8_t *e, fat_dirent_t *d) {
+    uint16_t hi, lo;
+    kmemcpy(&hi, e + 20, 2);
+    kmemcpy(&lo, e + 26, 2);
+    d->first_cluster = ((uint32_t)hi << 16) | lo;
+    kmemcpy(&d->size, e + 28, 4);
+    d->attr = e[11];
+    kmemcpy(&d->mtime, e + 22, 2);
+    kmemcpy(&d->mdate, e + 24, 2);
+}
+
+/* fetch the directory entry a synthesized ino points at */
+static int read_dirent(uint32_t ino, fat_dirent_t *d) {
+    if (ino == FAT_ROOT_INO) {
+        d->first_cluster = s_root_cluster;
+        d->size = 0;
+        d->attr = ATTR_DIR;
+        d->mtime = d->mdate = 0;
+        return 0;
+    }
+    uint32_t lba = ino >> 5, idx = ino & 31;
+    uint8_t sec[SECTOR];
+    if (fat_read_lba(lba, sec) != 0) return -ENOENT;
+    fill_dirent(sec + idx * DIRENT_SIZE, d);
+    return 0;
+}
+
+/* iterate a directory's entries. For each valid 8.3 entry, invoke cb; cb
+ * returns non-zero to stop. `want_index`<0 => visit all; else stop at the Nth.
+ * On a hit, *hit_ino / *hit_dirent are set. Returns 1 if cb stopped, else 0. */
+typedef int (*dir_cb)(const char *name, uint32_t ino, const fat_dirent_t *d, void *ctx);
+
+static int walk_dir(uint32_t dir_cluster, dir_cb cb, void *ctx) {
+    uint8_t sec[SECTOR];
+    uint32_t cl = dir_cluster;
+    while (cl >= 2 && cl < FAT_EOC) {
+        for (uint32_t s = 0; s < s_spc; s++) {
+            uint32_t lba = cluster_lba(cl) + s;
+            if (fat_read_lba(lba, sec) != 0) return 0;
+            for (uint32_t i = 0; i < SECTOR / DIRENT_SIZE; i++) {
+                const uint8_t *e = sec + i * DIRENT_SIZE;
+                if (e[0] == 0x00) return 0;              /* end of directory */
+                char name[16];
+                if (decode_83(e, name) != 0) continue;
+                fat_dirent_t d;
+                fill_dirent(e, &d);
+                uint32_t ino = (lba << 5) | i;
+                if (cb(name, ino, &d, ctx)) return 1;
+            }
+        }
+        cl = fat_next(cl);
+    }
+    return 0;
+}
+
+/* ---- path resolution ------------------------------------------------- */
+
+struct match_ctx { const char *want; uint32_t ino; fat_dirent_t d; int found; };
+static int match_cb(const char *name, uint32_t ino, const fat_dirent_t *d, void *c) {
+    struct match_ctx *m = c;
+    if (fat_streq(name, m->want)) { m->ino = ino; m->d = *d; m->found = 1; return 1; }
+    return 0;
+}
+
+/* resolve `path` to (ino, dirent). If parent_out != NULL, stop at the parent
+ * and return the final component's name in *base_out instead. */
+static int resolve(const char *path, uint32_t *ino_out, fat_dirent_t *d_out,
+                   uint32_t *parent_cluster_out, const char **base_out) {
+    while (*path == '/') path++;
+    uint32_t cur_cluster = s_root_cluster;
+    uint32_t cur_ino = FAT_ROOT_INO;
+    fat_dirent_t cur_d = { s_root_cluster, 0, ATTR_DIR, 0, 0 };
+
+    while (*path) {
+        char comp[16];
+        int n = 0;
+        while (*path && *path != '/' && n < 15) comp[n++] = *path++;
+        comp[n] = 0;
+        while (*path == '/') path++;
+        int last = (*path == 0);
+
+        if (parent_cluster_out && last) {         /* caller wants the parent */
+            *parent_cluster_out = cur_cluster;
+            *base_out = base_out ? *base_out : 0;  /* filled by caller copy */
+            static char lastname[16];
+            kmemcpy(lastname, comp, (uint32_t)(n + 1));
+            *base_out = lastname;
+            return 0;
+        }
+
+        struct match_ctx m = { comp, 0, {0}, 0 };
+        if (!(cur_d.attr & ATTR_DIR)) return -ENOTDIR;
+        walk_dir(cur_cluster, match_cb, &m);
+        if (!m.found) return -ENOENT;
+        cur_ino = m.ino; cur_d = m.d; cur_cluster = m.d.first_cluster;
+    }
+    if (ino_out) *ino_out = cur_ino;
+    if (d_out)   *d_out = cur_d;
+    return 0;
+}
+
+/* ---- fs_ops: superblock ---------------------------------------------- */
+
+static int fat_mount(const char *devname) {
+    s_dev = blkdev_get(devname);
+    if (!s_dev) return -ENOENT;
+    uint8_t bpb[SECTOR];
+    if (fat_read_lba(0, bpb) != 0) { s_dev = 0; return -EIO; }
+    kmemcpy(&s_bps, bpb + 11, 2);
+    s_spc = bpb[13];
+    uint16_t reserved; kmemcpy(&reserved, bpb + 14, 2);
+    uint8_t nfats = bpb[16];
+    uint32_t fat_size; kmemcpy(&fat_size, bpb + 36, 4);
+    kmemcpy(&s_root_cluster, bpb + 44, 4);
+    uint32_t total; kmemcpy(&total, bpb + 32, 4);
+    if (s_bps != SECTOR || s_spc == 0 || nfats == 0 || fat_size == 0) {
+        s_dev = 0; return -EINVAL;                  /* not a FAT32 volume    */
+    }
+    s_fat_lba  = reserved;
+    s_data_lba = reserved + (uint32_t)nfats * fat_size;
+    s_total_clusters = (total - s_data_lba) / s_spc;
+    printk("[FAT] OK: mounted %s, %u clusters, root@%u\n",
+           devname, s_total_clusters, s_root_cluster);
+    return 0;
+}
+
+static int  fat_sync(void)                          { return 0; }
+static int  fat_statfs(uint64_t *t, uint64_t *f)    { if (t) *t = (uint64_t)s_total_clusters * s_spc / 2; if (f) *f = 0; return 0; }
+static void fat_mark_clean(void)                    { }
+static const char *fat_devname(void)                { return s_dev ? s_dev->name : "none"; }
+static irqflags_t fat_lock(void)                    { return s_lock_flags; }
+static void fat_unlock(irqflags_t fl)               { (void)fl; }
+static uint32_t fat_ino_of(const void *o, void *p)  { (void)o; return p ? ((ext2_fd_priv_t *)p)->ino : 0; }
+
+/* ---- fs_ops: path -> inode ------------------------------------------- */
+
+static int fat_open(const char *path, uint32_t *ino) {
+    fat_dirent_t d;
+    return resolve(path, ino, &d, 0, 0);
+}
+static int fat_open_ex(const char *path, uint32_t *ino, int follow) { (void)follow; return fat_open(path, ino); }
+static int fat_open_prot(const char *path, uint32_t *ino, int *prot) { if (prot) *prot = 0; return fat_open(path, ino); }
+static int fat_lookup_parent(const char *path, uint32_t *pino, const char **base) {
+    uint32_t pcl = 0;
+    int r = resolve(path, 0, 0, &pcl, base);
+    if (r) return r;
+    /* the VFS uses parent_ino as a cluster handle here; encode the cluster */
+    if (pino) *pino = pcl;
+    return 0;
+}
+static int fat_under_prot(const char *path)         { (void)path; return 0; }
+
+/* ---- fs_ops: inode-level -------------------------------------------- */
+
+static void dirent_to_inode(const fat_dirent_t *d, ext2_inode_t *o) {
+    kmemset(o, 0, sizeof *o);
+    o->i_mode = (d->attr & ATTR_DIR) ? (S_IFDIR_M | 0755) : (S_IFREG_M | 0644);
+    o->i_size = (d->attr & ATTR_DIR) ? 0 : d->size;
+    o->i_links_count = 1;
+    o->i_uid = 0; o->i_gid = 0;
+    o->i_blocks = (d->size + 511) / 512;
+    /* mtime/atime/ctime left 0 (FAT date decode is a later refinement) */
+}
+
+static int fat_read_inode(uint32_t ino, ext2_inode_t *o) {
+    fat_dirent_t d;
+    int r = read_dirent(ino, &d);
+    if (r) return r;
+    dirent_to_inode(&d, o);
+    return 0;
+}
+
+/* inode-level read: follow the cluster chain to `off`, copy up to `len` */
+static int fat_read(uint32_t ino, void *buf, uint64_t off, uint32_t len) {
+    fat_dirent_t d;
+    if (read_dirent(ino, &d) != 0) return -ENOENT;
+    if (d.attr & ATTR_DIR) return -EISDIR;
+    if (off >= d.size) return 0;
+    if (off + len > d.size) len = (uint32_t)(d.size - off);
+
+    uint32_t csize = (uint32_t)s_spc * SECTOR;
+    uint32_t cl = d.first_cluster;
+    uint64_t skip = off;
+    while (skip >= csize && cl >= 2 && cl < FAT_EOC) { cl = fat_next(cl); skip -= csize; }
+
+    uint8_t sec[SECTOR];
+    uint32_t done = 0;
+    while (done < len && cl >= 2 && cl < FAT_EOC) {
+        uint32_t in_cluster = (uint32_t)skip;           /* offset within cluster */
+        for (uint32_t s = in_cluster / SECTOR; s < s_spc && done < len; s++) {
+            if (fat_read_lba(cluster_lba(cl) + s, sec) != 0) return (int)done;
+            uint32_t so = (s == in_cluster / SECTOR) ? in_cluster % SECTOR : 0;
+            uint32_t n = SECTOR - so;
+            if (n > len - done) n = len - done;
+            kmemcpy((uint8_t *)buf + done, sec + so, n);
+            done += n;
+        }
+        skip = 0;
+        cl = fat_next(cl);
+    }
+    return (int)done;
+}
+static int fat_read_val(uint32_t ino, void *buf, uint64_t off, uint32_t len, uint32_t gen) { (void)gen; return fat_read(ino, buf, off, len); }
+
+/* fs_ops.readdir walks the directory whose inode is `dir_ino`, returning the
+ * index-th valid entry's name+type. */
+struct rd_ctx { uint64_t want; uint64_t cur; char *name; uint8_t *type; int hit; };
+static int rd_cb(const char *name, uint32_t ino, const fat_dirent_t *d, void *c) {
+    (void)ino;
+    struct rd_ctx *r = c;
+    if (r->cur == r->want) {
+        int n = 0; while (name[n] && n < 255) { r->name[n] = name[n]; n++; } r->name[n] = 0;
+        *r->type = (d->attr & ATTR_DIR) ? 4 : 8;
+        r->hit = 1; return 1;
+    }
+    r->cur++; return 0;
+}
+static int fat_readdir(uint32_t dir_ino, uint64_t index, char *name_out, uint8_t *type_out) {
+    fat_dirent_t d;
+    if (read_dirent(dir_ino, &d) != 0 || !(d.attr & ATTR_DIR)) return -ENOTDIR;
+    struct rd_ctx r = { index, 0, name_out, type_out, 0 };
+    walk_dir(d.first_cluster, rd_cb, &r);
+    return r.hit ? 0 : -1;
+}
+
+static int fat_file_size(uint32_t ino) { fat_dirent_t d; if (read_dirent(ino, &d)) return -ENOENT; return (int)d.size; }
+static int fat_is_dir(uint32_t ino)    { fat_dirent_t d; if (read_dirent(ino, &d)) return 0; return (d.attr & ATTR_DIR) ? 1 : 0; }
+static int fat_check_perm(uint32_t i, uint16_t u, uint16_t g, int w) { (void)i; (void)u; (void)g; (void)w; return 0; }
+static uint32_t fat_inode_gen(uint32_t i) { (void)i; return 0; }
+static int fat_readlink_ino(uint32_t i, char *b, uint32_t n) { (void)i; (void)b; (void)n; return -EINVAL; }
+
+/* ---- read-only stubs for the write half (phase 4b) ------------------- */
+static int fat_ro5(const char *a, uint16_t b, int c) { (void)a; (void)b; (void)c; return -EPERM; }
+static int fat_create(const char *p, uint16_t m, int h) { return fat_ro5(p, m, h); }
+static int fat_mkdir(const char *p, uint16_t m, int h)  { return fat_ro5(p, m, h); }
+static int fat_chmod(const char *p, uint16_t m, int h)  { return fat_ro5(p, m, h); }
+static int fat_rmdir(const char *p, int h)  { (void)p; (void)h; return -EPERM; }
+static int fat_unlink(const char *p, int h) { (void)p; (void)h; return -EPERM; }
+static int fat_rename(const char *a, const char *b, int h) { (void)a; (void)b; (void)h; return -EPERM; }
+static int fat_link(const char *a, const char *b, int h)   { (void)a; (void)b; (void)h; return -EPERM; }
+static int fat_symlink(const char *a, const char *b, int h){ (void)a; (void)b; (void)h; return -EPERM; }
+static int fat_readlink(const char *p, char *b, uint32_t n){ (void)p; (void)b; (void)n; return -EINVAL; }
+static int fat_chown(const char *p, uint16_t u, uint16_t g, int f, int h) { (void)p; (void)u; (void)g; (void)f; (void)h; return -EPERM; }
+static int fat_utimes(const char *p, uint32_t a, uint32_t m, int f, int h){ (void)p; (void)a; (void)m; (void)f; (void)h; return -EPERM; }
+static int fat_write_inode(uint32_t i, const ext2_inode_t *o) { (void)i; (void)o; return -EPERM; }
+static int fat_write(uint32_t i, const void *b, uint32_t o, uint32_t n) { (void)i; (void)b; (void)o; (void)n; return -EPERM; }
+static int fat_truncate(uint32_t i) { (void)i; return -EPERM; }
+static uint32_t fat_zero(void) { return 0; }
+static void fat_anchors_reload(void) { }
+
+/* ---- fd-private pool + file (vfs_ops_t) layer ------------------------ */
+#define FAT_FDS 64
+static ext2_fd_priv_t s_fds[FAT_FDS];
+
+static ext2_fd_priv_t *fat_pool_alloc(uint32_t ino) {
+    for (int i = 0; i < FAT_FDS; i++)
+        if (!__atomic_exchange_n(&s_fds[i].in_use, 1, __ATOMIC_ACQ_REL)) {
+            s_fds[i].ino = ino; s_fds[i].write_offset = 0;
+            return &s_fds[i];
+        }
+    return 0;
+}
+static void fat_pool_free(ext2_fd_priv_t *p) { if (p) __atomic_store_n(&p->in_use, 0, __ATOMIC_RELEASE); }
+
+static int  fat_f_read(void *priv, void *buf, uint64_t off, uint64_t len) { return fat_read(((ext2_fd_priv_t *)priv)->ino, buf, off, (uint32_t)len); }
+static void fat_f_close(void *priv) { fat_pool_free((ext2_fd_priv_t *)priv); }
+static void fat_f_dup(void *priv)   { (void)priv; }
+static int  fat_f_readdir(void *priv, uint64_t index, char *name, uint8_t *type) { return fat_readdir(((ext2_fd_priv_t *)priv)->ino, index, name, type); }
+
+static const vfs_ops_t fat_file_ops = {
+    .read    = fat_f_read,
+    .write   = (void *)0,       /* read-only */
+    .close   = fat_f_close,
+    .readdir = fat_f_readdir,
+    .dup     = fat_f_dup,
+    .stat    = (void *)0,       /* VFS synthesizes from f->size */
+    .poll    = (void *)0,
+    .seekable = 1,
+};
+
+const fs_ops_t fat_ops = {
+    .name = "fat", .file_ops = &fat_file_ops,
+    .mount = fat_mount, .sync = fat_sync, .statfs = fat_statfs,
+    .mark_clean = fat_mark_clean, .devname = fat_devname,
+    .lock = fat_lock, .unlock = fat_unlock, .ino_of = fat_ino_of,
+    .open = fat_open, .open_ex = fat_open_ex, .open_protected = fat_open_prot,
+    .lookup_parent = fat_lookup_parent, .path_under_protected = fat_under_prot,
+    .create = fat_create, .mkdir = fat_mkdir, .rmdir = fat_rmdir, .unlink = fat_unlink,
+    .rename = fat_rename, .link = fat_link, .symlink = fat_symlink, .readlink = fat_readlink,
+    .chmod = fat_chmod, .chown = fat_chown, .utimes = fat_utimes,
+    .read_inode = fat_read_inode, .write_inode = fat_write_inode,
+    .read = fat_read, .read_validated = fat_read_val, .write = fat_write,
+    .readdir = fat_readdir, .file_size = fat_file_size, .truncate = fat_truncate,
+    .is_dir = fat_is_dir, .check_perm = fat_check_perm, .inode_gen = fat_inode_gen,
+    .read_symlink_target = fat_readlink_ino,
+    .pool_alloc = fat_pool_alloc, .pool_free = fat_pool_free,
+    .get_admin_ino = fat_zero, .get_passwd_ino = fat_zero,
+    .get_shadow_ino = fat_zero, .get_group_ino = fat_zero,
+    .anchors_reload = fat_anchors_reload,
+};
+
+const fs_ops_t *g_rootfs = &fat_ops;
