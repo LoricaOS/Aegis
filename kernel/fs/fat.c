@@ -15,10 +15,13 @@
  *
  * Read + write: mount parses the BPB; path resolution walks directory cluster
  * chains; read/write follow (and extend) the chain, allocating clusters and
- * updating every FAT copy + the directory entry. Names are case-insensitive
- * 8.3 (long-name entries are read-skipped and not yet generated on create; rmdir
- * and FAT-date decode are the remaining refinements). No Unix permissions — FAT
- * has none; chmod/chown are accepted no-ops, authority is the capability layer.
+ * updating every FAT copy + the directory entry. create/mkdir/unlink/rmdir/
+ * rename/truncate are supported; long filenames (VFAT LFN) are read (reassembled)
+ * and generated on create; names are case-insensitive; FAT dates decode into the
+ * inode times. No Unix permissions — FAT has none; chmod/chown are accepted
+ * no-ops, authority is the capability layer. Known gaps: FSInfo free-count is not
+ * updated (a hint only), and a moved directory's ".." still points at its old
+ * parent.
  */
 #include "fs_ops.h"
 #include "vfs.h"
@@ -149,8 +152,13 @@ static int read_dirent(uint32_t ino, fat_dirent_t *d) {
  * On a hit, *hit_ino / *hit_dirent are set. Returns 1 if cb stopped, else 0. */
 typedef int (*dir_cb)(const char *name, uint32_t ino, const fat_dirent_t *d, void *ctx);
 
+/* the 13 UCS-2 char slots within a 32-byte LFN entry */
+static const int LFN_POS[13] = { 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };
+
 static int walk_dir(uint32_t dir_cluster, dir_cb cb, void *ctx) {
     uint8_t sec[SECTOR];
+    char lfn[260];
+    int have_lfn = 0;
     uint32_t cl = dir_cluster;
     while (cl >= 2 && cl < FAT_EOC) {
         for (uint32_t s = 0; s < s_spc; s++) {
@@ -159,12 +167,26 @@ static int walk_dir(uint32_t dir_cluster, dir_cb cb, void *ctx) {
             for (uint32_t i = 0; i < SECTOR / DIRENT_SIZE; i++) {
                 const uint8_t *e = sec + i * DIRENT_SIZE;
                 if (e[0] == 0x00) return 0;              /* end of directory */
-                char name[16];
-                if (decode_83(e, name) != 0) continue;
+                if (e[0] == 0xE5) { have_lfn = 0; continue; }
+                if ((e[11] & ATTR_LFN) == ATTR_LFN) {    /* long-name fragment */
+                    if (e[0] & 0x40) { kmemset(lfn, 0, sizeof lfn); have_lfn = 1; }
+                    int seq = e[0] & 0x1F, base = (seq - 1) * 13;
+                    for (int k = 0; k < 13 && base + k < 259; k++) {
+                        uint16_t ch; kmemcpy(&ch, e + LFN_POS[k], 2);
+                        lfn[base + k] = (ch == 0 || ch == 0xFFFF) ? 0 : (char)(ch & 0xFF);
+                    }
+                    continue;
+                }
+                if (e[11] & ATTR_VOLUME) { have_lfn = 0; continue; }
+                char sname[16];
+                const char *use = sname;
+                if (have_lfn && lfn[0]) use = lfn;
+                else if (decode_83(e, sname) != 0) { have_lfn = 0; continue; }
                 fat_dirent_t d;
                 fill_dirent(e, &d);
                 uint32_t ino = (lba << 5) | i;
-                if (cb(name, ino, &d, ctx)) return 1;
+                have_lfn = 0;
+                if (cb(use, ino, &d, ctx)) return 1;
             }
         }
         cl = fat_next(cl);
@@ -191,9 +213,9 @@ static int resolve(const char *path, uint32_t *ino_out, fat_dirent_t *d_out,
     fat_dirent_t cur_d = { s_root_cluster, 0, ATTR_DIR, 0, 0 };
 
     while (*path) {
-        char comp[16];
+        char comp[256];
         int n = 0;
-        while (*path && *path != '/' && n < 15) comp[n++] = *path++;
+        while (*path && *path != '/' && n < 255) comp[n++] = *path++;
         comp[n] = 0;
         while (*path == '/') path++;
         int last = (*path == 0);
@@ -277,6 +299,19 @@ static int fat_under_prot(const char *path)         { (void)path; return 0; }
 
 /* ---- fs_ops: inode-level -------------------------------------------- */
 
+/* FAT date/time (DOS format) -> unix epoch seconds */
+static uint32_t fat_time_unix(uint16_t date, uint16_t time) {
+    if (date == 0) return 0;
+    int y = 1980 + (date >> 9), mo = (date >> 5) & 15, d = date & 31;
+    int h = time >> 11, mi = (time >> 5) & 63, s = (time & 31) * 2;
+    if (mo < 1) mo = 1;
+    if (d < 1)  d = 1;
+    static const int cum[] = { 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 };
+    long days = (long)(y - 1970) * 365 + (y - 1969) / 4 + cum[mo - 1] + (d - 1);
+    if (mo > 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) days++;
+    return (uint32_t)(days * 86400L + h * 3600 + mi * 60 + s);
+}
+
 static void dirent_to_inode(const fat_dirent_t *d, ext2_inode_t *o) {
     kmemset(o, 0, sizeof *o);
     o->i_mode = (d->attr & ATTR_DIR) ? (S_IFDIR_M | 0755) : (S_IFREG_M | 0644);
@@ -284,7 +319,7 @@ static void dirent_to_inode(const fat_dirent_t *d, ext2_inode_t *o) {
     o->i_links_count = 1;
     o->i_uid = 0; o->i_gid = 0;
     o->i_blocks = (d->size + 511) / 512;
-    /* mtime/atime/ctime left 0 (FAT date decode is a later refinement) */
+    o->i_mtime = o->i_atime = o->i_ctime = fat_time_unix(d->mdate, d->mtime);
 }
 
 static int fat_read_inode(uint32_t ino, ext2_inode_t *o) {
@@ -476,11 +511,11 @@ static int patch_entry(uint32_t ino, uint32_t first, uint32_t size) {
 }
 
 /* split path into parent-dir cluster + basename */
-static int split_parent(const char *path, uint32_t *parent_cluster, char base[16]) {
+static int split_parent(const char *path, uint32_t *parent_cluster, char base[256]) {
     const char *slash = 0;
     for (const char *p = path; *p; p++) if (*p == '/') slash = p;
     if (!slash) return -EINVAL;
-    int bn = 0; for (const char *p = slash + 1; *p && bn < 15; p++) base[bn++] = *p;
+    int bn = 0; for (const char *p = slash + 1; *p && bn < 255; p++) base[bn++] = *p;
     base[bn] = 0;
     if (bn == 0) return -EINVAL;
     if (slash == path) { *parent_cluster = s_root_cluster; return 0; }
@@ -495,25 +530,122 @@ static int split_parent(const char *path, uint32_t *parent_cluster, char base[16
     return 0;
 }
 
+/* ---- long-name (LFN) generation on create ---------------------------- */
+
+static uint8_t lfn_checksum(const uint8_t raw[11]) {
+    uint8_t s = 0;
+    for (int i = 0; i < 11; i++) s = (uint8_t)(((s & 1) << 7) + (s >> 1) + raw[i]);
+    return s;
+}
+
+/* linear directory slot -> (lba, idx), extending the dir chain if needed */
+static int dir_slot(uint32_t dir_cluster, uint32_t slot, uint32_t *o_lba, uint32_t *o_idx) {
+    uint32_t per = (uint32_t)s_spc * (SECTOR / DIRENT_SIZE);
+    uint32_t ci = slot / per, within = slot % per, cl = dir_cluster;
+    for (uint32_t k = 0; k < ci; k++) {
+        uint32_t nx = fat_next(cl);
+        if (nx >= FAT_EOC) { nx = fat_alloc(); if (!nx) return -ENOSPC; fat_zero_cluster(nx); fat_set(cl, nx); }
+        cl = nx;
+    }
+    *o_lba = cluster_lba(cl) + within / (SECTOR / DIRENT_SIZE);
+    *o_idx = within % (SECTOR / DIRENT_SIZE);
+    return 0;
+}
+
+/* index of the first free (0x00-terminated) slot in the directory */
+static uint32_t dir_end_slot(uint32_t dir_cluster) {
+    uint8_t sec[SECTOR];
+    uint32_t slot = 0, cl = dir_cluster;
+    while (cl >= 2 && cl < FAT_EOC) {
+        for (uint32_t s = 0; s < s_spc; s++) {
+            if (fat_read_lba(cluster_lba(cl) + s, sec) != 0) return slot;
+            for (uint32_t i = 0; i < SECTOR / DIRENT_SIZE; i++, slot++)
+                if (sec[i * DIRENT_SIZE] == 0x00) return slot;
+        }
+        cl = fat_next(cl);
+    }
+    return slot;
+}
+
+/* generate an 8.3 short name (BASE~1.EXT) to back a long name */
+static void gen_short(const char *name, uint8_t raw[11]) {
+    kmemset(raw, ' ', 11);
+    const char *dot = 0;
+    for (const char *p = name; *p; p++) if (*p == '.') dot = p;
+    int bn = 0;
+    for (const char *p = name; *p && (!dot || p < dot) && bn < 6; p++) {
+        char c = *p;
+        if (c == ' ' || c == '.') continue;
+        if (c >= 'a' && c <= 'z') c -= 32;
+        raw[bn++] = (uint8_t)c;
+    }
+    raw[6] = '~'; raw[7] = '1';
+    if (dot) {
+        int e = 0;
+        for (const char *p = dot + 1; *p && e < 3; p++) {
+            char c = *p;
+            if (c >= 'a' && c <= 'z') c -= 32;
+            raw[8 + e++] = (uint8_t)c;
+        }
+    }
+}
+
+/* write the LFN entries (reverse order) + the backing 8.3 entry at the dir end */
+static int write_lfn_name(uint32_t dir_cluster, const char *name, uint8_t attr,
+                          uint32_t first, uint32_t size, const uint8_t raw[11]) {
+    int len = 0;
+    for (const char *p = name; *p && len < 255; p++) len++;
+    int nent = (len + 12) / 13;
+    uint8_t csum = lfn_checksum(raw);
+    uint32_t end = dir_end_slot(dir_cluster);
+    for (int seq = nent; seq >= 1; seq--) {
+        uint8_t e[DIRENT_SIZE]; kmemset(e, 0, DIRENT_SIZE);
+        e[0] = (uint8_t)(seq | (seq == nent ? 0x40 : 0));
+        e[11] = ATTR_LFN; e[13] = csum;
+        int cbase = (seq - 1) * 13;
+        for (int k = 0; k < 13; k++) {
+            uint16_t ch;
+            int ci = cbase + k;
+            if (ci < len)       ch = (uint8_t)name[ci];
+            else if (ci == len) ch = 0;
+            else                ch = 0xFFFF;
+            kmemcpy(e + LFN_POS[k], &ch, 2);
+        }
+        uint32_t lba, idx;
+        if (dir_slot(dir_cluster, end + (uint32_t)(nent - seq), &lba, &idx)) return -ENOSPC;
+        uint8_t sec[SECTOR];
+        if (fat_read_lba(lba, sec)) return -EIO;
+        kmemcpy(sec + idx * DIRENT_SIZE, e, DIRENT_SIZE);
+        if (fat_write_lba(lba, sec)) return -EIO;
+    }
+    uint32_t lba, idx;
+    if (dir_slot(dir_cluster, end + (uint32_t)nent, &lba, &idx)) return -ENOSPC;
+    return write_entry(lba, idx, raw, attr, first, size);
+}
+
 static int fat_make(const char *path, int dir) {
-    uint32_t pcl; char base[16];
+    uint32_t pcl; char base[256];
     int r = split_parent(path, &pcl, base);
     if (r) return r;
-    uint8_t raw[11];
-    if (to_83(base, raw) != 0) return -EINVAL;      /* needs LFN — 4b+ */
-    uint32_t lba, idx;
-    if (find_free_slot(pcl, &lba, &idx) != 0) return -ENOSPC;
+    uint8_t attr = dir ? ATTR_DIR : 0x20 /* archive */;
+    uint32_t first = 0;
     if (dir) {
-        uint32_t nc = fat_alloc();
-        if (!nc) return -ENOSPC;
-        fat_zero_cluster(nc);
+        first = fat_alloc();
+        if (!first) return -ENOSPC;
+        fat_zero_cluster(first);
         uint8_t dot[11]; kmemset(dot, ' ', 11); dot[0] = '.';
-        write_entry(cluster_lba(nc), 0, dot, ATTR_DIR, nc, 0);
+        write_entry(cluster_lba(first), 0, dot, ATTR_DIR, first, 0);
         uint8_t dd[11]; kmemset(dd, ' ', 11); dd[0] = '.'; dd[1] = '.';
-        write_entry(cluster_lba(nc), 1, dd, ATTR_DIR, pcl, 0);
-        return write_entry(lba, idx, raw, ATTR_DIR, nc, 0);
+        write_entry(cluster_lba(first), 1, dd, ATTR_DIR, pcl, 0);
     }
-    return write_entry(lba, idx, raw, 0x20 /* archive */, 0, 0);
+    uint8_t raw[11];
+    if (to_83(base, raw) == 0) {                    /* fits 8.3 — no LFN needed */
+        uint32_t lba, idx;
+        if (find_free_slot(pcl, &lba, &idx) != 0) return -ENOSPC;
+        return write_entry(lba, idx, raw, attr, first, 0);
+    }
+    gen_short(base, raw);                            /* long name — LFN + 8.3 */
+    return write_lfn_name(pcl, base, attr, first, 0, raw);
 }
 
 /* ---- fs_ops: write half ---------------------------------------------- */
@@ -579,8 +711,49 @@ static int fat_truncate(uint32_t ino) {
 
 /* ---- ops FAT genuinely lacks (no perms / hard links / symlinks) ------ */
 static int fat_chmod(const char *p, uint16_t m, int h)  { (void)p; (void)m; (void)h; return 0; }  /* no-op: FAT has no mode */
-static int fat_rmdir(const char *p, int h)  { (void)p; (void)h; return -EPERM; }  /* 4b+ */
-static int fat_rename(const char *a, const char *b, int h) { (void)a; (void)b; (void)h; return -EPERM; }
+static int notempty_cb(const char *name, uint32_t ino, const fat_dirent_t *d, void *c) {
+    (void)ino; (void)d;
+    if (fat_streq(name, ".") || fat_streq(name, "..")) return 0;
+    *(int *)c = 1;
+    return 1;   /* found a real entry — stop */
+}
+static int fat_rmdir(const char *path, int h) {
+    (void)h;
+    uint32_t ino; fat_dirent_t d;
+    int r = resolve(path, &ino, &d, 0, 0);
+    if (r) return r;
+    if (!(d.attr & ATTR_DIR)) return -ENOTDIR;
+    int nonempty = 0;
+    walk_dir(d.first_cluster, notempty_cb, &nonempty);
+    if (nonempty) return -ENOTEMPTY;
+    if (d.first_cluster >= 2) fat_free_chain(d.first_cluster);
+    uint32_t lba = ino >> 5, idx = ino & 31; uint8_t sec[SECTOR];
+    if (fat_read_lba(lba, sec) != 0) return -EIO;
+    sec[idx * DIRENT_SIZE] = 0xE5;
+    return fat_write_lba(lba, sec) == 0 ? 0 : -EIO;
+}
+/* rename/move: create a new dir entry pointing at the same cluster chain, then
+ * delete the old one (the data is NOT freed — it moved). A moved directory's
+ * ".." still points at its old parent — a known limitation for now. */
+static int fat_rename(const char *old, const char *neu, int h) {
+    (void)h;
+    uint32_t oino; fat_dirent_t od;
+    int r = resolve(old, &oino, &od, 0, 0);
+    if (r) return r;
+    uint32_t tmp; fat_dirent_t td;
+    if (resolve(neu, &tmp, &td, 0, 0) == 0) return -EEXIST;
+    uint32_t pcl; char base[256];
+    if ((r = split_parent(neu, &pcl, base)) != 0) return r;
+    uint8_t raw[11];
+    if (to_83(base, raw) != 0) return -EINVAL;   /* long dest names: later */
+    uint32_t lba, idx;
+    if (find_free_slot(pcl, &lba, &idx) != 0) return -ENOSPC;
+    if ((r = write_entry(lba, idx, raw, od.attr, od.first_cluster, od.size)) != 0) return r;
+    uint32_t olba = oino >> 5, oidx = oino & 31; uint8_t sec[SECTOR];
+    if (fat_read_lba(olba, sec) != 0) return -EIO;
+    sec[oidx * DIRENT_SIZE] = 0xE5;
+    return fat_write_lba(olba, sec) == 0 ? 0 : -EIO;
+}
 static int fat_link(const char *a, const char *b, int h)   { (void)a; (void)b; (void)h; return -EPERM; }
 static int fat_symlink(const char *a, const char *b, int h){ (void)a; (void)b; (void)h; return -EPERM; }
 static int fat_readlink(const char *p, char *b, uint32_t n){ (void)p; (void)b; (void)n; return -EINVAL; }
@@ -634,14 +807,34 @@ static const vfs_ops_t fat_file_ops = {
 static void fat_selftest(void) {
     static const char msg[] = "AEGIS FAT WRITE OK\n";
     uint32_t wl = (uint32_t)(sizeof(msg) - 1), ino;
-    if (fat_create("/FATTEST.TXT", 0644, 0) != 0) { printk("[FAT] WRITE-TEST FAIL: create\n"); return; }
-    if (fat_open("/FATTEST.TXT", &ino) != 0)      { printk("[FAT] WRITE-TEST FAIL: open\n"); return; }
-    if (fat_write(ino, msg, 0, wl) != (int)wl)    { printk("[FAT] WRITE-TEST FAIL: write\n"); return; }
-    char rb[32]; kmemset(rb, 0, sizeof rb);
-    int rr = fat_read(ino, rb, 0, wl);
-    int ok = (rr == (int)wl);
-    for (uint32_t i = 0; i < wl && ok; i++) { if (rb[i] != msg[i]) ok = 0; }
-    printk("[FAT] WRITE-TEST %s: wrote %u, read %d back\n", ok ? "PASS" : "FAIL", wl, rr);
+
+    /* 1. 8.3 create + write + read-back */
+    int ok = (fat_create("/FATTEST.TXT", 0644, 0) == 0)
+          && (fat_open("/FATTEST.TXT", &ino) == 0)
+          && (fat_write(ino, msg, 0, wl) == (int)wl);
+    if (ok) {
+        char rb[32]; kmemset(rb, 0, sizeof rb);
+        ok = (fat_read(ino, rb, 0, wl) == (int)wl);
+        for (uint32_t i = 0; i < wl && ok; i++) if (rb[i] != msg[i]) ok = 0;
+    }
+    printk("[FAT] TEST short-name write %s\n", ok ? "PASS" : "FAIL");
+
+    /* 2. long (VFAT) name: create, then resolve it BY the long name */
+    const char *lname = "/A Long Filename.txt";
+    ok = (fat_create(lname, 0644, 0) == 0)
+      && (fat_open(lname, &ino) == 0)
+      && (fat_write(ino, msg, 0, wl) == (int)wl);
+    printk("[FAT] TEST long-name (LFN) %s\n", ok ? "PASS" : "FAIL");
+
+    /* 3. mkdir then rmdir the (empty) directory */
+    ok = (fat_mkdir("/SUBDIR", 0755, 0) == 0) && (fat_rmdir("/SUBDIR", 0) == 0);
+    printk("[FAT] TEST mkdir/rmdir %s\n", ok ? "PASS" : "FAIL");
+
+    /* 4. rename: new name resolves, old name is gone */
+    ok = (fat_rename("/FATTEST.TXT", "/RENAMED.TXT", 0) == 0)
+      && (fat_open("/RENAMED.TXT", &ino) == 0)
+      && (fat_open("/FATTEST.TXT", &ino) != 0);
+    printk("[FAT] TEST rename %s\n", ok ? "PASS" : "FAIL");
 }
 #endif
 
