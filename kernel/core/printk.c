@@ -37,7 +37,11 @@ static int s_at_bol = 1;        /* serial cursor is at beginning of line */
  * klog_read() copies in order (oldest → newest); when the caller's buffer
  * is smaller than the log it returns the TAIL (newest bytes) — that is
  * what /proc/dmesg wants from a 4KB procfs generation buffer. */
+#ifdef CONFIG_KLOG_SIZE_KB
+#define KLOG_SIZE  (CONFIG_KLOG_SIZE_KB * 1024u)
+#else
 #define KLOG_SIZE  (64u * 1024u)
+#endif
 static char     klog_buf[KLOG_SIZE];
 static uint32_t klog_head = 0;   /* next write position */
 static uint32_t klog_used = 0;   /* bytes in buffer (capped at KLOG_SIZE) */

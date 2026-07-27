@@ -10,7 +10,11 @@
 #include "../lib/refcount.h"
 #include <stdint.h>
 
+#ifdef CONFIG_PTY_MAX_PAIRS
+#define PTY_MAX_PAIRS  CONFIG_PTY_MAX_PAIRS
+#else
 #define PTY_MAX_PAIRS  16
+#endif
 #define PTY_BUF_SIZE   4096
 
 typedef struct {

@@ -124,7 +124,11 @@
  * nothing.  Bumping this number is cheap; only the small static arrays grow.
  *
  * MAX_CPUS (smp.h) and SMP_MAX_CPUS (acpi.h) both alias this. */
+#ifdef CONFIG_MAX_CPUS
+#define AEGIS_MAX_CPUS        CONFIG_MAX_CPUS
+#else
 #define AEGIS_MAX_CPUS        1024
+#endif
 
 /* STACK_SIZE: identical (STACK_PAGES * 4096) in proc.c AND sched.c. Both
  * compute from STACK_PAGES=4 (16 KB kernel stack). Canonical pages count here;

@@ -170,4 +170,35 @@ config RAMFS_PAGES_PER_FILE
 	int "tmpfs: max pages per file (x 4 KiB)"
 	default 256
 
+config MAX_CPUS
+	int "Maximum supported CPUs"
+	default 1024
+	help
+	  Sizes the per-CPU statics — TSS, GDT, and per-CPU areas — at roughly
+	  200 B x this value, so the default 1024 costs ~250 KB of BSS. A single-
+	  or dual-core target wants a handful (the SMP bring-up caps here too).
+
+config PTY_MAX_PAIRS
+	int "Max pseudo-terminal pairs"
+	default 16
+	help
+	  Each pair statically reserves two PTY_BUF_SIZE ring buffers (~8.7 KB),
+	  so 16 pairs is ~140 KB. A headless target with one console wants a few.
+
+config KLOG_SIZE_KB
+	int "Kernel log ring size (KB)"
+	default 64
+
+config EXT2_CACHE_SLOTS
+	int "ext2 block-cache slots"
+	default 16
+
+config PMM_BOOT_GB
+	int "Physical memory the boot bitmap covers (GB)"
+	default 4
+	help
+	  The early physical-page bitmap is sized to this many GB (1 GB -> 32 KB
+	  of BSS). Set it to the target's actual RAM; on an MCU with sub-GB SRAM
+	  the bitmap becomes negligible.
+
 endmenu

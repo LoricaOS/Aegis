@@ -69,7 +69,11 @@ static char *append_str(char *dst, const char *src)
  * array (below) mirrors this: absent during early boot, allocated full-size
  * from KVA in pmm_init_late.
  * -------------------------------------------------------------------------- */
+#ifdef CONFIG_PMM_BOOT_GB
+#define PMM_BOOT_GB     ((uint64_t)CONFIG_PMM_BOOT_GB)
+#else
 #define PMM_BOOT_GB     4ULL
+#endif
 #define PMM_BOOT_PAGES  (PMM_BOOT_GB * 1024 * 1024 * 1024 / PAGE_SIZE)
 
 /* The DMA-safe boundary: pages below this index have physical addresses

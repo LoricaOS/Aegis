@@ -37,7 +37,11 @@ void       ext2_lock_release(irqflags_t fl);
  * allocation hint in ext2.c — not the cache size.  Left at 16.
  * (Sequential DATA now bypasses these slots entirely: ext2_read batches
  * contiguous uncached full blocks into one direct device read.) */
+#ifdef CONFIG_EXT2_CACHE_SLOTS
+#define CACHE_SLOTS CONFIG_EXT2_CACHE_SLOTS
+#else
 #define CACHE_SLOTS 16
+#endif
 
 /* Cap for ext2_read's multi-block direct-read run (bytes).  64 KiB = 16
  * 4 KiB blocks: well under the NVMe driver's 128 KiB per-command bounce
