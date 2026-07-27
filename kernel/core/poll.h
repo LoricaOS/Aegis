@@ -22,6 +22,7 @@
 typedef void (*poll_fn_t)(void);
 
 enum {
+    POLL_PRIO_CONSOLE     =  5, /* serial RX drain — first, for input latency */
     POLL_PRIO_USB         = 10, /* xhci HID event ring                        */
     POLL_PRIO_HV_IC       = 20, /* Hyper-V synthetic kbd/mouse + IC channels  */
     POLL_PRIO_NETDEV      = 30, /* network RX — MUST be < POLL_PRIO_TCP_TIMER  */

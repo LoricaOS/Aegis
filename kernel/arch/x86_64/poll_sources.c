@@ -16,6 +16,7 @@
  * the timer ISR. */
 
 #include "../../core/poll.h"
+#include "serial.h"
 #include "xhci.h"
 #include "hv_kbd.h"
 #include "hv_timesync.h"
@@ -32,6 +33,13 @@
 void
 poll_sources_init(void)
 {
+    /* Serial console RX: drain COM1 into the input ring every tick. The UART is
+     * normally interrupt-driven (IRQ4), but a platform that doesn't route that
+     * IRQ to us — notably a microVM with no usable I/O APIC path — would never
+     * see a keystroke otherwise. Polling makes serial input work everywhere; on
+     * a machine where IRQ4 does fire, the handler just finds the FIFO already
+     * drained. First in the list so typed input has the lowest latency. */
+    poll_source_register(serial_rx_handler,   POLL_PRIO_CONSOLE,     "serial_rx");
     poll_source_register(xhci_poll,           POLL_PRIO_USB,         "xhci");
 #ifdef CONFIG_HYPERV
     poll_source_register(hv_kbd_poll,         POLL_PRIO_HV_IC,       "hv_kbd");
