@@ -16,6 +16,8 @@ CONFIG_MMU=y
 # CONFIG_VMWARE is not set
 # CONFIG_PVPANIC is not set
 # CONFIG_KERNEL_TESTS is not set
+# no disk fs — initrd (RO) + tmpfs only (nullfs backend)
+# CONFIG_FS_EXT2 is not set
 # arenas sized hard (a hair above pico2, still comfortable on a PC)
 CONFIG_MAX_CPUS=4
 CONFIG_RAMFS_MAX_INODES=16

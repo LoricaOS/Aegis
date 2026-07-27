@@ -1,4 +1,5 @@
 #include "sched.h"
+#include "fs_ops.h"
 #include "arch.h"
 #include "kva.h"
 #include "pmm.h"
@@ -627,7 +628,7 @@ sched_exit(void)
             t = t->next;
         }
         if (!live_users) {
-            ext2_sync();    /* flush dirty blocks to NVMe before exit */
+            g_rootfs->sync();    /* flush dirty blocks to NVMe before exit */
             printk("[AEGIS] System halted.\n");
             arch_request_shutdown();
         }

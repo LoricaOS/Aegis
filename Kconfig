@@ -45,6 +45,21 @@ config NET
 
 endmenu
 
+menu "Filesystems"
+
+config FS_EXT2
+	bool "ext2 disk filesystem"
+	default y
+	help
+	  The ext2 filesystem — the historical root/disk backend, with full Unix
+	  ownership + permissions (DAC). It is reached through the fs_ops vtable,
+	  so turning it off substitutes a "nullfs" backend: the VFS then serves
+	  only initrd (read-only) and tmpfs, and any disk path fails. Off is for a
+	  no-disk embedded config (or, later, one that mounts FAT on removable
+	  media instead). ~34 KB of code.
+
+endmenu
+
 menu "Device drivers"
 
 config HYPERV

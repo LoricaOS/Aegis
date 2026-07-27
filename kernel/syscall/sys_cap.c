@@ -1,5 +1,6 @@
 /* sys_cap.c — Capability syscalls: auth_session, grant_runtime, query, install_commit */
 #include "sys_impl.h"
+#include "fs_ops.h"
 #include "sched.h"
 #include "proc.h"
 #include "cap.h"    /* cap_policy_load (install-commit reload) */
@@ -236,7 +237,7 @@ sys_admin_session(uint64_t on)
  * effect WITHOUT a reboot:
  *   1. cap_policy_load()    — re-read /etc/aegis/caps.d so new caps.d/<binary>
  *      policies a package wrote (e.g. an engine service's NET_SOCKET) apply now.
- *   2. ext2_anchors_reload() — re-read /etc/aegis/anchors so a path the package
+ *   2. g_rootfs->anchors_reload() — re-read /etc/aegis/anchors so a path the package
  *      registered (e.g. /lib/<app>) becomes BOTH cap-granting (cap_policy) and
  *      write-protected (ext2), in lockstep — preserving the trusted==protected
  *      invariant.
@@ -258,6 +259,6 @@ sys_install_commit(void)
         return SYS_ERR(EPERM);
 
     cap_policy_load();
-    ext2_anchors_reload();
+    g_rootfs->anchors_reload();
     return 0;
 }

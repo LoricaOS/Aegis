@@ -11,6 +11,7 @@
 
 const fs_ops_t ext2_ops = {
     .name                 = "ext2",
+    .file_ops             = &s_ext2_ops,
 
     .mount                = ext2_mount,
     .sync                 = ext2_sync,

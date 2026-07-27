@@ -14,6 +14,7 @@
 #endif
 
 #include "arch.h"
+#include "fs_ops.h"
 #include "printk.h"
 #include "trace.h"
 #include "poll.h"
@@ -475,34 +476,34 @@ kernel_main(uint32_t mb_magic, void *mb_info)
      * Only mount NVMe when no ramdisk exists (installed system booting
      * from its own disk without GRUB modules). */
     if (blkdev_get("ramdisk0")) {
-        ext2_mount("ramdisk0");
-    } else if (ext2_mount("nvme0p1") == 0) {
+        g_rootfs->mount("ramdisk0");
+    } else if (g_rootfs->mount("nvme0p1") == 0) {
         /* installed system on NVMe */
-    } else if (ext2_mount("sata0p1") == 0) {
+    } else if (g_rootfs->mount("sata0p1") == 0) {
         /* Aegis partition on an AHCI/SATA disk */
-    } else if (ext2_mount("sata0") == 0) {
+    } else if (g_rootfs->mount("sata0") == 0) {
         /* whole-disk ext2 on SATA */
-    } else if (ext2_mount("vblk0p1") == 0) {
+    } else if (g_rootfs->mount("vblk0p1") == 0) {
         /* Aegis partition on virtio-blk (cloud/QEMU disk) */
-    } else if (ext2_mount("vblk0") == 0) {
+    } else if (g_rootfs->mount("vblk0") == 0) {
         /* whole-disk ext2 on virtio-blk (unpartitioned cloud image) */
-    } else if (ext2_mount("scsi0p1") == 0) {
+    } else if (g_rootfs->mount("scsi0p1") == 0) {
         /* Aegis partition on a virtio-scsi disk */
-    } else if (ext2_mount("scsi0") == 0) {
+    } else if (g_rootfs->mount("scsi0") == 0) {
         /* whole-disk ext2 on virtio-scsi */
-    } else if (ext2_mount("pvscsi0p1") == 0) {
+    } else if (g_rootfs->mount("pvscsi0p1") == 0) {
         /* Aegis partition on a VMware PVSCSI disk */
-    } else if (ext2_mount("pvscsi0") == 0) {
+    } else if (g_rootfs->mount("pvscsi0") == 0) {
         /* whole-disk ext2 on VMware PVSCSI */
-    } else if (ext2_mount("hvdisk0p1") == 0) {
+    } else if (g_rootfs->mount("hvdisk0p1") == 0) {
         /* Aegis partition on a Hyper-V StorVSC disk (Gen 2 VM) */
-    } else if (ext2_mount("hvdisk0") == 0) {
+    } else if (g_rootfs->mount("hvdisk0") == 0) {
         /* whole-disk ext2 on Hyper-V StorVSC */
     } else {
         printk("[VFS] WARN: no ramdisk and no Aegis root on NVMe/virtio-blk — running from initrd only\n");
     }
     cap_policy_load();      /* load /etc/aegis/caps.d/ — must be after ext2  */
-    ext2_anchors_reload();  /* register /etc/aegis/anchors install-anchors    */
+    g_rootfs->anchors_reload();  /* register /etc/aegis/anchors install-anchors    */
     cap_anchor_audit();     /* WARN if a granting anchor isn't write-protected */
     cap_policy_detect_first_boot(); /* /etc/aegis/configured? → g_first_boot   */
 #ifdef CONFIG_KERNEL_TESTS
@@ -590,7 +591,12 @@ kernel_main(uint32_t mb_magic, void *mb_info)
             if (q[0]=='p'&&q[1]=='e'&&q[2]=='r'&&q[3]=='f'&&q[4]=='b'&&
                 q[5]=='e'&&q[6]=='n'&&q[7]=='c'&&q[8]=='h'&&q[9]=='_'&&
                 q[10]=='f'&&q[11]=='s')
-                { ext2_perfbench(); break; }
+                {
+#ifdef CONFIG_FS_EXT2
+                    ext2_perfbench();   /* ext2-specific block-cache benchmark */
+#endif
+                    break;
+                }
             q++;
         }
     }

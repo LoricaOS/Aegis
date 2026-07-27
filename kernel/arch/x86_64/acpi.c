@@ -5,6 +5,7 @@
  * No AML interpreter — _S5_ sleep type is extracted by scanning DSDT bytecode.
  */
 #include "acpi.h"
+#include "fs_ops.h"
 #include "arch.h"
 #include "signal.h"
 #include "printk.h"
@@ -553,7 +554,7 @@ acpi_do_poweroff(void)
         return;
 
     printk("[ACPI] initiating S5 power off\n");
-    ext2_sync();
+    g_rootfs->sync();
     printk("[AEGIS] System halted.\n");
 
     uint16_t cnt = (uint16_t)s_pm1a_cnt;

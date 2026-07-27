@@ -286,6 +286,13 @@ ifneq ($(CONFIG_KERNEL_TESTS),y)
 FS_SRCS := $(filter-out kernel/fs/poll_test.c, $(FS_SRCS))
 endif
 
+# ext2 as the disk backend, reached through the fs_ops vtable. Off -> nullfs
+# provides g_rootfs (every disk op fails); the VFS serves only initrd + tmpfs.
+ifneq ($(CONFIG_FS_EXT2),y)
+FS_SRCS := $(filter-out kernel/fs/ext2.c kernel/fs/ext2_cache.c kernel/fs/ext2_dir.c \
+    kernel/fs/ext2_vfs.c kernel/fs/ext2_ops.c, $(FS_SRCS)) kernel/fs/nullfs.c
+endif
+
 # ── Object file lists ───────────���────────────────────────────────��───────────
 ARCH_OBJS      = $(patsubst kernel/%.c,$(BUILD)/%.o,$(ARCH_SRCS))
 CORE_OBJS      = $(patsubst kernel/%.c,$(BUILD)/%.o,$(CORE_SRCS))

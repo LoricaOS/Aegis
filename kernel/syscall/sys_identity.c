@@ -1,5 +1,6 @@
 /* sys_identity.c — Identity, info, session, and resource syscalls */
 #include "sys_impl.h"
+#include "fs_ops.h"
 #include "sched.h"
 #include "proc.h"
 #include "arch.h"
@@ -403,8 +404,8 @@ sys_reboot(uint64_t cmd)
     if (cmd == 0) {
         /* Power off.  Flush fs + the drive's volatile write cache first —
          * raw callers (no vigil teardown) must not lose dirty data. */
-        ext2_sync();
-        ext2_mark_clean();     /* orderly shutdown → next mount won't warn dirty */
+        g_rootfs->sync();
+        g_rootfs->mark_clean();     /* orderly shutdown → next mount won't warn dirty */
 #ifdef __x86_64__
         nvme_flush();
         acpi_do_poweroff();
@@ -415,8 +416,8 @@ sys_reboot(uint64_t cmd)
         for (;;) arch_halt();
     } else if (cmd == 1) {
         /* Reboot */
-        ext2_sync();
-        ext2_mark_clean();     /* orderly shutdown → next mount won't warn dirty */
+        g_rootfs->sync();
+        g_rootfs->mark_clean();     /* orderly shutdown → next mount won't warn dirty */
 #ifdef __x86_64__
         nvme_flush();          /* commit volatile write cache before reset */
 #endif

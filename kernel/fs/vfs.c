@@ -381,7 +381,7 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
             /* O_APPEND: start writing at end of file */
             if (flags & (int)VFS_O_APPEND)
                 p->write_offset = (uint32_t)sz;
-            out->ops    = &s_ext2_ops;
+            out->ops    = ((const vfs_ops_t *)g_rootfs->file_ops);
             out->priv   = (void *)p;
             out->offset = 0;
             out->size   = (uint64_t)sz;
@@ -410,7 +410,7 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
                 if (g_rootfs->open(path, &ino) >= 0) {
                     ext2_fd_priv_t *p = g_rootfs->pool_alloc(ino);
                     if (!p) return -ENOMEM;
-                    out->ops    = &s_ext2_ops;
+                    out->ops    = ((const vfs_ops_t *)g_rootfs->file_ops);
                     out->priv   = (void *)p;
                     out->offset = 0;
                     out->size   = 0;
@@ -667,7 +667,7 @@ vfs_stat_path_ex(const char *path, k_stat_t *out, int follow)
 int
 vfs_fchmod(vfs_file_t *f, uint16_t mode)
 {
-    if (!f || f->ops != &s_ext2_ops) return -1;
+    if (!f || f->ops != ((const vfs_ops_t *)g_rootfs->file_ops)) return -1;
     ext2_fd_priv_t *p = (ext2_fd_priv_t *)f->priv;
     ext2_inode_t inode;
     if (g_rootfs->read_inode(p->ino, &inode) != 0) return -1;
@@ -683,7 +683,7 @@ vfs_fchmod(vfs_file_t *f, uint16_t mode)
 int
 vfs_fchown(vfs_file_t *f, uint16_t uid, uint16_t gid)
 {
-    if (!f || f->ops != &s_ext2_ops) return -1;
+    if (!f || f->ops != ((const vfs_ops_t *)g_rootfs->file_ops)) return -1;
     ext2_fd_priv_t *p = (ext2_fd_priv_t *)f->priv;
     ext2_inode_t inode;
     if (g_rootfs->read_inode(p->ino, &inode) != 0) return -1;

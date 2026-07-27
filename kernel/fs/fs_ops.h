@@ -26,6 +26,8 @@
 
 typedef struct fs_ops {
     const char *name;                 /* "ext2", "fat", "none"                    */
+    const void *file_ops;             /* the vfs_ops_t used for files opened on
+                                       * this backend (cast to const vfs_ops_t*)  */
 
     /* superblock */
     int      (*mount)(const char *devname);
