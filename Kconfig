@@ -59,17 +59,17 @@ config FS_EXT2
 	  media instead). ~34 KB of code.
 
 config FS_FAT
-	bool "FAT32 disk filesystem (read-only)"
+	bool "FAT32 disk filesystem"
 	depends on !FS_EXT2
 	default n
 	help
-	  A FAT32 backend — small (~a third of ext2's code) and the on-disk format
-	  every SD card and PC already speaks, so a handheld's storage is readable
-	  on any machine. Selectable only when ext2 is off: both provide the root
-	  disk backend, and exactly one is linked. No Unix ownership/permissions
-	  (FAT has none) — authority comes from the capability layer at the syscall
-	  boundary. Read-only for now; write support (cluster allocation, LFN) is in
-	  progress.
+	  A read-write FAT32 backend — small (~a third of ext2's code) and the
+	  on-disk format every SD card and PC already speaks, so a handheld's storage
+	  is readable on any machine. Selectable only when ext2 is off: both provide
+	  the root disk backend, and exactly one is linked. Supports create/read/
+	  write/unlink/truncate, mkdir/rmdir, rename, and long filenames (VFAT LFN,
+	  read + generated). No Unix ownership/permissions (FAT has none) — authority
+	  comes from the capability layer at the syscall boundary.
 
 endmenu
 
