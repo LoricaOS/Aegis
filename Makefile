@@ -261,6 +261,30 @@ DRIVER_SRCS := $(filter-out \
     $(if $(CONFIG_VIRTIO_VSOCK),,kernel/drivers/virtio_vsock.c) \
     , $(DRIVER_SRCS))
 
+# Lean-build driver/test cuts. fb_stub / usb_stub satisfy the console, panic,
+# poll and /proc symbols the core references when those drivers are gone.
+ifneq ($(CONFIG_FB),y)
+DRIVER_SRCS := $(filter-out kernel/drivers/fb.c, $(DRIVER_SRCS)) kernel/drivers/fb_stub.c
+endif
+ifneq ($(CONFIG_NVME),y)
+DRIVER_SRCS := $(filter-out kernel/drivers/nvme.c, $(DRIVER_SRCS)) kernel/drivers/nvme_stub.c
+endif
+ifneq ($(CONFIG_AHCI),y)
+DRIVER_SRCS := $(filter-out kernel/drivers/ahci.c, $(DRIVER_SRCS))
+endif
+ifneq ($(CONFIG_USB),y)
+DRIVER_SRCS := $(filter-out kernel/drivers/xhci.c kernel/drivers/usb_hid.c kernel/drivers/usb_mouse.c, $(DRIVER_SRCS)) kernel/drivers/usb_stub.c
+endif
+ifneq ($(CONFIG_VMWARE),y)
+DRIVER_SRCS := $(filter-out kernel/drivers/pvscsi.c, $(DRIVER_SRCS))
+endif
+ifneq ($(CONFIG_PVPANIC),y)
+DRIVER_SRCS := $(filter-out kernel/drivers/pvpanic.c, $(DRIVER_SRCS))
+endif
+ifneq ($(CONFIG_KERNEL_TESTS),y)
+FS_SRCS := $(filter-out kernel/fs/poll_test.c, $(FS_SRCS))
+endif
+
 # ── Object file lists ───────────���────────────────────────────────��───────────
 ARCH_OBJS      = $(patsubst kernel/%.c,$(BUILD)/%.o,$(ARCH_SRCS))
 CORE_OBJS      = $(patsubst kernel/%.c,$(BUILD)/%.o,$(CORE_SRCS))

@@ -1,0 +1,27 @@
+# nano — the leanest bootable x86_64 kernel. Serial console only: no networking,
+# no block storage (NVMe/AHCI/PVSCSI), no USB, no framebuffer, no VirtIO, no
+# Hyper-V, no audio, no trace ring, no boot self-tests. Boots from initrd to the
+# no-init smoke panic. The closest x86 proxy to an embedded target — everything
+# optional is off, and the security core is (as always) not optional.
+CONFIG_MMU=y
+# CONFIG_NET is not set
+# CONFIG_VIRTIO is not set
+# CONFIG_HYPERV is not set
+# CONFIG_AUDIO_HDA is not set
+# CONFIG_TRACE is not set
+# CONFIG_FB is not set
+# CONFIG_NVME is not set
+# CONFIG_AHCI is not set
+# CONFIG_USB is not set
+# CONFIG_VMWARE is not set
+# CONFIG_PVPANIC is not set
+# CONFIG_KERNEL_TESTS is not set
+# arenas sized hard (a hair above pico2, still comfortable on a PC)
+CONFIG_MAX_CPUS=4
+CONFIG_RAMFS_MAX_INODES=16
+CONFIG_RAMFS_MAX_DENTS=16
+CONFIG_RAMFS_PAGES_PER_FILE=16
+CONFIG_PTY_MAX_PAIRS=2
+CONFIG_KLOG_SIZE_KB=8
+CONFIG_EXT2_CACHE_SLOTS=2
+CONFIG_PMM_BOOT_GB=2

@@ -64,6 +64,40 @@ config AUDIO_HDA
 	  The Intel HDA controller driver. A text-only or headless build has no
 	  use for it.
 
+config FB
+	bool "Framebuffer console"
+	default y
+	help
+	  The linear-framebuffer text console and compositor hooks (~80 KB of
+	  code). A headless / serial-only build has no use for it — printk falls
+	  back to serial/VGA, and the boot splash and panic screen go with it.
+
+config NVME
+	bool "NVMe block device"
+	default y
+
+config AHCI
+	bool "AHCI / SATA block device"
+	default y
+
+config USB
+	bool "USB host (xHCI) + HID"
+	default y
+	help
+	  The xHCI USB host controller and USB HID (keyboard/mouse). A device with
+	  no USB, or a non-USB keyboard, wants none of it.
+
+config VMWARE
+	bool "VMware PVSCSI"
+	default y
+	help
+	  VMware's paravirtual SCSI HBA. Only useful under ESXi/Workstation.
+	  (The vmxnet3 NIC is gated by CONFIG_NET.)
+
+config PVPANIC
+	bool "pvpanic guest->host panic notifier"
+	default y
+
 comment "VirtIO devices"
 
 config VIRTIO
@@ -147,6 +181,13 @@ config TRACE
 	  race-hunting instrument — invaluable while developing, dead weight on a
 	  constrained target. When off, trace_emit()/trace_dump() become no-ops
 	  and the ring is reclaimed.
+
+config KERNEL_TESTS
+	bool "In-tree boot self-tests"
+	default y
+	help
+	  Compile the self-tests that run during boot (e.g. the VFS poll test).
+	  Off for a lean production / embedded build.
 
 endmenu
 

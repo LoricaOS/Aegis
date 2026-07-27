@@ -429,11 +429,17 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     fb_check_amd();         /* warn if AMD GPU present but no UEFI fb tag    */
     virtio_gpu_init();      /* virtio-gpu 2D scanout — [GPU] OK or silent    */
     virtio_rng_init();      /* virtio-rng entropy — [RNG] mix or silent skip */
+#ifdef CONFIG_NVME
     nvme_init();            /* NVMe block device — [NVME] OK or silent skip  */
+#endif
+#ifdef CONFIG_AHCI
     ahci_init();            /* AHCI/SATA disk — [AHCI] OK or silent skip     */
+#endif
     virtio_blk_init();      /* virtio-blk disk — [BLK] OK or silent skip     */
     virtio_scsi_init();     /* virtio-scsi disk — [SCSI] OK or silent skip   */
+#ifdef CONFIG_VMWARE
     pvscsi_init();          /* VMware PVSCSI disk — [PVSCSI] OK or silent skip */
+#endif
     virtio_pmem_init();     /* virtio-pmem disk — [PMEM] OK or silent skip   */
     virtio_console_init();  /* virtio-console — [VCON] OK or silent skip     */
     virtio_9p_init();       /* virtio-9p host share — [9P] OK or silent skip */
@@ -499,7 +505,9 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     ext2_anchors_reload();  /* register /etc/aegis/anchors install-anchors    */
     cap_anchor_audit();     /* WARN if a granting anchor isn't write-protected */
     cap_policy_detect_first_boot(); /* /etc/aegis/configured? → g_first_boot   */
+#ifdef CONFIG_KERNEL_TESTS
     poll_test();            /* VFS .poll self-test — [POLL] OK               */
+#endif
     bph("mount+cap");
     xhci_init();            /* xHCI USB host — [XHCI] OK or silent skip     */
     gpt_scan("usb0");       /* GPT on a USB mass-storage device — silent if absent */
@@ -516,7 +524,9 @@ kernel_main(uint32_t mb_magic, void *mb_info)
 #ifdef CONFIG_AUDIO_HDA
     hda_init();             /* Intel HD Audio — [HDA] OK or silent skip      */
 #endif
+#ifdef CONFIG_PVPANIC
     pvpanic_init();         /* pvpanic guest→host notify — [PVPANIC] or skip */
+#endif
 #ifdef CONFIG_NET
     net_init();             /* Phase 25: protocol stack init + ICMP self-test ping */
 #endif
