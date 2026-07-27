@@ -1,0 +1,51 @@
+# pico2_defconfig — TARGET STAGING: ClockworkPi PicoCalc on an RP2350 (Pico 2).
+#
+# NOT YET BUILDABLE. It selects a no-MMU (CONFIG_MMU=n) armv8-M target that does
+# not exist yet — there is no arch/armv8m and no no-MMU mm backend, and the
+# Makefile here is x86-only. This file is the *spec* the port aims at: the knob
+# values a 520 KB-SRAM PicoCalc build should use, so the arch + driver work has a
+# concrete destination and every value is decided up front rather than discovered
+# late. It already resolves cleanly through kconf (`kconf defconfig
+# configs/pico2_defconfig Kconfig`); it will build once the port lands.
+#
+# Reminder on the budget: .text/.rodata run from XIP QSPI flash, so the 520 KB
+# SRAM is spent on .bss + .data + heap + stacks. Every value below is chosen to
+# keep the static footprint small; the display strategy (GRAM char-cell, no local
+# framebuffer) is what keeps the peripheral side near-zero.
+
+# ── Memory model ─────────────────────────────────────────────────────────────
+# The Cortex-M33 has an MPU, not an MMU. The no-MMU backend gives a flat,
+# MPU-isolated address space; capability *authority* is unaffected (software
+# enforced), hardware memory *isolation* is coarser. FUTURE.
+# CONFIG_MMU is not set
+
+# ── Everything x86 / server / VM drops out ──────────────────────────────────
+# CONFIG_NET is not set          # re-enable once the CYW43439 driver + a stack are wired (Pico 2 W)
+# CONFIG_VIRTIO is not set        # no virtio hardware on a microcontroller
+# CONFIG_HYPERV is not set
+# CONFIG_AUDIO_HDA is not set
+# CONFIG_TRACE is not set         # 640 KB debug ring — never on a 520 KB target
+
+# ── Static arenas, sized hard for 520 KB SRAM ───────────────────────────────
+CONFIG_MAX_CPUS=2                 # RP2350 is dual Cortex-M33 (per-CPU statics x2, not x1024)
+CONFIG_RAMFS_MAX_INODES=16        # ~4 KB per tmpfs instance (/tmp, /run)
+CONFIG_RAMFS_MAX_DENTS=16
+CONFIG_RAMFS_PAGES_PER_FILE=16    # 64 KB max file in tmpfs
+CONFIG_PTY_MAX_PAIRS=1            # a single console
+CONFIG_KLOG_SIZE_KB=4
+CONFIG_EXT2_CACHE_SLOTS=2
+CONFIG_PMM_BOOT_GB=1              # coarsest the current (GB-granular) knob allows; the
+                                  # no-MMU mm will size to the actual ~520 KB instead
+                                  # (a finer PMM_BOOT_KB knob is a TODO for MCU targets)
+
+# ── PicoCalc peripherals — drivers + their CONFIG knobs to be written ───────
+# These become real Kconfig symbols as the drivers land; listed here so the
+# hardware bring-up order is on record:
+#   CONFIG_PICOCALC_LCD    ST7789/ILI9488-class 320x320 IPS. Render to the panel's
+#                          GRAM (char-cell console) — NO 200 KB local framebuffer.
+#                          A framebuffer stays an opt-in knob for graphical use.
+#   CONFIG_PICOCALC_KBD    QWERTY via I2C to the onboard keyboard MCU (~1 KB).
+#   CONFIG_SD_SPI + FAT    microSD over SPI + a FAT filesystem (Aegis has ext2, not
+#                          FAT yet) — one 512 B sector buffer + FAT state (~4 KB).
+#   CONFIG_WIFI_CYW43      CYW43439 over SPI (Pico 2 W). Firmware blob lives in
+#                          flash / the chip's RAM; SRAM cost is TX/RX buffers only.
