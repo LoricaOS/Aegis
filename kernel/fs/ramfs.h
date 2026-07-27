@@ -19,10 +19,28 @@
 #include "spinlock.h"
 #include <stdint.h>
 
-#define RAMFS_MAX_INODES     256
-#define RAMFS_MAX_DENTS      256
+/* A tmpfs instance (ramfs_t) statically embeds inodes[] and dents[], and each
+ * inode a pages[] pointer array — so INODES x PAGES_PER_FILE dominates its size
+ * (256 x 256 x 8 B = 512 KB of pointers per instance at the defaults). These
+ * are CONFIG-tunable so a constrained target can shrink the arenas by orders of
+ * magnitude; the fallbacks preserve the historical size where the config system
+ * isn't wired (e.g. the arm64 Makefile). */
+#ifdef CONFIG_RAMFS_MAX_INODES
+#  define RAMFS_MAX_INODES     CONFIG_RAMFS_MAX_INODES
+#else
+#  define RAMFS_MAX_INODES     256
+#endif
+#ifdef CONFIG_RAMFS_MAX_DENTS
+#  define RAMFS_MAX_DENTS      CONFIG_RAMFS_MAX_DENTS
+#else
+#  define RAMFS_MAX_DENTS      256
+#endif
+#ifdef CONFIG_RAMFS_PAGES_PER_FILE
+#  define RAMFS_PAGES_PER_FILE CONFIG_RAMFS_PAGES_PER_FILE
+#else
+#  define RAMFS_PAGES_PER_FILE 256               /* N * 4 KiB max/file           */
+#endif
 #define RAMFS_MAX_NAMELEN    128
-#define RAMFS_PAGES_PER_FILE 256                /* 256 * 4 KiB = 1 MiB max/file  */
 #define RAMFS_MAX_SIZE       (RAMFS_PAGES_PER_FILE * 4096)
 
 struct ramfs;

@@ -149,3 +149,25 @@ config TRACE
 	  and the ring is reclaimed.
 
 endmenu
+
+menu "Static sizing (RAM footprint)"
+
+config RAMFS_MAX_INODES
+	int "tmpfs: max inodes per instance"
+	default 256
+	help
+	  Maximum files+dirs in each tmpfs (/tmp, /run). Every instance
+	  statically embeds inodes[] and, per inode, a pages-per-file pointer
+	  array — so this multiplied by RAMFS_PAGES_PER_FILE dominates the tmpfs
+	  BSS (256 x 256 x 8 B = 512 KB per instance at the defaults). Shrink both
+	  hard for a constrained target.
+
+config RAMFS_MAX_DENTS
+	int "tmpfs: max directory entries per instance"
+	default 256
+
+config RAMFS_PAGES_PER_FILE
+	int "tmpfs: max pages per file (x 4 KiB)"
+	default 256
+
+endmenu

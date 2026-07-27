@@ -7,3 +7,7 @@ CONFIG_MMU=y
 # CONFIG_HYPERV is not set
 # CONFIG_TRACE is not set
 # CONFIG_VIRTIO is not set
+# shrink the tmpfs arenas hard: 32 x 32 pages = ~14 KB/instance vs ~556 KB
+CONFIG_RAMFS_MAX_INODES=32
+CONFIG_RAMFS_MAX_DENTS=32
+CONFIG_RAMFS_PAGES_PER_FILE=32
