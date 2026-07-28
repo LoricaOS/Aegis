@@ -176,6 +176,23 @@ vga_putchar(char c)
 void
 vga_init(void)
 {
+    /* Probe for a real VGA CRTC before claiming the console. A no-legacy-device
+     * microVM (Firecracker, cloud-hypervisor) doesn't emulate VGA: writing its
+     * CRTC ports floods the VMM with unmapped-I/O faults and reads return 0xFF.
+     * Round-trip a scratch value through the cursor-location-low register (CRTC
+     * index 0x0F); if it doesn't read back, there is no VGA — stay serial-only
+     * (vga_available remains 0, so printk writes serial only). Costs a few
+     * one-time port pokes on such a host instead of a continuous flood. */
+    outb(0x3D4, 0x0F);
+    uint8_t crtc_saved = inb(0x3D5);
+    outb(0x3D5, 0x5A);
+    uint8_t crtc_rb = inb(0x3D5);
+    outb(0x3D5, crtc_saved);                       /* restore cursor low */
+    if (crtc_rb != 0x5A) {
+        serial_write_string("[VGA] absent — serial-only console\n");
+        return;                                     /* vga_available stays 0 */
+    }
+
     volatile uint16_t *vga = (volatile uint16_t *)VGA_PHYS;
     int i;
     /* Clear entire screen */

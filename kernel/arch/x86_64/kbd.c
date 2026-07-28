@@ -281,6 +281,7 @@ static void
 i8042_init(void)
 {
     int dev_ok = -1;            /* -1 none, 0 reset-ok, 1 f4-only */
+    int data_ok = 0;            /* did the controller ever return data (OBF)? */
     int r;
 
     i8042_drain();
@@ -312,6 +313,7 @@ i8042_init(void)
      * (several laptop ECs fail it yet work fine — Linux tolerates this
      * too). */
     r = i8042_cmd_read(0xAA);
+    data_ok = (r >= 0);         /* r < 0 = read timed out: no OBF data path */
     if (r != 0x55)
         printk("[KBD] WARN: 8042 self-test returned 0x%x (continuing)\n",
                (uint32_t)r);
@@ -353,10 +355,17 @@ reenable:
     /* Device reset: known-good state regardless of what firmware left
      * behind (defaults: scancode set 2 + our translation = set 1 on the
      * wire, scanning enabled).  No response is normal on machines whose
-     * keyboard is USB-only — not an error. */
-    if (i8042_kbd_send(0xFF) == 0 && i8042_kbd_wait_bat() == 0) {
+     * keyboard is USB-only — not an error.
+     *
+     * Skip it entirely when the controller never returned data (self-test
+     * timed out): a stub 8042 with no attached device — e.g. a microVM like
+     * Firecracker — can never ACK, and each poll of its unresponsive status
+     * port is a VM-exit, so the reset would grind through millions of exits
+     * (seconds to minutes) before giving up. The keyboard is serial-only there
+     * anyway; leave the device NONE and move on. */
+    if (data_ok && i8042_kbd_send(0xFF) == 0 && i8042_kbd_wait_bat() == 0) {
         dev_ok = 0;
-    } else if (i8042_kbd_send(0xF4) == 0) {
+    } else if (data_ok && i8042_kbd_send(0xF4) == 0) {
         /* Reset refused but enable-scanning ACKed — device is alive. */
         dev_ok = 1;
     }
