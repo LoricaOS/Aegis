@@ -71,7 +71,9 @@ elf_load(struct aegis_process *proc, uint64_t pml4_phys, const uint8_t *data,
     /* Verify ELF magic */
     if (eh->e_ident[0] != 0x7F || eh->e_ident[1] != 'E' ||
         eh->e_ident[2] != 'L'  || eh->e_ident[3] != 'F') {
-        printk("[ELF] FAIL: bad magic\n");
+        printk("[ELF] FAIL: bad magic — got %x %x %x %x %x %x %x %x\n",
+               eh->e_ident[0], eh->e_ident[1], eh->e_ident[2], eh->e_ident[3],
+               eh->e_ident[4], eh->e_ident[5], eh->e_ident[6], eh->e_ident[7]);
         return -1;
     }
     if (eh->e_ident[4] != ELFCLASS64 ||

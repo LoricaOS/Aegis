@@ -35,8 +35,16 @@
 #define VIRTIO_BLK_S_IOERR 1u
 
 #define VBLK_SECTOR        512u
-#define VBLK_BOUNCE_PAGES  8u                          /* 32 KiB max per chunk */
-#define VBLK_MAX_SECTORS   (VBLK_BOUNCE_PAGES * 4096u / VBLK_SECTOR) /* 64 */
+#define VBLK_BOUNCE_PAGES  8u
+/* One page (8 sectors) per request. A multi-page scatter-gather chain (header +
+ * N data descriptors + status) is mishandled by strict virtio backends:
+ * Firecracker completes only the first data segment (len=4097) and never writes
+ * the status byte, so the transfer silently returns zeroed data — ext2 then
+ * zero-fills and an exec'd binary fails its ELF magic. Single-page requests (3
+ * descriptors) are handled correctly everywhere, and the read/write loops
+ * already split large transfers into these chunks. TODO: negotiate
+ * VIRTIO_BLK_F_SEG_MAX and lift the cap where the device advertises a higher max. */
+#define VBLK_MAX_SECTORS   (4096u / VBLK_SECTOR)       /* 8 = one page */
 #define VBLK_POLL_BUDGET   100000000u
 
 typedef struct __attribute__((packed)) {
