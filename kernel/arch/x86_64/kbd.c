@@ -145,6 +145,16 @@ buf_push(char c)
 #define I8042_SPIN_CMD 2000000u
 #define I8042_SPIN_BAT 60000000u
 
+/* Wall-clock cap on a controller wait, via the TSC. The spin counts above assume
+ * each status read is a few ns (real port I/O), but under a VMM that traps port
+ * I/O (Firecracker/KVM) every read is a VM-exit (~µs), so a 2M-iteration timeout
+ * becomes seconds and probing an absent 8042 stalls the boot for ~20s. Capping
+ * by elapsed cycles bounds every wait to ~tens of ms regardless of how costly a
+ * single poll is — instant on real hardware, fast-fail in a micro-VM. arch_get_
+ * cycles() is the raw TSC (monotonic before calibration); the cap is generous at
+ * any plausible clock (~50ms @ 5GHz .. 250ms @ 1GHz). */
+#define I8042_TSC_CAP  250000000ull
+
 /* Diagnostic state for /proc/kbdstat — the bastion greeter renders this,
  * so serial-less machines show their controller state on screen. */
 static volatile uint8_t s_i8042_cfg   = 0;
@@ -161,9 +171,12 @@ kbd_i8042_get(uint8_t *cfg, uint8_t *state)
 static int
 i8042_wait_ibf_clear(uint32_t spins)
 {
+    uint64_t t0 = arch_get_cycles();
     while (spins--) {
         if (!(inb(KBD_STATUS) & I8042_STS_IBF))
             return 0;
+        if (arch_get_cycles() - t0 > I8042_TSC_CAP)
+            return -1;
         arch_pause();
     }
     return -1;
@@ -173,9 +186,12 @@ i8042_wait_ibf_clear(uint32_t spins)
 static int
 i8042_read_data(uint32_t spins)
 {
+    uint64_t t0 = arch_get_cycles();
     while (spins--) {
         if (inb(KBD_STATUS) & I8042_STS_OBF)
             return (int)inb(KBD_DATA);
+        if (arch_get_cycles() - t0 > I8042_TSC_CAP)
+            return -1;
         arch_pause();
     }
     return -1;

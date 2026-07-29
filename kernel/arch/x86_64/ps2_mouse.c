@@ -26,12 +26,21 @@
 
 /* Wait until the i8042 input buffer is empty (bit 1 of status = 0).
  * Must be clear before writing to port 0x60 or 0x64. */
+/* Wall-clock cap (TSC cycles) on an aux-port wait. Under a VMM that traps port
+ * I/O (Firecracker), each status read is a VM-exit, so an iteration-bounded
+ * timeout stalls for seconds when the mouse is absent. Bound by elapsed cycles
+ * instead — ~50ms @ 5GHz .. 250ms @ 1GHz, plenty for a real device. */
+#define I8042_TSC_CAP 250000000ull
+
 static void
 i8042_wait_write(void)
 {
     uint32_t timeout = 100000;
+    uint64_t t0 = arch_get_cycles();
     while (timeout--) {
         if (!(inb(KBD_STATUS) & 0x02))
+            return;
+        if (arch_get_cycles() - t0 > I8042_TSC_CAP)
             return;
     }
 }
@@ -42,8 +51,11 @@ static void
 i8042_wait_read(void)
 {
     uint32_t timeout = 100000;
+    uint64_t t0 = arch_get_cycles();
     while (timeout--) {
         if (inb(KBD_STATUS) & 0x01)
+            return;
+        if (arch_get_cycles() - t0 > I8042_TSC_CAP)
             return;
     }
 }
