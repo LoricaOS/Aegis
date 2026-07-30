@@ -132,12 +132,20 @@ sys_write(uint64_t arg1, uint64_t arg2, uint64_t arg3)
         int r = f->ops->write(f->priv, staging, chunk);
         if (r <= 0) {
             sched_current()->write_nonblock = 0;
+            f->offset += total;   /* advance by what succeeded (see below) */
             return (total > 0) ? total : (uint64_t)(int64_t)r;
         }
         total += (uint64_t)r;
         if ((uint64_t)r < chunk) break;  /* short write — don't retry */
     }
     sched_current()->write_nonblock = 0;
+    /* Advance the file offset by the bytes written, mirroring sys_read. POSIX
+     * requires write() to move the offset; without this a write-only fd keeps
+     * f->offset==0, so a later lseek(SEEK_CUR) reports 0 and (via the fs seek
+     * hook) resets the fs write position to 0 — musl stdio does exactly this
+     * between writes, which made every multi-write tool (echo, cp) clobber
+     * offset 0 and persist only its last byte. */
+    f->offset += total;
     return total;
 }
 
@@ -225,6 +233,10 @@ sys_writev(uint64_t arg1, uint64_t arg2, uint64_t arg3)
         total += vec_written;
     }
 done:
+    /* Advance the file offset by bytes written — same reason as sys_write, and
+     * this is the path musl's buffered stdio actually uses (__stdio_write ->
+     * writev), so it is what makes redirected `echo`/`cp` persist correctly. */
+    proc->fd_table->fds[arg1].offset += total;
     return total;
 }
 
