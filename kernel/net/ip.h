@@ -40,6 +40,10 @@ void net_set_config(ip4_addr_t ip, ip4_addr_t mask, ip4_addr_t gw);
 /* net_get_config: retrieve current IP configuration (may be 0.0.0.0). */
 void net_get_config(ip4_addr_t *ip, ip4_addr_t *mask, ip4_addr_t *gw);
 
+/* net_config_from_cmdline: apply a static address from the kernel cmdline token
+ * ip=<A.B.C.D>/<prefix>,<gateway>. No-op if absent/malformed. */
+void net_config_from_cmdline(void);
+
 /* ip_send: route and transmit a raw IP payload.
  * proto: IP_PROTO_ICMP / TCP / UDP.
  * src_ip may be 0.0.0.0 (DHCP bootstrap path — do not reject).
