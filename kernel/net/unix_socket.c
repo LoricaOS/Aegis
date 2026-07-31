@@ -336,8 +336,29 @@ int unix_sock_pair(uint32_t *a, uint32_t *b)
     return 0;
 }
 
+/* unix_close_staged — close fds staged on a socket but never received.
+ *
+ * MUST be called with unix_lock DROPPED. A staged fd may itself be an AF_UNIX
+ * socket (sys_socket.c's scm_fd_passable allowlist permits them), whose ->close
+ * is unix_vfs_close → unix_sock_free → spin_lock_irqsave(&unix_lock). That lock
+ * is a non-recursive ticket lock, so closing under it is a permanent
+ * IRQs-disabled lockup of this CPU, taking the whole system with it as other
+ * CPUs pile up on unix_lock. Same reason the ring kva_free_pages are deferred
+ * past the unlock below. Callers detach the staging area under the lock and
+ * pass the captured copy here. */
+static void unix_close_staged(const unix_passed_fd_t *staged, uint8_t n)
+{
+    for (uint8_t i = 0; i < n; i++)
+        if (staged[i].ops && staged[i].ops->close)
+            staged[i].ops->close(staged[i].priv);
+}
+
 void unix_sock_free(uint32_t id)
 {
+    /* Detached under the lock, closed after every unlock path. */
+    unix_passed_fd_t staged[UNIX_PASSED_FD_MAX];
+    uint8_t nstaged = 0;
+
     irqflags_t fl = spin_lock_irqsave(&unix_lock);
     if (id >= UNIX_SOCK_MAX || !s_unix[id].in_use) {
         spin_unlock_irqrestore(&unix_lock, fl);
@@ -349,11 +370,10 @@ void unix_sock_free(uint32_t id)
         return;
     }
 
-    /* Close any staged fds that were never received */
-    for (uint8_t i = 0; i < us->passed_fd_count; i++) {
-        if (us->passed_fds[i].ops && us->passed_fds[i].ops->close)
-            us->passed_fds[i].ops->close(us->passed_fds[i].priv);
-    }
+    /* Detach any staged fds that were never received — closed after unlock. */
+    nstaged = us->passed_fd_count;
+    for (uint8_t i = 0; i < nstaged; i++)
+        staged[i] = us->passed_fds[i];
     us->passed_fd_count = 0;
 
     /* Unregister name if bound */
@@ -390,6 +410,7 @@ void unix_sock_free(uint32_t id)
          * sched_lock and the order is sched_lock > waitq > unix_lock. */
         waitq_t *peer_wq = &p->poll_waiters;
         spin_unlock_irqrestore(&unix_lock, fl);
+        unix_close_staged(staged, nstaged);
         waitq_wake_all(peer_wq);
         return;
     }
@@ -408,6 +429,7 @@ void unix_sock_free(uint32_t id)
     }
     us->in_use = 0;
     spin_unlock_irqrestore(&unix_lock, fl);
+    unix_close_staged(staged, nstaged);
     if (free_a) kva_free_pages(free_a, UNIX_BUF_PAGES);
     if (free_b) kva_free_pages(free_b, UNIX_BUF_PAGES);
 }
@@ -974,14 +996,18 @@ int unix_sock_recv_fds(uint32_t id, int *fd_out, int max_fds)
         fd_out[installed++] = free_fd;
     }
 
-    /* Clear staging area (drop any fds that couldn't be installed) */
-    for (uint8_t i = (uint8_t)installed; i < us->passed_fd_count; i++) {
-        if (us->passed_fds[i].ops && us->passed_fds[i].ops->close)
-            us->passed_fds[i].ops->close(us->passed_fds[i].priv);
-    }
+    /* Clear staging area (drop any fds that couldn't be installed). Detach
+     * here, close after the unlock — see unix_close_staged: an undelivered
+     * AF_UNIX fd's ->close re-enters unix_lock and would deadlock this CPU.
+     * Reachable whenever the receiver's fd table is full. */
+    unix_passed_fd_t staged[UNIX_PASSED_FD_MAX];
+    uint8_t nstaged = 0;
+    for (uint8_t i = (uint8_t)installed; i < us->passed_fd_count; i++)
+        staged[nstaged++] = us->passed_fds[i];
     us->passed_fd_count = 0;
 
     spin_unlock_irqrestore(&unix_lock, fl);
+    unix_close_staged(staged, nstaged);
     return installed;
 }
 
