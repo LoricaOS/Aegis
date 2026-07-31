@@ -69,6 +69,7 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
 #define SYS_sigaltstack  132
 #define SYS_mmap         222
 #define SYS_mremap       216
+#define SYS_brk          214
 #define SYS_clock_gettime  113
 #define SYS_clock_nanosleep 115
 #define SYS_sched_yield  124
@@ -98,6 +99,7 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
 #define SYS_sigaltstack  131
 #define SYS_mmap         9
 #define SYS_mremap       25
+#define SYS_brk          12
 #define SYS_clock_gettime  228
 #define SYS_clock_nanosleep 230
 #define SYS_sched_yield  24
@@ -152,6 +154,14 @@ static long k_symlink(const char *target, const char *link)
     return sys3(SYS_symlinkat, (long)target, AT_FDCWD, (long)link);
 #else
     return sys3(SYS_symlink, (long)target, (long)link, 0);
+#endif
+}
+static long k_readlink(const char *p, char *buf, unsigned long bufsiz)
+{
+#ifdef __aarch64__
+    return sys6(SYS_readlinkat, AT_FDCWD, (long)p, (long)buf, (long)bufsiz, 0, 0);
+#else
+    return sys3(SYS_readlink, (long)p, (long)buf, (long)bufsiz);
 #endif
 }
 /* Fills the caller's struct-stat buffer; returns 0 or negative errno. */
@@ -449,8 +459,10 @@ void _start(void)
         int status = 0;
         sys6(SYS_wait4, pid, (long)&status, 0, 0, 0, 0);
         int cs = (status >> 8) & 0xff;
-        if (pid > 0 && cs == 42) { pass++; out("[KTEST] PASS exec\n"); }
+        if (pid > 0 && cs == 42) { pass++; out("[KTEST] PASS exec (+procfs cap gate)\n"); }
         else if (cs == 43) out("[KTEST] FAIL svc-tier-DISK_ADMIN-granted (privesc!)\n");
+        else if (cs == 44) out("[KTEST] FAIL procfs-unreachable (gate untestable)\n");
+        else if (cs == 45) out("[KTEST] FAIL proc-stackshot-ungated (freeze+leak!)\n");
         else out("[KTEST] FAIL exec\n");
     }
 
@@ -474,6 +486,124 @@ void _start(void)
         }
         if (ok) { pass++; out("[KTEST] PASS mremap (grow-in-place + shrink)\n"); }
         else out("[KTEST] FAIL mremap\n");
+    }
+
+    /* 8c. Audit regressions (2026-07-30 pass): two integer-underflow paths that
+     *     were stock-reachable from an unprivileged process.
+     *
+     *     C1 — readlink(path, buf, 0): the ext2 backend did `tlen = bufsiz - 1`
+     *     with bufsiz uint32, underflowing to 0xFFFFFFFF and running a ~4G-byte
+     *     copy off both ends of a 256-byte kernel stack buffer. Must be EINVAL.
+     *     A bufsiz of exactly 2^32 hit the same bug by narrowing to 0.
+     *
+     *     H1/H3 — mremap with a huge new_size: unbounded, so `old+new` wrapped
+     *     the address space (yielding a VMA overlapping every other mapping →
+     *     later double-free) and the grow scan ran billions of unpreemptible
+     *     page walks with IF=0. Must be EINVAL, not a wedged core. */
+    total++;
+    {
+        int ok = 1;
+        char lbuf[64];
+
+        /* A fast symlink (target <= 60 bytes, stored inline in i_block) — the
+         * common on-disk case the underflow was reachable through. The target
+         * need not exist; readlink just returns the stored string. */
+        if (k_mkdir("/ktrl") == 0 && k_symlink("/tgt45678", "/ktrl/rl") == 0) {
+            /* The underflow trigger itself. */
+            if (k_readlink("/ktrl/rl", lbuf, 0) >= 0) ok = 0;
+            /* Same bug via 32-bit narrowing of the length argument. */
+            if (k_readlink("/ktrl/rl", lbuf, 0x100000000UL) == 0) ok = 0;
+            /* ...while an ordinary readlink still works. */
+            if (k_readlink("/ktrl/rl", lbuf, sizeof(lbuf)) != 9) ok = 0;
+            k_unlink("/ktrl/rl");
+            k_rmdir("/ktrl");
+        } else ok = 0;
+
+        long q = sys6(SYS_mmap, 0, 4096, PROT_RW, MAP_ANON_PRIV, -1, 0);
+        if (q > 0) {
+            /* Wraps the address space when unchecked. */
+            if (sys6(SYS_mremap, q, 4096, -8192L, MREMAP_MAYMOVE, 0, 0) > 0)
+                ok = 0;
+            /* Huge but non-wrapping: the unpreemptible-scan wedge. If this
+             * regresses, the harness times out rather than failing here. */
+            if (sys6(SYS_mremap, q, 4096, 0x7FFFFFFFFFFF0000L,
+                     MREMAP_MAYMOVE, 0, 0) > 0)
+                ok = 0;
+            /* The mapping must be untouched and still growable afterwards. */
+            if (sys6(SYS_mremap, q, 4096, 8192, MREMAP_MAYMOVE, 0, 0) != q)
+                ok = 0;
+        } else ok = 0;
+
+        if (ok) { pass++; out("[KTEST] PASS readlink/mremap underflow guards\n"); }
+        else out("[KTEST] FAIL readlink/mremap underflow guards\n");
+    }
+
+    /* 8d. brk grow/shrink and the heap VMA that tracks it.
+     *
+     *     Nothing else in this suite touches brk (the test programs are
+     *     freestanding, so there is no musl malloc to drive it), yet the audit
+     *     fix for M5 changed how brk reserves its range: it now reserves
+     *     [brk, new) in the VMA table via vma_insert BEFORE mapping, which is
+     *     what makes it atomic against a sibling MAP_FIXED landing mid-grow
+     *     (previously that hit vmm_map_user_page's double-map panic). That
+     *     reservation also merges into the heap VMA, replacing the by-hand
+     *     len fixup the grow path used to do. If the merge ever stopped
+     *     happening, the heap would end up described by two entries and the
+     *     second grow below would overlap the first — so exercise
+     *     grow / write / grow / shrink / regrow and check the data survives. */
+    total++;
+    {
+        int ok = 1;
+        long b0 = sys3(SYS_brk, 0, 0, 0);                  /* query */
+        if (b0 <= 0) ok = 0;
+        else {
+            if (sys3(SYS_brk, b0 + 8192, 0, 0) != b0 + 8192) ok = 0;
+            if (ok) {
+                volatile unsigned char *h = (volatile unsigned char *)b0;
+                h[0] = 0xA5; h[8191] = 0x5A;
+                /* Second grow must EXTEND the same heap VMA, not overlap it. */
+                if (sys3(SYS_brk, b0 + 12288, 0, 0) != b0 + 12288) ok = 0;
+                if (h[0] != 0xA5 || h[8191] != 0x5A) ok = 0;  /* data preserved */
+                h[12287] = 0x7;                               /* new page usable */
+                /* Shrink all the way back, then regrow: the bookkeeping has to
+                 * stay consistent across the whole cycle. */
+                if (sys3(SYS_brk, b0, 0, 0) != b0) ok = 0;
+                if (sys3(SYS_brk, b0 + 4096, 0, 0) != b0 + 4096) ok = 0;
+                h[0] = 0x11;                                  /* refaults clean */
+                if (h[0] != 0x11) ok = 0;
+                if (sys3(SYS_brk, b0, 0, 0) != b0) ok = 0;
+
+                /* The invariant the reservation relies on: the heap is
+                 * described by exactly ONE VMA. Grow twice, then count
+                 * "[heap]" in /proc/self/maps — if the reservation ever stops
+                 * merging into the existing heap entry, the heap gets split
+                 * across several entries and the extras go stale (they keep
+                 * describing ranges brk has since dropped). Checking the
+                 * syscall's return values alone cannot see that. */
+                if (sys3(SYS_brk, b0 + 4096, 0, 0) != b0 + 4096) ok = 0;
+                if (sys3(SYS_brk, b0 + 8192, 0, 0) != b0 + 8192) ok = 0;
+                int mf = (int)sys6(SYS_openat, AT_FDCWD,
+                                   (long)"/proc/self/maps", 0, 0, 0, 0);
+                if (mf < 0) ok = 0;
+                else {
+                    char mb[2048];
+                    long n = sys3(SYS_read, mf, (long)mb, (long)sizeof(mb) - 1);
+                    sys3(SYS_close, mf, 0, 0);
+                    if (n <= 0) ok = 0;
+                    else {
+                        int heaps = 0;
+                        for (long q = 0; q + 6 <= n; q++)
+                            if (mb[q] == '[' && mb[q+1] == 'h' && mb[q+2] == 'e' &&
+                                mb[q+3] == 'a' && mb[q+4] == 'p' && mb[q+5] == ']')
+                                heaps++;
+                        if (heaps != 1) ok = 0;
+                    }
+                }
+                if (sys3(SYS_brk, b0, 0, 0) != b0) ok = 0;
+            }
+        }
+        if (ok) { pass++; out("[KTEST] PASS brk (grow/shrink + heap VMA)\n"); }
+        else out("[KTEST] FAIL brk (grow/shrink + heap VMA)\n");
     }
 
     /* 9. Concurrent multi-core scheduling: fork 4 children that each spin

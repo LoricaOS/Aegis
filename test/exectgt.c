@@ -28,6 +28,14 @@ static long sys3(long n, long a, long b, long c)
 #define SYS_write        1
 #define SYS_exit         60
 #define SYS_blkdev_list  510   /* gated on CAP_KIND_DISK_ADMIN */
+#define SYS_openat       257
+#define SYS_close        3
+#define AT_FDCWD         -100
+
+static long k_open(const char *p)
+{
+    return sys3(SYS_openat, AT_FDCWD, (long)p, 0 /* O_RDONLY */);
+}
 
 void _start(void)
 {
@@ -42,6 +50,26 @@ void _start(void)
      * blkdev_list needs DISK_ADMIN: refused (<0) = fix holds → exit 42; granted
      * (>=0) = the laundering hole is open → exit 43 so the parent FAILs. */
     long r = sys3(SYS_blkdev_list, 0, 0, 0);
-    sys3(SYS_exit, r < 0 ? 42 : 43, 0, 0);
+    if (r >= 0)
+        sys3(SYS_exit, 43, 0, 0);
+
+    /* procfs cap gate (audit H10). /proc/stackshot dumps every task's identity
+     * and kernel backtrace to the log, holding sched_lock across kilobytes of
+     * serial output; ungated it was an unprivileged system-wide freeze and a
+     * kernel-address leak. It now needs PROC_READ, which this service-tier
+     * binary does not have (PROC_READ is deliberately not baseline).
+     *
+     * Check a PUBLIC procfs file opens first — otherwise a /proc that isn't
+     * reachable at all would make the denial below pass for the wrong reason. */
+    long pub = k_open("/proc/uptime");
+    if (pub < 0)
+        sys3(SYS_exit, 44, 0, 0);          /* procfs broken — gate untestable */
+    sys3(SYS_close, pub, 0, 0);
+
+    long ss = k_open("/proc/stackshot");
+    if (ss >= 0)
+        sys3(SYS_exit, 45, 0, 0);          /* not gated → parent FAILs */
+
+    sys3(SYS_exit, 42, 0, 0);
     for (;;) { }
 }
