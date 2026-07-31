@@ -16,6 +16,7 @@
  */
 #include "virtio.h"
 #include "arch.h"
+#include "printk.h"
 
 /* Queue size is always a power of two (virtio spec §2.6), so &(size-1) is a
  * valid modulo for ring indexing. */
@@ -105,9 +106,22 @@ virtq_poll_used(virtq_t *vq, uint16_t *id, uint32_t *len)
      * reorder loads, so a compiler barrier is the correct read-side fence. */
     __asm__ volatile("" ::: "memory");
     uint16_t slot = (uint16_t)(vq->last_used & VQ_MASK(vq));
-    *id  = (uint16_t)vq->used->ring[slot].id;
+    uint32_t raw = vq->used->ring[slot].id;
     *len = vq->used->ring[slot].len;
     vq->last_used++;
+    /* used->ring[].id is DEVICE-WRITABLE shared memory: a malicious or broken
+     * device can put any value in it. vq->desc is a single 4096-byte DMA page
+     * holding 256 descriptors, and callers use this id both to index desc[]
+     * (virtq_free_chain) and to index their own per-descriptor buffer arrays.
+     * An id of 0xFFFF read desc[0xFFFF] — ~1 MiB past the descriptor page —
+     * so validate once here rather than in each of the eleven drivers.
+     * Consume the bogus entry and report "nothing completed". */
+    if (raw >= vq->size) {
+        printk("[VIRTQ] bad used id %u (size %u) from device — dropped\n",
+               raw, vq->size);
+        return 0;
+    }
+    *id = (uint16_t)raw;
     return 1;
 }
 
@@ -120,9 +134,16 @@ virtq_free_chain(virtq_t *vq, uint16_t head)
      * memory, so never trust a chain to terminate. */
     uint16_t guard;
     for (guard = 0; guard < vq->size; guard++) {
+        /* Bound BEFORE indexing. The old `cur < vq->size` test below guarded
+         * only the free-stack push — the two desc[cur] reads happened first
+         * and unconditionally, so both the initial device-supplied head and
+         * any out-of-range `next` mid-chain read off the end of the
+         * descriptor page. */
+        if (cur >= vq->size)
+            break;
         uint16_t next     = vq->desc[cur].next;
         uint16_t has_next = (uint16_t)(vq->desc[cur].flags & VIRTQ_DESC_F_NEXT);
-        if (cur < vq->size && vq->nfree < vq->size)
+        if (vq->nfree < vq->size)
             vq->free[vq->nfree++] = cur;
         if (!has_next)
             break;

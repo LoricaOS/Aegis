@@ -212,7 +212,13 @@ ahci_xfer(uint64_t lba, uint32_t nsec, int write)
 static int
 ahci_read(blkdev_t *dev, uint64_t lba, uint32_t count, void *buf)
 {
-    (void)dev;
+    /* Range-check against the device (audit M9). This driver used to ignore
+     * `dev` entirely and forward whatever LBA it was handed to the hardware —
+     * NVMe has this check in nvme_io_validate, virtio-blk and AHCI did not.
+     * Overflow-safe form: no lba+count that could wrap. */
+    if (dev && dev->block_count &&
+        (lba >= dev->block_count || count > dev->block_count - lba))
+        return -1;
     if (count == 0)
         return 0;
     uint8_t *out = (uint8_t *)buf;
@@ -239,7 +245,13 @@ ahci_read(blkdev_t *dev, uint64_t lba, uint32_t count, void *buf)
 static int
 ahci_write(blkdev_t *dev, uint64_t lba, uint32_t count, const void *buf)
 {
-    (void)dev;
+    /* Range-check against the device (audit M9). This driver used to ignore
+     * `dev` entirely and forward whatever LBA it was handed to the hardware —
+     * NVMe has this check in nvme_io_validate, virtio-blk and AHCI did not.
+     * Overflow-safe form: no lba+count that could wrap. */
+    if (dev && dev->block_count &&
+        (lba >= dev->block_count || count > dev->block_count - lba))
+        return -1;
     if (count == 0)
         return 0;
     const uint8_t *in = (const uint8_t *)buf;
