@@ -44,9 +44,19 @@ sys_ppoll(uint64_t fds_ptr, uint64_t nfds, uint64_t ts_ptr,
             return SYS_ERR(EFAULT);
         if (copy_from_user(&ts, (const void *)(uintptr_t)ts_ptr, sizeof(ts)) != 0)
             return SYS_ERR(EFAULT);
-        int64_t ms = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-        if (ms < 0) ms = 0;
-        timeout_ms = (uint64_t)ms;
+        /* Validate before converting (audit L2). tv_nsec was unchecked, and
+         * `tv_sec * 1000` is SIGNED overflow — undefined behaviour near
+         * INT64_MAX/1000, and in practice it wrapped negative, hit the `ms < 0`
+         * clamp, and silently turned a long wait into a zero-timeout poll.
+         * Compare in unsigned and saturate instead. (sys_nanosleep already
+         * range-checks its timespec; this brings ppoll in line.) */
+        if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000LL)
+            return SYS_ERR(EINVAL);
+        if ((uint64_t)ts.tv_sec > (uint64_t)-2 / 1000ULL)
+            timeout_ms = (uint64_t)-2;      /* saturate; -1 means "forever" */
+        else
+            timeout_ms = (uint64_t)ts.tv_sec * 1000ULL +
+                         (uint64_t)ts.tv_nsec / 1000000ULL;
     }
     return sys_poll(fds_ptr, nfds, timeout_ms);
 }

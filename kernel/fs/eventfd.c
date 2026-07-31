@@ -181,6 +181,12 @@ sys_eventfd2(uint64_t initval, uint64_t flags)
     if (fd < 0)
         return SYS_ERR(EMFILE);
 
+    /* The counter invariant is count <= EFD_VALMAX; the write path's overflow
+     * check (`val > EFD_VALMAX - count`) wraps and passes if count is already
+     * above it. eventfd2(UINT64_MAX, 0) seeded exactly that. (audit L7) */
+    if (initval > EFD_VALMAX)
+        return SYS_ERR(EINVAL);
+
     eventfd_t *e = kva_alloc_pages(1);
     if (!e)
         return SYS_ERR(ENOMEM);

@@ -241,7 +241,13 @@ pfs_bdec(char *p, char *end, uint64_t val)
 }
 
 /* Bounded counterpart of pfs_u64_hex — same rendering, never writes past
- * `end`. Max 16 hex digits for uint64. */
+ * `end`. Max 16 hex digits for uint64.
+ *
+ * Its only caller is gen_usbnet, whose body is #ifdef __x86_64__ (xHCI), so on
+ * arm64 this is legitimately unused — mark it so rather than duplicating the
+ * arch guard here and having the two drift. */
+static char *pfs_bhex(char *p, char *end, uint64_t val, int min_digits)
+    __attribute__((unused));
 static char *
 pfs_bhex(char *p, char *end, uint64_t val, int min_digits)
 {
@@ -1304,6 +1310,15 @@ pfs_parse_pid(const char **pp)
     const char *s = *pp;
     uint32_t pid = 0;
     while (*s >= '0' && *s <= '9') {
+        /* Saturate rather than wrap. `pid * 10 + d` in uint32 meant
+         * /proc/4294967297/... aliased to pid 1 — harmless today because
+         * procfs_check_access still gates non-self targets, but a pid that
+         * silently becomes a *different* pid is not a property to rely on.
+         * 0 is never a valid pid, so callers already reject it. (audit L8) */
+        if (pid > (0xFFFFFFFFu - (uint32_t)(*s - '0')) / 10u) {
+            *pp = s;
+            return 0;
+        }
         pid = pid * 10 + (uint32_t)(*s - '0');
         s++;
     }
@@ -1528,6 +1543,17 @@ procfs_stat(const char *path, k_stat_t *out)
      * worked), and "cmdline" was too from Phase 31 until 1.2.0. */
     for (uint32_t i = 0; i < PROCFS_NROOT; i++) {
         if (pfs_streq(rel, s_proc_root[i].name)) {
+            /* Same gate open() applies, so stat cannot describe a node the
+             * caller may not open (stackshot/trace/dmesg). */
+            if (s_proc_root[i].cap != CAP_KIND_NULL) {
+                aegis_task_t *cur = sched_current();
+                if (!cur || !cur->is_user)
+                    return -ENOENT;
+                aegis_process_t *caller = (aegis_process_t *)cur;
+                if (cap_check(caller->caps, CAP_TABLE_SIZE,
+                              s_proc_root[i].cap, CAP_RIGHTS_READ) != 0)
+                    return -ENOENT;
+            }
             out->st_dev   = 5;
             out->st_ino   = 1;
             out->st_nlink = (s_proc_root[i].dtype == 4) ? 2 : 1;
@@ -1572,6 +1598,14 @@ procfs_stat(const char *path, k_stat_t *out)
         const char *p = rel;
         uint32_t pid = pfs_parse_pid(&p);
         if (pid == 0)
+            return -ENOENT;
+
+        /* Gate on the same capability open() requires. stat() skipped this
+         * entirely, so a process without PROC_READ could still probe which
+         * pids exist (and the sizes of their /proc files) by stat'ing them.
+         * ENOENT, not EPERM — the point is not to answer the question.
+         * (audit L1) */
+        if (procfs_check_access(pid) != 0)
             return -ENOENT;
 
         /* Check process exists (pointer deliberately not kept — see

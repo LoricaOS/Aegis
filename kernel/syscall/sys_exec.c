@@ -18,6 +18,11 @@
 #include "vma.h"
 #include "printk.h"
 
+/* The kva allocation must cover the struct — EXECVE_ARGBUF_PAGES is a
+ * hand-computed ceiling and the struct has grown before. */
+_Static_assert(sizeof(execve_argbuf_t) <= EXECVE_ARGBUF_PAGES * 4096,
+               "EXECVE_ARGBUF_PAGES too small for execve_argbuf_t");
+
 /* Copy a NULL-terminated user array of C-strings into a FLAT kernel buffer:
  * up to `max` entries, appended NUL-separated into strbuf[strbuf_sz], with a
  * NULL-terminated pointer table ptrs[0..n] pointing into strbuf. Returns the
@@ -244,7 +249,7 @@ reload_binary:
         /* Rebuild argv. Snapshot the original pointers first (they index into
          * abuf->argv_strs, which stays valid) before overwriting the array. */
         for (uint64_t i = 0; i < sizeof(path); i++) script_path[i] = path[i];
-        char *saved[EXECVE_MAX_ARGV];
+        char **saved = abuf->saved_ptrs;   /* kva, not the kernel stack — L6 */
         int saved_n = argc2;
         if (saved_n > EXECVE_MAX_ARGV) saved_n = EXECVE_MAX_ARGV;
         for (int i = 0; i < saved_n; i++) saved[i] = abuf->argv_ptrs[i];

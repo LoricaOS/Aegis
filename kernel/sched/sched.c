@@ -160,7 +160,14 @@ run_list_remove_locked(aegis_task_t *task)
  * prevents).  All access is under sched_lock (task_pickable reads it there).
  * Bounded by CPU count in practice; on the never-hit overflow we simply skip
  * freezing that vfork (best-effort, never a corrupt set). */
-#define VFORK_FROZEN_MAX 16
+/* Sized so the set CANNOT overflow: a thread group has at most one vfork in
+ * flight, so there can never be more frozen tgids than process slots. It was
+ * 16, with the overflow documented as "never hit" — but ~17 thread groups all
+ * vforking at once is reachable from hostile userspace, and the 17th silently
+ * skipped its freeze, letting siblings run in the address space that vfork
+ * child still shares: exactly the corruption the freeze exists to prevent.
+ * 256 * 4 B = 1 KiB of BSS to make the failure mode impossible. (audit L12) */
+#define VFORK_FROZEN_MAX AEGIS_MAX_PROCESSES
 static uint32_t s_vfork_frozen[VFORK_FROZEN_MAX];
 static uint32_t s_vfork_frozen_count = 0;
 

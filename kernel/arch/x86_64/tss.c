@@ -2,6 +2,8 @@
 #include "smp.h"
 #include "printk.h"
 #include "kva.h"   /* per-CPU #DF IST stacks are kva-allocated, not a static array */
+#include "vmm.h"   /* vmm_unmap_page — #DF stack guard page */
+#include "pmm.h"   /* pmm_free_page  — #DF stack guard page */
 
 /* Verify the TSS is exactly 104 bytes as per x86-64 spec. */
 _Static_assert(sizeof(aegis_tss_t) == 104, "TSS must be 104 bytes");
@@ -18,9 +20,23 @@ static aegis_tss_t s_tss[MAX_CPUS];
  * 4 KiB-aligned, satisfying the 16-byte #DF-stack alignment requirement. */
 static uint64_t df_stack_top(void)
 {
-    uint8_t *df = (uint8_t *)kva_alloc_pages(1);
-    /* Stack grows down: IST entry must point at the TOP (one past the end). */
-    return (uint64_t)(uintptr_t)(df + 4096);
+    /* Two pages: the upper one is the usable 4 KiB #DF stack, the lower is an
+     * unmapped guard. The #DF handler runs printk repeatedly, panic_backtrace
+     * (an RBP-chain walk) and panic_bluescreen (framebuffer writes) — a tight
+     * fit in 4 KiB, and overflowing it with no guard below silently ran off
+     * into the neighbouring kva allocation and triple-faulted (silent reboot)
+     * instead of producing a diagnosable panic. #DF is already fatal and not
+     * user-reachable, so this is diagnostics reliability, not privilege.
+     * (audit L16) */
+    uint8_t *region = (uint8_t *)kva_alloc_pages(2);
+    if (!region)
+        return 0;
+    uint64_t guard_phys = kva_page_phys(region);
+    vmm_unmap_page((uint64_t)(uintptr_t)region);
+    pmm_free_page(guard_phys);
+    /* Stack grows down: IST entry must point at the TOP (one past the end).
+     * Usable stack is [region+4096, region+8192). */
+    return (uint64_t)(uintptr_t)(region + 8192);
 }
 
 /*

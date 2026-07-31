@@ -64,10 +64,16 @@ sys_mount(uint64_t source, uint64_t target_u, uint64_t fstype_u,
 
     char target[64];
     char fstype[16];
-    if (copy_path_from_user(target, target_u, sizeof(target)) != 0)
-        return SYS_ERR(EFAULT);
-    if (copy_path_from_user(fstype, fstype_u, sizeof(fstype)) != 0)
-        return SYS_ERR(EFAULT);
+    /* Propagate the real error. These mapped every failure to EFAULT, so a
+     * path longer than the 64/16-byte buffers was reported as a bad pointer
+     * rather than ENAMETOOLONG — misleading, since the pointer is fine.
+     * (audit L9) */
+    int cr = copy_path_from_user(target, target_u, sizeof(target));
+    if (cr != 0)
+        return (uint64_t)(int64_t)cr;
+    cr = copy_path_from_user(fstype, fstype_u, sizeof(fstype));
+    if (cr != 0)
+        return (uint64_t)(int64_t)cr;
 
     if (!mount_target_ok(target))
         return SYS_ERR(EPERM);

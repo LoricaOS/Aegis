@@ -552,10 +552,18 @@ nvme_init(void)
          * 0 = no limit.  Clamp our per-command ceiling to it so a large
          * bounce transfer can never exceed what the controller accepts. */
         {
+            /* Both inputs are device-controlled. In uint32 this overflowed:
+             * MPSMIN=15 gives mps_min = 4096<<15 = 0x80000000, and one more
+             * shift wraps to 0 — so s_mdts_max became 0, s_max_xfer became 0,
+             * and every subsequent nvme_io_validate rejected, failing ALL disk
+             * I/O. Compute in 64-bit and clamp; a controller that asks for more
+             * than our bounce budget is capped by it anyway. (audit L14) */
             uint8_t  mdts   = id_buf[77];
-            uint32_t mps_min = 4096u << ((s_bar0->cap >> 48) & 0xFu);
-            if (mdts != 0u && mdts < 15u)
-                s_mdts_max = mps_min << mdts;
+            uint64_t mps_min = 4096ull << ((s_bar0->cap >> 48) & 0xFu);
+            if (mdts != 0u && mdts < 15u) {
+                uint64_t m = mps_min << mdts;
+                s_mdts_max = (m > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (uint32_t)m;
+            }
         }
     }
 

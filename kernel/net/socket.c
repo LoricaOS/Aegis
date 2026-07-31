@@ -83,9 +83,39 @@ static int sock_vfs_read(void *priv, void *buf, uint64_t off, uint64_t len)
             if (avail > 0) {
                 uint32_t want = (uint32_t)len < (uint32_t)avail ? (uint32_t)len : (uint32_t)avail;
                 if (want > 8192) want = 8192;
-                int r = tcp_conn_recv(s->sock_id, s->tcp_conn_id, buf, (uint16_t)want);
+                /* Bounce through kernel memory instead of handing the USER
+                 * pointer to tcp_conn_recv, which does a plain
+                 * __builtin_memcpy into it (net/tcp.c). Two reasons:
+                 *   - That memcpy is not registered in __ex_table, so a user
+                 *     page that goes away between validation and the copy
+                 *     (a CLONE_VM sibling munmapping it) faults in ring 0 with
+                 *     no fixup — a panic, not an EFAULT.
+                 *   - The UDP and AF_UNIX paths already bounce for exactly
+                 *     this reason ("with SMAP enabled the kernel cannot access
+                 *     them directly"); TCP read was the one path that did not,
+                 *     so enabling SMAP/PAN — which arch_smap.c and the arm64
+                 *     TODO both intend — would have made it #PF at ring 0.
+                 * Chunked so the bounce costs 2 KiB of kernel stack rather
+                 * than the full 8 KiB window. (audit L11) */
+                uint8_t kbuf[2048];
+                uint32_t done = 0;
+                int rc_out = 0;
+                while (done < want) {
+                    uint32_t chunk = want - done;
+                    if (chunk > sizeof(kbuf)) chunk = (uint32_t)sizeof(kbuf);
+                    int r = tcp_conn_recv(s->sock_id, s->tcp_conn_id,
+                                          kbuf, (uint16_t)chunk);
+                    if (r <= 0) { if (done == 0) rc_out = r; break; }
+                    if (copy_to_user((void *)((uintptr_t)buf + done),
+                                     kbuf, (uint32_t)r) != 0) {
+                        if (done == 0) rc_out = -EFAULT;
+                        break;
+                    }
+                    done += (uint32_t)r;
+                    if ((uint32_t)r < chunk) break;   /* ring drained */
+                }
                 sock_vfs_close(priv);   /* drop the recv pin */
-                return r;
+                return done > 0 ? (int)done : rc_out;
             }
             /* avail <= 0.  tcp_conn_recv peek returns -11 ONLY while the
              * connection is alive but empty (the one case we block on); 0

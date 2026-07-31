@@ -92,11 +92,19 @@ typedef struct {
     char     env_strs[EXECVE_ENV_STRBYTES];
     char    *env_ptrs[EXECVE_MAX_ENV + 1];
     uint64_t env_str_ptrs[EXECVE_MAX_ENV];
+    /* Shebang argv snapshot. Lived on the KERNEL STACK as
+     * `char *saved[EXECVE_MAX_ARGV]` — 8 KiB of a 16 KiB stack, alongside
+     * path[256], shebang_interp[256], shebang_arg[256], script_path[256], two
+     * elf_load_result_t (~1 KiB) and the whole resolve_path -> vfs_open ->
+     * ext2_walk -> device-read callee chain. Any user could reach it with a
+     * `#!` script. Moved here, where the argv working set already lives.
+     * (audit L6) */
+    char    *saved_ptrs[EXECVE_MAX_ARGV];
 } execve_argbuf_t;
 
 /* ceil(sizeof(execve_argbuf_t) / 4096): 131072 + 8200 + 8192 + 65536 + 2056
- * + 2048 = 217104 → 54 pages. */
-#define EXECVE_ARGBUF_PAGES 54
+ * + 2048 + 8192 = 225296 → 56 pages. Asserted in sys_exec.c. */
+#define EXECVE_ARGBUF_PAGES 56
 
 /* Value single-sourced in limits.h (AEGIS_MAX_PROCESSES). */
 #define MAX_PROCESSES AEGIS_MAX_PROCESSES

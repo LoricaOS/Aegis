@@ -88,7 +88,7 @@ sys_brk(uint64_t arg1)
         return proc->brk;  /* query */
 
     /* Clamp to user address space */
-    if (arg1 >= 0x00007FFFFFFFFFFFULL)
+    if (arg1 >= 0x800000000000ULL)        /* match sys_mmap — audit L5 */
         return proc->brk;
 
     /* M2: reject shrink below the initial ELF brk — prevents freeing
@@ -856,8 +856,12 @@ sys_munmap(uint64_t arg1, uint64_t arg2)
 
     /* C7: reject kernel addresses and overflow — prevent kernel VAs from
      * being inserted into the mmap freelist. */
-    if (arg1 >= 0x00007FFFFFFFFFFFULL ||
-        arg1 + len > 0x00007FFFFFFFFFFFULL ||
+    /* Bound to the same limit sys_mmap uses (0x800000000000), not
+     * USER_ADDR_MAX (0x00007FFFFFFFFFFF). They disagreed by one page, so the
+     * last user page was mappable via mmap(MAP_FIXED) but NOT unmappable —
+     * EINVAL here — and stayed leaked until exit. (audit L5) */
+    if (arg1 >= 0x800000000000ULL ||
+        arg1 + len > 0x800000000000ULL ||
         arg1 + len < arg1)
         return SYS_ERR(EINVAL);
 
