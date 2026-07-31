@@ -29,8 +29,10 @@ The trusted computing base is plain C. Like any C kernel this young, it very lik
 contains memory-safety bugs (out-of-bounds accesses, use-after-free, integer overflow)
 that a determined attacker could turn into arbitrary code execution in the kernel —
 which would defeat the capability model from below. The capability *design* is sound
-and enforced at the syscall boundary; the *implementation* has not been audited or
-fuzzed to a production standard.
+and enforced at the syscall boundary; the *implementation* has had one internal
+source audit (2026-07-30 — 41 findings, all fixed; see `docs/audits/`), but it has
+not been fuzzed, and it has had no independent external review. Treat one internal
+pass as evidence that this class of bug exists here, not as evidence it is gone.
 
 In short:
 - The **model** (no ambient authority) is the product, and it is enforced deliberately.
