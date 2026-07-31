@@ -101,9 +101,19 @@ static const uint8_t k_aegis_guid_prefix[8] = {
  * For 4K-native drives, callers (ext2_cache) issue reads like lba=2, count=2
  * (two 512B sectors = 1024 bytes) which do NOT align to a 4K boundary.  We
  * use a static bounce buffer (one native sector = 4096 bytes max) to handle
- * sub-block alignment.  At most one native sector is ever needed per call
- * because ext2 block sizes (1024/2048/4096B) are always ≤ native block size
- * (512B or 4096B), so a single native sector contains the full request.
+ * sub-block alignment, walking ONE native sector per iteration.
+ *
+ * This used to assume "at most one native sector is ever needed per call,
+ * because ext2 block sizes (1024/2048/4096B) are always ≤ native block size"
+ * and memcpy the whole request through the bounce buffer in one go.  That was
+ * an unenforced assumption about callers, and sys_blkdev_io violates it: it
+ * chunks at sizeof(s_bounce)/512 = 128 sectors, so count arrived as high as
+ * 128 → a 64 KiB memcpy into this 4096-byte buffer, i.e. 60 KiB off the end
+ * into adjacent .bss — which holds s_devs[]/s_parts[], blkdev_t structs with
+ * read/write FUNCTION POINTERS.  On the write side those overflow bytes came
+ * straight from userspace (DISK_ADMIN → ring-0); on the read side the same
+ * span of kernel .bss was copied back out to the caller.  The loop below
+ * cannot overrun regardless of what any caller asks for.
  */
 static uint8_t s_part_bounce[4096];  /* sized for one 4K native sector */
 
@@ -115,16 +125,25 @@ static int gpt_part_read(blkdev_t *dev, uint64_t lba, uint32_t count, void *buf)
     uint32_t native_bs = p->parent->block_size;
     if (native_bs == 512)
         return p->parent->read(p->parent, lba + p->lba_offset, count, buf);
-
-    /* 512B → native translation with bounce for sub-block alignment */
-    uint64_t byte_start  = lba * 512ULL;
-    uint64_t byte_count  = (uint64_t)count * 512ULL;
-    uint64_t nat_lba     = byte_start / native_bs;
-    uint32_t sub_off     = (uint32_t)(byte_start % native_bs);
-    /* One native sector covers the entire request (ext2 block ≤ native_bs) */
-    if (p->parent->read(p->parent, p->lba_offset + nat_lba, 1, s_part_bounce) < 0)
+    if (native_bs == 0 || native_bs > sizeof(s_part_bounce))
         return -1;
-    __builtin_memcpy(buf, s_part_bounce + sub_off, byte_count);
+
+    /* 512B → native translation, one native sector at a time. */
+    uint64_t byte_start = lba * 512ULL;
+    uint64_t remaining  = (uint64_t)count * 512ULL;
+    uint8_t *out        = (uint8_t *)buf;
+    while (remaining) {
+        uint64_t nat_lba = byte_start / native_bs;
+        uint32_t sub_off = (uint32_t)(byte_start % native_bs);
+        uint32_t chunk   = native_bs - sub_off;      /* to end of this sector */
+        if ((uint64_t)chunk > remaining)
+            chunk = (uint32_t)remaining;
+        if (p->parent->read(p->parent, p->lba_offset + nat_lba, 1,
+                            s_part_bounce) < 0)
+            return -1;
+        __builtin_memcpy(out, s_part_bounce + sub_off, chunk);
+        out += chunk; byte_start += chunk; remaining -= chunk;
+    }
     return 0;
 }
 
@@ -137,16 +156,31 @@ static int gpt_part_write(blkdev_t *dev, uint64_t lba, uint32_t count,
     uint32_t native_bs = p->parent->block_size;
     if (native_bs == 512)
         return p->parent->write(p->parent, lba + p->lba_offset, count, buf);
+    if (native_bs == 0 || native_bs > sizeof(s_part_bounce))
+        return -1;
 
     uint64_t byte_start = lba * 512ULL;
-    uint64_t byte_count = (uint64_t)count * 512ULL;
-    uint64_t nat_lba    = byte_start / native_bs;
-    uint32_t sub_off    = (uint32_t)(byte_start % native_bs);
-    /* Read-modify-write: load the native sector, patch our bytes, write back */
-    if (p->parent->read(p->parent, p->lba_offset + nat_lba, 1, s_part_bounce) < 0)
-        return -1;
-    __builtin_memcpy(s_part_bounce + sub_off, buf, byte_count);
-    return p->parent->write(p->parent, p->lba_offset + nat_lba, 1, s_part_bounce);
+    uint64_t remaining  = (uint64_t)count * 512ULL;
+    const uint8_t *in   = (const uint8_t *)buf;
+    while (remaining) {
+        uint64_t nat_lba = byte_start / native_bs;
+        uint32_t sub_off = (uint32_t)(byte_start % native_bs);
+        uint32_t chunk   = native_bs - sub_off;
+        if ((uint64_t)chunk > remaining)
+            chunk = (uint32_t)remaining;
+        /* Read-modify-write: load the native sector, patch our bytes, write
+         * back. A full-sector chunk still round-trips through the bounce
+         * buffer — simpler, and this is already the slow compat path. */
+        if (p->parent->read(p->parent, p->lba_offset + nat_lba, 1,
+                            s_part_bounce) < 0)
+            return -1;
+        __builtin_memcpy(s_part_bounce + sub_off, in, chunk);
+        if (p->parent->write(p->parent, p->lba_offset + nat_lba, 1,
+                             s_part_bounce) < 0)
+            return -1;
+        in += chunk; byte_start += chunk; remaining -= chunk;
+    }
+    return 0;
 }
 
 /* ── Header validation ────────────────────────────────────────────────────
@@ -230,7 +264,16 @@ int gpt_scan(const char *devname)
      * Use hdr.partition_entry_lba (not 2) so the backup header's entry
      * array is read correctly on fallback. */
     uint32_t bs = dev->block_size;
+    if (bs == 0) return 0;
     uint32_t entry_lbas = (128u * 128u + bs - 1u) / bs;
+    /* partition_entry_lba is on-disk data too — bound the whole array read to
+     * the device before issuing it. */
+    if (dev->block_count &&
+        (hdr.partition_entry_lba >= dev->block_count ||
+         entry_lbas > dev->block_count - hdr.partition_entry_lba)) {
+        printk("[GPT] WARN: partition entry array out of range on %s\n", devname);
+        return 0;
+    }
     for (uint32_t ei = 0; ei < entry_lbas; ei++) {
         if (dev->read(dev, hdr.partition_entry_lba + ei, 1, s_entry_chunk) < 0) {
             printk("[GPT] WARN: cannot read partition entries on %s\n", devname);
@@ -263,6 +306,21 @@ int gpt_scan(const char *devname)
         if (!used) continue;
         /* Strict less-than: single-sector partitions unsupported (simplification) */
         if (e->start_lba >= e->end_lba) continue;
+
+        /* Bound the entry to the device and to the header's usable range.
+         * start_lba/end_lba come straight off the disk image with no check at
+         * all: an out-of-range pair set lba_offset past the end of the device
+         * (every later partition I/O then targeted attacker-chosen absolute
+         * sectors), and `end - start + 1` could wrap to a tiny block_count,
+         * defeating the range check in gpt_part_read/write that is supposed to
+         * confine a partition to its own extent. NVMe rejects the resulting
+         * out-of-range requests in nvme_io_validate, but virtio-blk and AHCI
+         * have no LBA range check, so they would forward them to hardware. */
+        if (dev->block_count &&
+            (e->start_lba >= dev->block_count || e->end_lba >= dev->block_count))
+            continue;
+        if (e->start_lba < hdr.first_usable_lba || e->end_lba > hdr.last_usable_lba)
+            continue;
 
         /* Only register Aegis-typed partitions (8-byte prefix match) */
         int aegis = 1;

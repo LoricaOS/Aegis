@@ -194,6 +194,13 @@ static uint64_t ext2_max_file_size(void)
     return bytes < cap ? bytes : cap;
 }
 
+/* See ext2_internal.h for why every directory walker must go through this. */
+uint32_t ext2_dir_size(const ext2_inode_t *inode)
+{
+    uint64_t max = ext2_max_file_size();
+    return (uint64_t)inode->i_size > max ? (uint32_t)max : inode->i_size;
+}
+
 /* Inode of /etc/shadow on the mounted ext2 volume.  Populated at mount
  * time and used by vfs_open to enforce CAP_KIND_AUTH after symlink
  * resolution — the pre-resolution string check in sys_open is
@@ -1028,8 +1035,9 @@ int ext2_readdir(uint32_t dir_inode, uint64_t index,
     uint64_t count = 0;
     uint32_t file_block_idx = 0;
     uint32_t bytes_walked = 0;
+    uint32_t dir_bytes = ext2_dir_size(&inode);   /* crafted i_size → wrap */
 
-    while (bytes_walked < inode.i_size) {
+    while (bytes_walked < dir_bytes) {
         uint32_t blk = ext2_block_num(&inode, file_block_idx);
         if (blk == 0) {
             bytes_walked += s_block_size;
@@ -1130,6 +1138,12 @@ static int ext2_read_symlink_target_impl(uint32_t ino, char *buf, uint32_t bufsi
         return -EIO;
 
     if ((inode.i_mode & EXT2_S_IFMT) != EXT2_S_IFLNK)
+        return -EINVAL;
+
+    /* A zero bufsiz leaves no room for the NUL, and `bufsiz - 1` below would
+     * underflow to 0xFFFFFFFF — a ~4G-iteration copy that runs off both ends
+     * of the caller's buffer. POSIX lets readlink reject bufsiz <= 0. */
+    if (bufsiz == 0)
         return -EINVAL;
 
     uint32_t tlen = inode.i_size;
@@ -2495,7 +2509,8 @@ int ext2_rmdir(const char *path, int has_install)
     {
         uint32_t file_block_idx = 0;
         uint32_t bytes_walked = 0;
-        while (bytes_walked < inode.i_size) {
+        uint32_t dir_bytes = ext2_dir_size(&inode);  /* crafted i_size → wrap */
+        while (bytes_walked < dir_bytes) {
             uint32_t blk = ext2_block_num(&inode, file_block_idx);
             if (blk == 0) {
                 bytes_walked += s_block_size;

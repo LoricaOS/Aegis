@@ -240,6 +240,29 @@ pfs_bdec(char *p, char *end, uint64_t val)
     return p;
 }
 
+/* Bounded counterpart of pfs_u64_hex — same rendering, never writes past
+ * `end`. Max 16 hex digits for uint64. */
+static char *
+pfs_bhex(char *p, char *end, uint64_t val, int min_digits)
+{
+    static const char hex[] = "0123456789abcdef";
+    char tmp[16];
+    int i = 0;
+    if (val == 0) {
+        tmp[i++] = '0';
+    } else {
+        while (val > 0) {
+            tmp[i++] = hex[val & 0xF];
+            val >>= 4;
+        }
+    }
+    while (i < min_digits && i < (int)sizeof(tmp))
+        tmp[i++] = '0';
+    while (i > 0 && p < end)
+        *p++ = tmp[--i];
+    return p;
+}
+
 /* basename helper — return pointer to last component after '/' */
 static const char *
 pfs_basename(const char *path)
@@ -750,7 +773,14 @@ static uint32_t
 gen_usbnet(char *buf, uint32_t bufsz)
 {
     char *p = buf;
-    (void)bufsz;
+    /* audit H7: bufsz used to be DISCARDED here, and every append below
+     * went through the unbounded pfs_* helpers. The per-port loop emits
+     * ~130 bytes per port with no ceiling, so a host controller reporting
+     * many ports walked straight off the single 4096-byte kva page this
+     * is generated into. Every write now goes through the end-bounded
+     * pfs_b* helpers, as gen_status already did. One byte is reserved for
+     * the terminating NUL stored after the loop. */
+    char *end = buf + bufsz - 1;
 #ifdef __x86_64__
     xhci_usbnet_diag_t d;
     xhci_host_diag_t   h;
@@ -759,154 +789,154 @@ gen_usbnet(char *buf, uint32_t bufsz)
 
     /* --- USB-ethernet (AX88179) section --- */
     if (!d.present) {
-        p = pfs_strcpy(p, "device:     none (no ASIX AX88179 claimed)\n");
+        p = pfs_bstr(p, end, "device:     none (no ASIX AX88179 claimed)\n");
         if (d.saw_device) {
             /* A USB device enumerated but wasn't an AX88179 — show its VID/PID
              * so we know what chip it is (e.g. RTL8153 dongle = 0x0bda). */
-            p = pfs_strcpy(p, "last usb:   vid=0x");
-            p = pfs_u64_hex(p, d.last_vid, 4);
-            p = pfs_strcpy(p, " pid=0x");
-            p = pfs_u64_hex(p, d.last_pid, 4);
-            p = pfs_strcpy(p, " (enumerated, not a supported ethernet chip)\n");
+            p = pfs_bstr(p, end, "last usb:   vid=0x");
+            p = pfs_bhex(p, end, d.last_vid, 4);
+            p = pfs_bstr(p, end, " pid=0x");
+            p = pfs_bhex(p, end, d.last_pid, 4);
+            p = pfs_bstr(p, end, " (enumerated, not a supported ethernet chip)\n");
         } else {
-            p = pfs_strcpy(p, "last usb:   no non-HID USB device enumerated\n");
+            p = pfs_bstr(p, end, "last usb:   no non-HID USB device enumerated\n");
         }
     } else {
-        p = pfs_strcpy(p, "device:     ASIX AX88179 USB ethernet\n");
-        p = pfs_strcpy(p, "configured: ");
-        p = pfs_strcpy(p, d.configured ? "yes (bulk endpoints set, RX armed)\n"
+        p = pfs_bstr(p, end, "device:     ASIX AX88179 USB ethernet\n");
+        p = pfs_bstr(p, end, "configured: ");
+        p = pfs_bstr(p, end, d.configured ? "yes (bulk endpoints set, RX armed)\n"
                                        : "no (configure failed)\n");
-        p = pfs_strcpy(p, "link:       ");
-        p = pfs_strcpy(p, d.link_up ? "UP" : "DOWN");
-        p = pfs_strcpy(p, " physr=0x");
-        p = pfs_u64_hex(p, d.physr, 4);
-        p = pfs_strcpy(p, " bmsr=0x");
-        p = pfs_u64_hex(p, d.bmsr, 4);
-        p = pfs_strcpy(p, " medium=0x");
-        p = pfs_u64_hex(p, d.medium_rb, 4);
-        p = pfs_strcpy(p, d.link_reset_done ? " link_reset=yes" : " link_reset=no");
-        p = pfs_strcpy(p, " mdio_cc=");
-        if (d.phy_cc == 0xFFu) p = pfs_strcpy(p, "timeout");
-        else                   p = pfs_u64_dec(p, d.phy_cc);
-        *p++ = '\n';
-        p = pfs_strcpy(p, "mac regs:   rx_ctl=0x");
-        p = pfs_u64_hex(p, d.rxctl_rb, 4);
-        p = pfs_strcpy(p, " plink=0x");
-        p = pfs_u64_hex(p, d.plink_rb, 2);
-        p = pfs_strcpy(p, " genstat=0x");
-        p = pfs_u64_hex(p, d.genstat_rb, 2);
-        p = pfs_strcpy(p, (d.genstat_rb & 0x04u) ? " (UA2)" : " (UA1+GPIO)");
-        p = pfs_strcpy(p, " bcd=0x");
-        p = pfs_u64_hex(p, d.bcd_device, 4);
-        p = pfs_strcpy(p, (d.bcd_device >= 0x0200u) ? " (179A:FW_MODE forced)\n"
+        p = pfs_bstr(p, end, "link:       ");
+        p = pfs_bstr(p, end, d.link_up ? "UP" : "DOWN");
+        p = pfs_bstr(p, end, " physr=0x");
+        p = pfs_bhex(p, end, d.physr, 4);
+        p = pfs_bstr(p, end, " bmsr=0x");
+        p = pfs_bhex(p, end, d.bmsr, 4);
+        p = pfs_bstr(p, end, " medium=0x");
+        p = pfs_bhex(p, end, d.medium_rb, 4);
+        p = pfs_bstr(p, end, d.link_reset_done ? " link_reset=yes" : " link_reset=no");
+        p = pfs_bstr(p, end, " mdio_cc=");
+        if (d.phy_cc == 0xFFu) p = pfs_bstr(p, end, "timeout");
+        else                   p = pfs_bdec(p, end, d.phy_cc);
+        p = pfs_bput(p, end, '\n');
+        p = pfs_bstr(p, end, "mac regs:   rx_ctl=0x");
+        p = pfs_bhex(p, end, d.rxctl_rb, 4);
+        p = pfs_bstr(p, end, " plink=0x");
+        p = pfs_bhex(p, end, d.plink_rb, 2);
+        p = pfs_bstr(p, end, " genstat=0x");
+        p = pfs_bhex(p, end, d.genstat_rb, 2);
+        p = pfs_bstr(p, end, (d.genstat_rb & 0x04u) ? " (UA2)" : " (UA1+GPIO)");
+        p = pfs_bstr(p, end, " bcd=0x");
+        p = pfs_bhex(p, end, d.bcd_device, 4);
+        p = pfs_bstr(p, end, (d.bcd_device >= 0x0200u) ? " (179A:FW_MODE forced)\n"
                                                     : "\n");
-        p = pfs_strcpy(p, "mac:        ");
+        p = pfs_bstr(p, end, "mac:        ");
         for (i = 0; i < 6; i++) {
-            if (i) *p++ = ':';
-            p = pfs_u64_hex(p, d.mac[i], 2);
+            if (i) p = pfs_bput(p, end, ':');
+            p = pfs_bhex(p, end, d.mac[i], 2);
         }
-        *p++ = '\n';
-        p = pfs_strcpy(p, "netdev:     ");
+        p = pfs_bput(p, end, '\n');
+        p = pfs_bstr(p, end, "netdev:     ");
         if (d.registered) {
-            p = pfs_strcpy(p, d.ifname);
-            p = pfs_strcpy(p, " (registered)\n");
+            p = pfs_bstr(p, end, d.ifname);
+            p = pfs_bstr(p, end, " (registered)\n");
         } else {
-            p = pfs_strcpy(p, "not registered\n");
+            p = pfs_bstr(p, end, "not registered\n");
         }
-        p = pfs_strcpy(p, "rx:         urbs=");
-        p = pfs_u64_dec(p, d.rx_count);
-        p = pfs_strcpy(p, " frames=");
-        p = pfs_u64_dec(p, d.rx_frames);
-        p = pfs_strcpy(p, " bytes=");
-        p = pfs_u64_dec(p, d.rx_bytes);
-        *p++ = '\n';
-        p = pfs_strcpy(p, "tx:         frames=");
-        p = pfs_u64_dec(p, d.tx_count);
-        *p++ = '\n';
+        p = pfs_bstr(p, end, "rx:         urbs=");
+        p = pfs_bdec(p, end, d.rx_count);
+        p = pfs_bstr(p, end, " frames=");
+        p = pfs_bdec(p, end, d.rx_frames);
+        p = pfs_bstr(p, end, " bytes=");
+        p = pfs_bdec(p, end, d.rx_bytes);
+        p = pfs_bput(p, end, '\n');
+        p = pfs_bstr(p, end, "tx:         frames=");
+        p = pfs_bdec(p, end, d.tx_count);
+        p = pfs_bput(p, end, '\n');
         /* Interrupt endpoint = the authoritative link source on this UA2 chip
          * (MDIO is dead). link bit = intdata1 & (1<<16). */
-        p = pfs_strcpy(p, "int ep:     dci=");
-        p = pfs_u64_dec(p, d.int_dci);
-        p = pfs_strcpy(p, d.int_armed ? " armed" : " NOT-armed");
-        p = pfs_strcpy(p, " reports=");
-        p = pfs_u64_dec(p, d.int_count);
-        p = pfs_strcpy(p, " link=");
-        p = pfs_strcpy(p, d.link_up_intr ? "UP" : "down");
-        p = pfs_strcpy(p, " intdata1=0x");
-        p = pfs_u64_hex(p, d.intdata1, 8);
-        p = pfs_strcpy(p, " intdata2=0x");
-        p = pfs_u64_hex(p, d.intdata2, 8);
-        *p++ = '\n';
+        p = pfs_bstr(p, end, "int ep:     dci=");
+        p = pfs_bdec(p, end, d.int_dci);
+        p = pfs_bstr(p, end, d.int_armed ? " armed" : " NOT-armed");
+        p = pfs_bstr(p, end, " reports=");
+        p = pfs_bdec(p, end, d.int_count);
+        p = pfs_bstr(p, end, " link=");
+        p = pfs_bstr(p, end, d.link_up_intr ? "UP" : "down");
+        p = pfs_bstr(p, end, " intdata1=0x");
+        p = pfs_bhex(p, end, d.intdata1, 8);
+        p = pfs_bstr(p, end, " intdata2=0x");
+        p = pfs_bhex(p, end, d.intdata2, 8);
+        p = pfs_bput(p, end, '\n');
         /* MDIO-free speed detection (MEDIUM signature-bit stick test). */
-        p = pfs_strcpy(p, "speed:      detected=");
+        p = pfs_bstr(p, end, "speed:      detected=");
         if (d.det_speed == 0u) {
-            p = pfs_strcpy(p, "NONE(no lock)");
+            p = pfs_bstr(p, end, "NONE(no lock)");
         } else {
-            p = pfs_u64_dec(p, d.det_speed);
-            *p++ = 'M';
+            p = pfs_bdec(p, end, d.det_speed);
+            p = pfs_bput(p, end, 'M');
         }
-        p = pfs_strcpy(p, " gig_rb=0x");
-        p = pfs_u64_hex(p, d.med_gig_rb, 4);
-        p = pfs_strcpy(p, " 100_rb=0x");
-        p = pfs_u64_hex(p, d.med_100_rb, 4);
-        *p++ = '\n';
+        p = pfs_bstr(p, end, " gig_rb=0x");
+        p = pfs_bhex(p, end, d.med_gig_rb, 4);
+        p = pfs_bstr(p, end, " 100_rb=0x");
+        p = pfs_bhex(p, end, d.med_100_rb, 4);
+        p = pfs_bput(p, end, '\n');
         /* Endpoint assignment — confirm bulk-IN is armed on the right DCI
          * (the int EP being at dci=3 means an interrupt-first descriptor). */
-        p = pfs_strcpy(p, "endpoints:  bulk_in=0x");
-        p = pfs_u64_hex(p, d.bulk_in_addr, 2);
-        p = pfs_strcpy(p, "(dci");
-        p = pfs_u64_dec(p, d.bulk_in_dci);
-        p = pfs_strcpy(p, ") bulk_out=0x");
-        p = pfs_u64_hex(p, d.bulk_out_addr, 2);
-        p = pfs_strcpy(p, "(dci");
-        p = pfs_u64_dec(p, d.bulk_out_dci);
-        p = pfs_strcpy(p, ") int=0x");
-        p = pfs_u64_hex(p, d.int_addr, 2);
-        p = pfs_strcpy(p, "(dci");
-        p = pfs_u64_dec(p, d.int_dci);
-        p = pfs_strcpy(p, ") in_burst=");
-        p = pfs_u64_dec(p, d.bulk_in_burst);
-        *p++ = '\n';
+        p = pfs_bstr(p, end, "endpoints:  bulk_in=0x");
+        p = pfs_bhex(p, end, d.bulk_in_addr, 2);
+        p = pfs_bstr(p, end, "(dci");
+        p = pfs_bdec(p, end, d.bulk_in_dci);
+        p = pfs_bstr(p, end, ") bulk_out=0x");
+        p = pfs_bhex(p, end, d.bulk_out_addr, 2);
+        p = pfs_bstr(p, end, "(dci");
+        p = pfs_bdec(p, end, d.bulk_out_dci);
+        p = pfs_bstr(p, end, ") int=0x");
+        p = pfs_bhex(p, end, d.int_addr, 2);
+        p = pfs_bstr(p, end, "(dci");
+        p = pfs_bdec(p, end, d.int_dci);
+        p = pfs_bstr(p, end, ") in_burst=");
+        p = pfs_bdec(p, end, d.bulk_in_burst);
+        p = pfs_bput(p, end, '\n');
     }
 
     /* --- xHCI host-controller section --- Aegis adopts ONE controller; a
      * USB-C port on a different one is never scanned. This shows the full
      * picture so we can tell which case we're in. */
     xhci_host_diag(&h);
-    p = pfs_strcpy(p, "\nxhci ctrls: ");
-    p = pfs_u64_dec(p, h.total_controllers);
-    p = pfs_strcpy(p, " present, ");
-    p = pfs_u64_dec(p, h.count);
-    p = pfs_strcpy(p, " scanned, adopted=");
+    p = pfs_bstr(p, end, "\nxhci ctrls: ");
+    p = pfs_bdec(p, end, h.total_controllers);
+    p = pfs_bstr(p, end, " present, ");
+    p = pfs_bdec(p, end, h.count);
+    p = pfs_bstr(p, end, " scanned, adopted=");
     if (h.adopted_index < 0)
-        p = pfs_strcpy(p, "NONE");
+        p = pfs_bstr(p, end, "NONE");
     else
-        p = pfs_u64_dec(p, (uint64_t)(h.adopted_index + 1));
-    *p++ = '\n';
+        p = pfs_bdec(p, end, (uint64_t)(h.adopted_index + 1));
+    p = pfs_bput(p, end, '\n');
     for (i = 0; i < (int)h.count; i++) {
-        p = pfs_strcpy(p, "  #");
-        p = pfs_u64_dec(p, (uint64_t)(i + 1));
-        p = pfs_strcpy(p, " ");
-        p = pfs_u64_hex(p, h.ctrl[i].vendor, 4);
-        *p++ = ':';
-        p = pfs_u64_hex(p, h.ctrl[i].device, 4);
-        p = pfs_strcpy(p, "  ");
-        p = pfs_strcpy(p, h.ctrl[i].result == 1 ? "ADOPTED (had a connected port)"
+        p = pfs_bstr(p, end, "  #");
+        p = pfs_bdec(p, end, (uint64_t)(i + 1));
+        p = pfs_bstr(p, end, " ");
+        p = pfs_bhex(p, end, h.ctrl[i].vendor, 4);
+        p = pfs_bput(p, end, ':');
+        p = pfs_bhex(p, end, h.ctrl[i].device, 4);
+        p = pfs_bstr(p, end, "  ");
+        p = pfs_bstr(p, end, h.ctrl[i].result == 1 ? "ADOPTED (had a connected port)"
                         : h.ctrl[i].result == 0 ? "empty (no device at boot)"
                         :                          "init failed");
-        *p++ = '\n';
+        p = pfs_bput(p, end, '\n');
     }
     if (h.total_controllers > h.count)
-        p = pfs_strcpy(p, "  (remaining controllers not scanned — adopt stops at first)\n");
+        p = pfs_bstr(p, end, "  (remaining controllers not scanned — adopt stops at first)\n");
     if (h.adopted_index >= 0 && h.adopted_max_ports > 0) {
         uint32_t conn = 0, pn;
         for (pn = 1; pn <= h.adopted_max_ports; pn++)
             if (h.port[pn] & 0x1u) conn++;
-        p = pfs_strcpy(p, "adopted ports: ");
-        p = pfs_u64_dec(p, conn);
-        p = pfs_strcpy(p, " of ");
-        p = pfs_u64_dec(p, h.adopted_max_ports);
-        p = pfs_strcpy(p, " connected\n");
+        p = pfs_bstr(p, end, "adopted ports: ");
+        p = pfs_bdec(p, end, conn);
+        p = pfs_bstr(p, end, " of ");
+        p = pfs_bdec(p, end, h.adopted_max_ports);
+        p = pfs_bstr(p, end, " connected\n");
         for (pn = 1; pn <= h.adopted_max_ports; pn++) {
             static const char *stg[] = {
                 "not-enumerated", "reset-timeout", "enable-slot-failed",
@@ -915,37 +945,37 @@ gen_usbnet(char *buf, uint32_t bufsz)
             };
             uint8_t st;
             if (!(h.port[pn] & 0x1u)) continue;   /* only connected ports */
-            p = pfs_strcpy(p, "  port ");
-            p = pfs_u64_dec(p, pn);
-            p = pfs_strcpy(p, ": speed=");
-            p = pfs_u64_dec(p, (h.port[pn] >> 10) & 0xFu);
-            p = pfs_strcpy(p, h.is_usb3[pn] ? " usb3" : " usb2");
+            p = pfs_bstr(p, end, "  port ");
+            p = pfs_bdec(p, end, pn);
+            p = pfs_bstr(p, end, ": speed=");
+            p = pfs_bdec(p, end, (h.port[pn] >> 10) & 0xFu);
+            p = pfs_bstr(p, end, h.is_usb3[pn] ? " usb3" : " usb2");
             st = h.enum_stage[pn];
-            p = pfs_strcpy(p, " enum=");
-            p = pfs_strcpy(p, st < 7u ? stg[st] : "?");
+            p = pfs_bstr(p, end, " enum=");
+            p = pfs_bstr(p, end, st < 7u ? stg[st] : "?");
             /* show the command completion code + controller status for a failed stage */
             if (st == 3u || st == 4u) {   /* address-device / configure-ep failed */
                 uint32_t us = h.enum_usbsts[pn];
-                p = pfs_strcpy(p, " cc=");
+                p = pfs_bstr(p, end, " cc=");
                 if (h.enum_cc[pn] == 0xFFu)
-                    p = pfs_strcpy(p, "timeout");
+                    p = pfs_bstr(p, end, "timeout");
                 else
-                    p = pfs_u64_dec(p, h.enum_cc[pn]);
-                p = pfs_strcpy(p, " usbsts=0x");
-                p = pfs_u64_hex(p, us, 4);
+                    p = pfs_bdec(p, end, h.enum_cc[pn]);
+                p = pfs_bstr(p, end, " usbsts=0x");
+                p = pfs_bhex(p, end, us, 4);
                 /* decode the fatal/halt bits: HCH(0) HSE(2) HCE(12) */
-                if (us & (1u << 0)) p = pfs_strcpy(p, "[HALTED]");
-                if (us & (1u << 2)) p = pfs_strcpy(p, "[HSE]");
-                if (us & (1u << 12)) p = pfs_strcpy(p, "[HCE]");
+                if (us & (1u << 0)) p = pfs_bstr(p, end, "[HALTED]");
+                if (us & (1u << 2)) p = pfs_bstr(p, end, "[HSE]");
+                if (us & (1u << 12)) p = pfs_bstr(p, end, "[HCE]");
             }
-            p = pfs_strcpy(p, " portsc=0x");
-            p = pfs_u64_hex(p, h.port[pn], 8);
-            *p++ = '\n';
+            p = pfs_bstr(p, end, " portsc=0x");
+            p = pfs_bhex(p, end, h.port[pn], 8);
+            p = pfs_bput(p, end, '\n');
         }
     }
-    p = pfs_strcpy(p, "note: USB-eth SS MaxBurst + RX_CTL AP, safe 4K rxbuf. diag-rev=25\n");
+    p = pfs_bstr(p, end, "note: USB-eth SS MaxBurst + RX_CTL AP, safe 4K rxbuf. diag-rev=25\n");
 #else
-    p = pfs_strcpy(p, "device:     n/a (no xHCI on this architecture)\n");
+    p = pfs_bstr(p, end, "device:     n/a (no xHCI on this architecture)\n");
 #endif
     *p = '\0';
     return (uint32_t)(p - buf);
@@ -1075,6 +1105,12 @@ typedef struct {
     uint8_t     dtype;
     uint16_t    mode;
     uint32_t  (*gen)(char *buf, uint32_t bufsz);
+    /* Capability required to open this node, or CAP_KIND_NULL for the
+     * genuinely public ones (meminfo, uptime, ...). Nodes that dump
+     * whole-system or kernel-internal state — every task's identity and
+     * backtrace, the kernel log, the trace ring — carry the same authority as
+     * reading another process's /proc entry, so they gate on PROC_READ. */
+    uint32_t    cap;
 } procfs_root_node_t;
 
 /* /proc/stackshot — reading it triggers a full stackshot (all tasks +
@@ -1085,7 +1121,7 @@ static uint32_t
 gen_stackshot(char *buf, uint32_t bufsz)
 {
     (void)bufsz;
-    dump_all_tasks("/proc/stackshot");
+    dump_all_tasks("/proc/stackshot", 1 /* blocking — see stackshot.h */);
     char *p = pfs_strcpy(buf, "stackshot written to kernel log (see serial / dmesg)\n");
     return (uint32_t)(p - buf);
 }
@@ -1102,21 +1138,25 @@ gen_trace(char *buf, uint32_t bufsz)
 }
 
 static const procfs_root_node_t s_proc_root[] = {
-    { "self",    4, S_IFDIR | 0555, (void *)0 },
-    { "meminfo", 8, S_IFREG | 0444, gen_meminfo  },
-    { "version", 8, S_IFREG | 0444, gen_version  },
-    { "cmdline", 8, S_IFREG | 0444, gen_kcmdline },
-    { "kbdstat", 8, S_IFREG | 0444, gen_kbdstat  },
-    { "dmesg",   8, S_IFREG | 0444, gen_dmesg    },
-    { "mounts",  8, S_IFREG | 0444, gen_mounts   },
-    { "usbnet",  8, S_IFREG | 0444, gen_usbnet   },
-    { "uptime",  8, S_IFREG | 0444, gen_uptime   },
-    { "cpuinfo", 8, S_IFREG | 0444, gen_cpuinfo  },
-    { "smart",   8, S_IFREG | 0444, gen_smart    },
-    { "hda",     8, S_IFREG | 0444, gen_hda      },
-    { "tasks",   8, S_IFREG | 0444, gen_tasks    },
-    { "stackshot", 8, S_IFREG | 0444, gen_stackshot },
-    { "trace",   8, S_IFREG | 0444, gen_trace    },
+    { "self",    4, S_IFDIR | 0555, (void *)0,     CAP_KIND_NULL },
+    { "meminfo", 8, S_IFREG | 0444, gen_meminfo,   CAP_KIND_NULL },
+    { "version", 8, S_IFREG | 0444, gen_version,   CAP_KIND_NULL },
+    { "cmdline", 8, S_IFREG | 0444, gen_kcmdline,  CAP_KIND_NULL },
+    { "kbdstat", 8, S_IFREG | 0444, gen_kbdstat,   CAP_KIND_NULL },
+    { "dmesg",   8, S_IFREG | 0440, gen_dmesg,     CAP_KIND_PROC_READ },
+    { "mounts",  8, S_IFREG | 0444, gen_mounts,    CAP_KIND_NULL },
+    { "usbnet",  8, S_IFREG | 0444, gen_usbnet,    CAP_KIND_NULL },
+    { "uptime",  8, S_IFREG | 0444, gen_uptime,    CAP_KIND_NULL },
+    { "cpuinfo", 8, S_IFREG | 0444, gen_cpuinfo,   CAP_KIND_NULL },
+    { "smart",   8, S_IFREG | 0444, gen_smart,     CAP_KIND_NULL },
+    { "hda",     8, S_IFREG | 0444, gen_hda,       CAP_KIND_NULL },
+    { "tasks",   8, S_IFREG | 0444, gen_tasks,     CAP_KIND_NULL },
+    /* stackshot/trace/dmesg: whole-system state and kernel addresses, and
+     * stackshot's dump holds sched_lock across kilobytes of serial output.
+     * Ungated these were an unprivileged system-wide freeze plus a kernel
+     * address leak — PROC_READ, same authority as reading another task. */
+    { "stackshot", 8, S_IFREG | 0440, gen_stackshot, CAP_KIND_PROC_READ },
+    { "trace",   8, S_IFREG | 0440, gen_trace,     CAP_KIND_PROC_READ },
 };
 #define PROCFS_NROOT (sizeof(s_proc_root) / sizeof(s_proc_root[0]))
 
@@ -1421,8 +1461,18 @@ procfs_open(const char *path, int flags, vfs_file_t *out)
 
     /* Global files (registry-driven; "self" has gen==NULL, handled below). */
     for (uint32_t i = 0; i < PROCFS_NROOT; i++) {
-        if (s_proc_root[i].gen && pfs_streq(path, s_proc_root[i].name))
+        if (s_proc_root[i].gen && pfs_streq(path, s_proc_root[i].name)) {
+            if (s_proc_root[i].cap != CAP_KIND_NULL) {
+                aegis_task_t *cur = sched_current();
+                if (!cur || !cur->is_user)
+                    return -EPERM;
+                aegis_process_t *caller = (aegis_process_t *)cur;
+                if (cap_check(caller->caps, CAP_TABLE_SIZE,
+                              s_proc_root[i].cap, CAP_RIGHTS_READ) != 0)
+                    return -EPERM;
+            }
             return procfs_open_global(s_proc_root[i].gen, out);
+        }
     }
 
     /* /proc/self/... → resolve to current pid */

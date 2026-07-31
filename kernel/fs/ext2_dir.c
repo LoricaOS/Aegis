@@ -57,6 +57,13 @@ int ext2_dir_add_entry(uint32_t dir_ino, uint32_t child_ino,
     /* round up to 4-byte boundary */
     needed = (uint16_t)((needed + 3u) & ~3u);
 
+    /* A directory whose i_size exceeds what this driver can address is
+     * corrupt: the walk below is uint32 and would wrap rather than terminate
+     * (see ext2_dir_size). This path MUTATES i_size, so refuse outright
+     * instead of clamping and writing the doctored value back. */
+    if (ext2_dir_size(&dir) != dir.i_size)
+        return -EIO;
+
     /* scan existing directory blocks looking for a slot */
     uint32_t pos = 0;
     uint32_t file_block_idx = 0;
@@ -188,6 +195,10 @@ int ext2_dir_remove_entry(uint32_t dir_ino, const char *name)
     if (name_len32 >= 256u)
         return -1;              /* longer than any ext2 dirent can hold */
     uint8_t name_len = (uint8_t)name_len32;
+
+    /* Corrupt directory inode — see ext2_dir_add_entry above. */
+    if (ext2_dir_size(&dir) != dir.i_size)
+        return -1;
 
     uint32_t pos = 0;
     uint32_t file_block_idx = 0;
