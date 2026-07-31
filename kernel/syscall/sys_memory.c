@@ -107,8 +107,6 @@ sys_brk(uint64_t arg1)
         (arg1 - proc->brk) / 4096UL > MM_MAX_RANGE_PAGES)
         return proc->brk;
 
-    uint64_t old_brk = proc->brk;
-
     if (arg1 > proc->brk) {
         /* Grow: map pages [proc->brk, arg1) into this process's PML4.
          * Zero each page before mapping — Linux brk/sbrk guarantee that
@@ -138,6 +136,22 @@ sys_brk(uint64_t arg1)
                 vma_find(proc, va) != (vma_entry_t *)0)
                 return proc->brk;  /* range collides — leave brk unchanged */
         }
+
+        /* ...and then RESERVE the range atomically before mapping it. The
+         * pre-scan above is advisory only: it and the map loop below share no
+         * lock, so a CLONE_VM sibling could land a MAP_FIXED page inside
+         * [brk, arg1) in between, and vmm_map_user_page PANICs on an
+         * already-present PTE ("double-map"). vma_insert does its overlap test
+         * and its insert under the VMA table lock and returns -2 if the range
+         * is now taken, which is the same atomic-reservation trick sys_mmap's
+         * non-fixed path uses. Reserving with the heap's own prot/type merges
+         * into the existing heap VMA (which ends exactly at brk), so this also
+         * IS the heap-VMA bookkeeping the grow path used to redo by hand
+         * afterwards. */
+        if (vma_insert(proc, proc->brk, arg1 - proc->brk,
+                       0x01 | 0x02, VMA_HEAP) != 0)
+            return proc->brk;  /* raced, or table full — grow refused */
+
         for (va = proc->brk; va < arg1; va += 4096UL) {
             uint64_t phys = pmm_alloc_page();
             if (!phys) {
@@ -152,6 +166,9 @@ sys_brk(uint64_t arg1)
                         pmm_free_page(p);
                     }
                 }
+                /* Give back the reservation taken above, or the heap VMA would
+                 * keep claiming a range brk no longer covers. */
+                (void)vma_remove(proc, proc->brk, arg1 - proc->brk);
                 return proc->brk;  /* OOM — return current brk unchanged */
             }
             vmm_zero_page(phys);
@@ -161,39 +178,14 @@ sys_brk(uint64_t arg1)
         }
         proc->brk = arg1;
 
-        /* Update heap VMA */
-        if (proc->vma_table) {
-            uint32_t vi;
-            int found = 0;
-            for (vi = 0; vi < vma_count_get(proc); vi++) {
-                if (proc->vma_table[vi].type == VMA_HEAP) {
-                    proc->vma_table[vi].len = proc->brk - proc->vma_table[vi].base;
-                    found = 1;
-                    break;
-                }
-            }
-            if (!found) {
-                if (vma_insert(proc, old_brk, proc->brk - old_brk,
-                               0x01 | 0x02, VMA_HEAP) != 0) {
-                    /* VMA table full: the grown range would be mapped but
-                     * untracked (corrupts /proc/maps, defeats teardown). Roll
-                     * back exactly like the OOM path above — unmap+free every
-                     * page mapped THIS call ([old_brk, arg1)) and restore brk.
-                     * brk failure convention (line 76, 60): return the current
-                     * (unchanged) break, NOT -ENOMEM. */
-                    uint64_t v2;
-                    for (v2 = old_brk; v2 < proc->brk; v2 += 4096UL) {
-                        uint64_t p = vmm_phys_of_user_raw(proc->pml4_phys, v2);
-                        if (p) {
-                            vmm_unmap_user_page(proc->pml4_phys, v2);
-                            pmm_free_page(p);
-                        }
-                    }
-                    proc->brk = old_brk;
-                    return proc->brk;
-                }
-            }
-        }
+        /* No heap-VMA fixup here any more: the vma_insert reservation above
+         * already extended (or created) the heap VMA to cover exactly
+         * [heap_base, arg1). The old code re-stretched the first VMA_HEAP
+         * entry's len by hand at this point, which on top of the reservation
+         * would make that entry overlap the range it just reserved — and
+         * overlapping entries are precisely what breaks vma_find's binary
+         * search and the teardown path. VMA_HEAP is only ever created here,
+         * always with prot 0x03, so the reservation always merges. */
     } else if (arg1 < proc->brk) {
         /* Shrink: unmap and free pages [arg1, proc->brk) */
         uint64_t va;
@@ -464,8 +456,10 @@ sys_mmap(uint64_t arg1, uint64_t arg2, uint64_t arg3,
                  * a real meltdown for a big mmap in a fragmented address space
                  * (a self-hosting cc1 spun the kernel for minutes here). A stray
                  * PTE with no VMA is rare, so skip just that page. */
-                vma_entry_t *v = vma_find(proc, sva);
-                if (v) { hit = sva; skip_to = v->base + v->len; break; }
+                vma_entry_t v;
+                if (vma_find_copy(proc, sva, &v)) {
+                    hit = sva; skip_to = v.base + v.len; break;
+                }
                 if (vmm_phys_of_user_raw(proc->pml4_phys, sva) != 0) {
                     hit = sva; skip_to = sva + 4096UL; break;
                 }
@@ -705,23 +699,27 @@ mm_populate_fault(aegis_process_t *proc, uint64_t va)
     if (!proc || !proc->pml4_phys)
         return -1;
     va &= ~0xFFFULL;
-    vma_entry_t *v = vma_find(proc, va);
-    if (!v || (v->type != VMA_MMAP && v->type != VMA_FILE))
+    /* Copy the entry out UNDER the table lock. The previous code called
+     * vma_find (which unlocks before returning) and then "snapshotted" the
+     * fields through the returned pointer — but that snapshot read a slot a
+     * sibling munmap on another CPU could already be shifting, so it could
+     * mix fields from two different mappings and resolve this fault against
+     * the wrong file's backing. */
+    vma_entry_t v;
+    if (!vma_find_copy(proc, va, &v) ||
+        (v.type != VMA_MMAP && v.type != VMA_FILE))
         return -1;
-    if ((v->prot & (PROT_READ | PROT_WRITE | PROT_EXEC)) == 0)
+    if ((v.prot & (PROT_READ | PROT_WRITE | PROT_EXEC)) == 0)
         return -1;                       /* PROT_NONE guard — real fault */
 
-    /* Snapshot the VMA fields now: v points into the shared table, which a
-     * sibling thread could shift (vma_insert/remove) after we drop out of
-     * vma_find's lock. All reads below use the snapshot, not v. */
-    uint8_t  vtype = v->type;
-    uint32_t vprot = v->prot;
-    uint32_t fino  = v->file_ino;
-    uint32_t fgen  = v->file_gen;
-    uint64_t foff  = v->file_off;
-    uint64_t fsize = v->file_size;
-    uint64_t vbase = v->base;
-    uint64_t vlen  = v->len;
+    uint8_t  vtype = v.type;
+    uint32_t vprot = v.prot;
+    uint32_t fino  = v.file_ino;
+    uint32_t fgen  = v.file_gen;
+    uint64_t foff  = v.file_off;
+    uint64_t fsize = v.file_size;
+    uint64_t vbase = v.base;
+    uint64_t vlen  = v.len;
 
     /* Fast path: already present (re-entry, or a sibling thread populated it). */
     if (vmm_phys_of_user_raw(proc->pml4_phys, va))
@@ -943,14 +941,36 @@ sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_size,
     if (flags & ~(uint64_t)MREMAP_MAYMOVE)          /* MREMAP_FIXED unsupported */
         return SYS_ERR(EINVAL);
 
+    /* Bound the range the way mmap/munmap/mprotect/brk all do — mremap was the
+     * one memory syscall that skipped both checks.
+     *
+     * Without the USER_ADDR_MAX test, `mremap(0x10000, 0x1000, ~0UL-0x1FFF)`
+     * makes `ext + glen` wrap 64-bit: the free-space scan below never executes,
+     * vma_insert's successor-overlap test compares against the wrapped end and
+     * passes, and the result is a single VMA spanning the whole address space
+     * that overlaps every existing mapping — breaking the sorted/non-overlapping
+     * invariant vma_find's binary search and teardown rely on, and letting a
+     * later munmap free frames another live VMA still owns (UAF).
+     *
+     * Without the MM_MAX_RANGE_PAGES cap, a large non-wrapping new_size turns
+     * the scan into billions of locked page-table walks with IF=0 — an
+     * unkillable, unpreemptible wedge of this core (see the comment above). */
+    if (old_addr >= USER_ADDR_MAX ||
+        old_size > USER_ADDR_MAX - old_addr ||
+        new_size > USER_ADDR_MAX - old_addr)
+        return SYS_ERR(EINVAL);
+
     uint64_t osz = (old_size + 4095UL) & ~4095UL;
     uint64_t nsz = (new_size + 4095UL) & ~4095UL;
 
-    /* v1: whole anonymous mapping only. */
-    vma_entry_t *v = vma_find(proc, old_addr);
-    if (!v || v->type != VMA_MMAP || v->base != old_addr || v->len != osz)
+    /* v1: whole anonymous mapping only. Copied under the table lock — reading
+     * prot through a post-unlock pointer could pick up a torn/stale value from
+     * a slot a sibling munmap is shifting, and apply it to the resized map. */
+    vma_entry_t v;
+    if (!vma_find_copy(proc, old_addr, &v) || v.type != VMA_MMAP ||
+        v.base != old_addr || v.len != osz)
         return SYS_ERR(EINVAL);
-    uint32_t prot = v->prot;    /* read before any table mutation invalidates v */
+    uint32_t prot = v.prot;
 
     if (nsz == osz)
         return old_addr;
@@ -968,6 +988,8 @@ sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_size,
 
     /* grow: extend in place iff the region right after is entirely free */
     uint64_t ext = old_addr + osz, glen = nsz - osz;
+    if (glen / 4096UL > MM_MAX_RANGE_PAGES)
+        return SYS_ERR(EINVAL);
     for (uint64_t va = ext; va < ext + glen; va += 4096UL) {
         if (vma_find(proc, va) || vmm_phys_of_user_raw(proc->pml4_phys, va))
             return SYS_ERR(ENOMEM);      /* blocked — v1 does not relocate */
