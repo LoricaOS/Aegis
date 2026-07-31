@@ -128,16 +128,37 @@ sys_write(uint64_t arg1, uint64_t arg2, uint64_t arg3)
     while (total < arg3) {
         uint64_t chunk = arg3 - total;
         if (chunk > sizeof(staging)) chunk = sizeof(staging);
-        copy_from_user(staging, (const void *)(uintptr_t)(arg2 + total), chunk);
+        /* `staging` is uninitialized kernel stack, and copy_from_user is
+         * fault-tolerant (exception-table fixup): on a partial fault it
+         * returns bytes-not-copied and leaves the tail of `staging` holding
+         * whatever was on the stack before. Ignoring the return handed those
+         * stale kernel-stack bytes to ops->write, persisting them into a file
+         * or pipe the caller can read back — kernel pointers included.
+         * Reachable by munmapping the source page from a CLONE_VM sibling
+         * while this thread is blocked in a full pipe. */
+        if (copy_from_user(staging, (const void *)(uintptr_t)(arg2 + total),
+                           chunk) != 0) {
+            sched_current()->write_nonblock = 0;
+            f->offset += total;
+            return (total > 0) ? total : SYS_ERR(EFAULT);
+        }
         int r = f->ops->write(f->priv, staging, chunk);
         if (r <= 0) {
             sched_current()->write_nonblock = 0;
+            f->offset += total;   /* advance by what succeeded (see below) */
             return (total > 0) ? total : (uint64_t)(int64_t)r;
         }
         total += (uint64_t)r;
         if ((uint64_t)r < chunk) break;  /* short write — don't retry */
     }
     sched_current()->write_nonblock = 0;
+    /* Advance the file offset by the bytes written, mirroring sys_read. POSIX
+     * requires write() to move the offset; without this a write-only fd keeps
+     * f->offset==0, so a later lseek(SEEK_CUR) reports 0 and (via the fs seek
+     * hook) resets the fs write position to 0 — musl stdio does exactly this
+     * between writes, which made every multi-write tool (echo, cp) clobber
+     * offset 0 and persist only its last byte. */
+    f->offset += total;
     return total;
 }
 
@@ -189,10 +210,12 @@ sys_writev(uint64_t arg1, uint64_t arg2, uint64_t arg3)
     uint64_t i;
     for (i = 0; i < arg3; i++) {
         aegis_iovec_t iov;
-        /* Copy the iovec descriptor from user space */
-        copy_from_user(&iov,
-                       (const void *)(uintptr_t)(arg2 + i * sizeof(aegis_iovec_t)),
-                       sizeof(aegis_iovec_t));
+        /* Copy the iovec descriptor from user space. On a fault `iov` would
+         * otherwise keep stack garbage and be used as a base/length pair. */
+        if (copy_from_user(&iov,
+                           (const void *)(uintptr_t)(arg2 + i * sizeof(aegis_iovec_t)),
+                           sizeof(aegis_iovec_t)) != 0)
+            return (total > 0) ? total : SYS_ERR(EFAULT);
 
         if (iov.iov_len == 0)
             continue;
@@ -208,9 +231,14 @@ sys_writev(uint64_t arg1, uint64_t arg2, uint64_t arg3)
             uint8_t staging[4096];
             uint64_t remaining = iov.iov_len - vec_written;
             uint64_t chunk = remaining > sizeof(staging) ? sizeof(staging) : remaining;
-            copy_from_user(staging,
-                           (const void *)(uintptr_t)(iov.iov_base + vec_written),
-                           chunk);
+            /* Same stale-stack leak as sys_write — see the comment there. */
+            if (copy_from_user(staging,
+                               (const void *)(uintptr_t)(iov.iov_base + vec_written),
+                               chunk) != 0) {
+                if (total == 0)
+                    return SYS_ERR(EFAULT);
+                goto done;
+            }
             int r = proc->fd_table->fds[arg1].ops->write(
                         proc->fd_table->fds[arg1].priv,
                         staging,
@@ -225,6 +253,10 @@ sys_writev(uint64_t arg1, uint64_t arg2, uint64_t arg3)
         total += vec_written;
     }
 done:
+    /* Advance the file offset by bytes written — same reason as sys_write, and
+     * this is the path musl's buffered stdio actually uses (__stdio_write ->
+     * writev), so it is what makes redirected `echo`/`cp` persist correctly. */
+    proc->fd_table->fds[arg1].offset += total;
     return total;
 }
 
@@ -258,9 +290,10 @@ sys_readv(uint64_t arg1, uint64_t arg2, uint64_t arg3)
     uint64_t i;
     for (i = 0; i < arg3; i++) {
         aegis_iovec_t iov;
-        copy_from_user(&iov,
-                       (const void *)(uintptr_t)(arg2 + i * sizeof(aegis_iovec_t)),
-                       sizeof(aegis_iovec_t));
+        if (copy_from_user(&iov,
+                           (const void *)(uintptr_t)(arg2 + i * sizeof(aegis_iovec_t)),
+                           sizeof(aegis_iovec_t)) != 0)
+            return (total > 0) ? total : SYS_ERR(EFAULT);
         if (iov.iov_len == 0)
             continue;
 
@@ -427,7 +460,10 @@ sys_pwrite64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t off)
     uint64_t n = count;
     if (n > 4096) n = 4096;
     if (n > to_end) n = to_end;
-    copy_from_user(kbuf, (const void *)(uintptr_t)buf, n);
+    /* Same stale-stack leak as sys_write, but written at an attacker-chosen
+     * file offset — see the comment there. */
+    if (copy_from_user(kbuf, (const void *)(uintptr_t)buf, n) != 0)
+        return SYS_ERR(EFAULT);
     f->ops->seek(f->priv, off);
     int64_t wrote = (int64_t)f->ops->write(f->priv, kbuf, n);
     f->ops->seek(f->priv, f->offset);    /* restore driver cursor to fd offset */
