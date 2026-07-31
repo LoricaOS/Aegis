@@ -69,6 +69,60 @@ void net_get_config(ip4_addr_t *ip, ip4_addr_t *mask, ip4_addr_t *gw)
     spin_unlock_irqrestore(&ip_lock, fl);
 }
 
+/* ---- static config from the kernel cmdline ----------------------------- */
+/* Token: ip=<A.B.C.D>/<prefix>,<A.B.C.D> (addr/prefixlen,gateway). The microVM
+ * guest's minimal rootfs carries no DHCP client, so lsa passes a fixed address
+ * on the cmdline (the host side — Firecracker + pasta — owns the subnet). No-op
+ * if the token is absent or malformed. */
+static int ipp_octet(const char **s, uint32_t *out)
+{
+    const char *p = *s;
+    uint32_t v = 0; int n = 0;
+    while (*p >= '0' && *p <= '9') {
+        v = v * 10u + (uint32_t)(*p - '0');
+        if (v > 255u) return -1;
+        p++; n++;
+    }
+    if (n == 0) return -1;
+    *s = p; *out = v; return 0;
+}
+
+static int ipp_quad(const char **s, uint32_t *out)   /* returns host-order */
+{
+    uint32_t a, b, c, d;
+    if (ipp_octet(s, &a) || **s != '.') return -1;
+    (*s)++;
+    if (ipp_octet(s, &b) || **s != '.') return -1;
+    (*s)++;
+    if (ipp_octet(s, &c) || **s != '.') return -1;
+    (*s)++;
+    if (ipp_octet(s, &d)) return -1;
+    *out = (a << 24) | (b << 16) | (c << 8) | d;
+    return 0;
+}
+
+void net_config_from_cmdline(void)
+{
+    const char *cmd = arch_get_cmdline();
+    if (!cmd) return;
+
+    const char *p = 0;
+    for (const char *q = cmd; *q; q++)
+        if ((q == cmd || q[-1] == ' ') &&
+            q[0] == 'i' && q[1] == 'p' && q[2] == '=') { p = q + 3; break; }
+    if (!p) return;
+
+    uint32_t ip, gw, prefix;
+    if (ipp_quad(&p, &ip) || *p != '/') return;
+    p++;
+    if (ipp_octet(&p, &prefix) || prefix > 32u || *p != ',') return;
+    p++;
+    if (ipp_quad(&p, &gw)) return;
+
+    uint32_t mask = prefix ? (uint32_t)(0xFFFFFFFFu << (32u - prefix)) : 0u;
+    net_set_config(htonl(ip), htonl(mask), htonl(gw));
+}
+
 /* ---- IP send ----------------------------------------------------------- */
 
 /* s_ip_id — IP identification counter. Shared, so it is bumped under ip_lock.

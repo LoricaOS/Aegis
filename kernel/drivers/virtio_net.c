@@ -16,6 +16,7 @@
  */
 #include "virtio_net.h"
 #include "netdev.h"
+#include "ip.h"      /* net_config_from_cmdline */
 #include "pcie.h"
 #include "kva.h"
 #include "vmm.h"
@@ -113,6 +114,12 @@ typedef struct __attribute__((packed)) {
 static int
 virtio_net_setup_msix(virtio_net_priv_t *p)
 {
+    /* MSI-X is a PCI-transport capability. On virtio-mmio (microVM) there is no
+     * PCI config space to walk — RX is serviced by the LAPIC-timer poll path
+     * (lapic_timer_handler drives timer_bsp_tick when g_ioapic_addr==0). */
+    if (p->dev.is_mmio)
+        return -1;
+
     const pcie_device_t *d = &p->dev.pci;
 
     /* Walk the PCI capability list for the MSI-X capability. */
@@ -262,6 +269,10 @@ virtio_net_init(void)
            s_dev.mac[0], s_dev.mac[1], s_dev.mac[2],
            s_dev.mac[3], s_dev.mac[4], s_dev.mac[5],
            p->msix_ok ? "msix-irq" : "poll");
+
+    /* Apply a static address if the cmdline carries one (microVM path — the
+     * minimal rootfs has no DHCP client). No-op otherwise. */
+    net_config_from_cmdline();
 }
 
 /* Return completed TX descriptors to the free stack. Caller holds tx.lock. */
