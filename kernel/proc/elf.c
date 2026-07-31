@@ -1,4 +1,5 @@
 #include "elf.h"
+#include "fs_ops.h"   /* g_rootfs — elf_interp_trusted */
 #include "arch.h"     /* USER_ADDR_MAX */
 #include "vmm.h"
 #include "kva.h"
@@ -53,6 +54,51 @@ typedef struct {
 #else
 #define EM_CURRENT EM_X86_64
 #endif
+
+/* elf_interp_trusted — gate a PT_INTERP interpreter BEFORE loading it.
+ *
+ * The interpreter's entry point becomes the process's actual RIP, and it runs
+ * inside a process that already holds whatever caps the MAIN binary's path
+ * policy granted. It used to be opened and loaded with no permission check of
+ * any kind — not even the X_OK the main binary gets — and the cap policy is
+ * applied only to the main binary's path, never the interpreter's. So a
+ * policy-privileged binary B (executable but not writable by the attacker)
+ * whose PT_INTERP named a path the attacker CAN write let them run their own
+ * ELF with B's capabilities: the classic setuid-interpreter attack. Latent in
+ * a default install only because the shipped /lib/ld-musl* is root-owned.
+ *
+ * Require: resolvable on the root fs, executable by the caller, root-owned,
+ * and not group/world-writable.
+ *
+ * Deliberately NOT requiring the install-protected trees that cap policy uses
+ * for its own anchors: those are /bin, /sbin, /apps and /etc/aegis, and the
+ * dynamic linker lives in /lib, so that test would reject every dynamically
+ * linked binary on the system. Ownership + write-permission is the check that
+ * actually distinguishes "shipped linker" from "attacker-planted file".
+ *
+ * Returns 1 if the interpreter may be loaded, 0 to refuse. */
+int
+elf_interp_trusted(const char *interp, uint16_t uid, uint16_t gid)
+{
+    uint32_t ino;
+    ext2_inode_t in;
+
+    if (!interp || !g_rootfs || !g_rootfs->open || !g_rootfs->read_inode)
+        return 0;
+    if (g_rootfs->open(interp, &ino) != 0)
+        return 0;                     /* not on the root fs — refuse, as exec
+                                       * already does for backends with no
+                                       * executable bit to consult */
+    if (!g_rootfs->check_perm || g_rootfs->check_perm(ino, uid, gid, 1) != 0)
+        return 0;                     /* not executable by the caller */
+    if (g_rootfs->read_inode(ino, &in) != 0)
+        return 0;
+    if (in.i_uid != 0)
+        return 0;                     /* must be root-owned */
+    if (in.i_mode & 0022)
+        return 0;                     /* group- or world-writable */
+    return 1;
+}
 
 int
 elf_load(struct aegis_process *proc, uint64_t pml4_phys, const uint8_t *data,

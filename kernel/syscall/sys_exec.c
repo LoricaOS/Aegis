@@ -215,7 +215,7 @@ reload_binary:
         if (rr < 0)
             { ret = SYS_ERR(EIO); goto done; }   /* EIO */
         elf_data = (const uint8_t *)ext2_buf;
-        elf_size = vf.size;
+        elf_size = (uint64_t)rr;      /* bytes READ, not declared (M6) */
     }
 
     /* 3.5 Shebang: a "#!" script → re-exec with its interpreter. Done here,
@@ -416,6 +416,13 @@ reload_binary:
             interp_data = (const uint8_t *)initrd_get_data(&interp_f);
             interp_size = (uint64_t)initrd_get_size(&interp_f);
         } else {
+            /* Gate the interpreter (audit M4) — it runs first, with this
+             * process's already-granted caps. */
+            if (!elf_interp_trusted(er.interp, (uint16_t)proc->uid,
+                                    (uint16_t)proc->gid)) {
+                printk("[EXEC] refused untrusted PT_INTERP: %s\n", er.interp);
+                sched_exit(); __builtin_unreachable();
+            }
             vfs_file_t vf;
             int vr = vfs_open(er.interp, 0, 0, &vf);
             if (vr != 0) { sched_exit(); __builtin_unreachable(); }
@@ -432,7 +439,7 @@ reload_binary:
                 sched_exit(); __builtin_unreachable();
             }
             interp_data = (const uint8_t *)interp_buf;
-            interp_size = vf.size;
+            interp_size = (uint64_t)rr;   /* bytes READ, not declared (M6) */
         }
 
         if (elf_load(proc, proc->pml4_phys, interp_data, (size_t)interp_size,
@@ -822,7 +829,7 @@ sys_spawn(uint64_t path_uptr, uint64_t argv_uptr,
             if (vf.ops->close) vf.ops->close(vf.priv);
             if (rr < 0) { result = SYS_ERR(EIO); goto fail_early; }
             elf_data = (const uint8_t *)ext2_buf;
-            elf_size = vf.size;
+            elf_size = (uint64_t)rr;      /* bytes READ, not declared (M6) */
         }
     }
 
@@ -879,6 +886,13 @@ sys_spawn(uint64_t path_uptr, uint64_t argv_uptr,
             interp_data = (const uint8_t *)initrd_get_data(&interp_f);
             interp_size = (uint64_t)initrd_get_size(&interp_f);
         } else {
+            /* Gate the interpreter (audit M4) — same uid/gid the main binary
+             * was X_OK-checked against above. */
+            if (!elf_interp_trusted(er.interp, (uint16_t)parent->uid,
+                                    (uint16_t)parent->gid)) {
+                printk("[EXEC] refused untrusted PT_INTERP: %s\n", er.interp);
+                goto fail_child;
+            }
             vfs_file_t vf;
             int vr = vfs_open(er.interp, 0, 0, &vf);
             if (vr != 0) goto fail_child;
@@ -896,7 +910,7 @@ sys_spawn(uint64_t path_uptr, uint64_t argv_uptr,
                 goto fail_child;
             }
             interp_data = (const uint8_t *)interp_buf;
-            interp_size = vf.size;
+            interp_size = (uint64_t)rr;   /* bytes READ, not declared (M6) */
         }
 
         if (elf_load(child, child->pml4_phys, interp_data, (size_t)interp_size,
