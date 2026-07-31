@@ -66,18 +66,25 @@ _vga_dispatch_csi(char cmd)
         if (s_esc_len == 1 && s_esc_buf[0] == '2')
             _vga_clear_screen();
     } else if (cmd == 'H' || cmd == 'f') {
-        int row = 0, col = 0, i = 0;
+        /* Accumulate UNSIGNED, like drivers/fb.c's parser. As signed int these
+         * overflowed: s_esc_buf holds up to 15 digits, so "4294967295" lands on
+         * -1, which passes a bare `< VGA_ROWS` test and makes the next putchar
+         * write vga[-80] — 160 bytes *before* the framebuffer, into kernel
+         * memory. Unsigned wraps instead of invoking UB, so the clamp below
+         * can't be optimised away and no value can come out negative. */
+        uint32_t row = 0, col = 0;
+        int i = 0;
         while (i < s_esc_len && s_esc_buf[i] >= '0' && s_esc_buf[i] <= '9')
-            row = row * 10 + (s_esc_buf[i++] - '0');
+            row = row * 10u + (uint32_t)(s_esc_buf[i++] - '0');
         if (row > 0) row--;
         if (i < s_esc_len && s_esc_buf[i] == ';') {
             i++;
             while (i < s_esc_len && s_esc_buf[i] >= '0' && s_esc_buf[i] <= '9')
-                col = col * 10 + (s_esc_buf[i++] - '0');
+                col = col * 10u + (uint32_t)(s_esc_buf[i++] - '0');
             if (col > 0) col--;
         }
-        s_row = (row < VGA_ROWS) ? row : VGA_ROWS - 1;
-        s_col = (col < VGA_COLS) ? col : VGA_COLS - 1;
+        s_row = (row < VGA_ROWS) ? (int)row : VGA_ROWS - 1;
+        s_col = (col < VGA_COLS) ? (int)col : VGA_COLS - 1;
         if (vga_available)
             vga_set_cursor(s_row, s_col);
     }

@@ -1165,11 +1165,10 @@ sched_tick(void)
 }
 
 /* dump_all_tasks — stackshot.  Walk the circular all-task list and print each
- * task's identity/state plus a kernel backtrace.  Best-effort & ISR-safe: uses
- * trylock on sched_lock so a SysRq/watchdog dump never deadlocks against code
- * that already holds it.  See stackshot.h. */
+ * task's identity/state plus a kernel backtrace.  See stackshot.h for what
+ * `blocking` selects and why the trylock mode is panic-path-only. */
 void
-dump_all_tasks(const char *reason)
+dump_all_tasks(const char *reason, int blocking)
 {
     aegis_task_t *cur = sched_current();
     printk("[STACKSHOT] ==== all tasks (%s) ====\n", reason ? reason : "?");
@@ -1178,10 +1177,19 @@ dump_all_tasks(const char *reason)
         return;
     }
 
-    irqflags_t fl = arch_irq_save();
-    int locked = spin_trylock(&sched_lock);
-    if (!locked)
-        printk("[STACKSHOT] WARN: sched_lock busy; walk may be inconsistent\n");
+    irqflags_t fl;
+    int locked;
+    if (blocking) {
+        /* Healthy-system caller: the list MUST NOT mutate under the walk — a
+         * concurrent waitpid reaper frees the PCB that `t->next` points at. */
+        fl = spin_lock_irqsave(&sched_lock);
+        locked = 1;
+    } else {
+        fl = arch_irq_save();
+        locked = spin_trylock(&sched_lock);
+        if (!locked)
+            printk("[STACKSHOT] WARN: sched_lock busy; walk may be inconsistent\n");
+    }
 
     aegis_task_t *t = cur;
     int n = 0;

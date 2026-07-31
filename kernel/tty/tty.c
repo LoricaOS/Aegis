@@ -540,6 +540,22 @@ int tty_ioctl(tty_t *tty, uint32_t cmd, uint64_t arg)
         aegis_process_t *proc = (aegis_process_t *)t;
         if (proc->sid != proc->pid) return -1; /* only a session leader */
         irqflags_t pf = spin_lock_irqsave(&tty_global_lock);
+        /* Only claim a tty that is UNCLAIMED, or already ours (idempotent).
+         * This used to overwrite session_id/fg_pgrp unconditionally, so any
+         * unprivileged process holding the console or a PTY on fd 0 could
+         * setsid() (which has no capability gate) and then steal the
+         * controlling terminal out from under its login shell: the shell's
+         * tty_find_controlling(sid) then returns NULL, it takes SIGTTIN on the
+         * next stdin read, and Ctrl-C/SIGTSTP go to the attacker's pgrp
+         * instead. Matches Linux, which requires CAP_SYS_ADMIN to steal an
+         * already-claimed tty. The legitimate caller (login_tty: setsid then
+         * TIOCSCTTY on a fresh slave) is claiming an unclaimed tty and is
+         * unaffected. Checked under the lock so it cannot race another
+         * claimant. */
+        if (tty->session_id != 0 && tty->session_id != proc->sid) {
+            spin_unlock_irqrestore(&tty_global_lock, pf);
+            return -1; /* EPERM — already another session's controlling tty */
+        }
         tty->session_id = proc->sid;
         tty->fg_pgrp    = proc->pgid;
         spin_unlock_irqrestore(&tty_global_lock, pf);
