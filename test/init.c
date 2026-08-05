@@ -824,8 +824,15 @@ void _start(void)
                     /* CLONE_VM|FS|FILES|SIGHAND|THREAD == a real thread: shares
                      * our address space AND our tgid, which is what makes it a
                      * sibling exit_group has to tear down. Stack grows down, so
-                     * hand clone the TOP, 16-aligned. */
-                    long top = (stk + 65536) & ~15L;
+                     * hand clone the TOP, 16-aligned — but leave a page of slack
+                     * BELOW the exact end. A cloned child resumes in the middle
+                     * of _start, which still has a live frame and addresses its
+                     * locals as POSITIVE offsets from rsp (it opens
+                     * `sub $0x890,%rsp`). Handed the exact end, the first such
+                     * access lands past the mapping, where there is no VMA to
+                     * fault against, and the thread takes a SIGSEGV that has
+                     * nothing to do with what it was written to test. */
+                    long top = (stk + 65536 - 4096) & ~15L;
                     long t = sys6(SYS_clone, 0x100 | 0x200 | 0x400 | 0x800 | 0x10000,
                                   top, 0, 0, 0, 0);
                     if (t == 0) {
@@ -895,7 +902,8 @@ void _start(void)
                 /* ---- child: the group LEADER ---- */
                 long stk = sys6(SYS_mmap, 0, 65536, PROT_RW, MAP_ANON_PRIV, -1, 0);
                 if (stk > 0) {
-                    long top = (stk + 65536) & ~15L;
+                    /* Slack below the exact end — see case 14 for the hazard. */
+                    long top = (stk + 65536 - 4096) & ~15L;
                     long t = sys6(SYS_clone, 0x100 | 0x200 | 0x400 | 0x800 | 0x10000,
                                   top, 0, 0, 0, 0);
                     if (t == 0) {
@@ -926,6 +934,66 @@ void _start(void)
         }
         if (ok) { pass++; out("[KTEST] PASS exit_group-from-thread (parent woken)\n"); }
         else out("[KTEST] FAIL exit_group-from-thread\n");
+    }
+
+    /* 16. Reaping a group leader must also free its thread zombies. A thread is
+     *     waitable by nobody — sys_clone sets ppid to the CREATING thread, so a
+     *     sibling's ppid names another thread of the same group and no waitpid
+     *     can ever match it. They used to stay in the task list for the rest of
+     *     the boot, each holding a PCB, a kernel stack and one of the 256
+     *     process slots.
+     *
+     *     Asserting on "fork eventually fails" does NOT discriminate, which is
+     *     worth recording because it is the obvious test to write. Leaked slots
+     *     plateau just below the ceiling: once the count is high enough that the
+     *     child's thread clones fail, the iteration stops leaking, the leader is
+     *     still reaped for -1, and the parent's fork keeps succeeding forever. A
+     *     test built on it passes on the broken kernel.
+     *
+     *     So assert what the leak actually destroys: the ability to CREATE
+     *     threads. Each child reports whether all three of its clones succeeded,
+     *     and one failure fails the case. At three leaked slots per iteration
+     *     that ceiling is reached around iteration 83, so 100 iterations clear
+     *     it with margin while staying well inside the harness timeout. */
+    total++;
+    {
+        int ok = 1;
+        for (int i = 0; i < 100 && ok; i++) {
+            long pid = sys6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);
+            if (pid < 0) { ok = 0; break; }
+            if (pid == 0) {
+                /* ---- child: the group leader ---- */
+                int failed = 0;
+                for (int j = 0; j < 3; j++) {
+                    long stk = sys6(SYS_mmap, 0, 16384, PROT_RW, MAP_ANON_PRIV,
+                                    -1, 0);
+                    if (stk <= 0) { failed = 1; break; }
+                    /* Hand clone a stack pointer with slack ABOVE it. The child
+                     * resumes inside _start, whose locals gcc addresses at
+                     * POSITIVE offsets from rsp (it opens `sub $0x890,%rsp`), so
+                     * an exact-end pointer puts the first spill just past the
+                     * mapping — a SIGSEGV with no VMA to fault against, which is
+                     * the kernel behaving correctly. Cases 14 and 15 get away
+                     * with the exact end only because their thread bodies happen
+                     * to compile to no stack access at all. */
+                    long top = (stk + 16384 - 4096) & ~15L;
+                    long t = sys6(SYS_clone,
+                                  0x100 | 0x200 | 0x400 | 0x800 | 0x10000,
+                                  top, 0, 0, 0, 0);
+                    if (t < 0) { failed = 1; break; }
+                    if (t == 0)
+                        for (;;) sys3(SYS_sched_yield, 0, 0, 0);
+                }
+                sys3(SYS_exit_group, failed, 0, 0);
+            }
+            int st = 0;
+            if (sys6(SYS_wait4, pid, (long)&st, 0, 0, 0, 0) != pid) { ok = 0; break; }
+            /* Non-zero == the child could not create its threads, i.e. the slots
+             * from earlier iterations were never returned. */
+            if (((st >> 8) & 0xff) != 0) { ok = 0; break; }
+        }
+        if (ok) { pass++; out("[KTEST] PASS thread-zombie reap (slots returned)\n"); }
+        else out("[KTEST] FAIL thread-zombie reap\n");
     }
 
     if (pass == total) out("[KTEST] DONE all-pass\n");
