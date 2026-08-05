@@ -1229,6 +1229,57 @@ tcp_listen(uint16_t port, uint32_t sock_id)
     return -1;
 }
 
+/* tcp_unlisten — release the LISTEN slot `owner` holds on `port`, and abort any
+ * connection to it that was never accepted.
+ *
+ * sys_listen records the listener only in s_tcp[]; the sock_t's tcp_conn_id
+ * stays SOCK_NONE, so sock_vfs_close's `connid != SOCK_NONE` teardown never
+ * fired for a listening socket and its slot was never reclaimed. That was a
+ * silent leak until tcp_listen grew its duplicate-listener scan, which turned
+ * it into a hard EADDRINUSE on every re-listen: bind/listen/close/listen on the
+ * same port failed the second listen forever after. Go's net package does
+ * exactly that sequence.
+ *
+ * Matching is on `owner` as well as port, never port alone — otherwise any
+ * NET_SOCKET holder could close out another process's listener and take the
+ * port, which is the squatting hole the duplicate scan exists to prevent.
+ *
+ * The second loop reclaims connections that completed a handshake but were
+ * never handed to accept(): they are queued in the listener's accept_queue (or
+ * still SYN_RCVD), and closing the listener discards that queue, so nothing
+ * would ever close them and each leaks an s_tcp[] slot. They are identified by
+ * sock_id == SOCK_NONE, which is precisely "no socket owns this yet" — accept()
+ * assigns the real id via tcp_conn_set_sock, so an ALREADY-ACCEPTED connection
+ * fails that test and is left untouched. That distinction is load-bearing:
+ * listener_id is never cleared on accept, so matching on it alone would RST
+ * live, accepted connections out from under their owners when the listener
+ * closes. Closing a listening socket must not disturb connections already
+ * accepted from it. */
+void
+tcp_unlisten(uint32_t owner, uint16_t port)
+{
+    irqflags_t fl = spin_lock_irqsave(&tcp_lock);
+    uint32_t i;
+    for (i = 0; i < TCP_MAX_CONNS; i++) {
+        if (s_tcp[i].state == TCP_LISTEN &&
+            s_tcp[i].local_port == port &&
+            s_tcp[i].sock_id == owner)
+            s_tcp[i].state = TCP_CLOSED;   /* reclaimable by tcp_claim_slot */
+    }
+    for (i = 0; i < TCP_MAX_CONNS; i++) {
+        if (s_tcp[i].state == TCP_CLOSED) continue;
+        if (s_tcp[i].listener_id != owner) continue;
+        if (s_tcp[i].sock_id != SOCK_NONE) continue;  /* accepted — not ours */
+        /* Never delivered to a socket: RST the peer rather than leave it
+         * believing an ESTABLISHED connection survives (same reasoning as
+         * tcp_conn_abort, inlined here to keep one tcp_lock acquisition). */
+        if (s_tcp[i].dev)
+            tcp_send_segment(s_tcp[i].dev, &s_tcp[i], TCP_RST | TCP_ACK, NULL, 0);
+        s_tcp[i].state = TCP_CLOSED;
+    }
+    spin_unlock_irqrestore(&tcp_lock, fl);
+}
+
 /* tcp_connect: send SYN, allocate conn. Returns 0 on success. */
 int
 tcp_connect(uint32_t sock_id, ip4_addr_t dst_ip, uint16_t dst_port,
