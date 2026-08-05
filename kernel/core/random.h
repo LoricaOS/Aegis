@@ -26,6 +26,14 @@ void random_add_entropy(const void *data, size_t len);
  * Always succeeds (pool is seeded at boot). Returns 0. */
 int random_get_bytes(void *buf, size_t len);
 
+/* random_is_ready — 1 once the pool has been seeded from a real entropy source
+ * (the CPU's hardware RNG at init, or enough accumulated interrupt/device
+ * entropy since). Deliberately advisory: random_get_bytes does NOT block on
+ * it, because it is called from early boot paths (ASLR at process spawn) where
+ * blocking would hang the machine rather than degrade it. It exists so callers
+ * that CAN wait, and the boot log, can tell the difference. */
+int random_is_ready(void);
+
 /* Called from interrupt handlers to mix in cycle-counter jitter.
  * Cheaper than random_add_entropy — just mixes one 64-bit timestamp. */
 void random_add_interrupt_entropy(void);

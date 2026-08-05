@@ -198,6 +198,17 @@ int memfd_truncate(uint32_t id, uint64_t size)
     memfd_t *mf = memfd_get(id);
     if (!mf) { spin_unlock_irqrestore(&memfd_lock, fl); return -EBADF; }
 
+    /* Bound `size` BEFORE the round-up. sys_ftruncate passes the user's 64-bit
+     * length straight through, so ftruncate(fd, 0xFFFFFFFFFFFFF001) made
+     * `size + 4095` wrap to a small value and `new_pages` come out 0 — sailing
+     * past the cap below. No OOB followed (reads clamp to mf->size and the
+     * page_idx < page_count test routes everything to the zero-fill branch),
+     * but the 8 MiB ceiling was circumvented and st_size reported a nonsense
+     * value. */
+    if (size > (uint64_t)MEMFD_PAGES_MAX * 4096ULL) {
+        spin_unlock_irqrestore(&memfd_lock, fl);
+        return -ENOMEM;
+    }
     uint32_t new_pages = (uint32_t)((size + 4095) / 4096);
     if (new_pages > MEMFD_PAGES_MAX) {
         spin_unlock_irqrestore(&memfd_lock, fl);

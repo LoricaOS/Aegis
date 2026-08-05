@@ -290,6 +290,7 @@ isr_dispatch(cpu_state_t *s)
          * or OOM falls through to the exception-table fixup below unchanged. */
         if (s->cs == ARCH_KERNEL_CS && s->vector == 14 &&
             (s->error_code & 1) && (s->error_code & 2) &&
+            ex_table_lookup(s->rip) &&
             sched_current() && sched_current()->is_user) {
             uint64_t cr2;
             __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
@@ -298,6 +299,16 @@ isr_dispatch(cpu_state_t *s)
                 vmm_cow_fault_handle(cp->pml4_phys, cr2) == 0)
                 return;   /* COW broken → retry the faulting kernel write */
         }
+        /* NOTE (audit L17): both kernel-mode branches here now require the
+         * faulting RIP to be a REGISTERED uaccess site (ex_table_lookup).
+         * They used to accept any kernel RIP faulting on any user address, so
+         * a genuine kernel pointer-confusion bug that happened to land in the
+         * user half was silently *resolved* — page populated or COW broken,
+         * instruction retried — instead of reaching the exception-table check
+         * and panicking. That masks exactly the class of bug this handler
+         * exists to surface. The intended users (copy_*_user's rep movsb, the
+         * arm64 ldr/str pair) are all registered; the one unregistered direct
+         * user deref was the TCP read path, fixed to bounce (audit L11). */
         /* Demand paging for KERNEL-mode accesses (copy_*_user et al.): a
          * NOT-PRESENT (#PF err.P==0) fault on a lazy anonymous user page.
          * Without this, a kernel copy into/out of a not-yet-faulted lazy buffer
@@ -310,6 +321,7 @@ isr_dispatch(cpu_state_t *s)
          * non-zero and falls through to the exception-table fixup unchanged. */
         if (s->cs == ARCH_KERNEL_CS && s->vector == 14 &&
             !(s->error_code & 1) &&
+            ex_table_lookup(s->rip) &&
             sched_current() && sched_current()->is_user) {
             uint64_t cr2;
             __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));

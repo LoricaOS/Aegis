@@ -237,7 +237,13 @@ arm64_fault_el1(cpu_state_t *s)
         uint64_t dfsc = esr & 0x3F;
         int is_write  = (esr & (1UL << 6)) != 0;
         aegis_task_t *t = sched_current();
-        if (t && t->is_user && far <= USER_ADDR_MAX) {
+        /* Require the faulting PC to be a REGISTERED uaccess site, as the x86
+         * side now does (audit L17). Accepting any EL1 PC faulting on any user
+         * address silently resolved genuine kernel pointer-confusion bugs that
+         * happened to land in the user half — populating a page and retrying —
+         * instead of falling through to the fixup/panic below that would have
+         * surfaced them. */
+        if (t && t->is_user && far <= USER_ADDR_MAX && ex_table_lookup(s->elr)) {
             aegis_process_t *proc = (aegis_process_t *)t;
             if (dfsc >= 0x04 && dfsc <= 0x07) {           /* not-present → demand-page */
                 if (mm_populate_fault(proc, far) == 0)

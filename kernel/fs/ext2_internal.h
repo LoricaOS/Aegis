@@ -77,6 +77,18 @@ uint8_t *cache_get_slot(uint32_t block_num);
 /* ── Inode + block helpers — defined in ext2.c ─────────────────────────── */
 int      ext2_read_inode(uint32_t ino, ext2_inode_t *out);
 int      ext2_write_inode(uint32_t ino, const ext2_inode_t *inode);
+/* ext2_dir_size — the byte length a directory walk may traverse for `inode`.
+ *
+ * ext2_read caps regular files against ext2_max_file_size(), but the directory
+ * walkers took i_size on trust. A crafted directory inode with
+ * i_size = 0xFFFFFFFF and a sparse i_block[] made every walker spin forever:
+ * the uint32 position counter advances by s_block_size on the "sparse block,
+ * skip it" path, wraps past 0xFFFFF000 back to 0, and is still < 0xFFFFFFFF.
+ * That loop runs under ext2_lock, so on SMP it hangs every other CPU touching
+ * the filesystem. ext2_max_file_size() returns at most 0xFFFFFFFF - s_block_size,
+ * so clamping here also guarantees `pos += s_block_size` cannot wrap. */
+uint32_t ext2_dir_size(const ext2_inode_t *inode);
+
 uint32_t ext2_block_num(const ext2_inode_t *inode, uint32_t file_block);
 uint32_t ext2_alloc_block(uint32_t preferred_group);
 uint32_t ext2_alloc_inode(uint32_t preferred_group);

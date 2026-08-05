@@ -104,7 +104,7 @@ sysrq_handle(unsigned char cmd)
 {
     switch (cmd) {
     case 't':
-        dump_all_tasks("sysrq-t");
+        dump_all_tasks("sysrq-t", 0 /* trylock — may run against a wedged CPU */);
         break;
     case 'r':
         trace_dump("sysrq-r");

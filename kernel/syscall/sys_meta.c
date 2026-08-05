@@ -289,7 +289,16 @@ sys_readlink(uint64_t arg1, uint64_t arg2, uint64_t arg3)
     if (resolve_path(path, proc->cwd, resolved, sizeof(resolved)) != 0)
         return SYS_ERR(ENAMETOOLONG);
 
-    uint32_t bufsiz = (uint32_t)arg3;
+    char kbuf[256];
+
+    /* Clamp in 64-bit BEFORE narrowing to uint32, and reject 0. A bufsiz of
+     * exactly 2^32 would otherwise truncate to 0 here, and a 0 reaching the
+     * backend underflows its `bufsiz - 1` into a ~4G-byte copy (the backend
+     * rejects it too — this is the defence-in-depth half). */
+    if (arg3 == 0)
+        return SYS_ERR(EINVAL);
+    uint32_t bufsiz = (arg3 > sizeof(kbuf)) ? (uint32_t)sizeof(kbuf)
+                                            : (uint32_t)arg3;
 
     /* /proc/self/exe → the calling process's binary path (set at execve).
      * procfs is not ext2-backed, so handle this readlink here before
@@ -308,9 +317,6 @@ sys_readlink(uint64_t arg1, uint64_t arg2, uint64_t arg3)
             return (uint64_t)len;
         }
     }
-
-    char kbuf[256];
-    if (bufsiz > sizeof(kbuf)) bufsiz = sizeof(kbuf);
 
     int n = g_rootfs->readlink(resolved, kbuf, bufsiz);
     if (n < 0) return (uint64_t)(int64_t)n;

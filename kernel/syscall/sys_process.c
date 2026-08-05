@@ -5,6 +5,7 @@
 #include "signal.h"
 #include "vfs.h"
 #include "vmm.h"
+#include "pmm.h"   /* pmm_free_page — kernel-stack guard page */
 #include "kva.h"
 #include "tty.h"
 #include "printk.h"
@@ -490,7 +491,20 @@ sys_clone(syscall_frame_t *frame, uint64_t flags, uint64_t child_stack,
     fpu_state_save_live(&child->task);
 
     /* 6. Allocate child kernel stack (4 pages / 16 KB). */
-    uint8_t *kstack = kva_alloc_pages(4);
+    /* 4 usable pages + one unmapped guard page below them (audit M10),
+     * mirroring sched.c's kernel-task stacks. kva_alloc_pages returns
+     * contiguous mapped pages, so without the guard a kernel-stack overflow
+     * silently scribbles over the adjacent kva allocation (another PCB or
+     * stack) instead of taking a clean fault. stack_pages stays 4 — it counts
+     * usable pages, so the teardown path is unchanged and the guard VA is
+     * abandoned, exactly as sched.c does. */
+    uint8_t *kstack = kva_alloc_pages(4 + 1);
+    if (kstack) {
+        uint64_t guard_phys = kva_page_phys(kstack);
+        vmm_unmap_page((uint64_t)(uintptr_t)kstack);
+        pmm_free_page(guard_phys);
+        kstack += 4096UL;
+    }
     if (!kstack) {
         /* Security: undo all allocations made before this point.
          * fd_table was ref'd or copied at step 3, vma_share
@@ -899,7 +913,20 @@ sys_fork(syscall_frame_t *frame, uint64_t u_rdi, uint64_t u_rsi, uint64_t u_rdx)
     /* 5. Allocate child kernel stack (4 pages / 16 KB — same as proc_spawn).
      * pipe_write_fn's 4060-byte staging buffer requires at least 4 pages;
      * see proc.c KSTACK_NPAGES comment for the full budget analysis. */
-    uint8_t *kstack = kva_alloc_pages(4);
+    /* 4 usable pages + one unmapped guard page below them (audit M10),
+     * mirroring sched.c's kernel-task stacks. kva_alloc_pages returns
+     * contiguous mapped pages, so without the guard a kernel-stack overflow
+     * silently scribbles over the adjacent kva allocation (another PCB or
+     * stack) instead of taking a clean fault. stack_pages stays 4 — it counts
+     * usable pages, so the teardown path is unchanged and the guard VA is
+     * abandoned, exactly as sched.c does. */
+    uint8_t *kstack = kva_alloc_pages(4 + 1);
+    if (kstack) {
+        uint64_t guard_phys = kva_page_phys(kstack);
+        vmm_unmap_page((uint64_t)(uintptr_t)kstack);
+        pmm_free_page(guard_phys);
+        kstack += 4096UL;
+    }
     if (!kstack) {
         vmm_free_user_pml4(child->pml4_phys);
         /* Release the copied fd_table through its refcount/close path, not a

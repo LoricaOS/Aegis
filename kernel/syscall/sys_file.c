@@ -107,7 +107,17 @@ sys_open(uint64_t arg1, uint64_t arg2, uint64_t arg3)
                 continue;
             }
             if (ni > 1) norm[ni++] = '/';
-            for (uint64_t k = 0; k < slen && ni < 254; k++)
+            /* Refuse rather than silently truncate. The `ni < 254` bound used
+             * to just stop copying, so an over-long path normalized to a
+             * DIFFERENT, shorter path — two distinct inputs collapsing to one
+             * key, and the normalized form no longer naming what the caller
+             * asked for. Defence-in-depth only (the authoritative check is the
+             * inode-based path_under_protected / vfs_open_ex gate), but a
+             * normalizer that quietly changes its answer is the wrong
+             * primitive to have underneath those. (audit L4) */
+            if (slen > 254 - ni)
+                return SYS_ERR(ENAMETOOLONG);
+            for (uint64_t k = 0; k < slen; k++)
                 norm[ni++] = seg[k];
         }
         if (ni == 0) norm[ni++] = '/';
@@ -217,6 +227,12 @@ sys_openat(uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4)
 int
 stat_copy_path(uint64_t user_ptr, char *out, uint32_t bufsz)
 {
+    /* bufsz is uint32 and the loop runs to `bufsz - 1`, so a zero bufsz would
+     * underflow to 0xFFFFFFFF iterations of OOB writes. Not reachable today
+     * (every caller passes a compile-time sizeof), but the guard costs nothing
+     * and the next runtime-bufsz caller would not think to add it. (audit L3) */
+    if (bufsz == 0)
+        return -EINVAL;
     uint32_t i;
     /* user_ptr_valid walks page tables; cache the validated page so a
      * path costs at most two walks, not one per byte. */
@@ -934,6 +950,8 @@ sys_getrusage(uint64_t who, uint64_t ubuf)
 int
 copy_path_from_user(char *kpath, uint64_t user_ptr, uint32_t bufsz)
 {
+    if (bufsz == 0)
+        return -EINVAL;                 /* `bufsz - 1` underflow — audit L3 */
     uint32_t i;
     /* user_ptr_valid walks page tables; cache the validated page so a
      * path costs at most two walks, not one per byte. */

@@ -39,6 +39,10 @@ typedef struct {
  * vma_table (e.g. early init before vma_init), in which case VMA recording is
  * skipped. */
 struct aegis_process;
+/* Gate a PT_INTERP interpreter before loading it — see elf.c for the threat
+ * model. Returns 1 if it may be loaded, 0 to refuse. */
+int elf_interp_trusted(const char *interp, uint16_t uid, uint16_t gid);
+
 int elf_load(struct aegis_process *proc, uint64_t pml4_phys, const uint8_t *data,
              size_t len, uint64_t base, elf_load_result_t *out);
 

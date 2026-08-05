@@ -93,18 +93,39 @@ vfs_scope_allows(const char *path)
     aegis_process_t *proc = current_proc();
     if (!proc || proc->vfs_scope_len == 0) return 1;   /* unconfined */
 
-    char abs[256];
+    /* Sized for cwd + '/' + path. This used to be abs[256], which SILENTLY
+     * TRUNCATED: cwd is char[256] and path is up to 255 chars, so the joined
+     * form reaches 511. The truncated string was then canonicalized and
+     * prefix-matched, while the backend (g_rootfs->open) received the FULL
+     * untruncated path — so a confined process could pass a path whose first
+     * 255 bytes canonicalize inside its scope while the real suffix escaped it
+     * via "..". Keep the bounds checks anyway and fail CLOSED if anything
+     * still does not fit: a path we cannot fully evaluate is not one we can
+     * declare in-scope. */
+    char abs[512];
     uint32_t i = 0;
     if (path[0] == '/') {
-        for (; path[i] && i < sizeof(abs) - 1; i++) abs[i] = path[i];
+        for (; path[i]; i++) {
+            if (i >= sizeof(abs) - 1) return 0;
+            abs[i] = path[i];
+        }
     } else {
-        for (; proc->cwd[i] && i < sizeof(abs) - 1; i++) abs[i] = proc->cwd[i];
-        if (i == 0 || abs[i - 1] != '/') { if (i < sizeof(abs) - 1) abs[i++] = '/'; }
-        for (uint32_t j = 0; path[j] && i < sizeof(abs) - 1; j++) abs[i++] = path[j];
+        for (; proc->cwd[i]; i++) {
+            if (i >= sizeof(abs) - 1) return 0;
+            abs[i] = proc->cwd[i];
+        }
+        if (i == 0 || abs[i - 1] != '/') {
+            if (i >= sizeof(abs) - 1) return 0;
+            abs[i++] = '/';
+        }
+        for (uint32_t j = 0; path[j]; j++) {
+            if (i >= sizeof(abs) - 1) return 0;
+            abs[i++] = path[j];
+        }
     }
     abs[i] = '\0';
 
-    char canon[256];
+    char canon[512];
     path_canonicalize(abs, canon, sizeof(canon));
 
     uint32_t L = proc->vfs_scope_len;

@@ -121,6 +121,35 @@ vma_entry_t *vma_find(struct aegis_process *proc, uint64_t va) {
     return result;
 }
 
+/* vma_find_copy — like vma_find, but COPIES the entry out under the table lock.
+ *
+ * Use this whenever the caller needs the entry's contents rather than just
+ * "does a VMA cover this address". vma_find returns a raw pointer into the
+ * shared table AFTER dropping the lock: IF=0 only masks interrupts on the
+ * local CPU, so a CLONE_VM sibling on another CPU can take the lock and run
+ * vma_remove → vma_shift_left, which overwrites *result with a different entry
+ * or tears it mid-copy (table[i] = table[i+1] is a non-atomic 48-byte struct
+ * copy). A caller "snapshotting" the fields after vma_find returns is reading
+ * from that racing slot, so the snapshot is not atomic — it can mix fields
+ * from two different mappings, e.g. resolving a fault against one file's
+ * backing at another file's offset. Returns 1 and fills *out on a hit. */
+int vma_find_copy(struct aegis_process *proc, uint64_t va, vma_entry_t *out) {
+    if (!proc || !proc->vma_table || !out) return 0;
+    spinlock_t *lk = vlock(proc);
+    irqflags_t fl = spin_lock_irqsave(lk);
+    vma_entry_t *t = proc->vma_table;
+    int found = 0;
+    int lo = 0, hi = (int)*vcnt(proc) - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (va < t[mid].base) hi = mid - 1;
+        else if (va >= t[mid].base + t[mid].len) lo = mid + 1;
+        else { *out = t[mid]; found = 1; break; }
+    }
+    spin_unlock_irqrestore(lk, fl);
+    return found;
+}
+
 /* vma_range_covered — 1 if [addr, addr+len) is fully spanned by VMAs. Walks VMA
  * to VMA (jumping to each one's end), not page to page, so it's O(VMAs spanned)
  * rather than a per-page windowed PTE walk. Matches vma_find's per-call locking
@@ -131,9 +160,9 @@ int vma_range_covered(struct aegis_process *proc, uint64_t addr, uint64_t len) {
     uint64_t end = addr + len;
     uint64_t va  = addr & ~0xFFFULL;
     while (va < end) {
-        vma_entry_t *v = vma_find(proc, va);
-        if (!v) return 0;                 /* hole → not covered */
-        uint64_t vend = v->base + v->len;
+        vma_entry_t v;
+        if (!vma_find_copy(proc, va, &v)) return 0;   /* hole → not covered */
+        uint64_t vend = v.base + v.len;
         if (vend <= va) return 0;         /* defensive: no forward progress */
         va = vend;                        /* skip to the end of this VMA */
     }

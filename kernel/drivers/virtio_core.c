@@ -190,7 +190,12 @@ virtio_setup_queue(virtio_dev_t *d, uint16_t qidx, virtq_t *vq)
     if (d->is_mmio) {
         mmio_wr(d, VMMIO_QUEUE_SEL, qidx);
         uint16_t dev_max = (uint16_t)mmio_rd(d, VMMIO_QUEUE_NUM_MAX);
-        if (dev_max == 0)
+        /* The spec requires a power of two, and VQ_MASK(vq) = size-1 is only a
+         * valid modulo for one. With e.g. 3, `ai & (size-1)` and the device's
+         * `idx % size` diverge, so the driver reads used-ring slots the device
+         * never wrote — silent desync/stalled I/O with a broken or malicious
+         * device. No OOB (all indices stay < size <= 256). (audit L13) */
+        if (dev_max == 0 || (dev_max & (uint16_t)(dev_max - 1)))
             return -1;
         qsz = (dev_max < VIRTQ_SIZE) ? dev_max : (uint16_t)VIRTQ_SIZE;
 
@@ -215,8 +220,8 @@ virtio_setup_queue(virtio_dev_t *d, uint16_t qidx, virtq_t *vq)
     volatile virtio_pci_common_cfg_t *c = d->common;
     c->queue_select = qidx;
     uint16_t dev_max = c->queue_size;
-    if (dev_max == 0)
-        return -1;
+    if (dev_max == 0 || (dev_max & (uint16_t)(dev_max - 1)))
+        return -1;                       /* must be a power of two — audit L13 */
     qsz = (dev_max < VIRTQ_SIZE) ? dev_max : (uint16_t)VIRTQ_SIZE;
     c->queue_size = qsz;
 

@@ -44,7 +44,10 @@ void vma_set_file_backing(struct aegis_process *proc, uint64_t base,
 void vma_init(struct aegis_process *proc);
 
 /* vma_find — VMA entry containing va, or NULL. Used by demand-paging fault. */
+/* Existence test only — the returned pointer is into the shared table and is
+ * NOT stable once the lock is dropped. To read any field, use vma_find_copy. */
 vma_entry_t *vma_find(struct aegis_process *proc, uint64_t va);
+int vma_find_copy(struct aegis_process *proc, uint64_t va, vma_entry_t *out);
 
 /* vma_range_covered — 1 if [addr, addr+len) is fully spanned by VMAs (no hole).
  * Cheap (O(VMAs spanned) binary searches) — the uaccess fast path uses it to

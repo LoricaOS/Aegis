@@ -160,7 +160,14 @@ run_list_remove_locked(aegis_task_t *task)
  * prevents).  All access is under sched_lock (task_pickable reads it there).
  * Bounded by CPU count in practice; on the never-hit overflow we simply skip
  * freezing that vfork (best-effort, never a corrupt set). */
-#define VFORK_FROZEN_MAX 16
+/* Sized so the set CANNOT overflow: a thread group has at most one vfork in
+ * flight, so there can never be more frozen tgids than process slots. It was
+ * 16, with the overflow documented as "never hit" — but ~17 thread groups all
+ * vforking at once is reachable from hostile userspace, and the 17th silently
+ * skipped its freeze, letting siblings run in the address space that vfork
+ * child still shares: exactly the corruption the freeze exists to prevent.
+ * 256 * 4 B = 1 KiB of BSS to make the failure mode impossible. (audit L12) */
+#define VFORK_FROZEN_MAX AEGIS_MAX_PROCESSES
 static uint32_t s_vfork_frozen[VFORK_FROZEN_MAX];
 static uint32_t s_vfork_frozen_count = 0;
 
@@ -1165,11 +1172,10 @@ sched_tick(void)
 }
 
 /* dump_all_tasks — stackshot.  Walk the circular all-task list and print each
- * task's identity/state plus a kernel backtrace.  Best-effort & ISR-safe: uses
- * trylock on sched_lock so a SysRq/watchdog dump never deadlocks against code
- * that already holds it.  See stackshot.h. */
+ * task's identity/state plus a kernel backtrace.  See stackshot.h for what
+ * `blocking` selects and why the trylock mode is panic-path-only. */
 void
-dump_all_tasks(const char *reason)
+dump_all_tasks(const char *reason, int blocking)
 {
     aegis_task_t *cur = sched_current();
     printk("[STACKSHOT] ==== all tasks (%s) ====\n", reason ? reason : "?");
@@ -1178,10 +1184,19 @@ dump_all_tasks(const char *reason)
         return;
     }
 
-    irqflags_t fl = arch_irq_save();
-    int locked = spin_trylock(&sched_lock);
-    if (!locked)
-        printk("[STACKSHOT] WARN: sched_lock busy; walk may be inconsistent\n");
+    irqflags_t fl;
+    int locked;
+    if (blocking) {
+        /* Healthy-system caller: the list MUST NOT mutate under the walk — a
+         * concurrent waitpid reaper frees the PCB that `t->next` points at. */
+        fl = spin_lock_irqsave(&sched_lock);
+        locked = 1;
+    } else {
+        fl = arch_irq_save();
+        locked = spin_trylock(&sched_lock);
+        if (!locked)
+            printk("[STACKSHOT] WARN: sched_lock busy; walk may be inconsistent\n");
+    }
 
     aegis_task_t *t = cur;
     int n = 0;

@@ -106,9 +106,59 @@ mix64(uint64_t x)
     return x;
 }
 
+/* ── Hardware RNG (audit L15) ─────────────────────────────────────────────
+ * s_entropy_count is a REKEY trigger and is reset every rekey, so it cannot
+ * answer "has this pool ever been meaningfully seeded". s_seed_credits is the
+ * cumulative counter that can, and s_rng_ready latches once the pool is
+ * trustworthy — either because the CPU's hardware RNG seeded it at init, or
+ * because enough interrupt/device entropy has since accumulated. */
+static uint32_t s_seed_credits;
+static int      s_rng_ready;
+#define RNG_READY_CREDITS 64u
+
+#ifdef __x86_64__
+/* CPUID.01H:ECX[30] = RDRAND. Present on essentially every x86-64 since Ivy
+ * Bridge, and unlike virtio-rng it needs no device — which is exactly the
+ * case this closes: a deterministic VM with no virtio-rng seeded the entire
+ * 256-bit key and 64-bit nonce from four cycle-counter reads and one tick. */
+static int hw_rng_supported(void)
+{
+    uint32_t a, b, c, d;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                             : "a"(1u), "c"(0u));
+    (void)a; (void)b; (void)d;
+    return (c >> 30) & 1u;
+}
+
+static int hw_rng_read(uint64_t *out)
+{
+    unsigned char ok = 0;
+    uint64_t v = 0;
+    /* RDRAND may transiently fail; the ISA recommends ~10 retries. */
+    for (int i = 0; i < 10; i++) {
+        __asm__ volatile("rdrand %0; setc %1" : "=r"(v), "=qm"(ok) : : "cc");
+        if (ok) { *out = v; return 1; }
+    }
+    return 0;
+}
+#else
+static int hw_rng_supported(void) { return 0; }
+static int hw_rng_read(uint64_t *out) { (void)out; return 0; }
+#endif
+
+int
+random_is_ready(void)
+{
+    if (!s_rng_ready &&
+        __atomic_load_n(&s_seed_credits, __ATOMIC_RELAXED) >= RNG_READY_CREDITS)
+        s_rng_ready = 1;
+    return s_rng_ready;
+}
+
 void
 random_add_entropy(const void *data, size_t len)
 {
+    __atomic_fetch_add(&s_seed_credits, (uint32_t)len, __ATOMIC_RELAXED);
     const uint8_t *p = (const uint8_t *)data;
     size_t i;
     uint64_t v = 0;
@@ -129,6 +179,7 @@ random_add_interrupt_entropy(void)
      * lost updates when two CPUs XOR/increment simultaneously. */
     __atomic_fetch_xor(&s_entropy_acc, mix64(arch_get_cycles()), __ATOMIC_RELAXED);
     __atomic_fetch_add(&s_entropy_count, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&s_seed_credits, 1, __ATOMIC_RELAXED);
 }
 
 /* ── Re-key: fold accumulated entropy into ChaCha20 key ──────────────── */
@@ -196,6 +247,19 @@ refill_buf(void)
 int
 random_get_bytes(void *buf, size_t len)
 {
+    /* Advisory readiness notice (audit L15). Deliberately does NOT block:
+     * this is called from early-boot paths (per-process ASLR at spawn), and
+     * blocking there hangs the machine instead of degrading it. Warn once so
+     * an entropy-starved boot is visible rather than silent. */
+    if (!random_is_ready()) {
+        static int warned;
+        if (!warned) {
+            warned = 1;
+            printk("[RNG] WARN: serving bytes before the pool is fully seeded "
+                   "(no hardware RNG; entropy still accumulating)\n");
+        }
+    }
+
     irqflags_t fl = spin_lock_irqsave(&rng_lock);
     uint8_t *dst = (uint8_t *)buf;
     while (len > 0) {
@@ -250,6 +314,30 @@ random_init(void)
     s_state[14] = (uint32_t)mix64(t4);
     s_state[15] = (uint32_t)(mix64(t4) >> 32);
 
+    /* Fold the CPU's hardware RNG into the seed UNCONDITIONALLY when present,
+     * before the priming rekey below spreads it over every key bit. On a VM
+     * without virtio-rng this is the difference between a 256-bit key derived
+     * from five timer reads and one derived from a real entropy source.
+     * (audit L15) */
+    if (hw_rng_supported()) {
+        int got = 0;
+        for (int i = 0; i < 4; i++) {
+            uint64_t hw;
+            if (!hw_rng_read(&hw))
+                break;
+            s_state[4 + i * 2] ^= (uint32_t)hw;
+            s_state[5 + i * 2] ^= (uint32_t)(hw >> 32);
+            got++;
+        }
+        uint64_t hwn;
+        if (hw_rng_read(&hwn)) {
+            s_state[14] ^= (uint32_t)hwn;
+            s_state[15] ^= (uint32_t)(hwn >> 32);
+        }
+        if (got == 4)
+            s_rng_ready = 1;   /* hardware-seeded — trustworthy from boot */
+    }
+
     /* Prime the buffer */
     s_buf_pos = 64;  /* force refill on first request */
     s_blocks_since_rekey = 0;
@@ -261,5 +349,6 @@ random_init(void)
      * providing avalanche over all seed bits. */
     rekey();
 
-    printk("[RNG] OK: ChaCha20 CSPRNG seeded\n");
+    printk("[RNG] OK: ChaCha20 CSPRNG seeded (%s)\n",
+           s_rng_ready ? "hardware RNG" : "timing only — awaiting entropy");
 }

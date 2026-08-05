@@ -5,15 +5,29 @@
  * its copy so they can never disagree.
  *
  * THE BUG THIS PREVENTS (highest-SAFETY payoff of the Tier-1 set):
- * copy_from_user / copy_to_user (uaccess.h) have NO fault-fixup table. A
- * kernel-mode #PF on an unmapped user pointer is UNRECOVERABLE — it panics the
- * kernel. So every copy MUST be preceded by user_ptr_valid() over the SAME
- * range. The hand-written idiom is:
+ * copy_from_user / copy_to_user (uaccess.h) ARE fault-tolerant: the `rep movsb`
+ * in __uaccess_copy is registered in __ex_table (arch/x86_64/arch_smap.c), and
+ * a kernel-mode #PF on an unmapped user pointer takes the fixup path in
+ * idt.c rather than panicking. They return the number of bytes NOT copied.
+ *
+ * (This comment used to claim the opposite — no fixup table, a #PF panics the
+ * kernel. That was false as of the exception-table work, and it was actively
+ * harmful: it led readers to treat an ignored copy_from_user return as merely
+ * "panic-prone therefore already fatal", when in fact the copy returns quietly
+ * and leaves the untouched tail of the destination holding stale kernel stack —
+ * which sys_write/writev/pwrite64 then wrote to a file the caller reads back.
+ * See audit M2; fixed, but the comment is what allowed it. audit L10.)
+ *
+ * The macros still matter, for a different reason: a copy whose length exceeds
+ * its validated length is a bug even when it cannot panic, because the
+ * validation is what enforces the user/kernel boundary. Every copy MUST be
+ * preceded by user_ptr_valid() over the SAME range. The hand-written idiom is:
  *     if (!user_ptr_valid((uint64_t)p, sizeof(x))) return SYS_ERR(EFAULT);
  *     copy_from_user(&x, p, sizeof(x));
  * which appears ~111× (user_ptr_valid) / ~118× (copy_*_user) across syscall/.
  * Two independent `len` arguments that MUST match is a latent footgun: a copy
- * whose length silently exceeds its validated length is a panic primitive. The
+ * whose length silently exceeds its validated length reads or writes past what
+ * the boundary check covered. The
  * macros derive ONE length from `sizeof(*(dst))` so the two cannot drift.
  *
  * This is a companion header to uaccess.h (copy_from_user/copy_to_user) and

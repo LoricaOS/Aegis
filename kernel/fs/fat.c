@@ -75,14 +75,41 @@ static int fat_streq(const char *a, const char *b) {
 
 /* ---- low-level sector / FAT access ----------------------------------- */
 
+/* Both accessors bound `lba` to the device. This is the last line of defence
+ * behind fat_cluster_ok(): every LBA here is derived from on-disk geometry or
+ * cluster numbers, and neither the block layer nor the drivers below (virtio-blk
+ * and AHCI have no LBA range check at all) will catch an out-of-range sector. */
 static int fat_read_lba(uint32_t lba, void *buf) {
     if (!s_dev) return -1;
+    if (s_dev->block_count && lba >= s_dev->block_count) return -1;
     return s_dev->read(s_dev, s_dev->lba_offset + lba, 1, buf);
 }
 
 static uint32_t cluster_lba(uint32_t cl) {
     return s_data_lba + (cl - 2) * s_spc;
 }
+
+/* fat_cluster_ok — is `cl` a real data cluster on this volume?
+ *
+ * Clusters are numbered from 2, so the last valid one is s_total_clusters + 1.
+ * EVERY cluster number the driver handles is attacker-controlled on a crafted
+ * image: first_cluster comes straight out of a directory entry, and the chain
+ * successor straight out of the FAT. Unchecked, a value like 0x0FFFFFF0 passes
+ * the old `cl < FAT_EOC` gate but makes cluster_lba()'s `(cl - 2) * s_spc`
+ * overflow uint32 (s_spc is up to 255) into an arbitrary LBA — and fat_read_lba
+ * does no bounds check of its own, so that became attacker-chosen on-disk read
+ * AND write. Gate every walk and every cluster_lba() caller on this. */
+static int fat_cluster_ok(uint32_t cl) {
+    return s_total_clusters != 0 && cl >= 2 && cl - 2 < s_total_clusters;
+}
+
+/* FAT chains are singly linked with no on-disk cycle detection, so a crafted
+ * image can simply point two clusters at each other (FAT[100]=101,
+ * FAT[101]=100) and every walker below spins forever holding the FS lock —
+ * on SMP that hangs every other CPU touching the filesystem too. No chain can
+ * legitimately be longer than the volume's cluster count, so each walk carries
+ * a step budget and gives up past it. */
+#define FAT_CHAIN_STEPS_OK(steps) ((steps) <= s_total_clusters)
 
 /* next cluster in the chain (FAT32), or >= FAT_EOC at end */
 static uint32_t fat_next(uint32_t cl) {
@@ -124,7 +151,9 @@ static void fill_dirent(const uint8_t *e, fat_dirent_t *d) {
     uint16_t hi, lo;
     kmemcpy(&hi, e + 20, 2);
     kmemcpy(&lo, e + 26, 2);
-    d->first_cluster = ((uint32_t)hi << 16) | lo;
+    /* FAT32 cluster numbers are 28-bit; the top 4 bits of the on-disk field
+     * are reserved and must be ignored, not carried into arithmetic. */
+    d->first_cluster = (((uint32_t)hi << 16) | lo) & 0x0FFFFFFFu;
     kmemcpy(&d->size, e + 28, 4);
     d->attr = e[11];
     kmemcpy(&d->mtime, e + 22, 2);
@@ -160,7 +189,8 @@ static int walk_dir(uint32_t dir_cluster, dir_cb cb, void *ctx) {
     char lfn[260];
     int have_lfn = 0;
     uint32_t cl = dir_cluster;
-    while (cl >= 2 && cl < FAT_EOC) {
+    uint32_t steps = 0;
+    while (fat_cluster_ok(cl) && FAT_CHAIN_STEPS_OK(steps)) {
         for (uint32_t s = 0; s < s_spc; s++) {
             uint32_t lba = cluster_lba(cl) + s;
             if (fat_read_lba(lba, sec) != 0) return 0;
@@ -170,7 +200,15 @@ static int walk_dir(uint32_t dir_cluster, dir_cb cb, void *ctx) {
                 if (e[0] == 0xE5) { have_lfn = 0; continue; }
                 if ((e[11] & ATTR_LFN) == ATTR_LFN) {    /* long-name fragment */
                     if (e[0] & 0x40) { kmemset(lfn, 0, sizeof lfn); have_lfn = 1; }
-                    int seq = e[0] & 0x1F, base = (seq - 1) * 13;
+                    int seq = e[0] & 0x1F;
+                    /* seq is 1-based; seq==0 made base = -13 and the SIGNED
+                     * `base + k < 259` test below happily passed, writing 13
+                     * attacker-chosen bytes BELOW lfn[] into the adjacent
+                     * stack locals (sec[512], have_lfn, cl — corrupting cl
+                     * redirects the whole directory walk). 20 fragments × 13
+                     * chars covers the 255-char max long name. */
+                    if (seq < 1 || seq > 20) { have_lfn = 0; continue; }
+                    int base = (seq - 1) * 13;
                     for (int k = 0; k < 13 && base + k < 259; k++) {
                         uint16_t ch; kmemcpy(&ch, e + LFN_POS[k], 2);
                         lfn[base + k] = (ch == 0 || ch == 0xFFFF) ? 0 : (char)(ch & 0xFF);
@@ -189,7 +227,7 @@ static int walk_dir(uint32_t dir_cluster, dir_cb cb, void *ctx) {
                 if (cb(use, ino, &d, ctx)) return 1;
             }
         }
-        cl = fat_next(cl);
+        cl = fat_next(cl); steps++;
     }
     return 0;
 }
@@ -223,8 +261,18 @@ static int resolve(const char *path, uint32_t *ino_out, fat_dirent_t *d_out,
         if (parent_cluster_out && last) {         /* caller wants the parent */
             *parent_cluster_out = cur_cluster;
             *base_out = base_out ? *base_out : 0;  /* filled by caller copy */
-            static char lastname[16];
-            kmemcpy(lastname, comp, (uint32_t)(n + 1));
+            /* Sized to match comp[] — `n` runs up to 255, so the old
+             * lastname[16] took a 256-byte copy into a 16-byte buffer: a
+             * 240-byte overflow into file-scope BSS, where the FAT geometry
+             * statics (s_dev, s_bps, s_spc, s_fat_lba, s_data_lba,
+             * s_root_cluster, s_total_clusters) live. Reachable from
+             * fat_lookup_parent on the O_CREAT path with any final component
+             * longer than 15 chars. */
+            static char lastname[256];
+            uint32_t ln = (uint32_t)n;
+            if (ln > sizeof(lastname) - 1) ln = sizeof(lastname) - 1;
+            kmemcpy(lastname, comp, ln);
+            lastname[ln] = '\0';
             *base_out = lastname;
             return 0;
         }
@@ -254,12 +302,36 @@ static int fat_mount(const char *devname) {
     uint32_t fat_size; kmemcpy(&fat_size, bpb + 36, 4);
     kmemcpy(&s_root_cluster, bpb + 44, 4);
     uint32_t total; kmemcpy(&total, bpb + 32, 4);
+    /* BPB_TotSec32 is 0 on volumes small enough to use the 16-bit
+     * BPB_TotSec16 field instead; fall back to it rather than treating 0 as
+     * the sector count (which the validation below would reject). */
+    if (total == 0) {
+        uint16_t total16; kmemcpy(&total16, bpb + 19, 2);
+        total = total16;
+    }
     if (s_bps != SECTOR || s_spc == 0 || nfats == 0 || fat_size == 0) {
         s_dev = 0; return -EINVAL;                  /* not a FAT32 volume    */
     }
+    /* Validate the BPB before deriving any geometry from it. These fields are
+     * attacker-controlled on a crafted image and were taken on trust:
+     *  - reserved == 0 puts the FAT on top of the BPB itself;
+     *  - reserved + nfats*fat_size overflows uint32 → s_data_lba wraps;
+     *  - total <= s_data_lba underflows s_total_clusters to ~4 billion, which
+     *    then makes every cluster look in-range to fat_cluster_ok().
+     * Compute the data start in 64-bit so the overflow is visible. */
+    uint64_t data_lba64 = (uint64_t)reserved + (uint64_t)nfats * fat_size;
+    if (reserved == 0 || data_lba64 >= (uint64_t)total ||
+        (s_dev->block_count && (uint64_t)total > s_dev->block_count)) {
+        s_dev = 0; return -EINVAL;
+    }
     s_fat_lba  = reserved;
-    s_data_lba = reserved + (uint32_t)nfats * fat_size;
+    s_data_lba = (uint32_t)data_lba64;
     s_total_clusters = (total - s_data_lba) / s_spc;
+    /* The root cluster must itself be a real data cluster — it seeds every
+     * path resolution, so a 0/1/out-of-range value walks off the volume. */
+    if (s_total_clusters == 0 || !fat_cluster_ok(s_root_cluster)) {
+        s_dev = 0; return -EINVAL;
+    }
     s_nfats = nfats;
     s_fat_size = fat_size;
     s_next_free = 2;
@@ -341,11 +413,14 @@ static int fat_read(uint32_t ino, void *buf, uint64_t off, uint32_t len) {
     uint32_t csize = (uint32_t)s_spc * SECTOR;
     uint32_t cl = d.first_cluster;
     uint64_t skip = off;
-    while (skip >= csize && cl >= 2 && cl < FAT_EOC) { cl = fat_next(cl); skip -= csize; }
+    uint32_t steps = 0;
+    while (skip >= csize && fat_cluster_ok(cl) && FAT_CHAIN_STEPS_OK(steps)) {
+        cl = fat_next(cl); steps++; skip -= csize;
+    }
 
     uint8_t sec[SECTOR];
     uint32_t done = 0;
-    while (done < len && cl >= 2 && cl < FAT_EOC) {
+    while (done < len && fat_cluster_ok(cl) && FAT_CHAIN_STEPS_OK(steps)) {
         uint32_t in_cluster = (uint32_t)skip;           /* offset within cluster */
         for (uint32_t s = in_cluster / SECTOR; s < s_spc && done < len; s++) {
             if (fat_read_lba(cluster_lba(cl) + s, sec) != 0) return (int)done;
@@ -356,7 +431,7 @@ static int fat_read(uint32_t ino, void *buf, uint64_t off, uint32_t len) {
             done += n;
         }
         skip = 0;
-        cl = fat_next(cl);
+        cl = fat_next(cl); steps++;
     }
     return (int)done;
 }
@@ -393,6 +468,7 @@ static int fat_readlink_ino(uint32_t i, char *b, uint32_t n) { (void)i; (void)b;
 
 static int fat_write_lba(uint32_t lba, const void *buf) {
     if (!s_dev || !s_dev->write) return -1;
+    if (s_dev->block_count && lba >= s_dev->block_count) return -1;
     return s_dev->write(s_dev, s_dev->lba_offset + lba, 1, buf);
 }
 
@@ -434,11 +510,12 @@ static void fat_zero_cluster(uint32_t cl) {
 }
 
 static void fat_free_chain(uint32_t cl) {
-    while (cl >= 2 && cl < FAT_EOC) {
+    uint32_t steps = 0;
+    while (fat_cluster_ok(cl) && FAT_CHAIN_STEPS_OK(steps)) {
         uint32_t nx = fat_next(cl);
         fat_set(cl, 0);
         if (cl < s_next_free) s_next_free = cl;
-        cl = nx;
+        cl = nx; steps++;
     }
 }
 
@@ -468,7 +545,8 @@ static int to_83(const char *name, uint8_t raw[11]) {
 static int find_free_slot(uint32_t dir_cluster, uint32_t *o_lba, uint32_t *o_idx) {
     uint8_t sec[SECTOR];
     uint32_t cl = dir_cluster, prev = dir_cluster;
-    while (cl >= 2 && cl < FAT_EOC) {
+    uint32_t steps = 0;
+    while (fat_cluster_ok(cl) && FAT_CHAIN_STEPS_OK(steps)) {
         for (uint32_t s = 0; s < s_spc; s++) {
             uint32_t lba = cluster_lba(cl) + s;
             if (fat_read_lba(lba, sec) != 0) return -EIO;
@@ -477,7 +555,7 @@ static int find_free_slot(uint32_t dir_cluster, uint32_t *o_lba, uint32_t *o_idx
                 if (b == 0x00 || b == 0xE5) { *o_lba = lba; *o_idx = i; return 0; }
             }
         }
-        prev = cl; cl = fat_next(cl);
+        prev = cl; cl = fat_next(cl); steps++;
     }
     uint32_t nc = fat_alloc();
     if (!nc) return -ENOSPC;
@@ -556,13 +634,14 @@ static int dir_slot(uint32_t dir_cluster, uint32_t slot, uint32_t *o_lba, uint32
 static uint32_t dir_end_slot(uint32_t dir_cluster) {
     uint8_t sec[SECTOR];
     uint32_t slot = 0, cl = dir_cluster;
-    while (cl >= 2 && cl < FAT_EOC) {
+    uint32_t steps = 0;
+    while (fat_cluster_ok(cl) && FAT_CHAIN_STEPS_OK(steps)) {
         for (uint32_t s = 0; s < s_spc; s++) {
             if (fat_read_lba(cluster_lba(cl) + s, sec) != 0) return slot;
             for (uint32_t i = 0; i < SECTOR / DIRENT_SIZE; i++, slot++)
                 if (sec[i * DIRENT_SIZE] == 0x00) return slot;
         }
-        cl = fat_next(cl);
+        cl = fat_next(cl); steps++;
     }
     return slot;
 }
@@ -674,12 +753,16 @@ static int fat_write(uint32_t ino, const void *buf, uint32_t off, uint32_t len) 
     uint32_t csize = (uint32_t)s_spc * SECTOR;
     uint32_t first = d.first_cluster;
     if (first < 2) { first = fat_alloc(); if (!first) return -ENOSPC; }
+    /* first_cluster came off a directory entry: reject it before it reaches
+     * cluster_lba() below. */
+    if (!fat_cluster_ok(first)) return -EIO;
 
     uint32_t cl = first;
     for (uint32_t k = 0; k < off / csize; k++) {
         uint32_t nx = fat_next(cl);
         if (nx >= FAT_EOC) { nx = fat_alloc(); if (!nx) return -ENOSPC; fat_set(cl, nx); }
         cl = nx;
+        if (!fat_cluster_ok(cl)) return -EIO;    /* corrupt/cyclic chain */
     }
     uint8_t sec[SECTOR];
     uint32_t done = 0, pos = off % csize;
@@ -695,9 +778,19 @@ static int fat_write(uint32_t ino, const void *buf, uint32_t off, uint32_t len) 
             uint32_t nx = fat_next(cl);
             if (nx >= FAT_EOC) { nx = fat_alloc(); if (!nx) break; fat_set(cl, nx); }
             cl = nx; pos = 0;
+            if (!fat_cluster_ok(cl)) break;      /* corrupt/cyclic chain */
         }
     }
-    uint32_t ns = off + done;
+    /* Compute the new size in 64-bit (audit M8): `off` is 64-bit, so the old
+     * `uint32_t ns = off + done` truncated, and a large offset recorded a size
+     * SMALLER than what was just written — leaving the size field inconsistent
+     * with the cluster chain. FAT32 tops out at 4 GiB - 1, so anything beyond
+     * that is refused rather than silently wrapped (no EFBIG in this errno
+     * set; ENOSPC is the closest and is already this function's overflow
+     * return). */
+    uint64_t ns64 = off + done;
+    if (ns64 > 0xFFFFFFFFULL) return -ENOSPC;
+    uint32_t ns = (uint32_t)ns64;
     patch_entry(ino, first, ns > d.size ? ns : d.size);
     return (int)done;
 }

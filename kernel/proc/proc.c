@@ -100,7 +100,23 @@ proc_spawn(const uint8_t *elf_data, size_t elf_len)
      * Each proc_spawn call gets a distinct kva-mapped VA.
      * 4 pages (16KB) matches the sched task stack size and is sufficient to
      * handle deep PIT ISR → virtio → tcp_rx call chains from user mode. */
-    uint8_t *kstack = kva_alloc_pages(STACK_PAGES);
+    /* ...plus one unmapped guard page at the bottom, mirroring sched.c's
+     * kernel-task stacks (audit M10). Without it a kernel-stack overflow does
+     * not fault: kva_alloc_pages hands out contiguous mapped pages, so the
+     * overflow silently writes into whatever kva allocation sits below — a
+     * neighbouring PCB or stack — turning a would-be clean #DF/panic into
+     * silent kernel-memory corruption. stack_base/stack_pages still describe
+     * only the usable pages, so the free path is unchanged; the guard VA is
+     * permanently abandoned exactly as in sched.c. */
+    uint8_t *kstack_region = kva_alloc_pages(STACK_PAGES + 1);
+    if (!kstack_region)
+        panic_halt("[PROC] FAIL: OOM allocating init kernel stack");
+    {
+        uint64_t guard_phys = kva_page_phys(kstack_region);
+        vmm_unmap_page((uint64_t)(uintptr_t)kstack_region);
+        pmm_free_page(guard_phys);
+    }
+    uint8_t *kstack = kstack_region + 4096UL;
 
     /* Create per-process page tables (kernel high entries shared) */
     proc->pml4_phys = vmm_create_user_pml4();
@@ -131,6 +147,15 @@ proc_spawn(const uint8_t *elf_data, size_t elf_len)
             interp_data = (const uint8_t *)initrd_get_data(&interp_f);
             interp_size = (uint64_t)initrd_get_size(&interp_f);
         } else {
+            /* Gate the interpreter (audit M4). This is the boot-time init
+             * spawn, so it is not attacker-influenced the way execve is —
+             * checked anyway so all three PT_INTERP load sites agree, and so a
+             * rootfs shipping a non-root-owned or world-writable linker fails
+             * loudly here rather than silently weakening every later exec. */
+            if (!elf_interp_trusted(er.interp, 0, 0)) {
+                printk("[PROC] FAIL: untrusted interpreter: %s\n", er.interp);
+                panic_halt("[PROC] FAIL: untrusted interpreter");
+            }
             vfs_file_t vf;
             int vr = vfs_open(er.interp, 0, 0, &vf);
             if (vr != 0) {
@@ -152,7 +177,7 @@ proc_spawn(const uint8_t *elf_data, size_t elf_len)
                 panic_halt("[PROC] FAIL: error reading interpreter");
             }
             interp_data = (const uint8_t *)interp_buf;
-            interp_size = vf.size;
+            interp_size = (uint64_t)rr;   /* bytes READ, not declared (M6) */
         }
 
         if (elf_load(proc, proc->pml4_phys, interp_data, (size_t)interp_size,
