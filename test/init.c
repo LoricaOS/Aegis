@@ -861,6 +861,73 @@ void _start(void)
         else out("[KTEST] FAIL exit_group-blocked-sibling\n");
     }
 
+    /* 15. exit_group called by a NON-LEADER thread must still wake the parent
+     *     blocked in wait4. Case 14 has the leader call exit_group, so the
+     *     leader zombifies LAST (thread_group_teardown does not return until
+     *     every sibling is a zombie) and the waiting parent always sees a
+     *     complete group on its first look. Invert that and the wedge appears:
+     *
+     *       - the thread calls exit_group, so the LEADER is SIGKILLed by the
+     *         teardown like any other sibling and zombifies FIRST;
+     *       - the leader's SIGCHLD wakes us, but sys_waitpid refuses to reap a
+     *         leader while a sibling is still live (it would free the shared
+     *         PML4), so we skip it and block again;
+     *       - the sibling then zombifies and notifies ITS ppid — which
+     *         sys_clone set to the thread's creator, another thread of the same
+     *         dying group, never us.
+     *
+     *     Nothing else reports the group is complete, so the parent sleeps
+     *     forever. On a real system that parent is the shell, and the console
+     *     goes silent with the kernel otherwise healthy.
+     *
+     *     Ordering is deterministic, not racy: the teardown waits for the
+     *     leader to reach TASK_ZOMBIE before the thread that called exit_group
+     *     runs its own. Like case 14 this is a liveness test, so a regression
+     *     shows up as the harness timing out here rather than a clean FAIL. */
+    total++;
+    {
+        int ok = 1;
+        int pfd[2] = { -1, -1 };
+        if (sys3(SYS_pipe2, (long)pfd, 0, 0) != 0) ok = 0;
+        if (ok) {
+            long pid = sys6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);
+            if (pid == 0) {
+                /* ---- child: the group LEADER ---- */
+                long stk = sys6(SYS_mmap, 0, 65536, PROT_RW, MAP_ANON_PRIV, -1, 0);
+                if (stk > 0) {
+                    long top = (stk + 65536) & ~15L;
+                    long t = sys6(SYS_clone, 0x100 | 0x200 | 0x400 | 0x800 | 0x10000,
+                                  top, 0, 0, 0, 0);
+                    if (t == 0) {
+                        /* ---- sibling thread, on the fresh stack ----
+                         * Straight into exit_group: no locals, no delay. It
+                         * does not matter whether the leader has reached its
+                         * read() yet, because thread_group_teardown does not
+                         * return until every sibling is a zombie — so the
+                         * leader zombifies before this thread does either way,
+                         * which is the whole point of the case. */
+                        sys3(SYS_exit_group, 88, 0, 0);
+                    }
+                }
+                /* Park the leader so the teardown has to kill it where it
+                 * blocks — the shape a shell's child is in when this bites. */
+                { char b; for (;;) sys3(SYS_read, pfd[0], (long)&b, 1); }
+            }
+            /* THE PROBE: a BLOCKING wait4. WNOHANG would poll its own way out
+             * of the bug and prove nothing — the defect is precisely that the
+             * blocked parent is never woken again. */
+            int status = 0;
+            long w = sys6(SYS_wait4, pid, (long)&status, 0, 0, 0, 0);
+            if (w != pid) ok = 0;
+            { int st2 = 0; while (sys6(SYS_wait4, -1, (long)&st2, 1 /*WNOHANG*/,
+                                       0, 0, 0) > 0) { } }
+            sys3(SYS_close, pfd[0], 0, 0);
+            sys3(SYS_close, pfd[1], 0, 0);
+        }
+        if (ok) { pass++; out("[KTEST] PASS exit_group-from-thread (parent woken)\n"); }
+        else out("[KTEST] FAIL exit_group-from-thread\n");
+    }
+
     if (pass == total) out("[KTEST] DONE all-pass\n");
     else                out("[KTEST] DONE FAIL\n");
 
