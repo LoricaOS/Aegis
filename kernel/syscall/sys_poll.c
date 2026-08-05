@@ -401,3 +401,59 @@ sys_epoll_wait(uint64_t epfd, uint64_t events_ptr, uint64_t maxevents, uint64_t 
     int r = epoll_wait_impl(eid, events_ptr, (int)maxevents, ticks);
     return r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
 }
+
+/* ── sys_epoll_pwait / sys_epoll_pwait2 ──────────────────────────────────
+ *
+ * epoll_wait with a signal mask applied for the duration of the wait.
+ * Required by Go: its netpoller calls epoll_pwait2 (441) and falls back to
+ * epoll_pwait (281). Aegis implemented only epoll_wait (232), so the netpoller
+ * could not initialise and every network operation blocked forever — a Go
+ * server would start, serve nothing, and accept nothing.
+ *
+ * The sigmask is REFUSED rather than ignored when non-NULL. Silently dropping
+ * it would be an authority-shape lie of the same kind as the *at flags: the
+ * caller believes those signals cannot interrupt the wait, and they would.
+ * Go always passes NULL, so this costs it nothing, and a caller that genuinely
+ * wants atomic mask-and-wait gets a clear ENOSYS instead of a wait that
+ * quietly does not honour its mask.
+ */
+uint64_t
+sys_epoll_pwait(uint64_t epfd, uint64_t events_ptr, uint64_t maxevents,
+                uint64_t timeout_ms, uint64_t sigmask)
+{
+    if (sigmask != 0)
+        return SYS_ERR(ENOSYS);   /* atomic mask-and-wait not implemented */
+    return sys_epoll_wait(epfd, events_ptr, maxevents, timeout_ms);
+}
+
+uint64_t
+sys_epoll_pwait2(uint64_t epfd, uint64_t events_ptr, uint64_t maxevents,
+                 uint64_t ts_ptr, uint64_t sigmask)
+{
+    if (sigmask != 0)
+        return SYS_ERR(ENOSYS);
+
+    /* epoll_pwait2 takes a `const struct timespec *`, not milliseconds.
+     * NULL means block indefinitely. */
+    uint64_t timeout_ms;
+    if (ts_ptr == 0) {
+        timeout_ms = (uint64_t)-1;
+    } else {
+        struct { int64_t tv_sec; int64_t tv_nsec; } ts;
+        if (!user_ptr_valid(ts_ptr, sizeof(ts)))
+            return SYS_ERR(EFAULT);
+        if (copy_from_user(&ts, (const void *)(uintptr_t)ts_ptr, sizeof(ts)) != 0)
+            return SYS_ERR(EFAULT);
+        if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L)
+            return SYS_ERR(EINVAL);
+        /* Clamp rather than overflow: a caller asking for a ~300-million-year
+         * timeout gets the longest finite wait we can express, not a wrapped
+         * tiny one. */
+        if (ts.tv_sec > 4000000LL)
+            timeout_ms = (uint64_t)-1;
+        else
+            timeout_ms = (uint64_t)ts.tv_sec * 1000ULL +
+                         (uint64_t)(ts.tv_nsec / 1000000L);
+    }
+    return sys_epoll_wait(epfd, events_ptr, maxevents, timeout_ms);
+}

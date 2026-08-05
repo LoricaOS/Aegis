@@ -103,6 +103,15 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 178: num = 186; break;  /* gettid (real; internal 186 → sys_gettid) */
     case 214: num = 12;  break;  /* brk */
     case 215: num = 11;  break;  /* munmap */
+    case  22: num = 281; break;  /* epoll_pwait (aarch64 __NR_epoll_pwait == 22).
+                                  * aarch64 has NO epoll_wait — 22 is the only
+                                  * epoll wait entry point, and musl's
+                                  * epoll_wait() calls it. Untranslated it fell
+                                  * through to the x86 table, where 22 is
+                                  * pipe(2) — so epoll_wait on arm64 wrote two
+                                  * fds into the caller's event buffer and
+                                  * returned. Same shape as the epoll_ctl bug
+                                  * below. */
     case  21: num = 233; break;  /* epoll_ctl (aarch64 __NR_epoll_ctl == 21).
                                   * Untranslated, 21 fell through to the x86
                                   * dispatch and hit sys_access — so epoll_ctl
@@ -296,6 +305,11 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 291: return sys_epoll_create1(arg1);
     case 233: return sys_epoll_ctl(arg1, arg2, arg3, arg4);
     case 232: return sys_epoll_wait(arg1, arg2, arg3, arg4);
+    /* Go's netpoller: it tries epoll_pwait2 (441) first and falls back to
+     * epoll_pwait (281). Without these it cannot initialise and every network
+     * operation blocks forever. */
+    case 281: return sys_epoll_pwait(arg1, arg2, arg3, arg4, arg5);
+    case 441: return sys_epoll_pwait2(arg1, arg2, arg3, arg4, arg5);
     case 500: return sys_netcfg(arg1, arg2, arg3, arg4);
     case 501: return sys_set_autologin(arg1);
     case 502: return sys_set_ntp(arg1);
