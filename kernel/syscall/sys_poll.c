@@ -391,7 +391,22 @@ sys_epoll_wait(uint64_t epfd, uint64_t events_ptr, uint64_t maxevents, uint64_t 
     aegis_process_t *proc = current_proc();
     uint32_t eid = epoll_id_from_fd((int)epfd, proc);
     if (eid == EPOLL_NONE) return SYS_ERR(EBADF);
-    if (maxevents > EPOLL_MAX_WATCHES) return SYS_ERR(EINVAL);
+    /* maxevents is the capacity of the caller's OUTPUT buffer, not a bound on
+     * how many fds an epoll set may watch. Linux requires only that it be
+     * positive. Rejecting anything above EPOLL_MAX_WATCHES conflated the two,
+     * and it killed every Go program at startup: the Go netpoller waits with a
+     * 128-entry array, got EINVAL back, and turned that into the unrecoverable
+     * "fatal error: runtime: netpoll failed" — a Go server would print that it
+     * was listening and then die before serving a single request.
+     *
+     * Clamp instead of rejecting. epoll_wait_impl delivers at most one event
+     * per live watch, so it can never fill more than EPOLL_MAX_WATCHES entries
+     * however large the caller's buffer is; the excess is slack we never touch.
+     * Clamping BEFORE the user_ptr_valid below also means we only require the
+     * prefix we might actually write to be mapped, which is what Linux does —
+     * and it keeps the size computation far from overflowing. */
+    if ((int64_t)maxevents <= 0) return SYS_ERR(EINVAL);
+    if (maxevents > EPOLL_MAX_WATCHES) maxevents = EPOLL_MAX_WATCHES;
     if (!user_ptr_valid(events_ptr, (uint64_t)maxevents * sizeof(k_epoll_event_t)))
         return SYS_ERR(EFAULT);
 
