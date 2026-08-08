@@ -1,1 +1,1 @@
-service DISK_ADMIN
+service DISK_ADMIN ADMIN_AUTH
