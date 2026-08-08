@@ -347,8 +347,12 @@ static inline uint32_t tcp_sbuf_space(const tcp_conn_t *c)
 
 /* tcp_retransmit_unacked — resend the oldest unacked segment (up to one MSS)
  * from sbuf at SND.UNA.  Called only from tcp_tick (PIT ISR context), which
- * holds tcp_lock: that is safe because arp_resolve does not block in ISR
- * context, so ip_send cannot park the CPU while the lock is held.  c points
+ * holds tcp_lock.  That is safe ONLY because arp_resolve refuses to block when
+ * g_in_isr_poll is set, so ip_send cannot park the CPU while the lock is held.
+ * That flag used to be set only inside netdev_poll_all, and tcp_tick is a
+ * sibling poll source rather than nested in it — so this claim was false for
+ * this exact path until poll_sources_run began setting it for the whole tick
+ * (audit C-2).  c points
  * into the static s_tcp[] table and is not freed on a single core. */
 static void tcp_retransmit_unacked(netdev_t *dev, tcp_conn_t *c)
 {
@@ -1119,9 +1123,12 @@ void tcp_tick(void)
         c->retransmit_at = now + rto;
 
         /* Retransmit per state.  tcp_tick runs in the PIT ISR with interrupts
-         * disabled; arp_resolve returns immediately (no blocking) from ISR
-         * context, so tcp_send_*  is safe to call under tcp_lock here (unlike
-         * the syscall-context senders).  Data retransmit reads from sbuf and
+         * disabled; arp_resolve returns immediately (no blocking) because
+         * poll_sources_run sets g_in_isr_poll for the whole tick, so tcp_send_*
+         * is safe to call under tcp_lock here (unlike the syscall-context
+         * senders).  See audit C-2: before that flag covered tcp_tick, an
+         * unresolved ARP entry here re-enabled interrupts under tcp_lock and
+         * deadlocked the machine.  Data retransmit reads from sbuf and
          * re-sends the oldest unacked MSS-worth at SND.UNA; SYN/FIN states
          * resend their control segment.  Previously only SYN/SYN-ACK were
          * retransmitted, so lost DATA was never resent (silent truncation) and

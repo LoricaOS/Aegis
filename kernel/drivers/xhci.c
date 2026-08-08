@@ -1212,7 +1212,7 @@ static spinlock_t s_eth_tx_lock = SPINLOCK_INIT;
  * xhci_poll is NOT called from netdev_poll_all (which normally sets this), so
  * the USB RX-deliver path must set it itself or an un-cached reply would spin
  * the blocking ARP wait inside the timer ISR. Defined in net/netdev.c. */
-extern volatile int g_in_netdev_poll;
+extern volatile int g_in_isr_poll;
 
 /* Last non-HID USB device probed (claimed or not) — for /proc/usbnet so an
  * unsupported adapter can be identified by VID/PID. */
@@ -1704,8 +1704,8 @@ xhci_eth_rx_complete(uint32_t len)
     uint32_t i;
     /* We're in the PIT ISR. Tell arp_resolve (reachable via a synchronous reply
      * inside netdev_rx_deliver) to use its non-blocking path. */
-    int prev_inpoll = g_in_netdev_poll;
-    g_in_netdev_poll = 1;
+    int prev_inpoll = g_in_isr_poll;
+    g_in_isr_poll = 1;
     for (i = 0; i < pkt_cnt; i++, pkt_hdr += 4) {
         uint32_t h       = le32(pkt_hdr);
         uint32_t pkt_len = (h >> 16) & 0x1FFFu;
@@ -1720,7 +1720,7 @@ xhci_eth_rx_complete(uint32_t len)
         s_eth.rx_frames++;
         data += padded; remain -= padded;
     }
-    g_in_netdev_poll = prev_inpoll;
+    g_in_isr_poll = prev_inpoll;
 }
 
 /* usb_eth_send — netdev TX (spec §7): prepend an 8-byte header (frame_len,

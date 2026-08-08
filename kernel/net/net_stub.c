@@ -55,4 +55,4 @@ uint32_t unix_sock_id_from_fd(int fd, void *proc) { return SOCK_NONE; }
 int       netdev_register(netdev_t *dev) { return -1; }
 netdev_t *netdev_get(const char *name) { return 0; }
 void      netdev_rx_deliver(netdev_t *dev, const void *frame, uint16_t len) { }
-volatile int g_in_netdev_poll = 0;
+volatile int g_in_isr_poll = 0;

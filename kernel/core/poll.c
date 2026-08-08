@@ -1,4 +1,7 @@
 #include "poll.h"
+
+/* Defined in net/netdev.c (or net/net_stub.c when CONFIG_NET=n). */
+extern volatile int g_in_isr_poll;
 #include "printk.h"
 
 /* Generic per-tick poll-source registry.  See poll.h for the contract.
@@ -60,6 +63,34 @@ poll_source_register(poll_fn_t fn, int priority, const char *name)
 void
 poll_sources_run(void)
 {
+    /* Mark the whole tick as ISR/poll context, not just the netdev source.
+     *
+     * g_in_isr_poll is what arp_resolve consults to decide whether it may
+     * BLOCK (arch_wait_for_irq() = `sti; hlt; cli`, then dev->poll()). It used
+     * to be set only inside netdev_poll_all, whose name it then carried — but
+     * every source in this loop runs in the same PIT-ISR context with
+     * interrupts disabled, and one of them, tcp_tick, sends.
+     *
+     * tcp_tick (PRIO 70) is a SIBLING of netdev_poll_all (PRIO 30) here, not
+     * nested inside it, so the flag was clear when it ran. tcp_tick holds
+     * tcp_lock across its retransmit; if the destination's ARP entry had
+     * expired, arp_resolve took the blocking path, re-enabled interrupts inside
+     * the ISR while tcp_lock was held, and called dev->poll() — which drives RX
+     * straight into tcp_rx and its spin_lock_irqsave(&tcp_lock). Same CPU,
+     * non-recursive ticket lock: a permanent IRQs-off hard lockup, taking the
+     * machine with it. The comments at tcp.c:349 and :1121 asserting
+     * "arp_resolve does not block in ISR context" were true only for the RX
+     * path they were written against. (audit 2026-08-01 C-2 / A4-C3.)
+     *
+     * Setting it here covers every source once, at the real boundary. The
+     * per-driver save/restore hacks in xhci_poll and virtio_net_poll — added
+     * because those are likewise reached outside netdev_poll_all — become
+     * redundant but stay harmless, since they restore rather than clear.
+     * Save/restore rather than clear-to-zero for the same reason: this runs
+     * around calls that may set it themselves. */
+    int prev = g_in_isr_poll;
+    g_in_isr_poll = 1;
     for (int i = 0; i < s_count; i++)
         s_sources[i].fn();
+    g_in_isr_poll = prev;
 }

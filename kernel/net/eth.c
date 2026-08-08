@@ -274,9 +274,11 @@ int eth_send(netdev_t *dev, const mac_addr_t *dst_mac,
 
 /* ---- arp_resolve ------------------------------------------------------- */
 
-/* Set by netdev_poll_all — when 1, we're inside the PIT ISR RX path
- * and arp_resolve must not block (would deadlock on netdev_lock). */
-extern volatile int g_in_netdev_poll;
+/* Non-zero while in PIT-ISR / poll context (set for the whole tick by
+ * poll_sources_run). When set, arp_resolve must NOT block: blocking re-enables
+ * interrupts and drives dev->poll() from inside the ISR, which re-enters
+ * netdev_lock/tcp_lock on the same CPU. */
+extern volatile int g_in_isr_poll;
 
 int arp_resolve(netdev_t *dev, ip4_addr_t ip, mac_addr_t *mac_out)
 {
@@ -289,7 +291,7 @@ int arp_resolve(netdev_t *dev, ip4_addr_t ip, mac_addr_t *mac_out)
          * but keep using the cached MAC so traffic never stalls on it. Updating
          * last_used here also rate-limits the refresh to once per window. Skip
          * from the ISR RX path, which must not send. */
-        if (!g_in_netdev_poll &&
+        if (!g_in_isr_poll &&
             (uint32_t)(now - e->last_used) > ARP_REFRESH_TICKS)
             arp_send_request(dev, ip);
         e->last_used = now;
@@ -305,16 +307,19 @@ int arp_resolve(netdev_t *dev, ip4_addr_t ip, mac_addr_t *mac_out)
     /* Send ARP request regardless of context. */
     arp_send_request(dev, ip);
 
-    /* If called from the PIT ISR RX path (netdev_poll_all → virtio_net_poll
-     * → tcp_rx → tcp_send_segment → ip_send), we CANNOT block.  Blocking
+    /* If called from ANY PIT-ISR poll source we CANNOT block. Two reachable
+     * chains: the RX path (netdev_poll_all → virtio_net_poll → tcp_rx →
+     * tcp_send_segment → ip_send), and the retransmit timer (tcp_tick →
+     * tcp_send_* → ip_send) which holds tcp_lock throughout.  Blocking
      * with arch_wait_for_irq() while holding netdev_lock + tcp_lock causes
      * a permanent deadlock: the next PIT tick tries to acquire those locks.
      * Return -1 so the TCP retransmit timer re-sends on the next tick.
      *
-     * We check g_in_netdev_poll (not IF flag) because syscall-context callers
-     * like tcp_connect also hold spinlocks with IRQs disabled — those callers
-     * CAN safely block here since they're not in the ISR chain. */
-    if (g_in_netdev_poll) {
+     * We check g_in_isr_poll (not the IF flag) because syscall-context callers
+     * like tcp_connect also run with IRQs disabled — those callers CAN safely
+     * block here, because they have released tcp_lock first and are not in the
+     * ISR chain. */
+    if (g_in_isr_poll) {
         return -1;  /* caller should retry later */
     }
 
@@ -331,7 +336,7 @@ int arp_resolve(netdev_t *dev, ip4_addr_t ip, mac_addr_t *mac_out)
      * That is deliberately longer than TCP's own SYN retransmit RTO chain
      * (1+2+4 s = 7 s before RST) yet short enough not to wedge a syscall
      * indefinitely if the host is simply gone.  We are in syscall/task
-     * context here (the g_in_netdev_poll ISR path returned above), so printk
+     * context here (the g_in_isr_poll ISR path returned above), so printk
      * is safe — emit one WARN on expiry so a silent ARP failure (peer/gateway
      * not answering) is diagnosable instead of surfacing only as a vague
      * downstream connect timeout. */

@@ -386,7 +386,7 @@ virtio_net_poll(netdev_t *dev)
  * via netdev_rx_deliver → tcp → ip_send when a frame triggers a reply) returns
  * -1 instead of blocking — blocking in an ISR would hang. netdev_poll_all sets
  * this for the poll path; the MSI-X path must set it itself. */
-extern volatile int g_in_netdev_poll;
+extern volatile int g_in_isr_poll;
 
 /* MSI-X RX interrupt entry (idt.c vector 0x40). Runs IF=0 on the BSP; the
  * shared servicing path is non-blocking. No-op if the NIC never registered. */
@@ -395,8 +395,8 @@ virtio_net_irq(void)
 {
     if (!s_dev.priv)
         return;
-    int prev = g_in_netdev_poll;
-    g_in_netdev_poll = 1;
+    int prev = g_in_isr_poll;
+    g_in_isr_poll = 1;
     virtio_net_service(&s_dev);
-    g_in_netdev_poll = prev;
+    g_in_isr_poll = prev;
 }
