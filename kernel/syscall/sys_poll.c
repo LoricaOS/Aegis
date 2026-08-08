@@ -91,6 +91,7 @@ sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms)
 
     waitq_entry_t fd_entries[64];
     waitq_t      *fd_queues[64];
+    fd_pin_t      fd_pins[64];      /* object refs held across the block */
     /* The timer entry is ALWAYS initialized and ALWAYS added to g_timer_waitq
      * before sched_block (see below), even on the infinite-timeout path. The
      * 100 Hz PIT wakes g_timer_waitq every tick, so the poller re-checks
@@ -166,8 +167,13 @@ sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms)
          * On wake, unregister from every queue (waitq_remove is
          * idempotent — only removes if still queued; the wake path
          * leaves entries for the woken task to detach itself). */
+        /* Pin each object for as long as our stack-allocated entry is linked
+         * into its queue — see fd_waitq.h. Without this a sibling thread
+         * (CLONE_FILES) closing the fd frees the object under us and the
+         * waitq_remove below writes into whatever now owns that memory. */
         for (i = 0; i < nfds; i++) {
-            fd_queues[i]           = fd_get_waitq(fds_cached[i]);
+            fd_waitq_pin(fds_cached[i], &fd_pins[i]);
+            fd_queues[i]           = fd_pins[i].q;
             fd_entries[i].task     = sched_current();
             fd_entries[i].next     = (void *)0;
             fd_entries[i].prev     = (void *)0;
@@ -181,9 +187,11 @@ sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms)
 
         sched_block();
 
-        for (i = 0; i < nfds; i++)
+        for (i = 0; i < nfds; i++) {
             if (fd_queues[i])
                 waitq_remove(fd_queues[i], &fd_entries[i]);
+            fd_waitq_unpin(&fd_pins[i]);   /* drop the ref AFTER unlinking */
+        }
         waitq_remove(&g_timer_waitq, &timer_entry);
 
         /* Interruptible: after cleanup (so no waitq entry is leaked), abort on a
@@ -225,6 +233,7 @@ do_poll_k(k_pollfd_t *pf, uint64_t nfds, uint64_t timeout_ms)
                                                      : now0 + (timeout_ms / 10);
     waitq_entry_t fd_entries[64];
     waitq_t      *fd_queues[64];
+    fd_pin_t      fd_pins[64];      /* object refs held across the block */
     waitq_entry_t timer_entry;
     timer_entry.task = sched_current(); timer_entry.next = (void *)0;
     timer_entry.prev = (void *)0;       timer_entry.on_queue = 0;
@@ -250,8 +259,10 @@ do_poll_k(k_pollfd_t *pf, uint64_t nfds, uint64_t timeout_ms)
         if (ready > 0 || timeout_ms == 0) return ready;
         if (deadline && arch_get_ticks() >= deadline) return 0;
 
+        /* Pinned for the duration — see fd_waitq.h and sys_poll above. */
         for (i = 0; i < nfds; i++) {
-            fd_queues[i]           = fd_get_waitq(pf[i].fd);
+            fd_waitq_pin(pf[i].fd, &fd_pins[i]);
+            fd_queues[i]           = fd_pins[i].q;
             fd_entries[i].task     = sched_current();
             fd_entries[i].next     = (void *)0;
             fd_entries[i].prev     = (void *)0;
@@ -260,8 +271,10 @@ do_poll_k(k_pollfd_t *pf, uint64_t nfds, uint64_t timeout_ms)
         }
         waitq_add(&g_timer_waitq, &timer_entry);
         sched_block();
-        for (i = 0; i < nfds; i++)
+        for (i = 0; i < nfds; i++) {
             if (fd_queues[i]) waitq_remove(fd_queues[i], &fd_entries[i]);
+            fd_waitq_unpin(&fd_pins[i]);   /* drop the ref AFTER unlinking */
+        }
         waitq_remove(&g_timer_waitq, &timer_entry);
 
         if (signal_check_pending()) return -EINTR;

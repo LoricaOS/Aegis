@@ -85,6 +85,7 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
 #define SYS_readlinkat   78
 #define SYS_newfstatat   79
 #define SYS_pipe2        59
+#define SYS_ppoll        73    /* aarch64 has no poll(2); dispatch maps 73→271 */
 #define SYS_read         63
 #define SYS_exit_group   94
 #else
@@ -114,6 +115,7 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
 #define SYS_symlink      88
 #define SYS_readlink     89
 #define SYS_pipe2        293
+#define SYS_ppoll        271
 #define SYS_read         0
 #define SYS_exit_group   231
 #endif
@@ -604,6 +606,67 @@ void _start(void)
         }
         if (ok) { pass++; out("[KTEST] PASS brk (grow/shrink + heap VMA)\n"); }
         else out("[KTEST] FAIL brk (grow/shrink + heap VMA)\n");
+    }
+
+    /* 8e. poll/select/epoll must hold a REFERENCE on each polled object for as
+     *     long as their (stack-allocated) waitq entry is linked into that
+     *     object's queue — see kernel/syscall/fd_waitq.h.
+     *
+     *     The pin calls ops->dup on register and ops->close on unregister, so an
+     *     UNBALANCED pair corrupts the refcount: too many closes frees the pipe
+     *     early (the very UAF the pin prevents), too few leaks it. Either
+     *     bankrupts the pipe pool within a few dozen cycles.
+     *
+     *     A NON-ZERO timeout is essential: sys_poll returns at
+     *     `if (ready > 0 || timeout_ms == 0)` BEFORE the registration block, so a
+     *     zero-timeout poll never reaches the pinned path at all. Poll a pipe
+     *     with nothing to read so the call actually blocks and registers.
+     *
+     *     Honest scope: proves the refcounting is balanced and the path runs. It
+     *     does NOT reproduce the cross-thread free — that needs a CLONE_FILES
+     *     sibling closing mid-block, and the resulting UAF is silent without
+     *     heap poisoning (KASAN's shadow covers the kernel image, not kva). */
+    total++;
+    {
+        int ok = 1, step = 0;
+        struct { int fd; short events; short revents; } pfds[2];
+        struct { long tv_sec; long tv_nsec; } ts = { 0, 20000000L };  /* 20 ms */
+
+        for (int iter = 0; iter < 40 && ok; iter++) {
+            /* pipe2 writes int fd[2] — NOT long[2]. Declaring it long packs
+             * both fds into pf[0] and leaves pf[1] as stack garbage, which
+             * polls as POLLNVAL: nonzero (so it counts as "ready") but not the
+             * event asked for. That cost me two debug cycles; keep it int. */
+            int pf[2];
+            if (sys3(SYS_pipe2, (long)pf, 0, 0) != 0) { step = 1; ok = 0; break; }
+
+            /* Read end has no data -> POLLIN not ready -> the call BLOCKS and
+             * therefore registers (and pins) on the pipe's read waitq, then
+             * times out after 20 ms and unregisters (and unpins). */
+            pfds[0].fd = pf[0]; pfds[0].events = 0x001; pfds[0].revents = 0;
+            long r = sys6(SYS_ppoll, (long)pfds, 1, (long)&ts, 0, 0, 0);
+            if (r < 0) { step = 2; ok = 0; break; }
+
+            /* Zero-timeout probe on the same pipe: sys_poll returns at the
+             * `ready > 0 || timeout_ms == 0` early exit, which must still have
+             * written revents back. The write end of an empty pipe is always
+             * POLLOUT-ready, so a 0 here means the non-blocking path reported a
+             * count without populating the array. */
+            pfds[0].fd = pf[1]; pfds[0].events = 0x004; pfds[0].revents = 0;
+            struct { long tv_sec; long tv_nsec; } z = { 0, 0 };
+            long r0 = sys6(SYS_ppoll, (long)pfds, 1, (long)&z, 0, 0, 0);
+            if (r0 < 0)                        { step = 3; ok = 0; break; }
+            if (!(pfds[0].revents & 0x004))    { step = 4; ok = 0; break; }
+
+            sys3(SYS_close, pf[0], 0, 0);
+            sys3(SYS_close, pf[1], 0, 0);
+        }
+
+        if (ok) { pass++; out("[KTEST] PASS poll pin/unpin balance (40 blocking cycles)\n"); }
+        else if (step == 1) out("[KTEST] FAIL poll pin/unpin: pipe2 failed (pool exhausted?)\n");
+        else if (step == 3) out("[KTEST] FAIL poll pin/unpin: zero-timeout ppoll errored\n");
+        else if (step == 4) out("[KTEST] FAIL poll: zero-timeout returned a count but no revents\n");
+        else out("[KTEST] FAIL poll pin/unpin: ppoll returned an error\n");
     }
 
     /* 9. Concurrent multi-core scheduling: fork 4 children that each spin
