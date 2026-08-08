@@ -15,6 +15,7 @@
  */
 #include "virtio_gpu.h"
 #include "virtio.h"
+#include "fb.h"      /* FB_MAX_WIDTH / FB_MAX_HEIGHT — shared geometry bounds */
 #include "arch.h"
 #include "kva.h"
 #include "printk.h"
@@ -199,14 +200,38 @@ virtio_gpu_init(void)
         (volatile virtio_gpu_resp_display_info_t *)s_resp_va;
     uint32_t w   = di->pmodes[0].r.width;
     uint32_t hgt = di->pmodes[0].r.height;
-    if (w == 0 || hgt == 0) { w = 1024; hgt = 768; }   /* sane default */
 
-    uint32_t pages = (w * hgt * 4u + 4095u) / 4096u;
-    if (pages > GPU_MAX_FB_PAGES) {
-        /* Clamp resolution to what we can back. */
+    /* `w` and `hgt` are whatever the DEVICE answered GET_DISPLAY_INFO with, so
+     * they are attacker-controlled under a hostile hypervisor. This used to be
+     *
+     *     uint32_t pages = (w * hgt * 4u + 4095u) / 4096u;
+     *     if (pages > GPU_MAX_FB_PAGES) { w = 1024; hgt = 768; ... }
+     *
+     * — all of it uint32. A geometry whose w*hgt*4 wraps 32 bits yields a SMALL
+     * page count, which passes the clamp; and because it passes, the clamp never
+     * rewrites w/hgt. The huge declared geometry is then stored into
+     * s_fb_w/s_fb_h/s_fb_pitch below while the allocation is the wrapped size,
+     * and the test-pattern loop walks `hgt` rows of `s_fb_pitch` bytes over it.
+     * Measured: w=0x100000, h=1025 allocates 4 MiB and writes 4.29 GiB.
+     *
+     * Fixed the way drivers/fb.c already does it for bootloader-supplied
+     * geometry — bound each dimension against an explicit maximum FIRST, then
+     * compute the extent in 64-bit so it cannot wrap. Sharing fb.h's limits
+     * keeps the two paths from drifting. Any failure lands in ONE branch that
+     * rewrites w, hgt and pages together, so they can no longer disagree.
+     * (audit 2026-08-01 C-4 / A6-C1 / A3-I2.) */
+    uint64_t fb_bytes = (uint64_t)w * (uint64_t)hgt * 4ull;
+    uint64_t pages64  = (fb_bytes + 4095ull) / 4096ull;
+    if (w == 0 || hgt == 0 ||
+        w > FB_MAX_WIDTH || hgt > FB_MAX_HEIGHT ||
+        pages64 > (uint64_t)GPU_MAX_FB_PAGES) {
+        /* Implausible, degenerate, or larger than we can back — use the safe
+         * default. Recompute from the SAME variables the caller will use. */
         w = 1024; hgt = 768;
-        pages = (w * hgt * 4u + 4095u) / 4096u;
+        fb_bytes = (uint64_t)w * (uint64_t)hgt * 4ull;
+        pages64  = (fb_bytes + 4095ull) / 4096ull;
     }
+    uint32_t pages = (uint32_t)pages64;   /* <= GPU_MAX_FB_PAGES by construction */
 
     /* 2. RESOURCE_CREATE_2D. */
     virtio_gpu_resource_create_2d_t *c2 =
