@@ -30,7 +30,35 @@ sys_getdents64(uint64_t fd_num, uint64_t dirp, uint64_t count)
     char name[256];
     uint8_t type;
 
+    /* GETDENTS_MAX_ENTRIES — ceiling on the entries ONE getdents64 call will
+     * produce, in the spirit of MM_MAX_RANGE_PAGES (sys_memory.c).
+     *
+     * ext2_readdir(index) restarts its walk from block 0 on every call, so
+     * returning entry k costs O(k). `count` bounds the OUTPUT, not the WALK —
+     * so one call with a large buffer over an N-entry directory was ~O(N^2)
+     * inner iterations, and syscalls run with IF=0, so it could not be
+     * preempted, interrupted or killed. A concurrent TLB shootdown from any
+     * other core then spins for an ack the wedged core never sends, taking the
+     * machine with it. Trigger needs only baseline caps: mkdir a directory you
+     * own on the ext2 root, create ~30k files, one getdents64 with a 4 MiB
+     * buffer. (/tmp is not a vector — ramfs caps dirents at 256.)
+     *
+     * Transparent to callers: getdents64 is already specified to return short,
+     * and every libc loops until it returns 0. Bounding the entries per call
+     * bounds the work per call, which is what stops the unpreemptible wedge —
+     * interrupts are serviced between calls.
+     *
+     * RESIDUAL, stated honestly: this does not fix the underlying O(N^2) cost
+     * of listing a large directory, only the unbounded single syscall. The
+     * principled fix is a resumable cursor in ext2_readdir (carry the
+     * block/offset position rather than re-deriving it from an entry index),
+     * which changes the fs_ops readdir contract and every backend with it.
+     * (audit 2026-08-01, A8.) */
+    #define GETDENTS_MAX_ENTRIES 512u
+    uint32_t produced = 0;
+
     while (1) {
+        if (produced >= GETDENTS_MAX_ENTRIES) break;
         if (f->ops->readdir(f->priv, f->offset, name, &type) != 0) break;
 
         /* Record size: fixed header (19 bytes) + name + null, rounded up to 8 */
@@ -56,6 +84,7 @@ sys_getdents64(uint64_t fd_num, uint64_t dirp, uint64_t count)
         copy_to_user((void *)(uintptr_t)(dirp + written), kbuf, reclen);
         written += reclen;
         f->offset++;
+        produced++;
     }
     return written;
 }

@@ -86,6 +86,7 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
 #define SYS_newfstatat   79
 #define SYS_pipe2        59
 #define SYS_ppoll        73    /* aarch64 has no poll(2); dispatch maps 73→271 */
+#define SYS_getdents64   61
 #define SYS_read         63
 #define SYS_exit_group   94
 #else
@@ -116,6 +117,7 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
 #define SYS_readlink     89
 #define SYS_pipe2        293
 #define SYS_ppoll        271
+#define SYS_getdents64   217
 #define SYS_read         0
 #define SYS_exit_group   231
 #endif
@@ -693,6 +695,75 @@ void _start(void)
         }
         if (ok) { pass++; out("[KTEST] PASS ptmx slot release (48 cycles)\n"); }
         else out("[KTEST] FAIL ptmx slot release — pool exhausted (leak)\n");
+    }
+
+    /* 8g. getdents64 caps the ENTRIES it returns per call (GETDENTS_MAX_ENTRIES,
+     *     512) so one syscall cannot run unbounded at IF=0 over a huge
+     *     directory. That cap is only safe if it is transparent — getdents64 is
+     *     specified to return short and callers loop — so build a directory
+     *     LARGER than the cap and prove a full listing still enumerates every
+     *     entry across multiple calls.
+     *
+     *     This is the regression that matters: a cap that silently truncated a
+     *     listing would break every directory read on the system, and no
+     *     existing test has a directory anywhere near 512 entries. */
+    total++;
+    {
+        int ok = 1;
+        const int NFILES = 600;          /* > GETDENTS_MAX_ENTRIES */
+        char nm[32];
+        if (k_mkdir("/gd") != 0) ok = 0;
+        for (int i = 0; i < NFILES && ok; i++) {
+            int p2 = 0;
+            nm[p2++]='/'; nm[p2++]='g'; nm[p2++]='d'; nm[p2++]='/'; nm[p2++]='f';
+            int v = i, d[4], nd = 0;
+            do { d[nd++] = v % 10; v /= 10; } while (v && nd < 4);
+            while (nd > 0) nm[p2++] = (char)('0' + d[--nd]);
+            nm[p2] = '\0';
+            long fd = sys6(SYS_openat, AT_FDCWD, (long)nm, 0x40 /*O_CREAT*/ | 1, 0644, 0, 0);
+            if (fd < 0) ok = 0; else sys3(SYS_close, fd, 0, 0);
+        }
+
+        long seen = 0, calls = 0;
+        if (ok) {
+            long dfd = sys6(SYS_openat, AT_FDCWD, (long)"/gd", 0, 0, 0, 0);
+            if (dfd < 0) ok = 0;
+            else {
+                static char dbuf[8192];
+                for (;;) {
+                    long n = sys3(SYS_getdents64, dfd, (long)dbuf, sizeof(dbuf));
+                    if (n <= 0) break;
+                    calls++;
+                    /* Walk the returned records: d_reclen is at offset 16. */
+                    for (long off = 0; off + 19 <= n; ) {
+                        unsigned short rl = *(unsigned short *)(dbuf + off + 16);
+                        if (rl == 0) break;
+                        seen++;
+                        off += rl;
+                    }
+                    if (calls > 20) break;   /* runaway guard */
+                }
+                sys3(SYS_close, dfd, 0, 0);
+            }
+        }
+        /* Every file must be enumerated, and it must have taken more than one
+         * call — otherwise the cap did not actually engage and proves nothing. */
+        if (ok && seen < NFILES) ok = 0;
+        if (ok && calls < 2)     ok = 0;
+
+        for (int i = 0; i < NFILES; i++) {
+            int p2 = 0;
+            nm[p2++]='/'; nm[p2++]='g'; nm[p2++]='d'; nm[p2++]='/'; nm[p2++]='f';
+            int v = i, d[4], nd = 0;
+            do { d[nd++] = v % 10; v /= 10; } while (v && nd < 4);
+            while (nd > 0) nm[p2++] = (char)('0' + d[--nd]);
+            nm[p2] = '\0';
+            k_unlink(nm);
+        }
+        k_rmdir("/gd");
+
+        if (ok) { pass++; out("[KTEST] PASS getdents64 cap is transparent (600 entries)\n"); }
+        else out("[KTEST] FAIL getdents64 cap truncated a listing\n");
     }
 
     /* 9. Concurrent multi-core scheduling: fork 4 children that each spin
