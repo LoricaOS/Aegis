@@ -669,6 +669,32 @@ void _start(void)
         else out("[KTEST] FAIL poll pin/unpin: ppoll returned an error\n");
     }
 
+    /* 8f. PTY pool slots must be released exactly once, and only after the
+     *     close path has finished touching the pair.
+     *
+     *     in_use was cleared under pair->lock while ptmx_open scans it and
+     *     memsets the whole pair under pty_pool_lock — two different locks
+     *     guarding one word. The slot is now released under pty_pool_lock and
+     *     only AFTER the wakes, so a new owner cannot re-init pair->lock and
+     *     both waitqueues under a thread that is still closing.
+     *
+     *     What this catches: the release is now conditional on `release`, so
+     *     getting that wrong leaks the slot. The pool is PTY_MAX_PAIRS (16), so
+     *     a leak fails within 17 iterations; 48 gives margin. It does NOT
+     *     reproduce the cross-CPU re-init — that needs two threads racing
+     *     open and close, and the corruption is silent without poisoning. */
+    total++;
+    {
+        int ok = 1;
+        for (int i = 0; i < 48 && ok; i++) {
+            long fd = sys6(SYS_openat, AT_FDCWD, (long)"/dev/ptmx", 2 /*O_RDWR*/, 0, 0, 0);
+            if (fd < 0) { ok = 0; break; }
+            sys3(SYS_close, fd, 0, 0);
+        }
+        if (ok) { pass++; out("[KTEST] PASS ptmx slot release (48 cycles)\n"); }
+        else out("[KTEST] FAIL ptmx slot release — pool exhausted (leak)\n");
+    }
+
     /* 9. Concurrent multi-core scheduling: fork 4 children that each spin
      *    (long enough to overlap in wall time) and exit with a distinct
      *    code; the parent reaps all four and checks every code came back.
