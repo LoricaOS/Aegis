@@ -365,7 +365,16 @@ e1000_send(netdev_t *dev, const void *pkt, uint16_t len)
 static void
 e1000_poll(netdev_t *dev)
 {
-    while (s_rx_ring[s_rx_cur].status & RXD_STAT_DD) {
+    /* Bound by the ring size. The loop condition reads a DD bit out of
+     * DMA-shared memory that the DEVICE writes, and this runs from the PIT ISR
+     * (netdev_poll_all) — so a device that keeps DD set on every descriptor,
+     * whether malicious or merely wedged, spins here forever in interrupt
+     * context and takes the machine with it. A device cannot legitimately
+     * complete more than a ring's worth of descriptors between two polls; if
+     * more are ready they are simply picked up on the next tick.
+     * (audit 2026-08-01, A10-H1.) */
+    uint32_t guard = 0;
+    while ((s_rx_ring[s_rx_cur].status & RXD_STAT_DD) && guard++ < E1000_RX_DESC) {
         static uint8_t rx_copy[E1000_BUF_SIZE];
         uint8_t  st  = s_rx_ring[s_rx_cur].status;
         uint16_t len = s_rx_ring[s_rx_cur].length;
