@@ -87,10 +87,46 @@ static void run(int fixed)
           "C-4: oversize 4K still clamps to the safe default");
 }
 
+/* ── C-6: fs/fat.c — the install-protected-tree test ───────────────────
+ * fat_under_prot was `return 0`, so on a FAT root nothing was ever protected
+ * and four capability gates took the permitted branch unconditionally. It is a
+ * path-PREFIX test (FAT has no inode identity to anchor to, and no symlinks),
+ * so the boundary case that matters is a sibling name sharing a prefix with a
+ * protected tree: "/binary" must NOT be treated as inside "/bin". */
+static int fat_path_under(const char *path, const char *tree)
+{
+    uint32_t i = 0;
+    while (tree[i] && path[i] == tree[i]) i++;
+    if (tree[i] != '\0') return 0;
+    return path[i] == '\0' || path[i] == '/';
+}
+static int fat_under_prot(const char *path, int fixed)
+{
+    if (!fixed) return 0;                 /* the pre-fix constant */
+    if (!path || path[0] != '/') return 0;
+    return fat_path_under(path, "/bin")  || fat_path_under(path, "/sbin") ||
+           fat_path_under(path, "/apps") || fat_path_under(path, "/etc/aegis");
+}
+
+static void run_fat(int fixed)
+{
+    CHECK(fat_under_prot("/bin/sh", fixed),        "C-6: /bin/sh is protected");
+    CHECK(fat_under_prot("/bin", fixed),           "C-6: /bin itself is protected");
+    CHECK(fat_under_prot("/etc/aegis/caps.d/x", fixed),
+                                                   "C-6: /etc/aegis subtree protected");
+    /* These must be false in BOTH arms — a fix that over-matched would be worse
+     * than the bug, locking users out of their own files. */
+    CHECK(!fat_under_prot("/binary", fixed),       "C-6: /binary is NOT /bin");
+    CHECK(!fat_under_prot("/home/u/bin/sh", fixed),"C-6: a nested bin/ is not /bin");
+    CHECK(!fat_under_prot("/etc/passwd", fixed),   "C-6: /etc is not /etc/aegis");
+}
+
 int main(void)
 {
     run(0);
     run(1);
+    printf("\n=== C-6 fat_under_prot: BEFORE ===\n");  run_fat(0);
+    printf("\n=== C-6 fat_under_prot: AFTER  ===\n");  run_fat(1);
     printf("\n%d check(s) failed\n", fails);
     return 0;
 }

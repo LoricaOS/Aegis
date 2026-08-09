@@ -358,7 +358,53 @@ static int fat_open(const char *path, uint32_t *ino) {
     return resolve(path, ino, &d, 0, 0);
 }
 static int fat_open_ex(const char *path, uint32_t *ino, int follow) { (void)follow; return fat_open(path, ino); }
-static int fat_open_prot(const char *path, uint32_t *ino, int *prot) { if (prot) *prot = 0; return fat_open(path, ino); }
+/* fat_under_prot / fat_open_prot — the install-protected-tree test.
+ *
+ * These are NOT decoration: cap_path_is_protected() is a one-line forwarder to
+ * g_rootfs->path_under_protected(), so the whole path-based half of the
+ * capability layer is implemented by whichever fs backend the config links.
+ * Both used to be constants — `return 0` and `*prot = 0` — which meant that on
+ * a FAT root NOTHING was ever protected. Four gates then took the permitted
+ * branch unconditionally: the INSTALL gate on mutating opens under
+ * /bin,/sbin,/apps,/etc/aegis (sys_file.c), the two fd-based INSTALL gates on
+ * fchmod/fchown (sys_meta.c, keyed on VFS_KF_PROTECTED which was never set), and
+ * the AF_UNIX name-squatting gate (unix_socket.c). Unlike nullfs.c — which has
+ * the same constants but fails closed because every operation returns -ENOENT —
+ * fat.c is a complete read-write filesystem, so those gates were the only thing
+ * between an unprivileged process and /bin. The Kconfig help names the
+ * capability layer as the compensating control for FAT's lack of Unix
+ * permissions; this is that control. (audit 2026-08-01 C-6.)
+ *
+ * A path-PREFIX test, where ext2 resolves the inode. That is weaker in general
+ * — a prefix check can be fooled by symlinks and by ".." — but it is sound for
+ * FAT specifically: this driver has no symlinks at all (fat_readlink and
+ * fat_readlink_ino both return -EINVAL), and callers pass the already
+ * normalized absolute path, with "." / ".." / "//" collapsed by sys_open before
+ * it ever reaches the fs layer. FAT has no stable inode identity to anchor to,
+ * so a prefix test is also the only option available. */
+static int fat_path_under(const char *path, const char *tree)
+{
+    uint32_t i = 0;
+    while (tree[i] && path[i] == tree[i]) i++;
+    if (tree[i] != '\0')
+        return 0;                       /* diverged before the tree ended */
+    /* Exact match, or a genuine child: "/bin" and "/bin/sh" but not "/binary". */
+    return path[i] == '\0' || path[i] == '/';
+}
+
+static int fat_under_prot(const char *path)
+{
+    if (!path || path[0] != '/')
+        return 0;
+    return fat_path_under(path, "/bin")  || fat_path_under(path, "/sbin") ||
+           fat_path_under(path, "/apps") || fat_path_under(path, "/etc/aegis");
+}
+
+static int fat_open_prot(const char *path, uint32_t *ino, int *prot)
+{
+    if (prot) *prot = fat_under_prot(path);
+    return fat_open(path, ino);
+}
 static int fat_lookup_parent(const char *path, uint32_t *pino, const char **base) {
     uint32_t pcl = 0;
     int r = resolve(path, 0, 0, &pcl, base);
@@ -367,7 +413,7 @@ static int fat_lookup_parent(const char *path, uint32_t *pino, const char **base
     if (pino) *pino = pcl;
     return 0;
 }
-static int fat_under_prot(const char *path)         { (void)path; return 0; }
+
 
 /* ---- fs_ops: inode-level -------------------------------------------- */
 

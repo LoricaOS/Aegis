@@ -20,7 +20,7 @@ behaviour is unchanged, so a fix that simply rejected everything would fail too.
 |---|---|
 | `poc-mm-arch.c`  | C1 (`readlink` bufsiz underflow, both halves), H9 (VGA CSI signed overflow), H1 (`mremap` address-space wrap), H3 (`mremap` unbounded scan) |
 | `poc-fs-block.c` | C2 (FAT LFN `seq==0`), H4 (ext2 dir `i_size` infinite loop), H5b (BPB geometry underflow), H5c (`cluster_lba` overflow), H8 (GPT bounce overrun) |
-| `poc-2026-08-01.c` | C-4 (virtio-GPU `GET_DISPLAY_INFO` geometry overflow defeating its own clamp) |
+| `poc-2026-08-01.c` | C-4 (virtio-GPU `GET_DISPLAY_INFO` geometry overflow defeating its own clamp), C-6 (FAT's install-protected-tree test, incl. the `/binary` vs `/bin` boundary) |
 
 Findings not represented here are structural rather than arithmetic (lock
 recursion, capability gating, SMP races, guard pages) and are covered by the
