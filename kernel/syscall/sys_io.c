@@ -484,9 +484,16 @@ sys_close(uint64_t arg1)
     if (arg1 >= PROC_MAX_FDS)
         return SYS_ERR(EBADF);
     aegis_process_t *proc = current_proc();
+    /* Detach the slot UNDER the table lock so a concurrent fd_table_copy
+     * (fork/clone from a sibling sharing this table) cannot snapshot the slot
+     * and then ->dup an object we are about to release. Close AFTER the
+     * unlock: ops->close does real work and must not run under a spinlock. */
+    irqflags_t fl = spin_lock_irqsave(&proc->fd_table->lock);
     vfs_file_t *f = &proc->fd_table->fds[arg1];
-    if (!f->ops)
+    if (!f->ops) {
+        spin_unlock_irqrestore(&proc->fd_table->lock, fl);
         return SYS_ERR(EBADF);
+    }
     const vfs_ops_t *ops = f->ops;
     void *priv = f->priv;
     f->ops    = (const vfs_ops_t *)0;
@@ -495,6 +502,7 @@ sys_close(uint64_t arg1)
                       * inherit a stale AUTH_GATED/PROTECTED bit — invariant: a
                       * free slot (ops==NULL) has kflags==0. Creation paths that
                       * don't set kflags (memfd/pipe/socket) then stay clean. */
+    spin_unlock_irqrestore(&proc->fd_table->lock, fl);
     ops->close(priv);
     return 0;
 }
