@@ -53,7 +53,8 @@ CFLAGS = \
     -DAEGIS_BOOT_NATIVE \
     -Ikernel/arch/arm64 -Ikernel/core -Ikernel/cap -Ikernel/mm \
     -Ikernel/sched -Ikernel/proc -Ikernel/syscall -Ikernel/fs \
-    -Ikernel/tty -Ikernel/signal -Ikernel/drivers -Ikernel/net
+    -Ikernel/tty -Ikernel/signal -Ikernel/drivers -Ikernel/net \
+    -include build/generated/autoconf.h
 # NATIVE_KVATEST=1 (optional): append `kvatest` to the built-in cmdline so the
 # kernel VA allocator integrity stress runs early in boot. For chasing the arm64
 # multi-page corruption — it only ever reproduced on real hardware (the build
@@ -141,7 +142,7 @@ SHARED_SRCS = \
     kernel/fs/memfd.c kernel/fs/eventfd.c kernel/fs/poll_test.c \
     kernel/fs/mount.c \
     kernel/drivers/fb.c kernel/drivers/ramdisk.c kernel/drivers/nvme.c \
-    kernel/drivers/virtio_pci.c kernel/drivers/virtqueue.c \
+    kernel/drivers/virtio_core.c kernel/drivers/virtio_pci.c kernel/drivers/virtqueue.c \
     kernel/drivers/virtio_blk.c kernel/drivers/virtio_input.c \
     kernel/drivers/virtio_gpu.c kernel/drivers/virtio_net.c \
     kernel/drivers/usb_mouse.c \
