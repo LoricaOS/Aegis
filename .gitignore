@@ -12,3 +12,15 @@ kernel/cap/target/
 # Local working notes / throwaway scripts (not for the public repo)
 TODO.md
 regen_o1.sh
+
+# tools/fuzz build products + generated corpora (harnesses/seeds are tracked)
+/tools/fuzz/fuzz_netrx
+/tools/fuzz/fuzz_ethrx
+/tools/fuzz/corpus_*/
+/tools/fuzz/crash-*
+/tools/fuzz/leak-*
+/tools/fuzz/timeout-*
+/tools/fuzz/oom-*
+/tools/fuzz/fuzz_fat
+/tools/fuzz/fuzz_ext2
+/tools/fuzz/fuzz_gpt

@@ -476,6 +476,64 @@ sched_add(aegis_task_t *task)
     spin_unlock_irqrestore(&sched_lock, fl);
 }
 
+/* wake_group_parent_locked — wake the parent of a dying THREAD's process.
+ *
+ * A task's exit notification goes to dying->ppid, and sys_clone sets ppid to
+ * the caller's pid for CLONE_THREAD too — so a thread's SIGCHLD lands on
+ * whichever sibling happened to clone it, never on the process's own parent.
+ * That is fine for signal delivery (a process reports one child death, not one
+ * per thread), but it loses the only event a waitpid'ing parent is waiting for.
+ *
+ * sys_waitpid refuses to reap a group leader while any sibling is still live,
+ * because reaping frees the PML4 the siblings share. So a parent that waits on
+ * a multi-threaded child must be re-woken when the LAST sibling zombifies. The
+ * leader's own SIGCHLD cannot serve: the leader is killed by
+ * thread_group_teardown like any other sibling and typically zombifies first,
+ * while its siblings are still running — the parent wakes, finds the leader
+ * unreapable, and blocks again. Every later sibling exit then notifies another
+ * thread of the same (already dying) group, so nothing ever wakes the parent
+ * and it sleeps forever holding the console.
+ *
+ * Wake it here instead. No signal is raised — only the block is broken;
+ * sys_waitpid re-scans and blocks again if the group is still incomplete, so a
+ * wake that turns out to be early costs one loop iteration. Caller holds
+ * sched_lock, which is also what makes this race-free against the parent:
+ * waitpid's no-zombie scan and its transition to TASK_BLOCKED are one critical
+ * section, so we either run before the scan (which then sees the whole group
+ * zombified and reaps it) or after it blocked (and we wake it). */
+static void
+wake_group_parent_locked(aegis_process_t *dying)
+{
+    aegis_task_t *cur = sched_current();
+    aegis_task_t *t   = cur;
+    uint32_t      ppid = 0;
+
+    /* The leader carries the process's real parent. If it is already gone from
+     * the task list it has been reaped, so nobody is waiting on this group. */
+    do {
+        if (t->is_user && ((aegis_process_t *)t)->pid == dying->tgid) {
+            ppid = ((aegis_process_t *)t)->ppid;
+            break;
+        }
+        t = t->next;
+    } while (t != cur);
+
+    /* ppid == dying->ppid means the sibling was cloned by the leader's parent
+     * itself, which sched_exit already notified. */
+    if (ppid == 0 || ppid == dying->ppid)
+        return;
+
+    t = cur;
+    do {
+        if (t->is_user && ((aegis_process_t *)t)->pid == ppid) {
+            if (t->state == TASK_BLOCKED)
+                sched_wake_locked(t);
+            return;
+        }
+        t = t->next;
+    } while (t != cur);
+}
+
 /* Deferred cleanup: dying task's resources cannot be freed before ctx_switch
  * (ctx_switch writes dying->sp; the dying stack is live until the stack pointer switches).
  * Recorded in percpu_t (prev_dying_tcb/stack/stack_pages) and freed at the
@@ -593,6 +651,11 @@ sched_exit(void)
          * parent in TASK_RUNNING state. */
         if (dying->ppid != 0)
             signal_send_pid_locked(dying->ppid, SIGCHLD);
+
+        /* A thread exiting is also the event that can finally make its group
+         * leader reapable — and that news reaches nobody via SIGCHLD above. */
+        if (dying->tgid != dying->pid)
+            wake_group_parent_locked(dying);
 
         /* Find parent for direct ctx_switch (avoids PIT dependency).
          * signal_send_pid may have transitioned the parent BLOCKED→RUNNING;
@@ -1202,21 +1265,30 @@ dump_all_tasks(const char *reason, int blocking)
     int n = 0;
     do {
         const char *name = "<kthread>";
-        uint32_t pid = 0;
+        uint32_t pid = 0, ppid = 0, tgid = 0;
         if (t->is_user) {
             aegis_process_t *proc = (aegis_process_t *)t;
             name = proc->exe_path[0] ? proc->exe_path : "<user>";
             pid  = proc->pid;
+            /* ppid/tgid are what distinguish a thread from a process here, and
+             * a stuck waitpid is almost always a question of which task the
+             * exit notification was aimed at — without them a stackshot of a
+             * hung thread group cannot be read. */
+            ppid = proc->ppid;
+            tgid = proc->tgid;
         }
         const char *mark = (t == cur) ? " <== current" : "";
         /* printk has no %d; on_cpu is int32 (-1 when not running on any CPU). */
         if (t->on_cpu < 0)
-            printk("[STACKSHOT] pid=%u %s state=%u on_cpu=-1 sc=%u wait=%u%s\n",
-                   pid, name, t->state, t->last_syscall, t->waiting_for, mark);
-        else
-            printk("[STACKSHOT] pid=%u %s state=%u on_cpu=%u sc=%u wait=%u%s\n",
-                   pid, name, t->state, (uint32_t)t->on_cpu, t->last_syscall,
+            printk("[STACKSHOT] pid=%u ppid=%u tgid=%u %s state=%u on_cpu=-1 "
+                   "sc=%u wait=%u%s\n",
+                   pid, ppid, tgid, name, t->state, t->last_syscall,
                    t->waiting_for, mark);
+        else
+            printk("[STACKSHOT] pid=%u ppid=%u tgid=%u %s state=%u on_cpu=%u "
+                   "sc=%u wait=%u%s\n",
+                   pid, ppid, tgid, name, t->state, (uint32_t)t->on_cpu,
+                   t->last_syscall, t->waiting_for, mark);
 
         if (t == cur) {
             print_backtrace_from((uint64_t)__builtin_frame_address(0), 12);

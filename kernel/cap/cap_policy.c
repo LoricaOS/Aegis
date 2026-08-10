@@ -146,6 +146,20 @@ cap_path_is_protected(const char *path)
     return g_rootfs->path_under_protected(path);
 }
 
+/* The one binary permitted to hold CAP_KIND_ADMIN_AUTH at SERVICE tier — the
+ * authenticator that verifies the admin credential before calling
+ * sys_admin_session(1). It must be an exact, absolute path: a prefix or
+ * substring test would match /bin/login-evil or /apps/x/bin/login. */
+#define CAP_AUTHENTICATOR_PATH "/bin/login"
+
+/* Exact string equality without libc. */
+static int
+path_is(const char *s, const char *want)
+{
+    while (*s && *want && *s == *want) { s++; want++; }
+    return *s == '\0' && *want == '\0';
+}
+
 /* Substring test without libc: returns 1 if `needle` occurs anywhere in `s`. */
 static int
 contains(const char *s, const char *needle)
@@ -592,6 +606,38 @@ cap_apply_policy(cap_slot_t *caps, const char *path, int authenticated,
                  * shipped policy needs this: real INSTALL/DISK_ADMIN users declare
                  * `admin`; the sole service-tier INSTALL, caps.d/vigil, is inert —
                  * PID 1's caps come from proc.c, not policy.) Fail closed + WARN. */
+                /* ADMIN_AUTH belongs on that list too, and was missing.
+                 *
+                 * It is the cap sys_admin_session(1) requires to ELEVATE a
+                 * session, and the kernel's only other requirement there is a
+                 * same-session parent — the credential check lives entirely in
+                 * userland /bin/login. So `service ADMIN_AUTH` in ANY caps.d is
+                 * a credential-free path to a full admin session, which is
+                 * precisely the "tier word forges the authority the
+                 * admin_session gate exists to require" case the paragraph
+                 * above describes. (audit 2026-08-01, A5-H1.)
+                 *
+                 * It cannot simply be refused outright: /bin/login legitimately
+                 * ships `service AUTH SETUID ADMIN_AUTH`, and it MUST hold it
+                 * unconditionally because it runs before any session exists —
+                 * refusing it would leave no way to become admin at all. So the
+                 * cap is bound to the one authenticator that is supposed to have
+                 * it, rather than to the tier word alone.
+                 *
+                 * What this does and does not buy: it closes "a caps.d for some
+                 * OTHER binary grants ADMIN_AUTH", which is the hole the comment
+                 * above claims the refusal list closes. It does NOT stop someone
+                 * who can already write /bin/login from inheriting that policy —
+                 * nothing kernel-side can, short of signing executables. It
+                 * narrows the squat target from "any policy file" to exactly one
+                 * path; the write itself is the herald finding (C-5). */
+                if (pol->caps[ci].kind == CAP_KIND_ADMIN_AUTH &&
+                    !path_is(path, CAP_AUTHENTICATOR_PATH)) {
+                    printk("[CAP_POLICY] WARN: refusing service-tier ADMIN_AUTH "
+                           "for %s — only %s may hold it\n",
+                           path, CAP_AUTHENTICATOR_PATH);
+                    continue;
+                }
                 if (pol->caps[ci].kind == CAP_KIND_INSTALL ||
                     pol->caps[ci].kind == CAP_KIND_DISK_ADMIN) {
                     printk("[CAP_POLICY] WARN: refusing service-tier %s for %s "
@@ -603,6 +649,28 @@ cap_apply_policy(cap_slot_t *caps, const char *path, int authenticated,
                 cap_grant(caps, CAP_TABLE_SIZE,
                           pol->caps[ci].kind, pol->caps[ci].rights);
             } else if (pol->caps[ci].tier == CAP_TIER_ADMIN) {
+                /* ADMIN_AUTH is bound to the one authenticator at ANY tier.
+                 * The SERVICE-tier branch above refuses `service ADMIN_AUTH`
+                 * for any path != CAP_AUTHENTICATOR_PATH (audit 2026-08-01
+                 * A5-H1) — but that guard was never mirrored here, so an
+                 * `admin ADMIN_AUTH <anybin>` line fell through to the plain
+                 * `authenticated` bucket below and would hand ADMIN_AUTH to any
+                 * merely-logged-in user, who could then call sys_admin_session(1)
+                 * and elevate their parent shell to a full admin session with NO
+                 * credential check — the kernel does no crypt, it trusts that
+                 * only /bin/login can hold this cap. ADMIN_AUTH is admin_session's
+                 * root of trust; it must never be grantable by tier word alone.
+                 * No shipped caps.d declares `admin ADMIN_AUTH` (login uses the
+                 * service tier), so this refuses nothing legitimate; it closes
+                 * the same escape hatch on the admin tier that A5-H1 closed on
+                 * service. (Found by a 2026-08-09 red-team pass.) */
+                if (pol->caps[ci].kind == CAP_KIND_ADMIN_AUTH &&
+                    !path_is(path, CAP_AUTHENTICATOR_PATH)) {
+                    printk("[CAP_POLICY] WARN: refusing admin-tier ADMIN_AUTH "
+                           "for %s — only %s may hold it\n",
+                           path, CAP_AUTHENTICATOR_PATH);
+                    continue;
+                }
                 /* ADMIN-tier caps require an authenticated session. A stricter
                  * subset requires a sudo-style ADMIN SESSION (admin_session, set
                  * by the stsh `admin` flow / `login -elevate` after a SEPARATE

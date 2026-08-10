@@ -45,6 +45,18 @@ void usb_mouse_process_report(const uint8_t *data, uint32_t len);
  * well beyond the first 64 KB; the previous 16-page (64 KB) limit
  * caused USBLEGSUP cap walks to fault on AMD. */
 #define XHCI_BAR0_PAGES      256u
+#define XHCI_BAR0_BYTES      (XHCI_BAR0_PAGES * 4096u)
+
+/* Validated copies of the controller-supplied doorbell / runtime register
+ * offsets. cap->dboff and cap->rtsoff are uint32 read straight out of device
+ * MMIO and were used UNMASKED and UNBOUNDED at eight sites — one of them
+ * (update_erdp) fires from the PIT ISR on every event. rtsoff = 0xFFFFFFE0 put
+ * a 64-bit physical-address write roughly 4 GiB past the 1 MiB mapping. The
+ * SAFETY comment at the doorbell write even asserted the bound the code did not
+ * enforce, and cited a 64 KB window the driver stopped using. Validated once at
+ * init against the real mapping instead of at each use.
+ * (audit 2026-08-01, A6-H3.) */
+static uint32_t s_dboff, s_rtsoff;
 
 /* Maximum slots we support (hardware MaxSlots may be higher). */
 #define XHCI_MAX_SLOTS       32u
@@ -363,8 +375,14 @@ alloc_page(uint64_t *phys_out)
      * drained. This driver never frees on disconnect (acknowledged leak
      * below) and re-allocates on every enumeration, so a USB gadget cycling
      * connect/disconnect drains that pool — and the unconditional memset then
-     * faulted at EL1 on a NULL page. Report the failure instead; callers
-     * already handle a NULL ring/context. */
+     * faulted at EL1 on a NULL page. Report the failure instead.
+     *
+     * This comment used to claim "callers already handle a NULL ring/context".
+     * That held for the three ring/buffer sites but NOT for the two device-slot
+     * context sites (address_device / configure_endpoint), which dereferenced
+     * the result immediately. Both now check. Reachable without malice: the
+     * acknowledged disconnect leak above means ordinary connect/disconnect
+     * cycling drains the pool. (audit 2026-08-01, A6-H7.) */
     if (!va) {
         printk("[XHCI] FAIL: DMA page allocation failed (low/NC pool "
                "exhausted)\n");
@@ -561,7 +579,7 @@ ring_cmd_doorbell(void)
     /* SAFETY: s_bar0_va + cap->dboff is the doorbell array start;
      * doorbell 0 is the host-controller command doorbell. */
     volatile uint32_t *db =
-        (volatile uint32_t *)(s_bar0_va + s_cap->dboff);
+        (volatile uint32_t *)(s_bar0_va + s_dboff);
     /* sfence: all TRB writes must be globally visible before doorbell. */
     arch_wmb();
     db[0] = 0;
@@ -575,7 +593,7 @@ ring_cmd_doorbell(void)
 static void
 update_erdp(void)
 {
-    uint8_t *rts = s_bar0_va + s_cap->rtsoff;
+    uint8_t *rts = s_bar0_va + s_rtsoff;
     volatile uint64_t *erdp =
         (volatile uint64_t *)(rts + 0x20u + 0x18u);
     /* ERDP must be the BYTE-ACCURATE physical address of the next event TRB.
@@ -685,6 +703,8 @@ issue_address_device(uint8_t slot_id, uint8_t port_num, uint8_t speed)
 {
     uint64_t  ictx_phys;
     uint8_t  *ictx = (uint8_t *)alloc_page(&ictx_phys);
+    if (!ictx)
+        return -1;              /* DMA pool drained — see alloc_page */
 
     /* Input Control Context: Drop=0, Add=0x3 (A0=slot + A1=EP0) */
     ((volatile uint32_t *)ictx)[0] = 0u;
@@ -783,6 +803,8 @@ issue_configure_ep(uint8_t slot_id, uint8_t port_num, uint8_t speed)
 {
     uint64_t  ictx_phys;
     uint8_t  *ictx = (uint8_t *)alloc_page(&ictx_phys);
+    if (!ictx)
+        return -1;              /* DMA pool drained — see alloc_page */
     uint64_t  xfer_phys = s_xfer_ring_phys[slot_id];
 
     /* Input Control Context: Add A0(slot bit0) + A3(EP1IN DCI=3, bit3) = 0x9 */
@@ -971,7 +993,7 @@ issue_control_transfer(uint8_t slot_id, uint64_t setup_pkt, int data_dir)
     s_xfer_enqueue[slot_id] = ei;
 
     /* Ring doorbell for EP0 (DCI=1) */
-    db = (volatile uint32_t *)(s_bar0_va + s_cap->dboff);
+    db = (volatile uint32_t *)(s_bar0_va + s_dboff);
     arch_wmb();
     db[slot_id] = 1u;   /* DCI=1 for EP0 */
 
@@ -1212,7 +1234,7 @@ static spinlock_t s_eth_tx_lock = SPINLOCK_INIT;
  * xhci_poll is NOT called from netdev_poll_all (which normally sets this), so
  * the USB RX-deliver path must set it itself or an un-cached reply would spin
  * the blocking ARP wait inside the timer ISR. Defined in net/netdev.c. */
-extern volatile int g_in_netdev_poll;
+extern volatile int g_in_isr_poll;
 
 /* Last non-HID USB device probed (claimed or not) — for /proc/usbnet so an
  * unsupported adapter can be identified by VID/PID. */
@@ -1636,7 +1658,7 @@ xhci_eth_submit_rx(void)
         s_eth.in_cycle ^= 1u;
         s_eth.in_enq = 0;
     }
-    db = (volatile uint32_t *)(s_bar0_va + s_cap->dboff);
+    db = (volatile uint32_t *)(s_bar0_va + s_dboff);
     arch_wmb();
     db[s_eth.slot_id] = s_eth.bulk_in_dci;
 }
@@ -1663,7 +1685,7 @@ xhci_eth_submit_int(void)
         s_eth.int_cycle ^= 1u;
         s_eth.int_enq = 0;
     }
-    db = (volatile uint32_t *)(s_bar0_va + s_cap->dboff);
+    db = (volatile uint32_t *)(s_bar0_va + s_dboff);
     arch_wmb();
     db[s_eth.slot_id] = s_eth.int_dci;
 }
@@ -1704,8 +1726,8 @@ xhci_eth_rx_complete(uint32_t len)
     uint32_t i;
     /* We're in the PIT ISR. Tell arp_resolve (reachable via a synchronous reply
      * inside netdev_rx_deliver) to use its non-blocking path. */
-    int prev_inpoll = g_in_netdev_poll;
-    g_in_netdev_poll = 1;
+    int prev_inpoll = g_in_isr_poll;
+    g_in_isr_poll = 1;
     for (i = 0; i < pkt_cnt; i++, pkt_hdr += 4) {
         uint32_t h       = le32(pkt_hdr);
         uint32_t pkt_len = (h >> 16) & 0x1FFFu;
@@ -1720,7 +1742,7 @@ xhci_eth_rx_complete(uint32_t len)
         s_eth.rx_frames++;
         data += padded; remain -= padded;
     }
-    g_in_netdev_poll = prev_inpoll;
+    g_in_isr_poll = prev_inpoll;
 }
 
 /* usb_eth_send — netdev TX (spec §7): prepend an 8-byte header (frame_len,
@@ -1775,7 +1797,7 @@ usb_eth_send(netdev_t *dev, const void *pkt, uint16_t len)
     s_eth.tx_inflight = 1;
     s_eth.tx_count++;
 
-    volatile uint32_t *db = (volatile uint32_t *)(s_bar0_va + s_cap->dboff);
+    volatile uint32_t *db = (volatile uint32_t *)(s_bar0_va + s_dboff);
     arch_wmb();
     db[s_eth.slot_id] = s_eth.bulk_out_dci;
     spin_unlock_irqrestore(&s_eth_tx_lock, fl);
@@ -1907,7 +1929,7 @@ msc_bulk_one(uint8_t dci, xhci_trb_t *ring,
     }
     *p_enq = ei;
 
-    volatile uint32_t *db = (volatile uint32_t *)(s_bar0_va + s_cap->dboff);
+    volatile uint32_t *db = (volatile uint32_t *)(s_bar0_va + s_dboff);
     arch_wmb();
     db[s_msc.slot_id] = dci;
 
@@ -2835,6 +2857,29 @@ xhci_init_one(const pcie_device_t *dev)
     s_max_slots = (s_cap->hcsparams1)       & 0xFFu;
     s_max_ports = (s_cap->hcsparams1 >> 24) & 0xFFu;
 
+    /* Bound the controller-supplied register-array offsets to the mapping
+     * BEFORE anything derives a pointer from them. The spec reserves the low
+     * bits of each (dboff 2, rtsoff 5), so mask them as required and then check
+     * the whole array extent fits: the doorbell array is (max_slots + 1) dwords,
+     * and the runtime block is 0x20 bytes of header plus 32 bytes per
+     * interrupter. Refuse the controller outright rather than clamping — a
+     * controller reporting offsets outside its own BAR is not one to keep
+     * talking to. */
+    s_dboff  = s_cap->dboff  & ~0x3u;
+    s_rtsoff = s_cap->rtsoff & ~0x1Fu;
+    {
+        uint64_t db_end  = (uint64_t)s_dboff +
+                           ((uint64_t)s_max_slots + 1ull) * 4ull;
+        uint64_t rts_end = (uint64_t)s_rtsoff + 0x20ull + 32ull;
+        if (db_end > XHCI_BAR0_BYTES || rts_end > XHCI_BAR0_BYTES) {
+            printk("[XHCI] FAIL: controller reports dboff=0x%x rtsoff=0x%x "
+                   "outside the %u-byte BAR0 mapping\n",
+                   (unsigned)s_cap->dboff, (unsigned)s_cap->rtsoff,
+                   (unsigned)XHCI_BAR0_BYTES);
+            return -1;
+        }
+    }
+
     /* HCCPARAMS1.CSZ (bit 2) — 0 = 32-byte contexts, 1 = 64-byte. */
     s_ctx_entry_size = (s_cap->hccparams1 & (1u << 2)) ? 64u : 32u;
     pr_dbg("[XHCI] hccparams1=0x%x ctx_size=%u\n",
@@ -3003,7 +3048,7 @@ xhci_init_one(const pcie_device_t *dev)
          *
          * The interrupter registers begin at runtime_base + 0x20 (the first
          * 0x20 bytes are MFINDEX + reserved). */
-        rts = s_bar0_va + s_cap->rtsoff;
+        rts = s_bar0_va + s_rtsoff;
         {
             volatile uint32_t *erstsz =
                 (volatile uint32_t *)(rts + 0x20u + 0x08u);
@@ -3360,9 +3405,10 @@ xhci_schedule_interrupt_in(uint8_t slot_id, uint8_t ep_id,
     }
 
     /* Ring doorbell: slot_id selects device doorbell, ep_id selects endpoint.
-     * SAFETY: s_bar0_va + cap->dboff is the doorbell array base within the
-     * 64KB BAR0 mapping; db[slot_id] is within that range for slot_id < 32. */
-    db = (volatile uint32_t *)(s_bar0_va + s_cap->dboff);
+     * SAFETY: s_dboff was bounded against the BAR0 mapping at init (see its
+     * declaration), and db[slot_id] is within the doorbell array for
+     * slot_id <= s_max_slots, which that check accounted for. */
+    db = (volatile uint32_t *)(s_bar0_va + s_dboff);
     /* sfence: TRB write must be globally visible before doorbell write. */
     arch_wmb();
     db[slot_id] = ep_id;

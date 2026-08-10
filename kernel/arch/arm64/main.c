@@ -344,7 +344,9 @@ kernel_main_arm64(void)
     for (;;) { __asm__ volatile("wfi"); }   /* watchdog resets ~16s → netboot */
 #endif
 #endif
+#ifdef CONFIG_VIRTIO_BLK
     virtio_blk_init();        /* virtio-blk disk → vblk0 (poll mode)    */
+#endif
     virtio_input_init();      /* virtio keyboard + mouse (desktop input) */
     virtio_gpu_init();        /* virtio-gpu scanout → compositor fb      */
 
@@ -369,6 +371,7 @@ kernel_main_arm64(void)
     /* Root filesystem: a boot-module ramdisk wins (live/test media); else
      * try a virtio-blk disk (GPT partition, then whole-disk ext2). */
     gpt_scan("vblk0");
+#ifdef CONFIG_FS_EXT2
     if (blkdev_get("ramdisk0")) {
         ext2_mount("ramdisk0");
     } else if (ext2_mount("vblk0p1") == 0) {
@@ -378,15 +381,24 @@ kernel_main_arm64(void)
     } else {
         printk("[VFS] WARN: no ramdisk and no virtio-blk root — initrd only\n");
     }
+#else
+    printk("[VFS] no ext2 backend in this config — initrd + tmpfs only\n");
+#endif
 
     cap_policy_load();        /* /etc/aegis/caps.d/ — after ext2 mount  */
+#ifdef CONFIG_FS_EXT2
     ext2_anchors_reload();
+#endif
     cap_anchor_audit();
     cap_policy_detect_first_boot();  /* /etc/aegis/configured? → g_first_boot */
     poll_test();
 
+#ifdef CONFIG_VIRTIO_NET
     virtio_net_init();        /* virtio-net NIC → eth0 (poll mode)      */
+#endif
+#ifdef CONFIG_NET
     net_init();               /* loopback + TCP + eth0 stack            */
+#endif
 
     smp_start_aps();          /* PSCI CPU_ON secondary cores — [SMP] OK  */
     sched_init();

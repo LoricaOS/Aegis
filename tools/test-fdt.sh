@@ -17,3 +17,18 @@ cc -O2 -Wall -Wextra -DFDT_HOSTTEST -Ikernel/arch/arm64 \
     test/fdt_test.c kernel/arch/arm64/fdt.c -o "$BIN"
 
 "$BIN" "$DTB"
+
+# Crafted-blob regression (audit 2026-08-01 A3-I1): an FDT_PROP whose length is
+# chosen so `val + len` and the +3 round-up both wrap uint32 — the bound test
+# passed because it overflowed too, and `off` failed to advance. The walker then
+# handed that ~4 GiB length to compat_list_has, which is an out-of-range read
+# (SIGBUS, reproduced). The parser must now reject the property and return.
+EVIL="${TMPDIR:-/tmp}/aegis-fdt-crafted"
+cc -O2 -w -DFDT_HOSTTEST -Ikernel/arch/arm64 \
+    test/fdt_crafted_test.c kernel/arch/arm64/fdt.c -o "$EVIL"
+if "$EVIL"; then
+    echo "FDT-CRAFTED PASS"
+else
+    echo "FDT-CRAFTED FAIL (rc=$?) — crafted length not rejected"
+    exit 1
+fi

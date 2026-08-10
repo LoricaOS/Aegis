@@ -10,8 +10,9 @@ set -u
 ISO="${1:?usage: ktest.sh <kernel.iso>}"
 LOG="$(mktemp)"
 
-timeout 30 qemu-system-x86_64 -machine pc -cdrom "$ISO" -boot order=d \
+timeout 30 qemu-system-x86_64 -machine pc -smp 4 -cdrom "$ISO" -boot order=d \
     -display none -vga std -nodefaults -serial stdio -no-reboot -m 2048M \
+    -device virtio-net-pci -device virtio-rng-pci -device virtio-gpu-pci \
     > "$LOG" 2>&1 || true
 
 if grep -q "no init at" "$LOG"; then

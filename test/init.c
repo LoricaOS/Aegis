@@ -85,6 +85,8 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
 #define SYS_readlinkat   78
 #define SYS_newfstatat   79
 #define SYS_pipe2        59
+#define SYS_ppoll        73    /* aarch64 has no poll(2); dispatch maps 73→271 */
+#define SYS_getdents64   61
 #define SYS_read         63
 #define SYS_exit_group   94
 #else
@@ -114,6 +116,8 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
 #define SYS_symlink      88
 #define SYS_readlink     89
 #define SYS_pipe2        293
+#define SYS_ppoll        271
+#define SYS_getdents64   217
 #define SYS_read         0
 #define SYS_exit_group   231
 #endif
@@ -606,6 +610,162 @@ void _start(void)
         else out("[KTEST] FAIL brk (grow/shrink + heap VMA)\n");
     }
 
+    /* 8e. poll/select/epoll must hold a REFERENCE on each polled object for as
+     *     long as their (stack-allocated) waitq entry is linked into that
+     *     object's queue — see kernel/syscall/fd_waitq.h.
+     *
+     *     The pin calls ops->dup on register and ops->close on unregister, so an
+     *     UNBALANCED pair corrupts the refcount: too many closes frees the pipe
+     *     early (the very UAF the pin prevents), too few leaks it. Either
+     *     bankrupts the pipe pool within a few dozen cycles.
+     *
+     *     A NON-ZERO timeout is essential: sys_poll returns at
+     *     `if (ready > 0 || timeout_ms == 0)` BEFORE the registration block, so a
+     *     zero-timeout poll never reaches the pinned path at all. Poll a pipe
+     *     with nothing to read so the call actually blocks and registers.
+     *
+     *     Honest scope: proves the refcounting is balanced and the path runs. It
+     *     does NOT reproduce the cross-thread free — that needs a CLONE_FILES
+     *     sibling closing mid-block, and the resulting UAF is silent without
+     *     heap poisoning (KASAN's shadow covers the kernel image, not kva). */
+    total++;
+    {
+        int ok = 1, step = 0;
+        struct { int fd; short events; short revents; } pfds[2];
+        struct { long tv_sec; long tv_nsec; } ts = { 0, 20000000L };  /* 20 ms */
+
+        for (int iter = 0; iter < 40 && ok; iter++) {
+            /* pipe2 writes int fd[2] — NOT long[2]. Declaring it long packs
+             * both fds into pf[0] and leaves pf[1] as stack garbage, which
+             * polls as POLLNVAL: nonzero (so it counts as "ready") but not the
+             * event asked for. That cost me two debug cycles; keep it int. */
+            int pf[2];
+            if (sys3(SYS_pipe2, (long)pf, 0, 0) != 0) { step = 1; ok = 0; break; }
+
+            /* Read end has no data -> POLLIN not ready -> the call BLOCKS and
+             * therefore registers (and pins) on the pipe's read waitq, then
+             * times out after 20 ms and unregisters (and unpins). */
+            pfds[0].fd = pf[0]; pfds[0].events = 0x001; pfds[0].revents = 0;
+            long r = sys6(SYS_ppoll, (long)pfds, 1, (long)&ts, 0, 0, 0);
+            if (r < 0) { step = 2; ok = 0; break; }
+
+            /* Zero-timeout probe on the same pipe: sys_poll returns at the
+             * `ready > 0 || timeout_ms == 0` early exit, which must still have
+             * written revents back. The write end of an empty pipe is always
+             * POLLOUT-ready, so a 0 here means the non-blocking path reported a
+             * count without populating the array. */
+            pfds[0].fd = pf[1]; pfds[0].events = 0x004; pfds[0].revents = 0;
+            struct { long tv_sec; long tv_nsec; } z = { 0, 0 };
+            long r0 = sys6(SYS_ppoll, (long)pfds, 1, (long)&z, 0, 0, 0);
+            if (r0 < 0)                        { step = 3; ok = 0; break; }
+            if (!(pfds[0].revents & 0x004))    { step = 4; ok = 0; break; }
+
+            sys3(SYS_close, pf[0], 0, 0);
+            sys3(SYS_close, pf[1], 0, 0);
+        }
+
+        if (ok) { pass++; out("[KTEST] PASS poll pin/unpin balance (40 blocking cycles)\n"); }
+        else if (step == 1) out("[KTEST] FAIL poll pin/unpin: pipe2 failed (pool exhausted?)\n");
+        else if (step == 3) out("[KTEST] FAIL poll pin/unpin: zero-timeout ppoll errored\n");
+        else if (step == 4) out("[KTEST] FAIL poll: zero-timeout returned a count but no revents\n");
+        else out("[KTEST] FAIL poll pin/unpin: ppoll returned an error\n");
+    }
+
+    /* 8f. PTY pool slots must be released exactly once, and only after the
+     *     close path has finished touching the pair.
+     *
+     *     in_use was cleared under pair->lock while ptmx_open scans it and
+     *     memsets the whole pair under pty_pool_lock — two different locks
+     *     guarding one word. The slot is now released under pty_pool_lock and
+     *     only AFTER the wakes, so a new owner cannot re-init pair->lock and
+     *     both waitqueues under a thread that is still closing.
+     *
+     *     What this catches: the release is now conditional on `release`, so
+     *     getting that wrong leaks the slot. The pool is PTY_MAX_PAIRS (16), so
+     *     a leak fails within 17 iterations; 48 gives margin. It does NOT
+     *     reproduce the cross-CPU re-init — that needs two threads racing
+     *     open and close, and the corruption is silent without poisoning. */
+    total++;
+    {
+        int ok = 1;
+        for (int i = 0; i < 48 && ok; i++) {
+            long fd = sys6(SYS_openat, AT_FDCWD, (long)"/dev/ptmx", 2 /*O_RDWR*/, 0, 0, 0);
+            if (fd < 0) { ok = 0; break; }
+            sys3(SYS_close, fd, 0, 0);
+        }
+        if (ok) { pass++; out("[KTEST] PASS ptmx slot release (48 cycles)\n"); }
+        else out("[KTEST] FAIL ptmx slot release — pool exhausted (leak)\n");
+    }
+
+    /* 8g. getdents64 caps the ENTRIES it returns per call (GETDENTS_MAX_ENTRIES,
+     *     512) so one syscall cannot run unbounded at IF=0 over a huge
+     *     directory. That cap is only safe if it is transparent — getdents64 is
+     *     specified to return short and callers loop — so build a directory
+     *     LARGER than the cap and prove a full listing still enumerates every
+     *     entry across multiple calls.
+     *
+     *     This is the regression that matters: a cap that silently truncated a
+     *     listing would break every directory read on the system, and no
+     *     existing test has a directory anywhere near 512 entries. */
+    total++;
+    {
+        int ok = 1;
+        const int NFILES = 600;          /* > GETDENTS_MAX_ENTRIES */
+        char nm[32];
+        if (k_mkdir("/gd") != 0) ok = 0;
+        for (int i = 0; i < NFILES && ok; i++) {
+            int p2 = 0;
+            nm[p2++]='/'; nm[p2++]='g'; nm[p2++]='d'; nm[p2++]='/'; nm[p2++]='f';
+            int v = i, d[4], nd = 0;
+            do { d[nd++] = v % 10; v /= 10; } while (v && nd < 4);
+            while (nd > 0) nm[p2++] = (char)('0' + d[--nd]);
+            nm[p2] = '\0';
+            long fd = sys6(SYS_openat, AT_FDCWD, (long)nm, 0x40 /*O_CREAT*/ | 1, 0644, 0, 0);
+            if (fd < 0) ok = 0; else sys3(SYS_close, fd, 0, 0);
+        }
+
+        long seen = 0, calls = 0;
+        if (ok) {
+            long dfd = sys6(SYS_openat, AT_FDCWD, (long)"/gd", 0, 0, 0, 0);
+            if (dfd < 0) ok = 0;
+            else {
+                static char dbuf[8192];
+                for (;;) {
+                    long n = sys3(SYS_getdents64, dfd, (long)dbuf, sizeof(dbuf));
+                    if (n <= 0) break;
+                    calls++;
+                    /* Walk the returned records: d_reclen is at offset 16. */
+                    for (long off = 0; off + 19 <= n; ) {
+                        unsigned short rl = *(unsigned short *)(dbuf + off + 16);
+                        if (rl == 0) break;
+                        seen++;
+                        off += rl;
+                    }
+                    if (calls > 20) break;   /* runaway guard */
+                }
+                sys3(SYS_close, dfd, 0, 0);
+            }
+        }
+        /* Every file must be enumerated, and it must have taken more than one
+         * call — otherwise the cap did not actually engage and proves nothing. */
+        if (ok && seen < NFILES) ok = 0;
+        if (ok && calls < 2)     ok = 0;
+
+        for (int i = 0; i < NFILES; i++) {
+            int p2 = 0;
+            nm[p2++]='/'; nm[p2++]='g'; nm[p2++]='d'; nm[p2++]='/'; nm[p2++]='f';
+            int v = i, d[4], nd = 0;
+            do { d[nd++] = v % 10; v /= 10; } while (v && nd < 4);
+            while (nd > 0) nm[p2++] = (char)('0' + d[--nd]);
+            nm[p2] = '\0';
+            k_unlink(nm);
+        }
+        k_rmdir("/gd");
+
+        if (ok) { pass++; out("[KTEST] PASS getdents64 cap is transparent (600 entries)\n"); }
+        else out("[KTEST] FAIL getdents64 cap truncated a listing\n");
+    }
+
     /* 9. Concurrent multi-core scheduling: fork 4 children that each spin
      *    (long enough to overlap in wall time) and exit with a distinct
      *    code; the parent reaps all four and checks every code came back.
@@ -824,8 +984,15 @@ void _start(void)
                     /* CLONE_VM|FS|FILES|SIGHAND|THREAD == a real thread: shares
                      * our address space AND our tgid, which is what makes it a
                      * sibling exit_group has to tear down. Stack grows down, so
-                     * hand clone the TOP, 16-aligned. */
-                    long top = (stk + 65536) & ~15L;
+                     * hand clone the TOP, 16-aligned — but leave a page of slack
+                     * BELOW the exact end. A cloned child resumes in the middle
+                     * of _start, which still has a live frame and addresses its
+                     * locals as POSITIVE offsets from rsp (it opens
+                     * `sub $0x890,%rsp`). Handed the exact end, the first such
+                     * access lands past the mapping, where there is no VMA to
+                     * fault against, and the thread takes a SIGSEGV that has
+                     * nothing to do with what it was written to test. */
+                    long top = (stk + 65536 - 4096) & ~15L;
                     long t = sys6(SYS_clone, 0x100 | 0x200 | 0x400 | 0x800 | 0x10000,
                                   top, 0, 0, 0, 0);
                     if (t == 0) {
@@ -859,6 +1026,185 @@ void _start(void)
         }
         if (ok) { pass++; out("[KTEST] PASS exit_group-blocked-sibling (unwound)\n"); }
         else out("[KTEST] FAIL exit_group-blocked-sibling\n");
+    }
+
+    /* 15. exit_group called by a NON-LEADER thread must still wake the parent
+     *     blocked in wait4. Case 14 has the leader call exit_group, so the
+     *     leader zombifies LAST (thread_group_teardown does not return until
+     *     every sibling is a zombie) and the waiting parent always sees a
+     *     complete group on its first look. Invert that and the wedge appears:
+     *
+     *       - the thread calls exit_group, so the LEADER is SIGKILLed by the
+     *         teardown like any other sibling and zombifies FIRST;
+     *       - the leader's SIGCHLD wakes us, but sys_waitpid refuses to reap a
+     *         leader while a sibling is still live (it would free the shared
+     *         PML4), so we skip it and block again;
+     *       - the sibling then zombifies and notifies ITS ppid — which
+     *         sys_clone set to the thread's creator, another thread of the same
+     *         dying group, never us.
+     *
+     *     Nothing else reports the group is complete, so the parent sleeps
+     *     forever. On a real system that parent is the shell, and the console
+     *     goes silent with the kernel otherwise healthy.
+     *
+     *     Ordering is deterministic, not racy: the teardown waits for the
+     *     leader to reach TASK_ZOMBIE before the thread that called exit_group
+     *     runs its own. Like case 14 this is a liveness test, so a regression
+     *     shows up as the harness timing out here rather than a clean FAIL. */
+    total++;
+    {
+        int ok = 1;
+        int pfd[2] = { -1, -1 };
+        if (sys3(SYS_pipe2, (long)pfd, 0, 0) != 0) ok = 0;
+        if (ok) {
+            long pid = sys6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);
+            if (pid == 0) {
+                /* ---- child: the group LEADER ---- */
+                long stk = sys6(SYS_mmap, 0, 65536, PROT_RW, MAP_ANON_PRIV, -1, 0);
+                if (stk > 0) {
+                    /* Slack below the exact end — see case 14 for the hazard. */
+                    long top = (stk + 65536 - 4096) & ~15L;
+                    long t = sys6(SYS_clone, 0x100 | 0x200 | 0x400 | 0x800 | 0x10000,
+                                  top, 0, 0, 0, 0);
+                    if (t == 0) {
+                        /* ---- sibling thread, on the fresh stack ----
+                         * Straight into exit_group: no locals, no delay. It
+                         * does not matter whether the leader has reached its
+                         * read() yet, because thread_group_teardown does not
+                         * return until every sibling is a zombie — so the
+                         * leader zombifies before this thread does either way,
+                         * which is the whole point of the case. */
+                        sys3(SYS_exit_group, 88, 0, 0);
+                    }
+                }
+                /* Park the leader so the teardown has to kill it where it
+                 * blocks — the shape a shell's child is in when this bites. */
+                { char b; for (;;) sys3(SYS_read, pfd[0], (long)&b, 1); }
+            }
+            /* THE PROBE: a BLOCKING wait4. WNOHANG would poll its own way out
+             * of the bug and prove nothing — the defect is precisely that the
+             * blocked parent is never woken again. */
+            int status = 0;
+            long w = sys6(SYS_wait4, pid, (long)&status, 0, 0, 0, 0);
+            if (w != pid) ok = 0;
+            { int st2 = 0; while (sys6(SYS_wait4, -1, (long)&st2, 1 /*WNOHANG*/,
+                                       0, 0, 0) > 0) { } }
+            sys3(SYS_close, pfd[0], 0, 0);
+            sys3(SYS_close, pfd[1], 0, 0);
+        }
+        if (ok) { pass++; out("[KTEST] PASS exit_group-from-thread (parent woken)\n"); }
+        else out("[KTEST] FAIL exit_group-from-thread\n");
+    }
+
+    /* 16. Reaping a group leader must also free its thread zombies. A thread is
+     *     waitable by nobody — sys_clone sets ppid to the CREATING thread, so a
+     *     sibling's ppid names another thread of the same group and no waitpid
+     *     can ever match it. They used to stay in the task list for the rest of
+     *     the boot, each holding a PCB, a kernel stack and one of the 256
+     *     process slots.
+     *
+     *     Asserting on "fork eventually fails" does NOT discriminate, which is
+     *     worth recording because it is the obvious test to write. Leaked slots
+     *     plateau just below the ceiling: once the count is high enough that the
+     *     child's thread clones fail, the iteration stops leaking, the leader is
+     *     still reaped for -1, and the parent's fork keeps succeeding forever. A
+     *     test built on it passes on the broken kernel.
+     *
+     *     So assert what the leak actually destroys: the ability to CREATE
+     *     threads. Each child reports whether all three of its clones succeeded,
+     *     and one failure fails the case. At three leaked slots per iteration
+     *     that ceiling is reached around iteration 83, so 100 iterations clear
+     *     it with margin while staying well inside the harness timeout. */
+    total++;
+    {
+        int ok = 1;
+        for (int i = 0; i < 100 && ok; i++) {
+            long pid = sys6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);
+            if (pid < 0) { ok = 0; break; }
+            if (pid == 0) {
+                /* ---- child: the group leader ---- */
+                int failed = 0;
+                for (int j = 0; j < 3; j++) {
+                    long stk = sys6(SYS_mmap, 0, 16384, PROT_RW, MAP_ANON_PRIV,
+                                    -1, 0);
+                    if (stk <= 0) { failed = 1; break; }
+                    /* Hand clone a stack pointer with slack ABOVE it. The child
+                     * resumes inside _start, whose locals gcc addresses at
+                     * POSITIVE offsets from rsp (it opens `sub $0x890,%rsp`), so
+                     * an exact-end pointer puts the first spill just past the
+                     * mapping — a SIGSEGV with no VMA to fault against, which is
+                     * the kernel behaving correctly. Cases 14 and 15 get away
+                     * with the exact end only because their thread bodies happen
+                     * to compile to no stack access at all. */
+                    long top = (stk + 16384 - 4096) & ~15L;
+                    long t = sys6(SYS_clone,
+                                  0x100 | 0x200 | 0x400 | 0x800 | 0x10000,
+                                  top, 0, 0, 0, 0);
+                    if (t < 0) { failed = 1; break; }
+                    if (t == 0)
+                        for (;;) sys3(SYS_sched_yield, 0, 0, 0);
+                }
+                sys3(SYS_exit_group, failed, 0, 0);
+            }
+            int st = 0;
+            if (sys6(SYS_wait4, pid, (long)&st, 0, 0, 0, 0) != pid) { ok = 0; break; }
+            /* Non-zero == the child could not create its threads, i.e. the slots
+             * from earlier iterations were never returned. */
+            if (((st >> 8) & 0xff) != 0) { ok = 0; break; }
+        }
+        if (ok) { pass++; out("[KTEST] PASS thread-zombie reap (slots returned)\n"); }
+        else out("[KTEST] FAIL thread-zombie reap\n");
+    }
+
+    /* ── Hostile-syscall robustness battery ────────────────────────────────
+     * Hammer the syscall boundary with pointers no libc ever passes — kernel
+     * higher-half, non-canonical, huge/negative lengths — focused on the
+     * Aegis-specific syscalls (500-519, cap/auth) and structured-buffer calls.
+     * The in-tree loricaos `sysfuzz` covers this for the generic Linux syscalls
+     * but is never run under a kernel test harness AND never touches the custom
+     * Aegis numbers — the newest, least-exercised copy_from_user sites. Property:
+     * memory safety at the uaccess boundary — every probe must return an errno,
+     * NEVER dereference the bad pointer, panic, or corrupt memory. If any does,
+     * the kernel dies before the marker below and captest fails. init holds
+     * POWER but not DISK_ADMIN/INSTALL/AUTH, so the cap-gated calls must reject
+     * at the cap check BEFORE any copy — that ordering is what this tests. The
+     * cap_query(pid=0) probe needs no cap and copies TO the user buffer, so a
+     * kernel-pointer output arg exercises its user_ptr_valid directly. (Added
+     * during a 2026-08-09 memory-safety pass.) */
+    total++;
+    {
+        const long KPTR   = (long)0xFFFFFFFF80000000UL; /* kernel higher-half  */
+        const long NONCAN = (long)0x0000800000000000UL; /* first non-canonical */
+        const long HUGE   = (long)0x7FFFFFFFFFFFFFFFUL;
+        const long NEG1   = (long)0xFFFFFFFFFFFFFFFFUL;
+
+        /* Aegis raw-disk (511 io, 510 list): hostile buffer + lba/count. */
+        sys6(511, 0, 0, KPTR, HUGE, 0, 0);
+        sys6(511, 1, NEG1, NONCAN, HUGE, 0, 0);
+        sys3(510, KPTR, HUGE, 0);
+        /* Aegis netcfg (500) + adminconf (501 autologin, 502 ntp). */
+        sys6(500, KPTR, HUGE, 0, 0, 0, 0);
+        sys3(501, NEG1, 0, 0);
+        sys3(502, HUGE, 0, 0);
+        /* Aegis install/session gates (516 commit, 517 elevate, 519 query). */
+        sys3(516, 0, 0, 0);
+        sys3(517, NEG1, 0, 0);
+        sys3(519, 0, 0, 0);
+        /* Cap/auth: 362 cap_query copies TO the user buffer; 364 auth_session. */
+        sys6(362, 0, KPTR, HUGE, 0, 0, 0);
+        sys6(362, NEG1, NONCAN, HUGE, 0, 0, 0);
+        sys3(364, NEG1, NEG1, 0);
+        /* vfs_confine (518) with hostile path pointers. */
+        sys3(518, KPTR, 0, 0);
+        sys3(518, NONCAN, 0, 0);
+        /* Structured buffers: ppoll (huge nfds + kernel fds), getdents64. */
+        sys6(SYS_ppoll, KPTR, HUGE, 0, 0, 0, 0);
+        sys6(SYS_ppoll, NONCAN, 16, KPTR, 0, 0, 0);
+        sys6(SYS_getdents64, NEG1, KPTR, HUGE, 0, 0, 0);
+
+        /* Reached here → the kernel survived every hostile probe. */
+        pass++;
+        out("[KTEST] PASS hostile-syscall battery (kernel survived)\n");
     }
 
     if (pass == total) out("[KTEST] DONE all-pass\n");

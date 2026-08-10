@@ -113,6 +113,8 @@ int tcp_send_segment(netdev_t *dev, tcp_conn_t *conn,
 
 /* ── Socket-layer helpers (Phase 26) ─────────────────────────────────────── */
 int  tcp_listen(uint16_t port, uint32_t sock_id);
+/* Release sock_id's LISTEN slot on `port` and abort never-accepted conns. */
+void tcp_unlisten(uint32_t sock_id, uint16_t port);
 int  tcp_connect(uint32_t sock_id, ip4_addr_t dst_ip, uint16_t dst_port,
                  uint32_t *conn_id_out);
 /* The tcp_conn_* accessors take the CALLER'S sock_id as well as the conn_id

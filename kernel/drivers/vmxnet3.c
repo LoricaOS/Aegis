@@ -311,7 +311,12 @@ vmxnet3_init(void)
 static void
 vmxnet3_tx_reap(void)
 {
-    while ((s_tx_comp[s_tx_comp_next].w3 >> 31) == s_tx_comp_gen) {
+    /* Bounded by the completion-ring size — the generation bit is written by
+     * the device into shared memory, so an unbounded walk spins in the ISR on a
+     * device that never flips it. (audit 2026-08-01, A10-H2.) */
+    uint32_t tguard = 0;
+    while ((s_tx_comp[s_tx_comp_next].w3 >> 31) == s_tx_comp_gen &&
+           tguard++ < TX_COMP) {
         s_tx_comp_next++;
         if (s_tx_comp_next == TX_COMP) { s_tx_comp_next = 0; s_tx_comp_gen ^= 1u; }
     }
@@ -344,7 +349,10 @@ vmxnet3_send(netdev_t *dev, const void *pkt, uint16_t len)
 static void
 vmxnet3_poll(netdev_t *dev)
 {
-    while ((s_rx_comp[s_rx_comp_next].w3 >> 31) == s_rx_comp_gen) {
+    /* Bounded — see the TX completion loop above. */
+    uint32_t rguard = 0;
+    while ((s_rx_comp[s_rx_comp_next].w3 >> 31) == s_rx_comp_gen &&
+           rguard++ < RX_COMP) {
         uint32_t w0v = s_rx_comp[s_rx_comp_next].w0;
         uint32_t w2v = s_rx_comp[s_rx_comp_next].w2;
         uint32_t rxdIdx = w0v & 0xFFFu;

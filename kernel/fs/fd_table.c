@@ -26,6 +26,10 @@ fd_table_alloc(void)
     }
     t->refcount = 1;
     t->magic    = FD_TABLE_MAGIC;
+    {
+        spinlock_t init = SPINLOCK_INIT;
+        t->lock = init;
+    }
     return t;
 }
 
@@ -85,6 +89,16 @@ fd_table_copy(fd_table_t *src)
     fd_table_assert_live(src, "copy");
     fd_table_t *dst = (fd_table_t *)kva_alloc_pages(FD_TABLE_PAGES);
     if (!dst) return (fd_table_t *)0;
+    {
+        spinlock_t init = SPINLOCK_INIT;
+        dst->lock = init;
+    }
+    /* Both passes under the SOURCE table's lock. Snapshotting and then
+     * ref-taking in two unserialised passes let a concurrent close free an
+     * object between them, after which the dup pass touched freed memory.
+     * Copying and dup-ing slot by slot would NOT have fixed it — the close can
+     * land between the copy of slot i and the dup of slot i just as easily. */
+    irqflags_t fl = spin_lock_irqsave(&src->lock);
     uint32_t i;
     for (i = 0; i < PROC_MAX_FDS; i++)
         dst->fds[i] = src->fds[i];
@@ -92,6 +106,7 @@ fd_table_copy(fd_table_t *src)
         if (dst->fds[i].ops && dst->fds[i].ops->dup)
             dst->fds[i].ops->dup(dst->fds[i].priv);
     }
+    spin_unlock_irqrestore(&src->lock, fl);
     dst->refcount = 1;
     dst->magic    = FD_TABLE_MAGIC;
     return dst;

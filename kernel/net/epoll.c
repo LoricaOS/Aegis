@@ -402,11 +402,16 @@ int epoll_wait_impl(uint32_t epoll_id, uint64_t events_uptr,
          */
         waitq_entry_t fd_entries[EPOLL_MAX_WATCHES];
         waitq_t      *fd_queues[EPOLL_MAX_WATCHES];
+        fd_pin_t      fd_pins[EPOLL_MAX_WATCHES];  /* refs held across block */
         waitq_entry_t timer_entry;
         int n = 0;
 
         for (int i = 0; i < nsnap; i++) {
-            fd_queues[n]           = fd_get_waitq((int)snap[i].fd);
+            /* Pinned for the duration — see fd_waitq.h. A watched fd closed
+             * by a sibling thread while we are parked would otherwise free the
+             * object our stack entry is linked into. */
+            fd_waitq_pin((int)snap[i].fd, &fd_pins[n]);
+            fd_queues[n]           = fd_pins[n].q;
             fd_entries[n].task     = sched_current();
             fd_entries[n].next     = (void *)0;
             fd_entries[n].prev     = (void *)0;
@@ -432,16 +437,20 @@ int epoll_wait_impl(uint32_t epoll_id, uint64_t events_uptr,
          * unregister bracket exactly.
          */
         if (signal_check_pending()) {
-            for (int i = 0; i < n; i++)
+            for (int i = 0; i < n; i++) {
                 if (fd_queues[i]) waitq_remove(fd_queues[i], &fd_entries[i]);
+                fd_waitq_unpin(&fd_pins[i]);
+            }
             if (has_deadline) waitq_remove(&g_timer_waitq, &timer_entry);
             return -EINTR;
         }
 
         sched_block();
 
-        for (int i = 0; i < n; i++)
+        for (int i = 0; i < n; i++) {
             if (fd_queues[i]) waitq_remove(fd_queues[i], &fd_entries[i]);
+            fd_waitq_unpin(&fd_pins[i]);
+        }
         if (has_deadline) waitq_remove(&g_timer_waitq, &timer_entry);
 
         /* Loop: recompute readiness after wake. */

@@ -91,6 +91,7 @@ sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms)
 
     waitq_entry_t fd_entries[64];
     waitq_t      *fd_queues[64];
+    fd_pin_t      fd_pins[64];      /* object refs held across the block */
     /* The timer entry is ALWAYS initialized and ALWAYS added to g_timer_waitq
      * before sched_block (see below), even on the infinite-timeout path. The
      * 100 Hz PIT wakes g_timer_waitq every tick, so the poller re-checks
@@ -166,8 +167,13 @@ sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms)
          * On wake, unregister from every queue (waitq_remove is
          * idempotent — only removes if still queued; the wake path
          * leaves entries for the woken task to detach itself). */
+        /* Pin each object for as long as our stack-allocated entry is linked
+         * into its queue — see fd_waitq.h. Without this a sibling thread
+         * (CLONE_FILES) closing the fd frees the object under us and the
+         * waitq_remove below writes into whatever now owns that memory. */
         for (i = 0; i < nfds; i++) {
-            fd_queues[i]           = fd_get_waitq(fds_cached[i]);
+            fd_waitq_pin(fds_cached[i], &fd_pins[i]);
+            fd_queues[i]           = fd_pins[i].q;
             fd_entries[i].task     = sched_current();
             fd_entries[i].next     = (void *)0;
             fd_entries[i].prev     = (void *)0;
@@ -181,9 +187,11 @@ sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms)
 
         sched_block();
 
-        for (i = 0; i < nfds; i++)
+        for (i = 0; i < nfds; i++) {
             if (fd_queues[i])
                 waitq_remove(fd_queues[i], &fd_entries[i]);
+            fd_waitq_unpin(&fd_pins[i]);   /* drop the ref AFTER unlinking */
+        }
         waitq_remove(&g_timer_waitq, &timer_entry);
 
         /* Interruptible: after cleanup (so no waitq entry is leaked), abort on a
@@ -225,6 +233,7 @@ do_poll_k(k_pollfd_t *pf, uint64_t nfds, uint64_t timeout_ms)
                                                      : now0 + (timeout_ms / 10);
     waitq_entry_t fd_entries[64];
     waitq_t      *fd_queues[64];
+    fd_pin_t      fd_pins[64];      /* object refs held across the block */
     waitq_entry_t timer_entry;
     timer_entry.task = sched_current(); timer_entry.next = (void *)0;
     timer_entry.prev = (void *)0;       timer_entry.on_queue = 0;
@@ -250,8 +259,10 @@ do_poll_k(k_pollfd_t *pf, uint64_t nfds, uint64_t timeout_ms)
         if (ready > 0 || timeout_ms == 0) return ready;
         if (deadline && arch_get_ticks() >= deadline) return 0;
 
+        /* Pinned for the duration — see fd_waitq.h and sys_poll above. */
         for (i = 0; i < nfds; i++) {
-            fd_queues[i]           = fd_get_waitq(pf[i].fd);
+            fd_waitq_pin(pf[i].fd, &fd_pins[i]);
+            fd_queues[i]           = fd_pins[i].q;
             fd_entries[i].task     = sched_current();
             fd_entries[i].next     = (void *)0;
             fd_entries[i].prev     = (void *)0;
@@ -260,8 +271,10 @@ do_poll_k(k_pollfd_t *pf, uint64_t nfds, uint64_t timeout_ms)
         }
         waitq_add(&g_timer_waitq, &timer_entry);
         sched_block();
-        for (i = 0; i < nfds; i++)
+        for (i = 0; i < nfds; i++) {
             if (fd_queues[i]) waitq_remove(fd_queues[i], &fd_entries[i]);
+            fd_waitq_unpin(&fd_pins[i]);   /* drop the ref AFTER unlinking */
+        }
         waitq_remove(&g_timer_waitq, &timer_entry);
 
         if (signal_check_pending()) return -EINTR;
@@ -391,7 +404,22 @@ sys_epoll_wait(uint64_t epfd, uint64_t events_ptr, uint64_t maxevents, uint64_t 
     aegis_process_t *proc = current_proc();
     uint32_t eid = epoll_id_from_fd((int)epfd, proc);
     if (eid == EPOLL_NONE) return SYS_ERR(EBADF);
-    if (maxevents > EPOLL_MAX_WATCHES) return SYS_ERR(EINVAL);
+    /* maxevents is the capacity of the caller's OUTPUT buffer, not a bound on
+     * how many fds an epoll set may watch. Linux requires only that it be
+     * positive. Rejecting anything above EPOLL_MAX_WATCHES conflated the two,
+     * and it killed every Go program at startup: the Go netpoller waits with a
+     * 128-entry array, got EINVAL back, and turned that into the unrecoverable
+     * "fatal error: runtime: netpoll failed" — a Go server would print that it
+     * was listening and then die before serving a single request.
+     *
+     * Clamp instead of rejecting. epoll_wait_impl delivers at most one event
+     * per live watch, so it can never fill more than EPOLL_MAX_WATCHES entries
+     * however large the caller's buffer is; the excess is slack we never touch.
+     * Clamping BEFORE the user_ptr_valid below also means we only require the
+     * prefix we might actually write to be mapped, which is what Linux does —
+     * and it keeps the size computation far from overflowing. */
+    if ((int64_t)maxevents <= 0) return SYS_ERR(EINVAL);
+    if (maxevents > EPOLL_MAX_WATCHES) maxevents = EPOLL_MAX_WATCHES;
     if (!user_ptr_valid(events_ptr, (uint64_t)maxevents * sizeof(k_epoll_event_t)))
         return SYS_ERR(EFAULT);
 
@@ -400,4 +428,60 @@ sys_epoll_wait(uint64_t epfd, uint64_t events_ptr, uint64_t maxevents, uint64_t 
                      (uint32_t)(timeout_ms / 10);
     int r = epoll_wait_impl(eid, events_ptr, (int)maxevents, ticks);
     return r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
+}
+
+/* ── sys_epoll_pwait / sys_epoll_pwait2 ──────────────────────────────────
+ *
+ * epoll_wait with a signal mask applied for the duration of the wait.
+ * Required by Go: its netpoller calls epoll_pwait2 (441) and falls back to
+ * epoll_pwait (281). Aegis implemented only epoll_wait (232), so the netpoller
+ * could not initialise and every network operation blocked forever — a Go
+ * server would start, serve nothing, and accept nothing.
+ *
+ * The sigmask is REFUSED rather than ignored when non-NULL. Silently dropping
+ * it would be an authority-shape lie of the same kind as the *at flags: the
+ * caller believes those signals cannot interrupt the wait, and they would.
+ * Go always passes NULL, so this costs it nothing, and a caller that genuinely
+ * wants atomic mask-and-wait gets a clear ENOSYS instead of a wait that
+ * quietly does not honour its mask.
+ */
+uint64_t
+sys_epoll_pwait(uint64_t epfd, uint64_t events_ptr, uint64_t maxevents,
+                uint64_t timeout_ms, uint64_t sigmask)
+{
+    if (sigmask != 0)
+        return SYS_ERR(ENOSYS);   /* atomic mask-and-wait not implemented */
+    return sys_epoll_wait(epfd, events_ptr, maxevents, timeout_ms);
+}
+
+uint64_t
+sys_epoll_pwait2(uint64_t epfd, uint64_t events_ptr, uint64_t maxevents,
+                 uint64_t ts_ptr, uint64_t sigmask)
+{
+    if (sigmask != 0)
+        return SYS_ERR(ENOSYS);
+
+    /* epoll_pwait2 takes a `const struct timespec *`, not milliseconds.
+     * NULL means block indefinitely. */
+    uint64_t timeout_ms;
+    if (ts_ptr == 0) {
+        timeout_ms = (uint64_t)-1;
+    } else {
+        struct { int64_t tv_sec; int64_t tv_nsec; } ts;
+        if (!user_ptr_valid(ts_ptr, sizeof(ts)))
+            return SYS_ERR(EFAULT);
+        if (copy_from_user(&ts, (const void *)(uintptr_t)ts_ptr, sizeof(ts)) != 0)
+            return SYS_ERR(EFAULT);
+        if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L)
+            return SYS_ERR(EINVAL);
+        /* Clamp rather than overflow: a caller asking for a ~300-million-year
+         * timeout gets the longest finite wait we can express, not a wrapped
+         * tiny one. */
+        if (ts.tv_sec > 4000000LL)
+            timeout_ms = (uint64_t)-1;
+        else
+            timeout_ms = (uint64_t)ts.tv_sec * 1000ULL +
+                         (uint64_t)(ts.tv_nsec / 1000000L);
+    }
+    return sys_epoll_wait(epfd, events_ptr, maxevents, timeout_ms);
 }

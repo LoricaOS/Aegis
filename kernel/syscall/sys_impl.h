@@ -298,6 +298,12 @@ uint64_t sys_epoll_create1(uint64_t flags);
 uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd, uint64_t event);
 uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events,
                         uint64_t maxevents, uint64_t timeout_ms);
+/* epoll_wait + signal mask. Go's netpoller needs these (441 preferred, 281
+ * fallback); a non-NULL sigmask is REFUSED, not ignored. See sys_poll.c. */
+uint64_t sys_epoll_pwait(uint64_t epfd, uint64_t events, uint64_t maxevents,
+                         uint64_t timeout_ms, uint64_t sigmask);
+uint64_t sys_epoll_pwait2(uint64_t epfd, uint64_t events, uint64_t maxevents,
+                          uint64_t ts_ptr, uint64_t sigmask);
 uint64_t sys_netcfg(uint64_t op, uint64_t arg1, uint64_t arg2, uint64_t arg3);
 
 /* ── Process group / session / resource syscalls (sys_identity.c) ───────── */

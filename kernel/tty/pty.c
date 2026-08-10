@@ -441,8 +441,7 @@ master_close_fn(void *priv)
 		return;
 	}
 	pair->master_open = 0;
-	if (!pair->slave_open)
-		pair->in_use = 0;
+	int release = !pair->slave_open;
 	spin_unlock_irqrestore(&pair->lock, fl);
 
 	/* Wakes happen AFTER dropping pair->lock: waitq_wake_all takes
@@ -453,6 +452,29 @@ master_close_fn(void *priv)
 	 * ends see HUP / EOF. */
 	waitq_wake_all(&pair->master_waiters);
 	waitq_wake_all(&pair->slave_waiters);
+
+	/* The slot is released only AFTER the wakes below, and under
+	 * pty_pool_lock — the SAME lock ptmx_open allocates under.
+	 *
+	 * in_use was previously cleared here, under pair->lock, while ptmx_open
+	 * scans it and memsets the whole pair under pty_pool_lock. Two different
+	 * locks guarding one word is no lock at all: between this unlock and the
+	 * waitq_wake_all calls below, a concurrent ptmx_open could claim the slot
+	 * and re-initialise pair->lock and BOTH waitqueues out from under us — so
+	 * these wakes would operate on a new owner's queues, or on queues being
+	 * waitq_init'd concurrently. Reachable by unprivileged repeated
+	 * open("/dev/ptmx")/close() on SMP. (audit 2026-08-01, A2.)
+	 *
+	 * Deferring the release past the wakes also keeps the deferred-wake
+	 * discipline intact: we still take no other lock across waitq_wake_all,
+	 * and pty_pool_lock is acquired with nothing else held, so it stays below
+	 * pair->lock in the order and cannot invert against ptmx_open (which never
+	 * takes pair->lock while holding the pool lock — it re-inits it). */
+	if (release) {
+		irqflags_t pfl = spin_lock_irqsave(&pty_pool_lock);
+		pair->in_use = 0;
+		spin_unlock_irqrestore(&pty_pool_lock, pfl);
+	}
 }
 
 static int
@@ -537,8 +559,7 @@ slave_close_fn(void *priv)
 		return;
 	}
 	pair->slave_open = 0;
-	if (!pair->master_open)
-		pair->in_use = 0;
+	int release = !pair->master_open;
 	spin_unlock_irqrestore(&pair->lock, fl);
 
 	/* Wakes happen AFTER dropping pair->lock (sched_lock > all others);
@@ -548,6 +569,13 @@ slave_close_fn(void *priv)
 	 * EOF; pollers on both ends see HUP / EOF. */
 	waitq_wake_all(&pair->master_waiters);
 	waitq_wake_all(&pair->slave_waiters);
+
+	/* Release under pty_pool_lock, after the wakes — see master_close_fn. */
+	if (release) {
+		irqflags_t pfl = spin_lock_irqsave(&pty_pool_lock);
+		pair->in_use = 0;
+		spin_unlock_irqrestore(&pty_pool_lock, pfl);
+	}
 }
 
 static int

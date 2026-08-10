@@ -232,6 +232,7 @@ static void sock_vfs_close(void *priv)
     uint8_t  type   = s_socks[sock_id].type;
     uint16_t lport  = s_socks[sock_id].local_port;
     uint32_t connid = s_socks[sock_id].tcp_conn_id;
+    uint8_t  sstate = s_socks[sock_id].state;
     spin_unlock_irqrestore(&sock_lock, fl);
 
     /* Release the UDP port binding (if any). Without this, every closed UDP
@@ -250,6 +251,14 @@ static void sock_vfs_close(void *priv)
      * retransmit-limit RST in tcp_tick). */
     if (type == SOCK_TYPE_STREAM && connid != SOCK_NONE)
         tcp_conn_close(sock_id, connid);
+    /* A LISTENING socket has no tcp_conn_id — sys_listen registers the listener
+     * in s_tcp[] only — so the teardown above skipped it entirely and its
+     * TCP_LISTEN slot was never reclaimed. Harmless-looking until tcp_listen
+     * began refusing duplicate listeners, at which point the stale slot made
+     * every re-listen on that port fail EADDRINUSE for the rest of the boot.
+     * tcp_unlisten also reaps connections queued but never accepted. */
+    if (type == SOCK_TYPE_STREAM && sstate == SOCK_LISTENING)
+        tcp_unlisten(sock_id, lport);
     sock_free(sock_id);
 }
 

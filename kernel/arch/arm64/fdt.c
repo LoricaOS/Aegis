@@ -186,9 +186,20 @@ walk(const char *compat, int want_reg, int reg_index,
             uint32_t len     = be32(s_buf + off);
             uint32_t nameoff = be32(s_buf + off + 4);
             uint32_t val     = off + 8;
-            off = (val + len + 3) & ~3u;
-            if (val + len > s_struct_end)
+            /* 64-bit, and CHECK BEFORE USE. `val + len` and the +3 round-up
+             * are both uint32 here and `len` comes straight out of the DTB, so
+             * a crafted length wrapped the sum: the bound test below passed
+             * because it overflowed too, and `off` was left not advancing —
+             * a 4 GiB out-of-range read plus a non-terminating walk. Built
+             * against the real fdt.c with -DFDT_HOSTTEST and a crafted blob,
+             * this faulted (SIGBUS). (audit 2026-08-01, A3-I1 / A6-H4.) */
+            uint64_t end64 = (uint64_t)val + (uint64_t)len;
+            if (end64 > (uint64_t)s_struct_end)
                 break;
+            uint32_t next = (uint32_t)((end64 + 3ull) & ~3ull);
+            if (next <= off)        /* refuse to spin if it did not advance */
+                break;
+            off = next;
 
             if (str_at_is(nameoff, "#address-cells") && len >= 4)
                 ac[depth] = be32(s_buf + val);
@@ -289,9 +300,20 @@ fdt_reg_by_compat_nth(const char *compat, int node_index,
             uint32_t len     = be32(s_buf + off);
             uint32_t nameoff = be32(s_buf + off + 4);
             uint32_t val     = off + 8;
-            off = (val + len + 3) & ~3u;
-            if (val + len > s_struct_end)
+            /* 64-bit, and CHECK BEFORE USE. `val + len` and the +3 round-up
+             * are both uint32 here and `len` comes straight out of the DTB, so
+             * a crafted length wrapped the sum: the bound test below passed
+             * because it overflowed too, and `off` was left not advancing —
+             * a 4 GiB out-of-range read plus a non-terminating walk. Built
+             * against the real fdt.c with -DFDT_HOSTTEST and a crafted blob,
+             * this faulted (SIGBUS). (audit 2026-08-01, A3-I1 / A6-H4.) */
+            uint64_t end64 = (uint64_t)val + (uint64_t)len;
+            if (end64 > (uint64_t)s_struct_end)
                 break;
+            uint32_t next = (uint32_t)((end64 + 3ull) & ~3ull);
+            if (next <= off)        /* refuse to spin if it did not advance */
+                break;
+            off = next;
 
             if (str_at_is(nameoff, "#address-cells") && len >= 4)
                 ac[depth] = be32(s_buf + val);
@@ -392,9 +414,20 @@ prop_by_match(const char *compat, const char *devtype, const char *propname,
             uint32_t len     = be32(s_buf + off);
             uint32_t nameoff = be32(s_buf + off + 4);
             uint32_t val     = off + 8;
-            off = (val + len + 3) & ~3u;
-            if (val + len > s_struct_end)
+            /* 64-bit, and CHECK BEFORE USE. `val + len` and the +3 round-up
+             * are both uint32 here and `len` comes straight out of the DTB, so
+             * a crafted length wrapped the sum: the bound test below passed
+             * because it overflowed too, and `off` was left not advancing —
+             * a 4 GiB out-of-range read plus a non-terminating walk. Built
+             * against the real fdt.c with -DFDT_HOSTTEST and a crafted blob,
+             * this faulted (SIGBUS). (audit 2026-08-01, A3-I1 / A6-H4.) */
+            uint64_t end64 = (uint64_t)val + (uint64_t)len;
+            if (end64 > (uint64_t)s_struct_end)
                 break;
+            uint32_t next = (uint32_t)((end64 + 3ull) & ~3ull);
+            if (next <= off)        /* refuse to spin if it did not advance */
+                break;
+            off = next;
 
             if (str_at_is(nameoff, "#address-cells") && len >= 4)
                 ac[depth] = be32(s_buf + val);
@@ -528,9 +561,20 @@ fdt_memory_regions(uint64_t *addr_out, uint64_t *size_out, int max)
             uint32_t len     = be32(s_buf + off);
             uint32_t nameoff = be32(s_buf + off + 4);
             uint32_t val     = off + 8;
-            off = (val + len + 3) & ~3u;
-            if (val + len > s_struct_end)
+            /* 64-bit, and CHECK BEFORE USE. `val + len` and the +3 round-up
+             * are both uint32 here and `len` comes straight out of the DTB, so
+             * a crafted length wrapped the sum: the bound test below passed
+             * because it overflowed too, and `off` was left not advancing —
+             * a 4 GiB out-of-range read plus a non-terminating walk. Built
+             * against the real fdt.c with -DFDT_HOSTTEST and a crafted blob,
+             * this faulted (SIGBUS). (audit 2026-08-01, A3-I1 / A6-H4.) */
+            uint64_t end64 = (uint64_t)val + (uint64_t)len;
+            if (end64 > (uint64_t)s_struct_end)
                 break;
+            uint32_t next = (uint32_t)((end64 + 3ull) & ~3ull);
+            if (next <= off)        /* refuse to spin if it did not advance */
+                break;
+            off = next;
 
             if (str_at_is(nameoff, "#address-cells") && len >= 4)
                 ac[depth] = be32(s_buf + val);
@@ -603,9 +647,20 @@ fdt_initrd(uint64_t *start_out, uint64_t *end_out)
             uint32_t len     = be32(s_buf + off);
             uint32_t nameoff = be32(s_buf + off + 4);
             uint32_t val     = off + 8;
-            off = (val + len + 3) & ~3u;
-            if (val + len > s_struct_end)
+            /* 64-bit, and CHECK BEFORE USE. `val + len` and the +3 round-up
+             * are both uint32 here and `len` comes straight out of the DTB, so
+             * a crafted length wrapped the sum: the bound test below passed
+             * because it overflowed too, and `off` was left not advancing —
+             * a 4 GiB out-of-range read plus a non-terminating walk. Built
+             * against the real fdt.c with -DFDT_HOSTTEST and a crafted blob,
+             * this faulted (SIGBUS). (audit 2026-08-01, A3-I1 / A6-H4.) */
+            uint64_t end64 = (uint64_t)val + (uint64_t)len;
+            if (end64 > (uint64_t)s_struct_end)
                 break;
+            uint32_t next = (uint32_t)((end64 + 3ull) & ~3ull);
+            if (next <= off)        /* refuse to spin if it did not advance */
+                break;
+            off = next;
             if (in_chosen && (len == 4 || len == 8)) {
                 uint64_t v = (len == 4)
                     ? (uint64_t)be32(s_buf + val)

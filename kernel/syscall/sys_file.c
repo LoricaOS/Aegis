@@ -888,17 +888,25 @@ sys_dup2(uint64_t arg1, uint64_t arg2)
     if (arg1 == arg2)
         return arg2;            /* no-op per POSIX */
 
-    /* Close existing target fd */
-    if (proc->fd_table->fds[arg2].ops) {
-        proc->fd_table->fds[arg2].ops->close(proc->fd_table->fds[arg2].priv);
+    /* Close existing target fd. Detach under the table lock (so a concurrent
+     * fd_table_copy cannot snapshot a slot we are releasing), then close after
+     * the unlock — ops->close must not run under a spinlock. */
+    irqflags_t dfl = spin_lock_irqsave(&proc->fd_table->lock);
+    const vfs_ops_t *oldops = proc->fd_table->fds[arg2].ops;
+    void            *oldpriv = proc->fd_table->fds[arg2].priv;
+    if (oldops)
         __builtin_memset(&proc->fd_table->fds[arg2], 0, sizeof(vfs_file_t));
-    }
+    spin_unlock_irqrestore(&proc->fd_table->lock, dfl);
+    if (oldops && oldops->close)
+        oldops->close(oldpriv);
 
     /* Copy fd struct by value, then bump refcount via dup hook. */
+    dfl = spin_lock_irqsave(&proc->fd_table->lock);
     proc->fd_table->fds[arg2] = proc->fd_table->fds[arg1];
     proc->fd_table->fds[arg2].flags &= ~VFS_FD_CLOEXEC;  /* POSIX: dup2 clears FD_CLOEXEC */
-    if (proc->fd_table->fds[arg2].ops->dup)
+    if (proc->fd_table->fds[arg2].ops && proc->fd_table->fds[arg2].ops->dup)
         proc->fd_table->fds[arg2].ops->dup(proc->fd_table->fds[arg2].priv);
+    spin_unlock_irqrestore(&proc->fd_table->lock, dfl);
 
     return arg2;
 }

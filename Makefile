@@ -553,7 +553,7 @@ $(BUILD)/test-exectgt: test/exectgt.c
 	$(CC) -ffreestanding -nostdlib -static -fno-pie -no-pie -fno-stack-protector \
 	    -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -O2 -e _start -o $@ $<
 
-$(BUILD)/test-rootfs.img: $(BUILD)/test-init $(BUILD)/test-exectgt
+$(BUILD)/test-rootfs.img: $(BUILD)/test-init $(BUILD)/test-exectgt test/exectest.caps
 	dd if=/dev/zero of=$@ bs=512 count=8192 2>/dev/null      # 4 MiB
 	/sbin/mke2fs -t ext2 -F -b 4096 -L aegis-test $@ >/dev/null 2>&1
 	printf 'mkdir /bin\nwrite $(BUILD)/test-init /bin/vigil\nwrite $(BUILD)/test-exectgt /bin/exectest\nmkdir /etc\nmkdir /etc/aegis\nmkdir /etc/aegis/caps.d\nwrite test/exectest.caps /etc/aegis/caps.d/exectest\n' | /sbin/debugfs -w $@ >/dev/null 2>&1

@@ -347,8 +347,12 @@ static inline uint32_t tcp_sbuf_space(const tcp_conn_t *c)
 
 /* tcp_retransmit_unacked — resend the oldest unacked segment (up to one MSS)
  * from sbuf at SND.UNA.  Called only from tcp_tick (PIT ISR context), which
- * holds tcp_lock: that is safe because arp_resolve does not block in ISR
- * context, so ip_send cannot park the CPU while the lock is held.  c points
+ * holds tcp_lock.  That is safe ONLY because arp_resolve refuses to block when
+ * g_in_isr_poll is set, so ip_send cannot park the CPU while the lock is held.
+ * That flag used to be set only inside netdev_poll_all, and tcp_tick is a
+ * sibling poll source rather than nested in it — so this claim was false for
+ * this exact path until poll_sources_run began setting it for the whole tick
+ * (audit C-2).  c points
  * into the static s_tcp[] table and is not freed on a single core. */
 static void tcp_retransmit_unacked(netdev_t *dev, tcp_conn_t *c)
 {
@@ -1119,9 +1123,12 @@ void tcp_tick(void)
         c->retransmit_at = now + rto;
 
         /* Retransmit per state.  tcp_tick runs in the PIT ISR with interrupts
-         * disabled; arp_resolve returns immediately (no blocking) from ISR
-         * context, so tcp_send_*  is safe to call under tcp_lock here (unlike
-         * the syscall-context senders).  Data retransmit reads from sbuf and
+         * disabled; arp_resolve returns immediately (no blocking) because
+         * poll_sources_run sets g_in_isr_poll for the whole tick, so tcp_send_*
+         * is safe to call under tcp_lock here (unlike the syscall-context
+         * senders).  See audit C-2: before that flag covered tcp_tick, an
+         * unresolved ARP entry here re-enabled interrupts under tcp_lock and
+         * deadlocked the machine.  Data retransmit reads from sbuf and
          * re-sends the oldest unacked MSS-worth at SND.UNA; SYN/FIN states
          * resend their control segment.  Previously only SYN/SYN-ACK were
          * retransmitted, so lost DATA was never resent (silent truncation) and
@@ -1227,6 +1234,57 @@ tcp_listen(uint16_t port, uint32_t sock_id)
     }
     spin_unlock_irqrestore(&tcp_lock, fl);
     return -1;
+}
+
+/* tcp_unlisten — release the LISTEN slot `owner` holds on `port`, and abort any
+ * connection to it that was never accepted.
+ *
+ * sys_listen records the listener only in s_tcp[]; the sock_t's tcp_conn_id
+ * stays SOCK_NONE, so sock_vfs_close's `connid != SOCK_NONE` teardown never
+ * fired for a listening socket and its slot was never reclaimed. That was a
+ * silent leak until tcp_listen grew its duplicate-listener scan, which turned
+ * it into a hard EADDRINUSE on every re-listen: bind/listen/close/listen on the
+ * same port failed the second listen forever after. Go's net package does
+ * exactly that sequence.
+ *
+ * Matching is on `owner` as well as port, never port alone — otherwise any
+ * NET_SOCKET holder could close out another process's listener and take the
+ * port, which is the squatting hole the duplicate scan exists to prevent.
+ *
+ * The second loop reclaims connections that completed a handshake but were
+ * never handed to accept(): they are queued in the listener's accept_queue (or
+ * still SYN_RCVD), and closing the listener discards that queue, so nothing
+ * would ever close them and each leaks an s_tcp[] slot. They are identified by
+ * sock_id == SOCK_NONE, which is precisely "no socket owns this yet" — accept()
+ * assigns the real id via tcp_conn_set_sock, so an ALREADY-ACCEPTED connection
+ * fails that test and is left untouched. That distinction is load-bearing:
+ * listener_id is never cleared on accept, so matching on it alone would RST
+ * live, accepted connections out from under their owners when the listener
+ * closes. Closing a listening socket must not disturb connections already
+ * accepted from it. */
+void
+tcp_unlisten(uint32_t owner, uint16_t port)
+{
+    irqflags_t fl = spin_lock_irqsave(&tcp_lock);
+    uint32_t i;
+    for (i = 0; i < TCP_MAX_CONNS; i++) {
+        if (s_tcp[i].state == TCP_LISTEN &&
+            s_tcp[i].local_port == port &&
+            s_tcp[i].sock_id == owner)
+            s_tcp[i].state = TCP_CLOSED;   /* reclaimable by tcp_claim_slot */
+    }
+    for (i = 0; i < TCP_MAX_CONNS; i++) {
+        if (s_tcp[i].state == TCP_CLOSED) continue;
+        if (s_tcp[i].listener_id != owner) continue;
+        if (s_tcp[i].sock_id != SOCK_NONE) continue;  /* accepted — not ours */
+        /* Never delivered to a socket: RST the peer rather than leave it
+         * believing an ESTABLISHED connection survives (same reasoning as
+         * tcp_conn_abort, inlined here to keep one tcp_lock acquisition). */
+        if (s_tcp[i].dev)
+            tcp_send_segment(s_tcp[i].dev, &s_tcp[i], TCP_RST | TCP_ACK, NULL, 0);
+        s_tcp[i].state = TCP_CLOSED;
+    }
+    spin_unlock_irqrestore(&tcp_lock, fl);
 }
 
 /* tcp_connect: send SYN, allocate conn. Returns 0 on success. */

@@ -1062,6 +1062,84 @@ sys_fork(syscall_frame_t *frame, uint64_t u_rdi, uint64_t u_rsi, uint64_t u_rdx)
 }
 
 /*
+ * reap_group_zombies — free the thread zombies a reaped group leader leaves.
+ *
+ * A thread is waitable by nobody. sys_clone sets ppid to the CREATING thread's
+ * pid for CLONE_THREAD too, so a sibling's ppid names another thread of the
+ * same group and the `child->ppid == caller->pid` test in sys_waitpid can never
+ * match it. Left alone the siblings sit in the task list for the rest of the
+ * boot, each holding a PCB, a kernel stack, a vma reference and one of the
+ * MAX_PROCESSES slots — a Go program with four worker threads burned four slots
+ * per run, and about sixty runs made clone() return EAGAIN permanently.
+ *
+ * Only ever called once the leader itself has been reaped, which sys_waitpid
+ * does only when its leader_not_reapable scan found every sibling already
+ * TASK_ZOMBIE under the same sched_lock hold as the unlink. A zombie never
+ * becomes runnable again, and a group whose members are all zombies cannot
+ * clone, so that set is complete and cannot grow after the lock is dropped.
+ *
+ * One sibling per iteration, unlinked under the lock and freed outside it: the
+ * frees are far too slow for a sched_lock critical section (the same reason the
+ * leader's are hoisted out of it), and collecting the whole set first would
+ * need unbounded storage on a kernel stack.
+ *
+ * The PML4 is deliberately NOT freed here. Siblings share the leader's, and the
+ * leader's own reap already released it exactly once; freeing it per sibling
+ * would free every user frame in the address space two, three, four times over.
+ */
+static void
+reap_group_zombies(uint32_t tgid)
+{
+    for (;;) {
+        irqflags_t fl = spin_lock_irqsave(&sched_lock);
+        aegis_process_t *sib = (aegis_process_t *)0;
+        aegis_task_t *t = sched_current()->next;
+        while (t != sched_current()) {
+            if (t->is_user && t->state == TASK_ZOMBIE) {
+                aegis_process_t *p = (aegis_process_t *)t;
+                if (p->tgid == tgid && p->pid != tgid) {
+                    aegis_task_t *prev = t;
+                    while (prev->next != t) prev = prev->next;
+                    prev->next = t->next;
+                    sib = p;
+                    break;
+                }
+            }
+            t = t->next;
+        }
+        /* Only decrement for a sibling we actually unlinked — this is the same
+         * single-decrement-site discipline the leader's reap keeps. */
+        if (sib && __atomic_load_n(&s_fork_count, __ATOMIC_RELAXED) > 0)
+            __atomic_fetch_sub(&s_fork_count, 1, __ATOMIC_RELAXED);
+        spin_unlock_irqrestore(&sched_lock, fl);
+        if (!sib)
+            return;
+
+        /* Same invariant the leader's reap spins on: a task publishes ZOMBIE in
+         * sched_exit while still running on its own kernel stack, and does not
+         * leave it until the final ctx_switch, which is where on_cpu = -1 is
+         * published. thread_group_teardown already waited for this, but it did
+         * so on behalf of a different CPU — re-establish it before we free the
+         * stack out from under anything. */
+        while (__atomic_load_n(&sib->task.on_cpu, __ATOMIC_ACQUIRE) >= 0)
+            arch_pause();
+
+        /* sched_exit released the fd table before the task ever reached ZOMBIE;
+         * the leader's reap pins the same invariant with this warning, and it
+         * must never fire on a correct kernel. */
+        if (sib->fd_table) {
+            printk("[PROC] WARN: reaping thread %u with live fd_table "
+                   "(sched_exit teardown regressed)\n", sib->pid);
+            fd_table_unref(sib->fd_table);
+            sib->fd_table = (fd_table_t *)0;
+        }
+        kva_free_pages(sib->task.stack_base, sib->task.stack_pages);
+        vma_free(sib);
+        kva_free_pages(sib, 2);
+    }
+}
+
+/*
  * sys_waitpid — syscall 61
  *
  * pid_arg = PID to wait for (-1 = any child)
@@ -1229,6 +1307,9 @@ retry:;
                  * it on its own exit; vma_free below drops the shared vma ref. */
                 int free_pml4 = (child->tgid == child->pid) &&
                                 (child->vfork_parent == (void *)0);
+                /* Captured here because the PCB is freed below, and only a
+                 * group leader can have thread zombies behind it. */
+                int was_leader = (child->tgid == child->pid);
 
                 /* Clear waiting_for on the caller — no longer blocked. */
                 sched_current()->waiting_for = 0;
@@ -1288,6 +1369,12 @@ retry:;
                     vmm_free_user_pml4(pml4_phys);
                 vma_free(child);
                 kva_free_pages(child, 2);
+
+                /* The leader is gone, so its thread zombies are now unreachable
+                 * by any waitpid at all — free them here or they hold their
+                 * slots until reboot. */
+                if (was_leader)
+                    reap_group_zombies(child_pid);
 
                 return (uint64_t)child_pid;
             }

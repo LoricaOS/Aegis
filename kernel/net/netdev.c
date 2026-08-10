@@ -12,9 +12,12 @@ static netdev_t *s_devices[NETDEV_MAX];
 static int        s_count = 0;
 static spinlock_t netdev_lock = SPINLOCK_INIT;
 
-/* Set to 1 inside netdev_poll_all so arp_resolve knows it's being called
- * from the PIT ISR RX path and must not block. */
-volatile int g_in_netdev_poll = 0;
+/* Non-zero while executing in PIT-ISR / poll context, where arp_resolve must
+ * not block (see core/poll.c poll_sources_run, which sets it for the whole
+ * tick, and net/eth.c which consults it). Formerly g_in_netdev_poll, set only
+ * inside netdev_poll_all — a narrower property than its consumers needed, which
+ * is how tcp_tick came to block in an ISR while holding tcp_lock. */
+volatile int g_in_isr_poll = 0;
 
 int
 netdev_register(netdev_t *dev)
@@ -52,13 +55,17 @@ void
 netdev_poll_all(void)
 {
     irqflags_t fl = spin_lock_irqsave(&netdev_lock);
-    g_in_netdev_poll = 1;
+    /* Save/restore, never clear: poll_sources_run has already set this for the
+     * whole tick, and clearing it on exit would leave the LATER sources (most
+     * importantly tcp_tick) believing they may block. */
+    int prev = g_in_isr_poll;
+    g_in_isr_poll = 1;
     int i;
     for (i = 0; i < s_count; i++) {
         if (s_devices[i]->poll)
             s_devices[i]->poll(s_devices[i]);
     }
-    g_in_netdev_poll = 0;
+    g_in_isr_poll = prev;
     spin_unlock_irqrestore(&netdev_lock, fl);
 }
 
