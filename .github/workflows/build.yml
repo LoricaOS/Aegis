@@ -1,0 +1,81 @@
+name: build
+
+# Builds the Aegis kernel for both architectures, runs the boot + capability
+# test suite under QEMU, and — on a version tag — publishes the kernel ELFs to
+# the GitHub release so downstream (LoricaOS tools/fetch-kernel.sh) can pin them.
+#
+# No bare-metal cross toolchain needed: the kernel builds freestanding with the
+# stock distro gcc (verified) for x86-64, and with apt's gcc-aarch64-linux-gnu
+# for AArch64.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # ── x86-64: build + full boot/capability test suite ─────────────────────
+  x86:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential nasm binutils xorriso \
+            e2fsprogs mtools qemu-system-x86 curl
+      - name: Build kernel (x86-64, stock gcc, freestanding)
+        run: make CC=gcc LD=ld OBJCOPY=objcopy NM=nm -j"$(nproc)"
+      - name: Boot + capability tests (captest + ktest under QEMU/TCG)
+        run: make CC=gcc LD=ld OBJCOPY=objcopy NM=nm test
+      - name: Stage release artifact
+        run: cp build/aegis.elf aegis.elf
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aegis-x86
+          path: aegis.elf
+          if-no-files-found: error
+
+  # ── AArch64: build (cross toolchain from apt) ───────────────────────────
+  arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install aarch64 cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            build-essential nasm curl
+      - name: Build kernel (AArch64)
+        run: make -f Makefile.arm64 -j"$(nproc)"
+      - name: Stage release artifact
+        run: cp build/arm64/aegis-arm64.elf aegis-arm64.elf
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aegis-arm64
+          path: aegis-arm64.elf
+          if-no-files-found: error
+
+  # ── On a version tag: attach both kernels to the release ────────────────
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [x86, arm64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: aegis-x86
+      - uses: actions/download-artifact@v4
+        with:
+          name: aegis-arm64
+      - name: Publish kernels to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            aegis.elf
+            aegis-arm64.elf
+          fail_on_unmatched_files: true
