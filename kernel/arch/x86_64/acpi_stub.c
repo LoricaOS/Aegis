@@ -40,4 +40,21 @@ void acpi_init(void)
 void     acpi_power_button_init(void) { }
 void     acpi_sci_handler(void)       { }
 uint16_t acpi_get_sci_irq(void)       { return 0; }
-void     acpi_do_poweroff(void)       { }
+
+/* No ACPI S5 register block exists on a no-ACPI target (Firecracker /
+ * cloud-hypervisor / qemu-microvm ship none). sys_reboot has already synced and
+ * marked the fs clean before calling us, so all that's left is to terminate the
+ * microVM the portable way every no-ACPI VMM honors: a triple fault (load a null
+ * IDT and raise an exception → double fault → triple fault → VM reset).
+ * Firecracker and cloud-hypervisor shut the VM down on it; qemu-microvm exits
+ * under -no-reboot. Without this the caller falls into a hlt loop and the VM
+ * never exits — the orchestrator has to kill it. Mirrors the reboot-path triple
+ * fault in sys_reboot(). */
+void acpi_do_poweroff(void)
+{
+    printk("[AEGIS] microVM power off\n");
+    struct __attribute__((packed)) { uint16_t limit; uint64_t base; }
+        null_idtr = { 0, 0 };
+    __asm__ volatile ("cli; lidt %0; int3" : : "m"(null_idtr));
+    for (;;) __asm__ volatile ("hlt");   /* unreachable */
+}
