@@ -649,6 +649,28 @@ cap_apply_policy(cap_slot_t *caps, const char *path, int authenticated,
                 cap_grant(caps, CAP_TABLE_SIZE,
                           pol->caps[ci].kind, pol->caps[ci].rights);
             } else if (pol->caps[ci].tier == CAP_TIER_ADMIN) {
+                /* ADMIN_AUTH is bound to the one authenticator at ANY tier.
+                 * The SERVICE-tier branch above refuses `service ADMIN_AUTH`
+                 * for any path != CAP_AUTHENTICATOR_PATH (audit 2026-08-01
+                 * A5-H1) — but that guard was never mirrored here, so an
+                 * `admin ADMIN_AUTH <anybin>` line fell through to the plain
+                 * `authenticated` bucket below and would hand ADMIN_AUTH to any
+                 * merely-logged-in user, who could then call sys_admin_session(1)
+                 * and elevate their parent shell to a full admin session with NO
+                 * credential check — the kernel does no crypt, it trusts that
+                 * only /bin/login can hold this cap. ADMIN_AUTH is admin_session's
+                 * root of trust; it must never be grantable by tier word alone.
+                 * No shipped caps.d declares `admin ADMIN_AUTH` (login uses the
+                 * service tier), so this refuses nothing legitimate; it closes
+                 * the same escape hatch on the admin tier that A5-H1 closed on
+                 * service. (Found by a 2026-08-09 red-team pass.) */
+                if (pol->caps[ci].kind == CAP_KIND_ADMIN_AUTH &&
+                    !path_is(path, CAP_AUTHENTICATOR_PATH)) {
+                    printk("[CAP_POLICY] WARN: refusing admin-tier ADMIN_AUTH "
+                           "for %s — only %s may hold it\n",
+                           path, CAP_AUTHENTICATOR_PATH);
+                    continue;
+                }
                 /* ADMIN-tier caps require an authenticated session. A stricter
                  * subset requires a sudo-style ADMIN SESSION (admin_session, set
                  * by the stsh `admin` flow / `login -elevate` after a SEPARATE
