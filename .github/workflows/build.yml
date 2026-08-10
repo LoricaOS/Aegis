@@ -25,9 +25,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain
+        # gcc-14 specifically: the kernel is -Werror-clean under the canonical
+        # x86_64-elf-gcc and gcc-14, but ubuntu's default gcc-13 promotes an
+        # -Waddress-of-packed-member in a driver to an error. Match the validated
+        # compiler rather than relax the warning set.
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential nasm binutils xorriso \
+          sudo apt-get install -y build-essential gcc-14 nasm binutils xorriso \
             e2fsprogs mtools qemu-system-x86 curl python3-venv
       - name: Generate kernel config (kconfiglib — public kconf replacement)
         run: |
@@ -44,9 +48,9 @@ jobs:
           PY
           touch .config build/auto.conf build/generated/autoconf.h
       - name: Build kernel (x86-64, stock gcc, freestanding)
-        run: make CC=gcc LD=ld OBJCOPY=objcopy NM=nm -j"$(nproc)"
+        run: make CC=gcc-14 LD=ld OBJCOPY=objcopy NM=nm -j"$(nproc)"
       - name: Boot + capability tests (captest + ktest under QEMU/TCG)
-        run: make CC=gcc LD=ld OBJCOPY=objcopy NM=nm test
+        run: make CC=gcc-14 LD=ld OBJCOPY=objcopy NM=nm test
       - name: Stage release artifact
         run: cp build/aegis.elf aegis.elf
       - uses: actions/upload-artifact@v4
