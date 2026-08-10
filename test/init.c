@@ -1156,6 +1156,57 @@ void _start(void)
         else out("[KTEST] FAIL thread-zombie reap\n");
     }
 
+    /* ── Hostile-syscall robustness battery ────────────────────────────────
+     * Hammer the syscall boundary with pointers no libc ever passes — kernel
+     * higher-half, non-canonical, huge/negative lengths — focused on the
+     * Aegis-specific syscalls (500-519, cap/auth) and structured-buffer calls.
+     * The in-tree loricaos `sysfuzz` covers this for the generic Linux syscalls
+     * but is never run under a kernel test harness AND never touches the custom
+     * Aegis numbers — the newest, least-exercised copy_from_user sites. Property:
+     * memory safety at the uaccess boundary — every probe must return an errno,
+     * NEVER dereference the bad pointer, panic, or corrupt memory. If any does,
+     * the kernel dies before the marker below and captest fails. init holds
+     * POWER but not DISK_ADMIN/INSTALL/AUTH, so the cap-gated calls must reject
+     * at the cap check BEFORE any copy — that ordering is what this tests. The
+     * cap_query(pid=0) probe needs no cap and copies TO the user buffer, so a
+     * kernel-pointer output arg exercises its user_ptr_valid directly. (Added
+     * during a 2026-08-09 memory-safety pass.) */
+    total++;
+    {
+        const long KPTR   = (long)0xFFFFFFFF80000000UL; /* kernel higher-half  */
+        const long NONCAN = (long)0x0000800000000000UL; /* first non-canonical */
+        const long HUGE   = (long)0x7FFFFFFFFFFFFFFFUL;
+        const long NEG1   = (long)0xFFFFFFFFFFFFFFFFUL;
+
+        /* Aegis raw-disk (511 io, 510 list): hostile buffer + lba/count. */
+        sys6(511, 0, 0, KPTR, HUGE, 0, 0);
+        sys6(511, 1, NEG1, NONCAN, HUGE, 0, 0);
+        sys3(510, KPTR, HUGE, 0);
+        /* Aegis netcfg (500) + adminconf (501 autologin, 502 ntp). */
+        sys6(500, KPTR, HUGE, 0, 0, 0, 0);
+        sys3(501, NEG1, 0, 0);
+        sys3(502, HUGE, 0, 0);
+        /* Aegis install/session gates (516 commit, 517 elevate, 519 query). */
+        sys3(516, 0, 0, 0);
+        sys3(517, NEG1, 0, 0);
+        sys3(519, 0, 0, 0);
+        /* Cap/auth: 362 cap_query copies TO the user buffer; 364 auth_session. */
+        sys6(362, 0, KPTR, HUGE, 0, 0, 0);
+        sys6(362, NEG1, NONCAN, HUGE, 0, 0, 0);
+        sys3(364, NEG1, NEG1, 0);
+        /* vfs_confine (518) with hostile path pointers. */
+        sys3(518, KPTR, 0, 0);
+        sys3(518, NONCAN, 0, 0);
+        /* Structured buffers: ppoll (huge nfds + kernel fds), getdents64. */
+        sys6(SYS_ppoll, KPTR, HUGE, 0, 0, 0, 0);
+        sys6(SYS_ppoll, NONCAN, 16, KPTR, 0, 0, 0);
+        sys6(SYS_getdents64, NEG1, KPTR, HUGE, 0, 0, 0);
+
+        /* Reached here → the kernel survived every hostile probe. */
+        pass++;
+        out("[KTEST] PASS hostile-syscall battery (kernel survived)\n");
+    }
+
     if (pass == total) out("[KTEST] DONE all-pass\n");
     else                out("[KTEST] DONE FAIL\n");
 
