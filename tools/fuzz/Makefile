@@ -63,3 +63,15 @@ fuzz_ext2: fuzz_diskfs.c $(AEGIS)/kernel/fs/ext2.c $(AEGIS)/kernel/fs/ext2_ops.c
 # GPT is the very first thing to touch a hostile disk.
 fuzz_gpt: fuzz_gpt.c $(AEGIS)/kernel/fs/gpt.c $(BLK) $(STRING)
 	$(CC) $(CFLAGS) $(INC) -o $@ $^
+
+# Write-path variants: same source with -DFUZZ_WRITE, backing the blkdev with a
+# mutable image and running a fixed mutation sequence after the walk. Finds bugs
+# in the block/inode allocator + directory/symlink writers on a hostile image.
+fuzz_ext2_rw: fuzz_diskfs.c $(AEGIS)/kernel/fs/ext2.c $(AEGIS)/kernel/fs/ext2_ops.c \
+              $(AEGIS)/kernel/fs/ext2_vfs.c \
+              $(AEGIS)/kernel/fs/ext2_dir.c $(AEGIS)/kernel/fs/ext2_cache.c \
+              $(BLK) $(STRING)
+	$(CC) $(CFLAGS) $(INC) -DFS_BACKEND=ext2_ops -DFUZZ_WRITE -o $@ $^
+
+fuzz_fat_rw: fuzz_diskfs.c $(AEGIS)/kernel/fs/fat.c $(BLK) $(STRING)
+	$(CC) $(CFLAGS) $(INC) -DFS_BACKEND=fat_ops -DFUZZ_WRITE -o $@ $^

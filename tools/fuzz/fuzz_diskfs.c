@@ -95,7 +95,9 @@ void kva_free_pages(void *va, uint64_t n) { (void)n; free(va); }
 
 /* ---- the fuzz input, as a block device ------------------------------- */
 
-static const uint8_t *s_img;
+/* Non-const so the FUZZ_WRITE build can let the fs mutate the medium. The read
+ * harness never writes (img_write returns -1 below unless FUZZ_WRITE). */
+static uint8_t       *s_img;
 static size_t         s_img_len;
 
 static int img_read(blkdev_t *dev, uint64_t lba, uint32_t count, void *buf)
@@ -113,10 +115,24 @@ static int img_read(blkdev_t *dev, uint64_t lba, uint32_t count, void *buf)
 
 static int img_write(blkdev_t *dev, uint64_t lba, uint32_t count, const void *buf)
 {
+#ifdef FUZZ_WRITE
+    /* Write-path fuzzing: let the fs mutate the medium (in the exact-size heap
+     * image, so an out-of-range block/inode the allocator derives from crafted
+     * bitmaps/group-descriptors overflows into an ASan redzone). A saved crash
+     * replays deterministically in a fresh process, so static-cache state across
+     * fuzz iterations can't fake it. */
+    uint64_t off = (lba + dev->lba_offset) * dev->block_size;
+    uint64_t n   = (uint64_t)count * dev->block_size;
+    if (off > s_img_len || n > s_img_len - off)
+        return -1;
+    memcpy(s_img + off, buf, (size_t)n);
+    return 0;
+#else
     /* Read-only medium: the interesting bugs are in parsing, and letting the
      * fs mutate the image would make crashes irreproducible. */
     (void)dev; (void)lba; (void)count; (void)buf;
     return -1;
+#endif
 }
 
 static blkdev_t s_dev;
@@ -246,6 +262,40 @@ static void walk(const fs_ops_t *fs)
     free(name);
 }
 
+#ifdef FUZZ_WRITE
+/* Write-path exercise: a FIXED sequence of mutations (has_install=1 so the
+ * protection gates don't short-circuit). The attacker-controlled part is the
+ * on-disk metadata the fuzzer mutates — the block/inode allocator reads the
+ * crafted bitmaps, group descriptors and inode table to satisfy these, so a
+ * bogus free-block number or out-of-range inode-table pointer surfaces here as
+ * a cache-slot / bitmap overflow. Errors are ignored; only memory safety
+ * matters. */
+static void do_writes(const fs_ops_t *fs)
+{
+    uint32_t ino;
+    static const char blk[8192];   /* forces >1 block + indirect allocation */
+
+    fs->create("/fuzzw", 0644, 1);
+    if (fs->open("/fuzzw", &ino) == 0) {
+        fs->write(ino, blk, 0, sizeof(blk));   /* allocate data + indirect */
+        fs->write(ino, blk, 0x100000, 64);     /* deep offset → double-indirect */
+        fs->truncate(ino);
+        fs->read_inode(ino, &(ext2_inode_t){0});
+    }
+    fs->mkdir("/fuzzd", 0755, 1);
+    fs->create("/fuzzd/a", 0644, 1);
+    fs->symlink("/fuzzl", "the-symlink-target", 1);
+    fs->link("/fuzzw", "/fuzzh", 1);
+    fs->rename("/fuzzw", "/fuzzr", 1);
+    fs->chmod("/fuzzr", 0600, 1);
+    fs->unlink("/fuzzr", 1);
+    fs->unlink("/fuzzh", 1);
+    fs->unlink("/fuzzl", 1);
+    fs->unlink("/fuzzd/a", 1);
+    fs->rmdir("/fuzzd", 1);
+}
+#endif
+
 int LLVMFuzzerTestOneInput(const uint8_t *d, size_t n)
 {
     const fs_ops_t *fs = &FS_BACKEND;
@@ -283,6 +333,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *d, size_t n)
     if (fs->mount("fuzz0") == 0) {
         s_mounts++;
         walk(fs);
+#ifdef FUZZ_WRITE
+        do_writes(fs);
+#endif
     }
 
     s_img     = NULL;
