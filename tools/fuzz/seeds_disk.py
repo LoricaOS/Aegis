@@ -174,7 +174,14 @@ if have("mkfs.ext2"):
                     f.write("hello from the fuzz corpus\n")
                 for cmd in (f"write {content} hello.txt",
                             "mkdir /subdir",
-                            "symlink /link hello.txt"):
+                            f"write {content} /subdir/nested.txt",
+                            "mkdir /subdir/deep",
+                            f"write {content} /subdir/deep/leaf.txt",
+                            "symlink /link hello.txt",           # relative
+                            "symlink /abslink /etc/shadow",       # absolute
+                            "symlink /loop /loop",                # self-loop
+                            "symlink /dotdot ../../../../etc",     # traversal
+                            "symlink /chain /link"):              # link->link
                     subprocess.run(["debugfs", "-w", "-R", cmd, p],
                                    capture_output=True)
             write("corpus_ext2", label, open(p, "rb").read())

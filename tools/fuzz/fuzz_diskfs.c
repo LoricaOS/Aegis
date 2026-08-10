@@ -141,52 +141,77 @@ __attribute__((destructor)) static void report(void)
  * a 257th byte instead of it landing harmlessly in a stack slot. */
 #define READDIR_NAME_SZ 256
 
-static void walk(const fs_ops_t *fs)
+/* Depth-bounded recursive walk. The shallow version only touched root's direct
+ * entries; the rich ext2/FAT bugs live DEEPER — path resolution across nested
+ * directories, symlink chains (open() follows the final link and re-walks the
+ * whole path, so a crafted symlink target exercises the resolver's loop/length
+ * handling — the C1 symlink-target-read bug lived exactly here), and indirect
+ * block lookup on large files. Bounds: MAX_DEPTH nesting, a global entry budget,
+ * and a visited-dir set so a symlink/hardlink cycle in the tree can't spin the
+ * harness (a genuine open() loop that ignores ELOOP would instead show as a
+ * libFuzzer -timeout, which is itself a finding). */
+#define WALK_MAX_DEPTH   10
+#define WALK_MAX_VISITED 512u
+#define WALK_ENTRY_BUDGET 4096u
+
+static uint32_t s_visited[WALK_MAX_VISITED];
+static unsigned s_visited_n;
+static unsigned s_walk_budget;
+
+static int seen_dir(uint32_t ino)
 {
-    uint32_t root_ino;
+    unsigned i;
+    for (i = 0; i < s_visited_n; i++)
+        if (s_visited[i] == ino)
+            return 1;
+    if (s_visited_n < WALK_MAX_VISITED)
+        s_visited[s_visited_n++] = ino;
+    return 0;
+}
+
+static void walk_dir(const fs_ops_t *fs, uint32_t dir_ino,
+                     const char *prefix, int depth, char *name)
+{
     uint32_t idx;
-    char *name = malloc(READDIR_NAME_SZ);
 
-    if (!name)
+    if (depth > WALK_MAX_DEPTH || seen_dir(dir_ino))
         return;
-    if (fs->open("/", &root_ino) != 0) {
-        free(name);
-        return;
-    }
 
-    for (idx = 0; idx < 64; idx++) {
+    for (idx = 0; idx < 256 && s_walk_budget < WALK_ENTRY_BUDGET; idx++) {
         ext2_inode_t ino;
-        char path[300];
+        char path[1024];
         uint8_t buf[512];
         char link[256];
         uint8_t dtype = 0;
         uint32_t child;
 
         memset(name, 0, READDIR_NAME_SZ);
-        if (fs->readdir(root_ino, idx, name, &dtype) != 0)
+        if (fs->readdir(dir_ino, idx, name, &dtype) != 0)
             break;
 
-        /* readdir must NUL-terminate inside that buffer. */
+        /* readdir must NUL-terminate inside the caller's buffer. */
         if (memchr(name, 0, READDIR_NAME_SZ) == NULL) {
             fprintf(stderr, "readdir returned an unterminated name\n");
             abort();
         }
         if (name[0] == '\0')
             continue;
+        /* Skip the self/parent links so recursion terminates on the tree. */
+        if (!strcmp(name, ".") || !strcmp(name, ".."))
+            continue;
         s_entries++;
+        s_walk_budget++;
 
-        snprintf(path, sizeof(path), "/%s", name);
+        snprintf(path, sizeof(path), "%s/%s", prefix, name);
 
-        /* Resolve the entry by path — this is the lookup an actual open() does,
-         * and it re-walks the attacker's directory structure. */
+        /* Resolve by FULL PATH — open() re-walks the attacker's directory
+         * structure from root and follows the final symlink. */
         if (fs->open(path, &child) != 0)
             continue;
 
         if (fs->read_inode(child, &ino) == 0) {
             fs->file_size(child);
-            fs->is_dir(child);
-            /* Head of the file, plus deep offsets so indirect-block lookup is
-             * exercised rather than only the direct blocks. */
+            /* File head + deep offsets so single/double-indirect lookup runs. */
             fs->read(child, buf, 0, sizeof(buf));
             fs->read(child, buf, 4096, sizeof(buf));
             fs->read(child, buf, 0x100000, sizeof(buf));
@@ -195,7 +220,28 @@ static void walk(const fs_ops_t *fs)
         fs->read_symlink_target(child, link, sizeof(link));
         fs->readlink(path, link, sizeof(link));
         fs->path_under_protected(path);
+
+        /* Recurse into real subdirectories (child ino from the parent's
+         * readdir, so a symlink-to-dir is read as a file here, not descended —
+         * its resolution was already exercised by the open() above). */
+        if (fs->is_dir(child))
+            walk_dir(fs, child, path, depth + 1, name);
     }
+}
+
+static void walk(const fs_ops_t *fs)
+{
+    uint32_t root_ino;
+    char *name = malloc(READDIR_NAME_SZ);
+
+    if (!name)
+        return;
+
+    s_visited_n   = 0;
+    s_walk_budget = 0;
+
+    if (fs->open("/", &root_ino) == 0)
+        walk_dir(fs, root_ino, "", 0, name);
 
     free(name);
 }
