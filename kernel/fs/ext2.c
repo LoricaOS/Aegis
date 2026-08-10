@@ -1577,6 +1577,20 @@ int ext2_symlink(const char *linkpath, const char *target, int has_install)
     while (target[tlen] != '\0')
         tlen++;
 
+    /* A slow symlink (tlen > 60) stores its target inline in ONE data block, so
+     * the target cannot exceed the block size — the slow-symlink COPY below
+     * writes tlen bytes into a cache_get_slot() slot of exactly s_block_size.
+     * The READ path already guards this (tlen > s_block_size - 1 is clamped);
+     * the WRITE path did not, so a target longer than the block overflowed the
+     * cache slot. Latent today — the sole caller sys_symlink bounds target to
+     * 256 bytes and s_block_size is >= 1024 — but ext2_symlink is a public
+     * fs_ops method, so keep the write side symmetric with the read side and
+     * fail closed before allocating anything. (Red-team pass, 2026-08-09.) */
+    if (tlen > s_block_size - 1) {
+        ext2_lock_release(fl);
+        return -ENAMETOOLONG;
+    }
+
     uint32_t new_ino = ext2_alloc_inode(0);
     if (new_ino == 0) {
         ext2_lock_release(fl);
