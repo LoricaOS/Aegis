@@ -422,7 +422,15 @@ static uint32_t fat_time_unix(uint16_t date, uint16_t time) {
     if (date == 0) return 0;
     int y = 1980 + (date >> 9), mo = (date >> 5) & 15, d = date & 31;
     int h = time >> 11, mi = (time >> 5) & 63, s = (time & 31) * 2;
-    if (mo < 1) mo = 1;
+    /* The DOS month field is 4 bits, so a crafted directory entry can hold
+     * 0..15. Only the LOWER bound was clamped, and cum[] has 12 entries — a
+     * month of 13..15 indexed cum[12..14], reading up to 12 bytes past the end
+     * of a .rodata array. The value lands in i_mtime/i_atime/i_ctime, where an
+     * attacker who supplied the image can read it straight back out with
+     * stat() and solve for the leaked word (every other term of `days` is
+     * theirs). A removable-media .rodata infoleak, and UB besides. */
+    if (mo < 1)  mo = 1;
+    if (mo > 12) mo = 12;
     if (d < 1)  d = 1;
     static const int cum[] = { 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 };
     long days = (long)(y - 1970) * 365 + (y - 1969) / 4 + cum[mo - 1] + (d - 1);

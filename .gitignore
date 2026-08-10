@@ -21,3 +21,6 @@ regen_o1.sh
 /tools/fuzz/leak-*
 /tools/fuzz/timeout-*
 /tools/fuzz/oom-*
+/tools/fuzz/fuzz_fat
+/tools/fuzz/fuzz_ext2
+/tools/fuzz/fuzz_gpt

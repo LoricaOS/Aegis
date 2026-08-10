@@ -25,7 +25,7 @@ INC := -Ishim -I$(KNET) -I$(AEGIS)/kernel/core -I$(AEGIS)/kernel/fs \
 
 STRING := $(AEGIS)/kernel/lib/string.c
 
-all: fuzz_netrx fuzz_ethrx
+all: fuzz_netrx fuzz_ethrx fuzz_fat fuzz_ext2 fuzz_gpt
 
 # Full stack: Ethernet -> ARP / IPv4 -> ICMP / TCP / UDP, with a listening
 # TCP port and a bound UDP port so the state machines are live.
@@ -45,3 +45,21 @@ clean:
 	rm -rf corpus_ethrx
 
 .PHONY: all seeds clean
+
+# ---- disk filesystems: a hostile on-disk image -----------------------------
+# The fuzz input IS the disk image, exposed as a blkdev. Built twice from one
+# source, once per backend.
+BLK := $(AEGIS)/kernel/fs/blkdev.c
+
+fuzz_fat: fuzz_diskfs.c $(AEGIS)/kernel/fs/fat.c $(BLK) $(STRING)
+	$(CC) $(CFLAGS) $(INC) -DFS_BACKEND=fat_ops -o $@ $^
+
+fuzz_ext2: fuzz_diskfs.c $(AEGIS)/kernel/fs/ext2.c $(AEGIS)/kernel/fs/ext2_ops.c \
+           $(AEGIS)/kernel/fs/ext2_vfs.c \
+           $(AEGIS)/kernel/fs/ext2_dir.c $(AEGIS)/kernel/fs/ext2_cache.c \
+           $(BLK) $(STRING)
+	$(CC) $(CFLAGS) $(INC) -DFS_BACKEND=ext2_ops -o $@ $^
+
+# GPT is the very first thing to touch a hostile disk.
+fuzz_gpt: fuzz_gpt.c $(AEGIS)/kernel/fs/gpt.c $(BLK) $(STRING)
+	$(CC) $(CFLAGS) $(INC) -o $@ $^

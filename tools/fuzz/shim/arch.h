@@ -14,4 +14,12 @@ static inline void     arch_wait_for_irq(void) { g_fake_ticks++; }
 static inline void     arch_enable_irq(void) { }
 static inline void     arch_disable_irq(void) { }
 static inline const char *arch_get_cmdline(void) { return ""; }
+/* ext2's block cache ages entries against the TSC. A fixed nominal frequency
+ * and a monotonic counter keep that deterministic for the fuzzer. */
+static inline uint64_t arch_tsc_hz(void)     { return 1000000000ull; }
+static inline uint64_t arch_get_cycles(void) { return ++g_fake_ticks; }
+/* uaccess.h builds copy_from_user/copy_to_user on this. There is no user space
+ * in the harness, so it is a plain copy; returns bytes NOT copied. */
+static inline uint64_t __uaccess_copy(void *dst, const void *src, uint64_t len)
+{ __builtin_memcpy(dst, src, (unsigned long)len); return 0; }
 #endif
