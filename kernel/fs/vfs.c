@@ -13,8 +13,15 @@
 #include "sched.h"
 #include "proc.h"
 #include "dev_table.h"
+#include "arch.h"        /* arch_get_ticks() — admin-credential read throttle */
 #include "../include/aegis_errno.h"
 #include <stdint.h>
+
+/* Anti-brute-force throttle state for the admin elevation credential
+ * (/etc/aegis/admin). See the read gate in vfs_open_ex. One read per window,
+ * globally, for non-admin user processes. 200 ticks = 2 s at the 100 Hz PIT. */
+#define ADMIN_CRED_MIN_TICKS 200u
+static volatile uint64_t s_admin_cred_last_read = 0;
 
 static ramfs_t s_run_ramfs;
 static ramfs_t s_tmp_ramfs;
@@ -343,6 +350,36 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
                     if (cap_check(pr->caps, CAP_TABLE_SIZE,
                                   CAP_KIND_AUTH, CAP_RIGHTS_READ) != 0)
                         return -EACCES;
+
+                    /* Kernel-enforced brute-force throttle on the admin
+                     * ELEVATION credential. `login -elevate` opens this once per
+                     * password guess, and the userland serialization it relied
+                     * on (flock on a /run lock) is INERT: flock() and fcntl()
+                     * record locks are unimplemented in this kernel (ENOSYS /
+                     * fake-success), and /run is world-writable so any lock file
+                     * there is attacker-manipulable anyway. With uid cosmetically
+                     * 0, the kernel is the only arbiter a local attacker cannot
+                     * subvert. Pace non-admin reads of the credential to at most
+                     * one per window, GLOBALLY: reject the rest with -EAGAIN
+                     * WITHOUT advancing the clock, so a parallel re-exec storm of
+                     * `login -elevate` is capped to one guess per window no
+                     * matter how it is driven. Admin sessions are exempt (adminpw
+                     * / the installer re-reading during an already-elevated flow).
+                     * Only the admin credential is throttled — /etc/shadow reads
+                     * on the normal login path must stay unpaced. login fails
+                     * closed on the -EAGAIN (open<0), so a throttled guess simply
+                     * does not verify. (Red-team finding, 2026-08-09.) */
+                    if (admin_ino != 0 && ino == admin_ino &&
+                        pr->admin_session == 0) {
+                        uint64_t now  = arch_get_ticks();
+                        uint64_t last = __atomic_load_n(&s_admin_cred_last_read,
+                                                        __ATOMIC_RELAXED);
+                        if (last != 0 &&
+                            (now - last) < ADMIN_CRED_MIN_TICKS)
+                            return -EAGAIN;
+                        __atomic_store_n(&s_admin_cred_last_read, now,
+                                         __ATOMIC_RELAXED);
+                    }
                 }
             }
             /* Account-DB write gate: /etc/passwd and /etc/group are world-
