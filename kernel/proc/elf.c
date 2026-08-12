@@ -68,22 +68,23 @@ typedef struct {
  * a default install only because the shipped /lib/ld-musl* is root-owned.
  *
  * Require: resolvable on the root fs, executable by the caller, root-owned,
- * and not group/world-writable.
- *
- * Deliberately NOT requiring the install-protected trees that cap policy uses
- * for its own anchors: those are /bin, /sbin, /apps and /etc/aegis, and the
- * dynamic linker lives in /lib, so that test would reject every dynamically
- * linked binary on the system. Ownership + write-permission is the check that
- * actually distinguishes "shipped linker" from "attacker-planted file".
+ * and not group/world-writable. If the main image receives policy authority,
+ * require the interpreter to be in the same inode-backed protected set; uid 0
+ * ownership alone is cosmetic and does not make owner-writable code immutable.
  *
  * Returns 1 if the interpreter may be loaded, 0 to refuse. */
 int
-elf_interp_trusted(const char *interp, uint16_t uid, uint16_t gid)
+elf_interp_trusted(const char *interp, uint16_t uid, uint16_t gid,
+                   int require_protected)
 {
     uint32_t ino;
     ext2_inode_t in;
 
     if (!interp || !g_rootfs || !g_rootfs->open || !g_rootfs->read_inode)
+        return 0;
+    if (require_protected &&
+        (!g_rootfs->path_under_protected ||
+         !g_rootfs->path_under_protected(interp)))
         return 0;
     if (g_rootfs->open(interp, &ino) != 0)
         return 0;                     /* not on the root fs — refuse, as exec

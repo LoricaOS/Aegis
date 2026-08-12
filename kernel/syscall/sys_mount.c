@@ -115,7 +115,7 @@ sys_umount(uint64_t target_u, uint64_t flags)
     if (copy_path_from_user(target, target_u, sizeof(target)) != 0)
         return SYS_ERR(EFAULT);
 
-    /* Refuse while anything still has the filesystem open. umount used to
+    /* Refuse while anything still has the filesystem open or resolved. umount used to
      * unconditionally kva_free_pages the ramfs_t, but an open fd's vfs priv is
      * a pointer INTO that struct (ramfs.c: the node it opened), so the freed
      * ~553 KB went straight back to the kva pool that fd_table_alloc and
@@ -130,22 +130,11 @@ sys_umount(uint64_t target_u, uint64_t flags)
      * `open("/mnt/x", O_DIRECTORY)` + umount freed the instance under a live
      * handle deterministically.
      *
-     * RESIDUAL, stated plainly: this is a point-in-time check, not a
-     * reference. A CAP_KIND_MOUNT holder can still race a sibling's open
-     * between the busy check and mount_remove/kva_free below. Closing that
-     * needs a real per-mount refcount (resolve and every open handle take one;
-     * umount marks dying, refuses new refs, frees at zero) — an interface
-     * change across mount_resolve and every fs backend, not a batch item. */
-    {
-        void *bctx = (void *)0;
-        const char *brel = (const char *)0;
-        if (mount_resolve(target, &bctx, &brel) == MOUNT_FS_TMPFS && bctx &&
-            ramfs_busy((ramfs_t *)bctx))
-            return SYS_ERR(EBUSY);
-    }
-
+     * mount_remove_idle performs the open-handle and transient-reference
+     * checks under the mount-table lock, then removes the entry in the same
+     * critical section. That closes the check/remove race. */
     void *ctx = (void *)0;
-    int ft = mount_remove(target, &ctx);
+    int ft = mount_remove_idle(target, &ctx);
     if (ft < 0)
         return (uint64_t)(int64_t)ft;              /* -EINVAL: not mounted */
     if (ft == MOUNT_FS_TMPFS && ctx)

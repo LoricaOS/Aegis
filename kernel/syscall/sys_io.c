@@ -11,12 +11,16 @@
 /*
  * sys_audio_volume — syscall 503.  arg1 = output volume percent (0..100).
  *
- * Ungated: volume is a non-privileged user preference, not a security or
- * install concern. Clamped to 0..100. No-op when there is no HDA codec.
+ * Requires AUDIO_CONTROL|WRITE because this mutates global device state.
+ * Clamped to 0..100. No-op when there is no HDA codec.
  */
 uint64_t
 sys_audio_volume(uint64_t pct)
 {
+    aegis_process_t *proc = current_proc();
+    if (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_AUDIO_CONTROL,
+                  CAP_RIGHTS_WRITE) != 0)
+        return SYS_ERR(ENOCAP);
     int v = (int)pct;
     if (v < 0)   v = 0;
     if (v > 100) v = 100;
@@ -28,11 +32,16 @@ sys_audio_volume(uint64_t pct)
 
 /*
  * sys_audio_stop — syscall 504.  Stop /dev/audio playback immediately and
- * discard the buffered tail (the Tunes Stop button). Ungated. No-op without HDA.
+ * discard the buffered tail (the Tunes Stop button). Requires
+ * AUDIO_CONTROL|WRITE. No-op without HDA.
  */
 uint64_t
 sys_audio_stop(void)
 {
+    aegis_process_t *proc = current_proc();
+    if (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_AUDIO_CONTROL,
+                  CAP_RIGHTS_WRITE) != 0)
+        return SYS_ERR(ENOCAP);
 #ifdef __x86_64__
     hda_audio_stop();
 #endif

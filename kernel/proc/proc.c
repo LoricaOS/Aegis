@@ -152,7 +152,7 @@ proc_spawn(const uint8_t *elf_data, size_t elf_len)
              * checked anyway so all three PT_INTERP load sites agree, and so a
              * rootfs shipping a non-root-owned or world-writable linker fails
              * loudly here rather than silently weakening every later exec. */
-            if (!elf_interp_trusted(er.interp, 0, 0)) {
+            if (!elf_interp_trusted(er.interp, 0, 0, 1)) {
                 printk("[PROC] FAIL: untrusted interpreter: %s\n", er.interp);
                 panic_halt("[PROC] FAIL: untrusted interpreter");
             }

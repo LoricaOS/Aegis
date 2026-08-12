@@ -247,11 +247,14 @@ uint32_t ext2_get_group_ino(void)  { return s_group_ino; }
  * ordinary user, that user could overwrite /bin/login (→ AUTH+SETUID) or drop
  * a /bin/reboot (→ POWER) and forge authority by filename — exactly the
  * privilege-by-filename attack the anchor exists to stop. The trusted-for-
- * granting tree and the write-protected tree MUST be the same set. */
+ * granting tree and the write-protected tree MUST be the same set. /lib is
+ * protected because its dynamic linker executes inside those privileged
+ * processes and therefore belongs to the same code-integrity boundary. */
 static uint32_t s_apps_ino = 0;
 static uint32_t s_etc_aegis_ino = 0;
 static uint32_t s_bin_ino = 0;
 static uint32_t s_sbin_ino = 0;
+static uint32_t s_lib_ino = 0;
 /* Dynamic install-anchor set: extra trusted-path / install-protected dirs beyond
  * the hardcoded builtins above. Registered from /etc/aegis/anchors (one absolute
  * path per line) by ext2_anchors_reload() — called at boot after mount and by
@@ -346,7 +349,7 @@ ext2_ino_is_guarded(uint32_t ino)
     if (ino == 0)
         return 0;
     if (ino == s_apps_ino || ino == s_etc_aegis_ino ||
-        ino == s_bin_ino  || ino == s_sbin_ino)
+        ino == s_bin_ino  || ino == s_sbin_ino || ino == s_lib_ino)
         return 1;
     if (ino == s_shadow_ino || ino == s_admin_ino ||
         ino == s_passwd_ino || ino == s_group_ino)
@@ -574,6 +577,9 @@ int ext2_mount(const char *devname)
         ino = 0;
         if (ext2_open_ex("/sbin", &ino, 1) == 0)
             s_sbin_ino = ino;
+        ino = 0;
+        if (ext2_open_ex("/lib", &ino, 1) == 0)
+            s_lib_ino = ino;
         /* Dynamic anchors (e.g. /lib/<app> from installed packages) are recorded
          * post-mount by ext2_anchors_reload() — they require reading a file
          * (/etc/aegis/anchors), which can't be done under the mount lock. */
@@ -591,6 +597,7 @@ int ext2_mount(const char *devname)
     ext2_guard_record_ancestors("/apps");
     ext2_guard_record_ancestors("/bin");
     ext2_guard_record_ancestors("/sbin");
+    ext2_guard_record_ancestors("/lib");
 
     printk("[EXT2] OK: mounted %s, %u blocks, %u inodes\n",
            devname, s_sb.s_blocks_count, s_sb.s_inodes_count);
@@ -1344,6 +1351,7 @@ restart_walk:
             if (touched && child_ino != 0 &&
                 (child_ino == s_apps_ino || child_ino == s_etc_aegis_ino ||
                  child_ino == s_bin_ino  || child_ino == s_sbin_ino ||
+                 child_ino == s_lib_ino ||
                  ext2_ino_is_anchor(child_ino)))
                 *touched = 1;
 
@@ -1433,7 +1441,8 @@ int ext2_open_ex(const char *path, uint32_t *inode_out, int follow_final)
 int ext2_path_under_protected(const char *path)
 {
     if (!s_mounted || (s_apps_ino == 0 && s_etc_aegis_ino == 0 &&
-                       s_bin_ino == 0 && s_sbin_ino == 0 && s_anchor_count == 0))
+                       s_bin_ino == 0 && s_sbin_ino == 0 && s_lib_ino == 0 &&
+                       s_anchor_count == 0))
         return 0;
     uint32_t ino = 0;
     int touched = 0;

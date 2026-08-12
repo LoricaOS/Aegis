@@ -424,7 +424,8 @@ reload_binary:
             /* Gate the interpreter (audit M4) — it runs first, with this
              * process's already-granted caps. */
             if (!elf_interp_trusted(er.interp, (uint16_t)proc->uid,
-                                    (uint16_t)proc->gid)) {
+                                    (uint16_t)proc->gid,
+                                    cap_policy_lookup(path) != 0)) {
                 printk("[EXEC] refused untrusted PT_INTERP: %s\n", er.interp);
                 sched_exit(); __builtin_unreachable();
             }
@@ -894,7 +895,8 @@ sys_spawn(uint64_t path_uptr, uint64_t argv_uptr,
             /* Gate the interpreter (audit M4) — same uid/gid the main binary
              * was X_OK-checked against above. */
             if (!elf_interp_trusted(er.interp, (uint16_t)parent->uid,
-                                    (uint16_t)parent->gid)) {
+                                    (uint16_t)parent->gid,
+                                    cap_policy_lookup(path) != 0)) {
                 printk("[EXEC] refused untrusted PT_INTERP: %s\n", er.interp);
                 goto fail_child;
             }
