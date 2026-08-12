@@ -289,6 +289,16 @@ sys_mmap(uint64_t arg1, uint64_t arg2, uint64_t arg3,
     uint64_t len = (arg2 + 4095UL) & ~4095UL;
     if (len == 0)
         return SYS_ERR(EINVAL);
+    /* Same per-syscall page-work ceiling munmap/mprotect/mremap/brk enforce, and
+     * for the same reason: the gap scan below and the MAP_FIXED teardown walk
+     * the requested range ONE PAGE AT A TIME with IF=0, so an mmap of a few TiB
+     * of (never-touched) VA is billions of uninterruptible page-table walks —
+     * a core wedged from any process, no capability needed. mmap was the one
+     * range syscall missing the bound. Checked on the ROUNDED len, before the
+     * scan; the rounding above cannot wrap (arg2 near 2^64 rounds to 0 and is
+     * rejected as EINVAL). ENOMEM, which POSIX permits for an unmappable len. */
+    if (len > MM_MAX_RANGE_PAGES * 4096UL)
+        return SYS_ERR(ENOMEM);
     if (prot & ~(uint64_t)(PROT_READ | PROT_WRITE | PROT_EXEC))
         return SYS_ERR(EINVAL);
     /* W^X: reject simultaneous write+execute. Sequential W-then-X
@@ -382,6 +392,25 @@ sys_mmap(uint64_t arg1, uint64_t arg2, uint64_t arg3,
          * mapping survives intact. */
         if (vma_remove(proc, addr, len) != 0)
             return SYS_ERR(ENOMEM);   /* -ENOMEM: cannot record split */
+        /* Re-RESERVE the range immediately — before any page teardown — exactly
+         * as the non-fixed path reserves before it populates.
+         *
+         * vma_remove leaves [addr,len) owned by nobody, and the teardown loop
+         * below plus the map/read path after it are long. A CLONE_VM sibling
+         * mmap'ing in that window scans the range clear, wins it, and maps its
+         * pages there; we then unmap and pmm_free_page frames that now belong to
+         * the sibling's live mapping, or collide with it in vmm_map_user_page —
+         * whose double-map check is a panic_halt. Holding the reservation across
+         * the whole operation closes both: no sibling can select the range, so
+         * the teardown can only ever free the frames it just displaced.
+         *
+         * (A sibling FAULTING on the range mid-populate remains possible — but
+         * that is the pre-existing shape of the non-fixed path, not new here,
+         * and it takes a thread touching an address its own group is still
+         * mmap'ing.) */
+        if (vma_insert(proc, addr, len, (uint32_t)(prot & 0x07), vma_type) != 0)
+            return SYS_ERR(ENOMEM);
+        reserved = 1;
         /* Now silently unmap+free existing pages so the subsequent map loop
          * does not hit an already-present PTE (which would panic_halt). Use
          * vmm_phys_of_user_raw so PROT_NONE pages (PRESENT cleared but phys

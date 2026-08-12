@@ -437,7 +437,13 @@ proc_spawn(const uint8_t *elf_data, size_t elf_len)
     cap_grant(proc->caps, CAP_TABLE_SIZE, CAP_KIND_IPC,           CAP_RIGHTS_READ);
     cap_grant(proc->caps, CAP_TABLE_SIZE, CAP_KIND_PROC_READ,     CAP_RIGHTS_READ | CAP_RIGHTS_WRITE);
     cap_grant(proc->caps, CAP_TABLE_SIZE, CAP_KIND_THREAD_CREATE, CAP_RIGHTS_READ);
-    cap_grant(proc->caps, CAP_TABLE_SIZE, CAP_KIND_POWER,         CAP_RIGHTS_READ);
+    /* POWER carries WRITE: its sinks (reboot, sethostname, kill(PID 1)) all
+     * MUTATE global state and now demand WRITE rights, so that a read-only
+     * POWER delegation cannot reboot the machine. This bootstrap grant is the
+     * one cap source that is not a policy file (which grant R|W|X), so it has
+     * to spell the rights out — same as PROC_READ above. */
+    cap_grant(proc->caps, CAP_TABLE_SIZE, CAP_KIND_POWER,
+              CAP_RIGHTS_READ | CAP_RIGHTS_WRITE);
 
     /* Pre-open fd 1 (stdout) to the console device.
      * User process inherits stdout without a sys_open call. */

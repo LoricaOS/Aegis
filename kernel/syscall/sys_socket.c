@@ -939,11 +939,23 @@ uint64_t sys_sendmsg(uint64_t fd, uint64_t msg_ptr, uint64_t flags)
                     (const void *)((uintptr_t)mh.msg_control + sizeof(k_cmsghdr_t)),
                     (uint32_t)((uint64_t)nfds * sizeof(int)));
 
-            /* Dup each fd and stage for peer */
+            /* Dup each fd and stage for peer.
+             *
+             * The whole validate → allowlist → dup → snapshot sequence runs
+             * under fd_table.lock, per that lock's contract (fd_table.h): a
+             * CLONE_FILES sibling closing sfd between the scm_fd_passable()
+             * check and the dup would leave us ->dup'ing freed memory, or —
+             * worse — reopening the slot in that window swaps a PASSABLE
+             * object for the authority-bearing one we just cleared, sending an
+             * fd the allowlist exists to refuse. ops->dup is a refcount bump
+             * and is explicitly allowed under this lock; ops->close is NOT, so
+             * every unwind happens after the unlock. */
             unix_sock_t *us = unix_sock_get(uid);
             if (us && us->peer_id != UNIX_NONE) {
                 unix_passed_fd_t staged[UNIX_PASSED_FD_MAX];
                 uint8_t count = 0;
+                int denied = 0;
+                irqflags_t ffl = spin_lock_irqsave(&proc->fd_table->lock);
                 for (int i = 0; i < nfds; i++) {
                     int sfd = sender_fds[i];
                     if (sfd < 0 || sfd >= PROC_MAX_FDS) continue;
@@ -952,17 +964,19 @@ uint64_t sys_sendmsg(uint64_t fd, uint64_t msg_ptr, uint64_t flags)
                     /* Authority-laundering guard: refuse to pass an fd that
                      * carries filesystem/device authority (see scm_fd_passable).
                      * Unwind the refs already dup'd this message, then EPERM. */
-                    if (!scm_fd_passable(f->ops)) {
-                        for (uint8_t k = 0; k < count; k++)
-                            if (staged[k].ops && staged[k].ops->close)
-                                staged[k].ops->close(staged[k].priv);
-                        return SYS_ERR(EPERM);
-                    }
+                    if (!scm_fd_passable(f->ops)) { denied = 1; break; }
                     if (f->ops->dup) f->ops->dup(f->priv);
                     staged[count].ops   = f->ops;
                     staged[count].priv  = f->priv;
                     staged[count].flags = f->flags;
                     count++;
+                }
+                spin_unlock_irqrestore(&proc->fd_table->lock, ffl);
+                if (denied) {
+                    for (uint8_t k = 0; k < count; k++)
+                        if (staged[k].ops && staged[k].ops->close)
+                            staged[k].ops->close(staged[k].priv);
+                    return SYS_ERR(EPERM);
                 }
                 if (count > 0) {
                     int sr = unix_sock_stage_fds(us->peer_id, staged, count);

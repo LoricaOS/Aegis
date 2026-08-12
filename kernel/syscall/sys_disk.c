@@ -215,7 +215,7 @@ sys_fb_map(uint64_t arg1)
 {
     aegis_process_t *proc = current_proc();
     if (cap_check(proc->caps, CAP_TABLE_SIZE,
-                  CAP_KIND_FB, CAP_RIGHTS_READ) != 0)
+                  CAP_KIND_FB, CAP_RIGHTS_WRITE) != 0)
         return SYS_ERR(EPERM);
 
     /* virtio-gpu path: when an accelerated GPU is live, publish its backing
@@ -352,7 +352,7 @@ sys_fb_flush(void)
 {
     aegis_process_t *proc = current_proc();
     if (cap_check(proc->caps, CAP_TABLE_SIZE,
-                  CAP_KIND_FB, CAP_RIGHTS_READ) != 0)
+                  CAP_KIND_FB, CAP_RIGHTS_WRITE) != 0)
         return SYS_ERR(ENOCAP);
     virtio_gpu_flush();
     return 0;
