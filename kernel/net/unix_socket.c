@@ -69,18 +69,18 @@ static uint16_t ring_free(unix_sock_t *s)
  * about the client, not the client about the server, so the client cannot
  * detect the swap.
  *
- * Two gates, both cheap:
+ * Named bind is separately gated at the syscall boundary by IPC_BIND, so the
+ * baseline IPC capability permits clients and socketpair users but cannot
+ * claim service identities. Two additional checks remain here:
  *   - a path under an install-protected tree needs CAP_KIND_INSTALL, which is
  *     the same authority required to create a real file there;
  *   - the binder's uid is recorded, and a name may only be re-bound by the uid
  *     that owned it, so a name freed by a crashing service cannot be picked up
  *     by a different user.
  *
- * PARTIAL. The real fix is to back these names with the filesystem so the
- * ordinary directory permissions apply — that is an architectural change, not
- * a batch item. Until then a same-uid squatter is still possible, which on a
- * system where everything runs as uid 0 means most of the value here is the
- * protected-tree gate. Said plainly so nobody reads this as solved. */
+ * IPC_BIND is intentionally the explicit authority to claim names. A process
+ * granted it can choose any unoccupied name; service policy must therefore
+ * grant it only to programs intended to publish AF_UNIX endpoints. */
 static int name_register(const char *path, uint32_t sock_id)
 {
     aegis_process_t *proc = sched_current()->is_user ? current_proc()

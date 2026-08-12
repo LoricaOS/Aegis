@@ -187,6 +187,9 @@ sys_bind(uint64_t fd, uint64_t addr, uint64_t addrlen)
     /* AF_UNIX bind */
     uint32_t uid = unix_sock_id_from_fd((int)fd, proc);
     if (uid != UNIX_NONE) {
+        if (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_IPC_BIND,
+                      CAP_RIGHTS_WRITE) != 0)
+            return SYS_ERR(ENOCAP);
         if (addrlen < 4 || !user_ptr_valid(addr, addrlen))
             return SYS_ERR(EFAULT);
         k_sockaddr_un_t sun;
@@ -933,11 +936,12 @@ uint64_t sys_sendmsg(uint64_t fd, uint64_t msg_ptr, uint64_t flags)
             if (nfds_u > (uint64_t)UNIX_PASSED_FD_MAX) nfds_u = (uint64_t)UNIX_PASSED_FD_MAX;
             int nfds = (int)nfds_u;
 
-            int sender_fds[UNIX_PASSED_FD_MAX];
-            if (nfds > 0)
+            int sender_fds[UNIX_PASSED_FD_MAX] = {0};
+            if (nfds > 0 &&
                 copy_from_user(sender_fds,
                     (const void *)((uintptr_t)mh.msg_control + sizeof(k_cmsghdr_t)),
-                    (uint32_t)((uint64_t)nfds * sizeof(int)));
+                    (uint32_t)((uint64_t)nfds * sizeof(int))) != 0)
+                return SYS_ERR(EFAULT);
 
             /* Dup each fd and stage for peer.
              *

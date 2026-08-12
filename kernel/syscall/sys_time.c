@@ -167,7 +167,7 @@ sys_clock_settime(uint64_t clk_id, uint64_t timespec_uptr)
 {
     aegis_process_t *proc = current_proc();
     if (cap_check(proc->caps, CAP_TABLE_SIZE,
-                  CAP_KIND_NET_ADMIN, CAP_RIGHTS_WRITE) != 0)
+                  CAP_KIND_TIME, CAP_RIGHTS_WRITE) != 0)
         return SYS_ERR(EPERM);
     if (clk_id != 0) return SYS_ERR(EINVAL); /* EINVAL: only CLOCK_REALTIME */
     if (!user_ptr_valid(timespec_uptr, 16)) return SYS_ERR(EFAULT);

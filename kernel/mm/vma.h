@@ -3,6 +3,7 @@
 #define AEGIS_VMA_H
 
 #include <stdint.h>
+#include "spinlock.h"
 
 /* VMA type constants */
 #define VMA_NONE         0
@@ -53,6 +54,12 @@ int vma_find_copy(struct aegis_process *proc, uint64_t va, vma_entry_t *out);
  * Cheap (O(VMAs spanned) binary searches) — the uaccess fast path uses it to
  * validate a user buffer without a per-page windowed PTE walk. */
 int vma_range_covered(struct aegis_process *proc, uint64_t addr, uint64_t len);
+
+/* Serialize whole address-space ownership transitions (VMA metadata plus PTE
+ * population/teardown) across CLONE_VM siblings.  Leaf VMA helpers keep their
+ * own table lock; this outer lock is for syscall/fault transactions. */
+irqflags_t vma_op_lock(struct aegis_process *proc);
+void vma_op_unlock(struct aegis_process *proc, irqflags_t flags);
 
 /* vma_insert — add a VMA entry sorted by base address.
  * Merges with adjacent entries if same prot+type.

@@ -42,6 +42,9 @@ typedef struct {
                                     * filesystem into the /mnt tree). A distinct,
                                     * least-authority cap: mounting a tmpfs must
                                     * not require raw-disk (DISK_ADMIN) rights. */
+#define CAP_KIND_IPC_BIND     21u  /* may claim a named AF_UNIX service endpoint */
+#define CAP_KIND_AUDIO_CONTROL 22u /* may mutate global audio volume/playback */
+#define CAP_KIND_TIME         23u  /* may set the global realtime clock */
 
 /* CAP_KIND_MAX — highest DEFINED capability kind. Used to reject undefined kinds
  * (e.g. the sys_spawn cap_mask delegation path) without hardcoding a specific
@@ -50,7 +53,7 @@ typedef struct {
  * undelegatable (exactly the bug that left NET_LISTEN undelegatable when the
  * check still read `> CAP_KIND_INSTALL`). Also add a name to cap_policy.c's
  * table (the _Static_assert there lists every kind 1..MAX). */
-#define CAP_KIND_MAX          CAP_KIND_MOUNT
+#define CAP_KIND_MAX          CAP_KIND_TIME
 
 /* Compile-time invariants for the cap-kind space (T4 cap-enum guards). These
  * turn the prose contract above into build errors:

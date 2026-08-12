@@ -1,17 +1,16 @@
 /* mount.c — the dynamic mount table (see mount.h).
  *
  * A small fixed table of {target, fstype, ctx}. sys_mount adds entries,
- * sys_umount removes them, and the VFS calls mount_resolve() on every path to
+ * sys_umount removes them, and the VFS calls mount_acquire() on every path to
  * route dynamic mounts before the builtin prefix chain.
  *
- * Concurrency ceiling (ponytail): the table is spinlock-guarded, but a ctx
- * pointer handed back by mount_resolve is NOT refcounted — a concurrent
- * umount that frees the instance while another CPU holds the resolved ctx is a
- * use-after-free. mount/umount are CAP_KIND_MOUNT-gated privileged ops and
- * umount of a busy mount is a caller error; per-mount refcounting is the
- * upgrade path if that ceiling is ever hit.
+ * A transient reference protects every resolved operation. Open ramfs handles
+ * are separately counted by ramfs_busy(); mount_remove_idle checks both while
+ * holding the table lock, so no new operation can enter between the check and
+ * removal.
  */
 #include "mount.h"
+#include "ramfs.h"
 #include "spinlock.h"
 #include "../include/aegis_errno.h"
 #include <stddef.h>
@@ -24,6 +23,7 @@ typedef struct {
     uint32_t target_len;
     int      fstype;
     void    *ctx;
+    uint32_t refs;
     int      in_use;
 } mount_ent_t;
 
@@ -69,6 +69,7 @@ int mount_add(const char *target, int fstype, void *ctx)
     m->target_len  = len;
     m->fstype      = fstype;
     m->ctx         = ctx;
+    m->refs        = 0;
     m->in_use      = 1;
     spin_unlock_irqrestore(&mount_lock, fl);
     return 0;
@@ -76,25 +77,36 @@ int mount_add(const char *target, int fstype, void *ctx)
 
 int mount_remove(const char *target, void **ctx_out)
 {
+    return mount_remove_idle(target, ctx_out);
+}
+
+int mount_remove_idle(const char *target, void **ctx_out)
+{
     uint32_t len = m_strlen(target);
     irqflags_t fl = spin_lock_irqsave(&mount_lock);
     for (int i = 0; i < MOUNT_MAX; i++) {
-        if (s_mounts[i].in_use && s_mounts[i].target_len == len &&
-            m_streqn(s_mounts[i].target, target, len)) {
-            int ft = s_mounts[i].fstype;
-            if (ctx_out) *ctx_out = s_mounts[i].ctx;
-            s_mounts[i].in_use     = 0;
-            s_mounts[i].ctx        = NULL;
-            s_mounts[i].target_len = 0;
+        mount_ent_t *m = &s_mounts[i];
+        if (!m->in_use || m->target_len != len ||
+            !m_streqn(m->target, target, len))
+            continue;
+        if (m->refs != 0 ||
+            (m->fstype == MOUNT_FS_TMPFS && ramfs_busy((ramfs_t *)m->ctx))) {
             spin_unlock_irqrestore(&mount_lock, fl);
-            return ft;
+            return -EBUSY;
         }
+        int ft = m->fstype;
+        if (ctx_out) *ctx_out = m->ctx;
+        m->in_use = 0;
+        m->ctx = NULL;
+        m->target_len = 0;
+        spin_unlock_irqrestore(&mount_lock, fl);
+        return ft;
     }
     spin_unlock_irqrestore(&mount_lock, fl);
     return -EINVAL;
 }
 
-int mount_resolve(const char *path, void **ctx, const char **rel)
+int mount_acquire(const char *path, void **ctx, const char **rel)
 {
     if (!path || path[0] != '/') return MOUNT_FS_NONE;
 
@@ -116,6 +128,7 @@ int mount_resolve(const char *path, void **ctx, const char **rel)
         return MOUNT_FS_NONE;
     }
     int ft = s_mounts[best].fstype;
+    s_mounts[best].refs++;
     if (ctx) *ctx = s_mounts[best].ctx;
     if (rel) {
         const char *r = path + best_len;   /* stable: into the caller's buffer */
@@ -124,4 +137,17 @@ int mount_resolve(const char *path, void **ctx, const char **rel)
     }
     spin_unlock_irqrestore(&mount_lock, fl);
     return ft;
+}
+
+void mount_release(void *ctx)
+{
+    if (!ctx) return;
+    irqflags_t fl = spin_lock_irqsave(&mount_lock);
+    for (int i = 0; i < MOUNT_MAX; i++) {
+        if (s_mounts[i].in_use && s_mounts[i].ctx == ctx) {
+            if (s_mounts[i].refs) s_mounts[i].refs--;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&mount_lock, fl);
 }

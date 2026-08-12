@@ -81,7 +81,7 @@ static const char s_dhcp_caps[]   = "NET_ADMIN NET_SOCKET\n";
 /* chronos vigil service config — NTP time sync daemon */
 static const char s_chronos_run[]    = "/bin/chronos\n";
 static const char s_chronos_policy[] = "oneshot\n";
-static const char s_chronos_caps[]   = "NET_SOCKET\n";
+static const char s_chronos_caps[]   = "NET_SOCKET TIME\n";
 
 /* Capability policy files — /etc/aegis/caps.d/<binary>
  * The kernel's cap policy table reads these at execve time to determine
@@ -92,8 +92,10 @@ static const char s_cap_login[]     = "service AUTH SETUID\n";
 static const char s_cap_bastion[]   = "service AUTH FB SETUID\n";
 static const char s_cap_httpd[]     = "service NET_SOCKET\n";
 static const char s_cap_dhcp[]      = "service NET_SOCKET NET_ADMIN\n";
+static const char s_cap_chronos[]   = "service NET_SOCKET TIME\n";
 static const char s_cap_stsh[]      = "admin DISK_ADMIN POWER CAP_DELEGATE CAP_QUERY\nadmin PROC_READ\n";
-static const char s_cap_lumen[]     = "service FB THREAD_CREATE\n";
+static const char s_cap_lumen[]     = "service FB THREAD_CREATE IPC_BIND AUDIO_CONTROL\n";
+static const char s_cap_tunes[]     = "service AUDIO_CONTROL\n";
 static const char s_cap_installer[] = "admin DISK_ADMIN AUTH\n";
 
 /* Compile-time size constants for static string entries. */
@@ -117,8 +119,10 @@ static const unsigned int s_cap_login_size      = sizeof(s_cap_login)      - 1;
 static const unsigned int s_cap_bastion_size    = sizeof(s_cap_bastion)    - 1;
 static const unsigned int s_cap_httpd_size      = sizeof(s_cap_httpd)      - 1;
 static const unsigned int s_cap_dhcp_size       = sizeof(s_cap_dhcp)       - 1;
+static const unsigned int s_cap_chronos_size    = sizeof(s_cap_chronos)    - 1;
 static const unsigned int s_cap_stsh_size       = sizeof(s_cap_stsh)       - 1;
 static const unsigned int s_cap_lumen_size      = sizeof(s_cap_lumen)      - 1;
+static const unsigned int s_cap_tunes_size      = sizeof(s_cap_tunes)      - 1;
 static const unsigned int s_cap_installer_size  = sizeof(s_cap_installer)  - 1;
 
 /* Binary blobs embedded into the kernel image.
@@ -180,8 +184,10 @@ static const initrd_entry_t s_files[] = {
     { "/etc/aegis/caps.d/bastion", (const unsigned char *)s_cap_bastion, (const unsigned char *)s_cap_bastion + s_cap_bastion_size },
     { "/etc/aegis/caps.d/httpd", (const unsigned char *)s_cap_httpd, (const unsigned char *)s_cap_httpd + s_cap_httpd_size },
     { "/etc/aegis/caps.d/dhcp", (const unsigned char *)s_cap_dhcp, (const unsigned char *)s_cap_dhcp + s_cap_dhcp_size },
+    { "/etc/aegis/caps.d/chronos", (const unsigned char *)s_cap_chronos, (const unsigned char *)s_cap_chronos + s_cap_chronos_size },
     { "/etc/aegis/caps.d/stsh", (const unsigned char *)s_cap_stsh, (const unsigned char *)s_cap_stsh + s_cap_stsh_size },
     { "/etc/aegis/caps.d/lumen", (const unsigned char *)s_cap_lumen, (const unsigned char *)s_cap_lumen + s_cap_lumen_size },
+    { "/etc/aegis/caps.d/tunes", (const unsigned char *)s_cap_tunes, (const unsigned char *)s_cap_tunes + s_cap_tunes_size },
     { "/etc/aegis/caps.d/installer", (const unsigned char *)s_cap_installer, (const unsigned char *)s_cap_installer + s_cap_installer_size },
     { (const char *)0, (const unsigned char *)0, (const unsigned char *)0 }  /* sentinel */
 };
@@ -313,7 +319,8 @@ static const dir_entry_t s_aegis_entries[] = {
 };
 static const dir_entry_t s_aegis_capsd_entries[] = {
     { "login", 8 }, { "bastion", 8 }, { "httpd", 8 }, { "dhcp", 8 },
-    { "stsh", 8 }, { "lumen", 8 }, { "installer", 8 }, { (const char *)0, 0 }
+    { "chronos", 8 }, { "stsh", 8 }, { "lumen", 8 }, { "tunes", 8 },
+    { "installer", 8 }, { (const char *)0, 0 }
 };
 /* s_bin_entries removed — /bin directory listing now handled by ext2.
  * Individual files (/bin/login, /bin/vigil) are still found via initrd_open

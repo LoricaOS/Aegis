@@ -144,8 +144,9 @@ vfs_scope_allows(const char *path)
 /* is_ramfs_path — returns the ramfs instance backing a "/tmp/..." or
  * "/run/..." path (and sets *rel to the name within it), else NULL. */
 static ramfs_t *
-ramfs_for_path(const char *path, const char **rel)
+ramfs_for_path(const char *path, const char **rel, int *dynamic)
 {
+    *dynamic = 0;
     if (path[0]=='/' && path[1]=='t' && path[2]=='m' && path[3]=='p' && path[4]=='/') {
         *rel = path + 5;
         return &s_tmp_ramfs;
@@ -157,8 +158,10 @@ ramfs_for_path(const char *path, const char **rel)
     /* Dynamic tmpfs mounts (sys_mount) — routes unlink/mkdir/rmdir/rename too. */
     {
         void *ctx;
-        if (mount_resolve(path, &ctx, rel) == MOUNT_FS_TMPFS)
+        if (mount_acquire(path, &ctx, rel) == MOUNT_FS_TMPFS) {
+            *dynamic = 1;
             return (ramfs_t *)ctx;
+        }
     }
     return (ramfs_t *)0;
 }
@@ -169,9 +172,11 @@ int
 vfs_ramfs_unlink(const char *path, int *out_rc)
 {
     const char *rel;
-    ramfs_t *r = ramfs_for_path(path, &rel);
+    int dynamic;
+    ramfs_t *r = ramfs_for_path(path, &rel, &dynamic);
     if (!r) return 0;
     *out_rc = ramfs_unlink(r, rel);
+    if (dynamic) mount_release(r);
     return 1;
 }
 
@@ -192,9 +197,11 @@ vfs_ramfs_mkdir(const char *path, int *out_rc)
              (p[0]=='/'&&p[1]=='r'&&p[2]=='u'&&p[3]=='n'&&(p[4]=='\0'||(p[4]=='/'&&p[5]=='\0'))));
         if (is_root) { *out_rc = -17; /* EEXIST */ return 1; }
     }
-    ramfs_t *r = ramfs_for_path(path, &rel);
+    int dynamic;
+    ramfs_t *r = ramfs_for_path(path, &rel, &dynamic);
     if (!r) return 0;
     *out_rc = ramfs_mkdir(r, rel);
+    if (dynamic) mount_release(r);
     return 1;
 }
 
@@ -214,9 +221,11 @@ vfs_ramfs_rmdir(const char *path, int *out_rc)
              (p[0]=='/'&&p[1]=='r'&&p[2]=='u'&&p[3]=='n'&&(p[4]=='\0'||(p[4]=='/'&&p[5]=='\0'))));
         if (is_root) { *out_rc = -EBUSY; return 1; }
     }
-    ramfs_t *r = ramfs_for_path(path, &rel);
+    int dynamic;
+    ramfs_t *r = ramfs_for_path(path, &rel, &dynamic);
     if (!r) return 0;
     *out_rc = ramfs_rmdir(r, rel);
+    if (dynamic) mount_release(r);
     return 1;
 }
 
@@ -226,11 +235,14 @@ int
 vfs_ramfs_rename(const char *oldp, const char *newp, int *out_rc)
 {
     const char *orel, *nrel;
-    ramfs_t *ro = ramfs_for_path(oldp, &orel);
-    ramfs_t *rn = ramfs_for_path(newp, &nrel);
+    int odyn, ndyn;
+    ramfs_t *ro = ramfs_for_path(oldp, &orel, &odyn);
+    ramfs_t *rn = ramfs_for_path(newp, &nrel, &ndyn);
     if (!ro && !rn) return 0;
-    if (ro != rn) { *out_rc = -18; return 1; }   /* EXDEV: cross-device */
-    *out_rc = ramfs_rename(ro, orel, nrel);
+    if (ro != rn) *out_rc = -18;   /* EXDEV: cross-device */
+    else *out_rc = ramfs_rename(ro, orel, nrel);
+    if (odyn) mount_release(ro);
+    if (ndyn) mount_release(rn);
     return 1;
 }
 
@@ -304,10 +316,12 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
     {
         void *ctx;
         const char *rel;
-        if (mount_resolve(path, &ctx, &rel) == MOUNT_FS_TMPFS) {
-            if (*rel == '\0')
-                return ramfs_opendir((ramfs_t *)ctx, out);
-            return ramfs_open((ramfs_t *)ctx, rel, flags, out);
+        if (mount_acquire(path, &ctx, &rel) == MOUNT_FS_TMPFS) {
+            int r = (*rel == '\0')
+                  ? ramfs_opendir((ramfs_t *)ctx, out)
+                  : ramfs_open((ramfs_t *)ctx, rel, flags, out);
+            mount_release(ctx);
+            return r;
         }
     }
 
@@ -587,7 +601,8 @@ vfs_stat_path(const char *path, k_stat_t *out)
     {
         void *ctx;
         const char *rel;
-        if (mount_resolve(path, &ctx, &rel) == MOUNT_FS_TMPFS) {
+        if (mount_acquire(path, &ctx, &rel) == MOUNT_FS_TMPFS) {
+            int r;
             if (*rel == '\0') {
                 /* the mount root itself — a synthetic directory */
                 __builtin_memset(out, 0, sizeof(*out));
@@ -595,9 +610,12 @@ vfs_stat_path(const char *path, k_stat_t *out)
                 out->st_ino   = 1;
                 out->st_nlink = 2;
                 out->st_mode  = S_IFDIR | 0755;
-                return 0;
+                r = 0;
+            } else {
+                r = ramfs_stat((ramfs_t *)ctx, rel, out);
             }
-            return ramfs_stat((ramfs_t *)ctx, rel, out);
+            mount_release(ctx);
+            return r;
         }
     }
 
@@ -667,8 +685,10 @@ vfs_stat_path_ex(const char *path, k_stat_t *out, int follow)
     {
         void *ctx;
         const char *rel;
-        if (mount_resolve(path, &ctx, &rel) != MOUNT_FS_NONE)
+        if (mount_acquire(path, &ctx, &rel) != MOUNT_FS_NONE) {
+            mount_release(ctx);
             return vfs_stat_path(path, out);
+        }
     }
 
     /* Non-ext2 paths: no symlinks, delegate to vfs_stat_path */

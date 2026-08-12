@@ -39,7 +39,12 @@
  * update_prot for the array op itself, and those touch only the table (no vmm/pmm
  * calls), so it nests under nothing and is never held across the slow mmap
  * map/read path (the "held across" recursion that deadlocked an earlier attempt). */
-typedef struct { refcount_t rc; uint32_t count; spinlock_t lock; } vma_hdr_t;
+typedef struct {
+    refcount_t rc;
+    uint32_t count;
+    spinlock_t lock;
+    spinlock_t op_lock;
+} vma_hdr_t;
 #define VMA_CAPACITY (((VMA_TABLE_PAGES * PAGE_SIZE) - sizeof(vma_hdr_t)) / sizeof(vma_entry_t))
 #define VMA_HDR_OFFSET (VMA_CAPACITY * sizeof(vma_entry_t))
 _Static_assert(VMA_HDR_OFFSET + sizeof(vma_hdr_t) <= (VMA_TABLE_PAGES * PAGE_SIZE),
@@ -57,6 +62,14 @@ static inline uint32_t *vcnt(struct aegis_process *proc) {
 }
 static inline spinlock_t *vlock(struct aegis_process *proc) {
     return &vma_hdr(proc)->lock;
+}
+
+irqflags_t vma_op_lock(struct aegis_process *proc) {
+    return spin_lock_irqsave(&vma_hdr(proc)->op_lock);
+}
+
+void vma_op_unlock(struct aegis_process *proc, irqflags_t flags) {
+    spin_unlock_irqrestore(&vma_hdr(proc)->op_lock, flags);
 }
 
 /* Public read-only accessor for code outside vma.c (procfs, brk). */
@@ -176,6 +189,7 @@ void vma_init(struct aegis_process *proc) {
     refcount_init(vma_rc(proc), 1);
     *vcnt(proc) = 0;
     { spinlock_t init = SPINLOCK_INIT; vma_hdr(proc)->lock = init; }
+    { spinlock_t init = SPINLOCK_INIT; vma_hdr(proc)->op_lock = init; }
 }
 
 /* vma_insert_nolock — caller holds vlock. Returns 0 on success (inserted/merged),
@@ -608,12 +622,12 @@ void vma_clone(struct aegis_process *dst, struct aegis_process *src) {
 
     dst->vma_table    = new_table;
     dst->vma_capacity = (uint32_t)VMA_CAPACITY;
-    /* Independent copy: fresh header (refcount + count + lock) in the new page's
-     * tail; the memcpy above copies only entry bytes and never touches the tail.
-     * The new address space gets its own table lock. */
+    /* Independent copy: fresh header (refcount + count + locks) in the new
+     * page's tail; the memcpy above copies only entry bytes. */
     refcount_init(vma_rc(dst), 1);
     *vcnt(dst) = count;
     { spinlock_t init = SPINLOCK_INIT; vma_hdr(dst)->lock = init; }
+    { spinlock_t init = SPINLOCK_INIT; vma_hdr(dst)->op_lock = init; }
 }
 
 void vma_share(struct aegis_process *child, struct aegis_process *parent) {

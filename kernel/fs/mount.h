@@ -24,9 +24,13 @@ int mount_add(const char *target, int fstype, void *ctx);
  * ctx to *ctx_out (caller frees) and returns the fstype; -EINVAL if none. */
 int mount_remove(const char *target, void **ctx_out);
 
-/* mount_resolve — longest-prefix match of `path`. On a hit returns the fstype,
- * sets *ctx and *rel (path relative to the mount point, no leading slash; ""
- * at the mount root). Returns MOUNT_FS_NONE if no dynamic mount covers path. */
-int mount_resolve(const char *path, void **ctx, const char **rel);
+/* Atomically refuse removal while a routed VFS operation or an open tmpfs
+ * handle still owns the mount context. */
+int mount_remove_idle(const char *target, void **ctx_out);
+
+/* mount_acquire — longest-prefix match of `path`, retaining the context until
+ * mount_release. Sets *ctx and *rel (relative path, no leading slash). */
+int mount_acquire(const char *path, void **ctx, const char **rel);
+void mount_release(void *ctx);
 
 #endif /* AEGIS_MOUNT_H */

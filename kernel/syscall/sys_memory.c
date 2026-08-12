@@ -79,8 +79,8 @@ static uint8_t *s_filebuf[AEGIS_MAX_CPUS];
  * page-aligned. musl's malloc passes exact byte offsets and expects the
  * kernel to return the actual (rounded-up) new break — this is correct.
  */
-uint64_t
-sys_brk(uint64_t arg1)
+static uint64_t
+sys_brk_impl(uint64_t arg1)
 {
     aegis_process_t *proc = current_proc();
 
@@ -222,6 +222,16 @@ sys_brk(uint64_t arg1)
     return proc->brk;
 }
 
+uint64_t
+sys_brk(uint64_t arg1)
+{
+    aegis_process_t *proc = current_proc();
+    irqflags_t fl = vma_op_lock(proc);
+    uint64_t r = sys_brk_impl(arg1);
+    vma_op_unlock(proc, fl);
+    return r;
+}
+
 /* ── mmap VA freelist helpers ─────────────────────────────────────────── */
 
 /*
@@ -275,8 +285,8 @@ mmap_free_insert(aegis_process_t *proc, uint64_t base, uint64_t len)
  * OOM rollback: already-mapped pages are unmapped and freed before returning -ENOMEM.
  * No capability gate — process expands its own address space only.
  */
-uint64_t
-sys_mmap(uint64_t arg1, uint64_t arg2, uint64_t arg3,
+static uint64_t
+sys_mmap_impl(uint64_t arg1, uint64_t arg2, uint64_t arg3,
          uint64_t arg4, uint64_t arg5, uint64_t arg6)
 {
     aegis_process_t *proc = current_proc();
@@ -712,6 +722,17 @@ sys_mmap(uint64_t arg1, uint64_t arg2, uint64_t arg3,
     return base;
 }
 
+uint64_t
+sys_mmap(uint64_t arg1, uint64_t arg2, uint64_t arg3,
+         uint64_t arg4, uint64_t arg5, uint64_t arg6)
+{
+    aegis_process_t *proc = current_proc();
+    irqflags_t fl = vma_op_lock(proc);
+    uint64_t r = sys_mmap_impl(arg1, arg2, arg3, arg4, arg5, arg6);
+    vma_op_unlock(proc, fl);
+    return r;
+}
+
 /* mm_populate_fault — demand-paging populate for a single user page.
  * Called from the #PF handler (user touches a lazy page) and from
  * uaccess_range_mapped (kernel about to read/write a lazy page). Returns 0 if
@@ -722,8 +743,8 @@ sys_mmap(uint64_t arg1, uint64_t arg2, uint64_t arg3,
  * MAP_PRIVATE — read the backing file page, zero-fill the EOF tail). PROT_NONE
  * regions are never populated (guard pages → real fault). Runs with IF=0
  * (interrupt-gate #PF / syscall context). */
-int
-mm_populate_fault(aegis_process_t *proc, uint64_t va)
+static int
+mm_populate_fault_impl(aegis_process_t *proc, uint64_t va)
 {
     if (!proc || !proc->pml4_phys)
         return -1;
@@ -857,6 +878,17 @@ mm_populate_fault(aegis_process_t *proc, uint64_t va)
     return 0;
 }
 
+int
+mm_populate_fault(aegis_process_t *proc, uint64_t va)
+{
+    if (!proc || !proc->vma_table)
+        return -1;
+    irqflags_t fl = vma_op_lock(proc);
+    int r = mm_populate_fault_impl(proc, va);
+    vma_op_unlock(proc, fl);
+    return r;
+}
+
 /*
  * sys_munmap — syscall 11
  *
@@ -867,8 +899,8 @@ mm_populate_fault(aegis_process_t *proc, uint64_t va)
  * per-process freelist for reuse by future mmap calls.
  * Returns 0 on success, -EINVAL if addr is not page-aligned.
  */
-uint64_t
-sys_munmap(uint64_t arg1, uint64_t arg2)
+static uint64_t
+sys_munmap_impl(uint64_t arg1, uint64_t arg2)
 {
     if (arg1 & 0xFFFUL)
         return SYS_ERR(EINVAL);   /* EINVAL — not page-aligned */
@@ -946,6 +978,16 @@ sys_munmap(uint64_t arg1, uint64_t arg2)
     return 0;
 }
 
+uint64_t
+sys_munmap(uint64_t arg1, uint64_t arg2)
+{
+    aegis_process_t *proc = current_proc();
+    irqflags_t fl = vma_op_lock(proc);
+    uint64_t r = sys_munmap_impl(arg1, arg2);
+    vma_op_unlock(proc, fl);
+    return r;
+}
+
 /*
  * sys_mremap — syscall 25
  *
@@ -962,8 +1004,8 @@ sys_munmap(uint64_t arg1, uint64_t arg2)
 #define MREMAP_MAYMOVE 1u
 #define MREMAP_FIXED   2u
 
-uint64_t
-sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_size,
+static uint64_t
+sys_mremap_impl(uint64_t old_addr, uint64_t old_size, uint64_t new_size,
            uint64_t flags, uint64_t new_addr)
 {
     (void)new_addr;
@@ -1037,6 +1079,17 @@ sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_size,
     return old_addr;
 }
 
+uint64_t
+sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_size,
+           uint64_t flags, uint64_t new_addr)
+{
+    aegis_process_t *proc = current_proc();
+    irqflags_t fl = vma_op_lock(proc);
+    uint64_t r = sys_mremap_impl(old_addr, old_size, new_size, flags, new_addr);
+    vma_op_unlock(proc, fl);
+    return r;
+}
+
 /*
  * sys_mprotect — syscall 10
  *
@@ -1048,8 +1101,8 @@ sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_size,
  * silently skipped (matching Linux). W^X: NX is set by default; only
  * an explicit PROT_EXEC clears NX.
  */
-uint64_t
-sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
+static uint64_t
+sys_mprotect_impl(uint64_t addr, uint64_t len, uint64_t prot)
 {
     if (addr & 0xFFFUL)
         return SYS_ERR(EINVAL);   /* -EINVAL: not page-aligned */
@@ -1147,6 +1200,16 @@ sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
     }
 
     return 0;
+}
+
+uint64_t
+sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
+{
+    aegis_process_t *proc = current_proc();
+    irqflags_t fl = vma_op_lock(proc);
+    uint64_t r = sys_mprotect_impl(addr, len, prot);
+    vma_op_unlock(proc, fl);
+    return r;
 }
 
 /* ── sys_memfd_create ─────────────────────────────────────────────────── */
