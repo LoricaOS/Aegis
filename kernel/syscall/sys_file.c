@@ -140,6 +140,9 @@ sys_open(uint64_t arg1, uint64_t arg2, uint64_t arg3)
      * (caps.d/, anchors) stays readable.  This pre-resolution check catches
      * direct path access and normalized traversals (../etc/shadow); symlink
      * bypasses are caught by the post-resolution inode check in vfs_open. */
+    int mutating = (arg2 & 1) /* O_WRONLY */ || (arg2 & 2) /* O_RDWR */ ||
+                   (arg2 & VFS_O_CREAT) || (arg2 & VFS_O_TRUNC) ||
+                   (arg2 & VFS_O_APPEND);
     int auth_gated = 0;
     {
         static const char shadow_path[] = "/etc/shadow";
@@ -152,8 +155,11 @@ sys_open(uint64_t arg1, uint64_t arg2, uint64_t arg3)
             if (kpath[si] != admin_path[si]) { admin_match = 0; break; }
         }
         if (shadow_match || admin_match) {
-            if (cap_check(proc->caps, CAP_TABLE_SIZE,
-                          CAP_KIND_AUTH, CAP_RIGHTS_READ) != 0)
+            /* An open that can MUTATE the credential file needs AUTH|WRITE, not
+             * AUTH|READ: a cap_mask-delegated child given a read-only AUTH slot
+             * must not be able to rewrite the hash it is only allowed to read. */
+            if (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_AUTH,
+                          mutating ? CAP_RIGHTS_WRITE : CAP_RIGHTS_READ) != 0)
                 return SYS_ERR(EACCES);
             auth_gated = 1;   /* mark the resulting fd (see VFS_KF_AUTH_GATED) */
         }
@@ -166,11 +172,8 @@ sys_open(uint64_t arg1, uint64_t arg2, uint64_t arg3)
      * EXISTING protected file for write, which doesn't route through a mutator;
      * that narrower open-existing race is a documented residual. */
     int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
-                                 CAP_RIGHTS_READ) == 0);
+                                 CAP_RIGHTS_WRITE) == 0);
     {
-        int mutating = (arg2 & 1) /* O_WRONLY */ || (arg2 & 2) /* O_RDWR */ ||
-                       (arg2 & VFS_O_CREAT) || (arg2 & VFS_O_TRUNC) ||
-                       (arg2 & VFS_O_APPEND);
         if (mutating && !has_install && cap_path_is_protected(kpath))
             return SYS_ERR(EPERM); /* installing into the system tree needs CAP_KIND_INSTALL */
     }

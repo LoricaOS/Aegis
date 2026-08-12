@@ -97,9 +97,15 @@ sys_write(uint64_t arg1, uint64_t arg2, uint64_t arg3)
      * VFS_KF_AUTH_GATED and survives execve (only FD_CLOEXEC fds are closed),
      * while the exec'd image's caps are re-derived from policy. Without this,
      * a capless child could not READ the inherited fd but could WRITE a forged
-     * hash through it — the unprotected direction was the more damaging one. */
+     * hash through it — the unprotected direction was the more damaging one.
+     *
+     * WRITE rights, not READ: this gate guards a MUTATION. A cap_mask-delegated
+     * child holding AUTH|READ (an explicit read-only attenuation) must not be
+     * able to write a forged hash — the attenuation would be decorative. Every
+     * policy grant carries R|W|X, so only a deliberately attenuated delegation
+     * is affected. Same for the writev/pwrite64 siblings below. */
     if ((proc->fd_table->fds[arg1].kflags & VFS_KF_AUTH_GATED) &&
-        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_AUTH, CAP_RIGHTS_READ) != 0)
+        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_AUTH, CAP_RIGHTS_WRITE) != 0)
         return SYS_ERR(EACCES);
 
     if (!user_ptr_valid(arg2, arg3))
@@ -195,7 +201,7 @@ sys_writev(uint64_t arg1, uint64_t arg2, uint64_t arg3)
 
     /* AUTH-gated fd re-check on use — see the comment in sys_write. */
     if ((proc->fd_table->fds[arg1].kflags & VFS_KF_AUTH_GATED) &&
-        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_AUTH, CAP_RIGHTS_READ) != 0)
+        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_AUTH, CAP_RIGHTS_WRITE) != 0)
         return SYS_ERR(EACCES);
 
     /* Reject unreasonable iovcnt before multiplying to avoid overflow. */
@@ -449,7 +455,7 @@ sys_pwrite64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t off)
         return SYS_ERR(EBADF);           /* fd not opened for writing */
     /* AUTH-gated fd re-check on use — see the comment in sys_write. */
     if ((f->kflags & VFS_KF_AUTH_GATED) &&
-        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_AUTH, CAP_RIGHTS_READ) != 0)
+        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_AUTH, CAP_RIGHTS_WRITE) != 0)
         return SYS_ERR(EACCES);
     if (!f->ops->seek)
         return SYS_ERR(ESPIPE);          /* not positionable → can't pwrite */

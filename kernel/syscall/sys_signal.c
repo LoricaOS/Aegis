@@ -349,7 +349,7 @@ sys_kill(uint64_t arg1, uint64_t arg2)
      * preventing unprivileged processes from killing init. */
     if (pid == 1 && cur->pid != 1) {
         if (cap_check(cur->caps, CAP_TABLE_SIZE,
-                      CAP_KIND_POWER, CAP_RIGHTS_READ) < 0)
+                      CAP_KIND_POWER, CAP_RIGHTS_WRITE) < 0)
             return SYS_ERR(EPERM);
     }
 
@@ -397,7 +397,7 @@ sys_tgkill(uint64_t arg1, uint64_t arg2, uint64_t arg3)
         return SYS_ERR(EPERM);
     if (tid == 1 && cur->pid != 1) {         /* init: same POWER guard as kill */
         if (cap_check(cur->caps, CAP_TABLE_SIZE,
-                      CAP_KIND_POWER, CAP_RIGHTS_READ) < 0)
+                      CAP_KIND_POWER, CAP_RIGHTS_WRITE) < 0)
             return SYS_ERR(EPERM);
     }
 

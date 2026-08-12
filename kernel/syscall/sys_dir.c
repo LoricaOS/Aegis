@@ -112,7 +112,7 @@ sys_mkdir(uint64_t arg1, uint64_t arg2)
      * (closing the symlink-swap TOCTOU); we just compute the caller's authority.
      * ramfs paths (below) never reach ext2_mkdir. */
     int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
-                                 CAP_RIGHTS_READ) == 0);
+                                 CAP_RIGHTS_WRITE) == 0);
     /* Route ramfs (/tmp, /run) paths — these are not in ext2, so ext2_mkdir
      * would wrongly return EPERM. ramfs is a flat namespace; mkdir creates a
      * directory marker entry (needed by software that mkdir's cache/runtime
@@ -187,7 +187,7 @@ sys_rmdir(uint64_t arg1)
         }
     }
     int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
-                                 CAP_RIGHTS_READ) == 0);
+                                 CAP_RIGHTS_WRITE) == 0);
     int r = g_rootfs->rmdir(kpath, has_install);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }
@@ -211,7 +211,7 @@ sys_unlink(uint64_t arg1)
         return SYS_ERR(EFAULT);
     /* Install-tree gate enforced atomically inside ext2_unlink now. */
     int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
-                                 CAP_RIGHTS_READ) == 0);
+                                 CAP_RIGHTS_WRITE) == 0);
     /* Route ramfs (/tmp, /run) paths — these are not in ext2, so calling
      * ext2_unlink would wrongly return EPERM. */
     {
@@ -272,7 +272,7 @@ sys_rename(uint64_t arg1, uint64_t arg2)
         return SYS_ERR(EFAULT);
     /* Install-tree gate enforced atomically inside ext2_rename (both paths). */
     int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
-                                 CAP_RIGHTS_READ) == 0);
+                                 CAP_RIGHTS_WRITE) == 0);
     /* Route ramfs (/tmp, /run) renames before the ext2 path. */
     {
         int rc;

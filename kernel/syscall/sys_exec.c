@@ -1184,15 +1184,30 @@ sys_spawn(uint64_t path_uptr, uint64_t argv_uptr,
                 goto fail_child;
             }
 
-            /* Copy cap_mask from userspace */
+            /* Copy cap_mask from userspace.
+             *
+             * Zeroed first, and a SHORT copy is fatal. copy_from_user is
+             * fault-tolerant: it returns the residual byte count when the
+             * source is unmapped mid-copy (a CLONE_VM sibling racing the
+             * mask's tail). Ignoring that left the tail of an UNINITIALISED
+             * stack array in play, so whatever kinds happened to be on the
+             * kernel stack became mask entries — and an entry the caller
+             * meant to REMOVE could survive as stale stack data, silently
+             * un-attenuating the child. Both shipped uaccess backends
+             * (x86-64, arm64) report the residual, so fail closed on it. */
             cap_slot_t mask[CAP_TABLE_SIZE];
+            __builtin_memset(mask, 0, sizeof(mask));
             if (!user_ptr_valid(cap_mask_uptr, sizeof(mask))) {
                 kva_free_pages(kstack, 4);
                 result = SYS_ERR(EFAULT);
                 goto fail_child;
             }
-            copy_from_user(mask, (const void *)cap_mask_uptr,
-                           sizeof(mask));
+            if (copy_from_user(mask, (const void *)cap_mask_uptr,
+                               sizeof(mask)) != 0) {
+                kva_free_pages(kstack, 4);
+                result = SYS_ERR(EFAULT);
+                goto fail_child;
+            }
 
             /* Validate and apply: caller can only grant caps it holds.
              * Zero the child's caps and re-grant only those in the mask

@@ -392,7 +392,7 @@ sys_reboot(uint64_t cmd)
 {
     aegis_process_t *proc = current_proc();
     if (cap_check(proc->caps, CAP_TABLE_SIZE,
-                  CAP_KIND_POWER, CAP_RIGHTS_READ) != 0)
+                  CAP_KIND_POWER, CAP_RIGHTS_WRITE) != 0)
         return SYS_ERR(ENOCAP);
 
 #ifdef __x86_64__

@@ -76,6 +76,11 @@ typedef struct {
 typedef struct ramfs {
     ramfs_inode_t inodes[RAMFS_MAX_INODES];
     ramfs_dent_t  dents[RAMFS_MAX_DENTS];
+    /* Open DIRECTORY handles on this instance. A dir fd's vfs priv is the
+     * ramfs_t itself (ramfs_opendir), not an inode, so per-inode open_count
+     * cannot see it — an `open(/mnt/x, O_DIRECTORY)` left the instance
+     * apparently idle and umount kva_free'd it under the live handle. */
+    uint32_t      open_dirs;
     spinlock_t    lock;
 } ramfs_t;
 

@@ -152,6 +152,17 @@ sys_admin_session(uint64_t on)
     if (!on) {
         proc->admin_session = 0;
         proc->admin_session_firstboot = 0;
+        /* Re-derive the cap table with admin_session = 0 — the mirror image of
+         * the re-derive the ELEVATE path does below. Clearing the flag alone
+         * left the expanded table (DISK_ADMIN, INSTALL, AUTH, POWER) installed,
+         * because every sensitive sink authorises from the TABLE, not the flag:
+         * de-escalation dropped the label and kept the authority, and the caps
+         * then rode fork/exec into descendants. Same policy inputs as exec, so
+         * this can only ever narrow the table back to the un-elevated set. */
+        cap_slot_t newcaps[CAP_TABLE_SIZE];
+        cap_apply_policy(newcaps, proc->exe_path, (int)proc->authenticated,
+                         0 /* admin_session */);
+        __builtin_memcpy(proc->caps, newcaps, sizeof(newcaps));
         return 0;
     }
 

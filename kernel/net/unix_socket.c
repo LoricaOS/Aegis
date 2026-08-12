@@ -89,7 +89,7 @@ static int name_register(const char *path, uint32_t sock_id)
 
     if (proc && cap_path_is_protected(path) &&
         cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
-                  CAP_RIGHTS_READ) != 0)
+                  CAP_RIGHTS_WRITE) != 0)
         return -EACCES;
 
     for (int i = 0; i < UNIX_NAME_MAX; i++) {
@@ -958,17 +958,36 @@ int unix_sock_stage_fds(uint32_t peer_id, unix_passed_fd_t *fds, uint8_t count)
 
 int unix_sock_recv_fds(uint32_t id, int *fd_out, int max_fds)
 {
+    /* Take the staged fds under unix_lock, then INSTALL them under the
+     * receiver's fd_table.lock.
+     *
+     * Two locks, strictly in sequence, because they cannot be nested: the
+     * documented order is fd_table.lock > any object lock (fd_table.h), and
+     * this runs with unix_lock already the inner one. Installing with no fd
+     * lock at all — the old code — raced a CLONE_FILES sibling: two threads
+     * (or a concurrent open) could pick the SAME free slot, and the loser's
+     * object was overwritten in place, leaking its reference and handing the
+     * receiver two fds onto one object. Detaching first also means an
+     * fd-table-full receiver drops the tail exactly once. */
+    unix_passed_fd_t take[UNIX_PASSED_FD_MAX];
+    uint8_t ntake = 0;
+
     irqflags_t fl = spin_lock_irqsave(&unix_lock);
     unix_sock_t *us = unix_sock_get(id);
     if (!us || us->passed_fd_count == 0) {
         spin_unlock_irqrestore(&unix_lock, fl);
         return 0;
     }
+    for (uint8_t i = 0; i < us->passed_fd_count; i++)
+        take[ntake++] = us->passed_fds[i];
+    us->passed_fd_count = 0;
+    spin_unlock_irqrestore(&unix_lock, fl);
 
     aegis_process_t *proc = current_proc();
     int installed = 0;
 
-    for (uint8_t i = 0; i < us->passed_fd_count && installed < max_fds; i++) {
+    irqflags_t ffl = spin_lock_irqsave(&proc->fd_table->lock);
+    for (uint8_t i = 0; i < ntake && installed < max_fds; i++) {
         /* Find free fd slot */
         int free_fd = -1;
         for (int f = 0; f < PROC_MAX_FDS; f++) {
@@ -976,8 +995,7 @@ int unix_sock_recv_fds(uint32_t id, int *fd_out, int max_fds)
         }
         if (free_fd < 0) break;  /* fd table full */
 
-        proc->fd_table->fds[free_fd].ops    = us->passed_fds[i].ops;
-        proc->fd_table->fds[free_fd].priv   = us->passed_fds[i].priv;
+        proc->fd_table->fds[free_fd].priv   = take[i].priv;
         proc->fd_table->fds[free_fd].offset = 0;
         proc->fd_table->fds[free_fd].size   = 0;
         /* Received fds carry no filesystem/device authority (sys_sendmsg's
@@ -992,22 +1010,18 @@ int unix_sock_recv_fds(uint32_t id, int *fd_out, int max_fds)
          * for MSG_CMSG_CLOEXEC; carrying the sender's bit through could close
          * a passed fd across the receiver's next execve. */
         proc->fd_table->fds[free_fd].flags  =
-            us->passed_fds[i].flags & ~VFS_FD_CLOEXEC;
+            take[i].flags & ~VFS_FD_CLOEXEC;
+        /* ops LAST: it is the slot's in-use marker, so the slot is fully
+         * populated before any other holder of this table can see it taken. */
+        proc->fd_table->fds[free_fd].ops    = take[i].ops;
         fd_out[installed++] = free_fd;
     }
+    spin_unlock_irqrestore(&proc->fd_table->lock, ffl);
 
-    /* Clear staging area (drop any fds that couldn't be installed). Detach
-     * here, close after the unlock — see unix_close_staged: an undelivered
-     * AF_UNIX fd's ->close re-enters unix_lock and would deadlock this CPU.
-     * Reachable whenever the receiver's fd table is full. */
-    unix_passed_fd_t staged[UNIX_PASSED_FD_MAX];
-    uint8_t nstaged = 0;
-    for (uint8_t i = (uint8_t)installed; i < us->passed_fd_count; i++)
-        staged[nstaged++] = us->passed_fds[i];
-    us->passed_fd_count = 0;
-
-    spin_unlock_irqrestore(&unix_lock, fl);
-    unix_close_staged(staged, nstaged);
+    /* Drop any fds that couldn't be installed (receiver's fd table full).
+     * Closed with NO lock held — see unix_close_staged: an undelivered
+     * AF_UNIX fd's ->close re-enters unix_lock and would deadlock this CPU. */
+    unix_close_staged(take + installed, (uint8_t)(ntake - installed));
     return installed;
 }
 

@@ -301,13 +301,17 @@ ramfs_dir_readdir_fn(void *priv, uint64_t index, char *name_out, uint8_t *type_o
 
 /* Directory-handle close: priv is the ramfs_t instance (NOT an inode), so it
  * must NOT go through ramfs_close_fn (which dereferences priv as an inode).
- * It's a no-op — but it must be NON-NULL: the VFS close path calls ops->close
+ * It must also be NON-NULL: the VFS close path calls ops->close
  * unconditionally, so a NULL here is a jump-to-0 panic when a dir fd closes
- * (e.g. `find /tmp`). */
+ * (e.g. `find /tmp`). Drops the instance's open-dir count (see open_dirs). */
 static void
 ramfs_dir_close_fn(void *priv)
 {
-    (void)priv;
+    ramfs_t *inst = (ramfs_t *)priv;
+    if (!inst) return;
+    irqflags_t fl = spin_lock_irqsave(&inst->lock);
+    if (inst->open_dirs) inst->open_dirs--;
+    spin_unlock_irqrestore(&inst->lock, fl);
 }
 
 static const vfs_ops_t s_ramfs_dir_ops = {
@@ -331,8 +335,8 @@ ramfs_busy(ramfs_t *inst)
 {
     if (!inst) return 0;
     irqflags_t fl = spin_lock_irqsave(&inst->lock);
-    int busy = 0;
-    for (uint32_t i = 0; i < RAMFS_MAX_INODES; i++) {
+    int busy = (inst->open_dirs != 0);   /* dir handles hold the instance itself */
+    for (uint32_t i = 0; !busy && i < RAMFS_MAX_INODES; i++) {
         if (inst->inodes[i].in_use && inst->inodes[i].open_count) { busy = 1; break; }
     }
     spin_unlock_irqrestore(&inst->lock, fl);
@@ -348,6 +352,7 @@ ramfs_init(ramfs_t *inst)
         inst->inodes[i].in_use = 0;
     for (i = 0; i < RAMFS_MAX_DENTS; i++)
         inst->dents[i].in_use = 0;
+    inst->open_dirs = 0;
     spinlock_t init = SPINLOCK_INIT;
     inst->lock = init;
 }
@@ -432,6 +437,9 @@ ramfs_stat(ramfs_t *inst, const char *name, k_stat_t *st)
 int
 ramfs_opendir(ramfs_t *inst, vfs_file_t *out)
 {
+    irqflags_t fl = spin_lock_irqsave(&inst->lock);
+    inst->open_dirs++;                            /* fd holds the instance */
+    spin_unlock_irqrestore(&inst->lock, fl);
     out->ops    = &s_ramfs_dir_ops;
     out->priv   = (void *)inst;
     out->offset = 0;

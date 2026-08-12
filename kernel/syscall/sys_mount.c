@@ -49,8 +49,10 @@ static int mount_capable(void)
 {
     if (!sched_current()->is_user) return 1;       /* kernel-internal */
     aegis_process_t *pr = current_proc();
+    /* WRITE: mount/umount both MUTATE the namespace, so a read-only MOUNT
+     * delegation must not pass. Policy grants carry R|W|X. */
     return cap_check(pr->caps, CAP_TABLE_SIZE,
-                     CAP_KIND_MOUNT, CAP_RIGHTS_READ) == 0;
+                     CAP_KIND_MOUNT, CAP_RIGHTS_WRITE) == 0;
 }
 
 uint64_t
@@ -121,7 +123,19 @@ sys_umount(uint64_t target_u, uint64_t flags)
      * in a freshly allocated fd table, i.e. controlled writes over vfs_ops_t
      * function pointers. Deterministic, not a race. Needs CAP_KIND_MOUNT to
      * reach, but "unmount my own tmpfs" is not supposed to be a write-anything
-     * primitive. Check BEFORE unlinking the mount so a busy fs stays usable. */
+     * primitive. Check BEFORE unlinking the mount so a busy fs stays usable.
+     *
+     * ramfs_busy now also counts open DIRECTORY handles, whose vfs priv is the
+     * ramfs_t itself rather than an inode — those were invisible here, so
+     * `open("/mnt/x", O_DIRECTORY)` + umount freed the instance under a live
+     * handle deterministically.
+     *
+     * RESIDUAL, stated plainly: this is a point-in-time check, not a
+     * reference. A CAP_KIND_MOUNT holder can still race a sibling's open
+     * between the busy check and mount_remove/kva_free below. Closing that
+     * needs a real per-mount refcount (resolve and every open handle take one;
+     * umount marks dying, refuses new refs, frees at zero) — an interface
+     * change across mount_resolve and every fs backend, not a batch item. */
     {
         void *bctx = (void *)0;
         const char *brel = (const char *)0;

@@ -67,7 +67,7 @@ sys_sethostname(uint64_t name_uptr, uint64_t len)
 {
     aegis_process_t *proc = current_proc();
     if (cap_check(proc->caps, CAP_TABLE_SIZE,
-                  CAP_KIND_POWER, CAP_RIGHTS_READ) != 0)
+                  CAP_KIND_POWER, CAP_RIGHTS_WRITE) != 0)
         return SYS_ERR(EPERM);
 
     if (len > HOSTNAME_MAX)

@@ -139,8 +139,10 @@ sensitive_write_gate(uint32_t ino)
     uint32_t admin_ino  = g_rootfs->get_admin_ino();
     if ((shadow_ino != 0 && ino == shadow_ino) ||
         (admin_ino  != 0 && ino == admin_ino)) {
+        /* WRITE rights: this is the sensitive-inode MUTATION gate, so a
+         * read-only AUTH delegation must not pass it. */
         if (cap_check(proc->caps, CAP_TABLE_SIZE,
-                      CAP_KIND_AUTH, CAP_RIGHTS_READ) != 0)
+                      CAP_KIND_AUTH, CAP_RIGHTS_WRITE) != 0)
             return -EACCES;
     }
 
@@ -209,7 +211,7 @@ sys_symlink(uint64_t arg1, uint64_t arg2)
      * TOCTOU the old separate cap_path_is_protected check had. We just tell it
      * whether this caller is INSTALL-authorized. */
     int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
-                                 CAP_RIGHTS_READ) == 0);
+                                 CAP_RIGHTS_WRITE) == 0);
     /* Sensitive-inode mutation gate (shadow/admin → AUTH, passwd/group → admin
      * session). Keyed on the resolved inode so a symlink alias cannot bypass. */
     irqflags_t fl = g_rootfs->lock();   /* gate + create in ONE hold */
@@ -250,7 +252,7 @@ sys_link(uint64_t arg1, uint64_t arg2)
 
     /* Install-tree gate enforced atomically inside ext2_link (both paths). */
     int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
-                                 CAP_RIGHTS_READ) == 0);
+                                 CAP_RIGHTS_WRITE) == 0);
     /* Sensitive-inode gate on BOTH ends: hard-linking /etc/shadow to an alias
      * (source) or clobbering a sensitive target both require the authority. */
     irqflags_t fl = g_rootfs->lock();   /* gate BOTH ends + link in ONE hold */
@@ -349,7 +351,7 @@ sys_chmod(uint64_t arg1, uint64_t arg2)
 
     /* Install-tree mutation gate enforced atomically inside ext2_chmod. */
     int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
-                                 CAP_RIGHTS_READ) == 0);
+                                 CAP_RIGHTS_WRITE) == 0);
 
     /* Validate and mutate under ONE ext2_lock hold — see meta_gate_locked. */
     irqflags_t fl = g_rootfs->lock();
@@ -380,7 +382,7 @@ sys_fchmod(uint64_t arg1, uint64_t arg2)
      * file under the install-protected trees can't mutate it without
      * CAP_KIND_INSTALL, even if it was opened O_RDONLY. */
     if ((f->kflags & VFS_KF_PROTECTED) &&
-        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL, CAP_RIGHTS_READ) != 0)
+        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL, CAP_RIGHTS_WRITE) != 0)
         return SYS_ERR(EPERM);
 
     /* Ownership check via stat: only file owner (or uid 0) may fchmod */
@@ -425,7 +427,7 @@ sys_chown(uint64_t arg1, uint64_t arg2, uint64_t arg3)
         return SYS_ERR(ENAMETOOLONG);
 
     int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
-                                 CAP_RIGHTS_READ) == 0);
+                                 CAP_RIGHTS_WRITE) == 0);
 
     /* No GIVE-AWAY chown. meta_gate_locked already requires the caller to own
      * the file, but owning it did not stop handing it to somebody else — and
@@ -465,7 +467,7 @@ sys_fchown(uint64_t arg1, uint64_t arg2, uint64_t arg3)
 
     /* fd-based install gate (parity with path-based sys_chown): see sys_fchmod. */
     if ((f->kflags & VFS_KF_PROTECTED) &&
-        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL, CAP_RIGHTS_READ) != 0)
+        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL, CAP_RIGHTS_WRITE) != 0)
         return SYS_ERR(EPERM);
 
     /* Ownership check via stat: only file owner (or uid 0) may fchown */
@@ -519,7 +521,7 @@ sys_utimensat(uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4)
 
     /* Install-tree gate enforced atomically inside ext2_utimes. */
     int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
-                                 CAP_RIGHTS_READ) == 0);
+                                 CAP_RIGHTS_WRITE) == 0);
 
     /* Ownership check: only the file owner may set times. */
     {
@@ -592,7 +594,7 @@ sys_lchown(uint64_t arg1, uint64_t arg2, uint64_t arg3)
         return SYS_ERR(ENAMETOOLONG);
 
     int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
-                                 CAP_RIGHTS_READ) == 0);
+                                 CAP_RIGHTS_WRITE) == 0);
 
     /* No give-away chown — see sys_chown. */
     if (!has_install && (uint32_t)arg2 != 0xFFFFFFFFu &&

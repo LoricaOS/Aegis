@@ -492,6 +492,21 @@ void _start(void)
         else out("[KTEST] FAIL mremap\n");
     }
 
+    /* 8b'. mmap page-work ceiling: an absurd length must be REFUSED, not walked.
+     *      sys_mmap scans the requested range a page at a time to pick a gap,
+     *      with IF=0 — so a multi-TiB anonymous request was ~10^9 uninterruptible
+     *      page-table walks, wedging the core from an unprivileged process. The
+     *      other range syscalls already enforced MM_MAX_RANGE_PAGES (4 GiB); mmap
+     *      did not. If this test HANGS rather than fails, the guard is gone. */
+    total++;
+    {
+        long huge = sys6(SYS_mmap, 0, 0x100000000000L /* 16 TiB */,
+                         PROT_RW, MAP_ANON_PRIV, -1, 0);
+        /* Kernel returns -errno; a "success" here would be a bogus mapping. */
+        if (huge < 0) { pass++; out("[KTEST] PASS mmap ceiling (huge len refused)\n"); }
+        else out("[KTEST] FAIL mmap-huge-len-not-refused\n");
+    }
+
     /* 8c. Audit regressions (2026-07-30 pass): two integer-underflow paths that
      *     were stock-reachable from an unprivileged process.
      *
