@@ -1,4 +1,5 @@
 /build/
+/needle/
 kernel/cap/target/
 *.o
 *.d
