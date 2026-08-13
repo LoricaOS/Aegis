@@ -413,6 +413,9 @@ sys_clone(syscall_frame_t *frame, uint64_t flags, uint64_t child_stack,
     uint32_t ci;
     for (ci = 0; ci < CAP_TABLE_SIZE; ci++)
         child->caps[ci] = parent->caps[ci];
+    __builtin_memcpy(child->cap_ceiling, parent->cap_ceiling,
+                     sizeof(child->cap_ceiling));
+    child->cap_ceiling_active = parent->cap_ceiling_active;
     child->authenticated = parent->authenticated;
     child->admin_session = parent->admin_session;
     child->admin_session_firstboot = parent->admin_session_firstboot;
@@ -756,6 +759,9 @@ sys_fork(syscall_frame_t *frame, uint64_t u_rdi, uint64_t u_rsi, uint64_t u_rdx)
     uint32_t ci;
     for (ci = 0; ci < CAP_TABLE_SIZE; ci++)
         child->caps[ci] = parent->caps[ci];
+    __builtin_memcpy(child->cap_ceiling, parent->cap_ceiling,
+                     sizeof(child->cap_ceiling));
+    child->cap_ceiling_active = parent->cap_ceiling_active;
     child->authenticated = parent->authenticated;
     child->admin_session = parent->admin_session;
     child->admin_session_firstboot = parent->admin_session_firstboot;

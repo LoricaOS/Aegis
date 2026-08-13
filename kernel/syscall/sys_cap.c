@@ -162,6 +162,8 @@ sys_admin_session(uint64_t on)
         cap_slot_t newcaps[CAP_TABLE_SIZE];
         cap_apply_policy(newcaps, proc->exe_path, (int)proc->authenticated,
                          0 /* admin_session */);
+        if (proc->cap_ceiling_active)
+            cap_apply_ceiling(newcaps, proc->cap_ceiling);
         __builtin_memcpy(proc->caps, newcaps, sizeof(newcaps));
         return 0;
     }
@@ -194,9 +196,17 @@ sys_admin_session(uint64_t on)
     {
         irqflags_t fl = spin_lock_irqsave(&sched_lock);
         parent = proc_find_by_pid_locked(parent_pid);
-        if (!parent || parent->sid != proc->sid) {
+        if (!parent || parent->sid != proc->sid ||
+            parent->cap_ceiling_active) {
             spin_unlock_irqrestore(&sched_lock, fl);
-            return SYS_ERR(EPERM);   /* gone, or not our session */
+            /* A spawn cap_mask is a one-way attenuation boundary. The cap
+             * ceiling filters policy-derived caps, but admin_session is also
+             * consulted directly by account-DB and namespace gates. Setting
+             * the flag on an attenuated parent would therefore restore direct
+             * authority even if every regenerated cap were filtered out.
+             * Refuse before mutating either session flag; on=0 above remains
+             * available so an attenuated process can always drop authority. */
+            return SYS_ERR(EPERM);   /* gone, wrong session, or attenuated */
         }
         parent->admin_session = 1u;
         /* Credential-backed: /bin/login -elevate verified a separate admin

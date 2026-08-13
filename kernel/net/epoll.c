@@ -258,16 +258,21 @@ epoll_compute_readiness(uint32_t fd, aegis_process_t *proc)
      * from sys_poll on CLOSE_WAIT/HUP semantics. */
 
     /* VFS fd — AF_INET / AF_UNIX sockets, pipe, tty, console, memfd, etc. */
-    if (fd < PROC_MAX_FDS && proc->fd_table->fds[fd].ops) {
-        const vfs_ops_t *ops = proc->fd_table->fds[fd].ops;
+    fd_table_pin_t pin;
+    if (fd_table_pin(proc->fd_table, (int)fd, &pin)) {
+        const vfs_ops_t *ops = pin.file.ops;
+        uint32_t ready;
         if (ops->poll) {
             /* ops->poll returns POLL* bits, which share values with the
              * EPOLL* readiness bits (IN=1, OUT=4, ERR=8, HUP=0x10). */
-            return (uint32_t)ops->poll(proc->fd_table->fds[fd].priv);
+            ready = (uint32_t)ops->poll(pin.file.priv);
+        } else {
+            /* No .poll callback — treat as always ready for IN/OUT (permissive
+             * default, matching sys_poll). */
+            ready = EPOLLIN | EPOLLOUT;
         }
-        /* No .poll callback — treat as always ready for IN/OUT (permissive
-         * default, matching sys_poll). */
-        return EPOLLIN | EPOLLOUT;
+        fd_table_unpin(&pin);
+        return ready;
     }
 
     /* fd not a socket and not an open VFS fd → invalid. epoll on Linux
@@ -327,10 +332,8 @@ int epoll_wait_impl(uint32_t epoll_id, uint64_t events_uptr,
          * in the sys_epoll_wait wrapper. epoll_wait is the kernel's
          * longest-blocking syscall; between the wrapper's check and a post-block
          * copy_to_user here, a sibling thread (CLONE_VM — e.g. a multithreaded
-         * client) can munmap the buffer. copy_to_user is a raw memcpy with no
-         * fault fixup, so writing to the now-unmapped page would #PF in ring 0
-         * and panic the kernel. Re-checking before each delivery sweep closes
-         * that TOCTOU (cheap: one page-table walk per wake). */
+         * client) can unmap the buffer. Re-check before each delivery sweep,
+         * then reject any residual from the fault-contained copy below. */
         if (!user_ptr_valid(events_uptr,
                             (uint64_t)maxevents * sizeof(k_epoll_event_t)))
             return -EFAULT;
@@ -351,10 +354,10 @@ int epoll_wait_impl(uint32_t epoll_id, uint64_t events_uptr,
              * mask; .data round-trips the user's cookie unchanged. */
             kev.events = revents;
             kev.data   = snap[i].data;
-            /* copy_to_user returns void — no fault recovery without extable. */
-            copy_to_user((void *)(uintptr_t)(events_uptr +
-                         (uint64_t)delivered * sizeof(k_epoll_event_t)),
-                         &kev, sizeof(kev));
+            if (copy_to_user((void *)(uintptr_t)(events_uptr +
+                             (uint64_t)delivered * sizeof(k_epoll_event_t)),
+                             &kev, sizeof(kev)) != 0)
+                return -EFAULT;
             delivered++;
 
             /* EPOLLONESHOT: disarm the watch after the first delivery. The
@@ -459,22 +462,29 @@ int epoll_wait_impl(uint32_t epoll_id, uint64_t events_uptr,
 
 int epoll_open_fd(uint32_t epoll_id, aegis_process_t *proc)
 {
+    vfs_file_t file = {
+        .ops = &s_epoll_ops,
+        .priv = (void *)(uintptr_t)epoll_id,
+        .offset = 0,
+        .size = 0,
+        .flags = 0,
+        .kflags = 0,
+    };
+    irqflags_t fl = spin_lock_irqsave(&proc->fd_table->lock);
     uint32_t fd;
     for (fd = 0; fd < PROC_MAX_FDS; fd++) {
         if (!proc->fd_table->fds[fd].ops) {
-            proc->fd_table->fds[fd].ops    = &s_epoll_ops;
-            proc->fd_table->fds[fd].priv   = (void *)(uintptr_t)epoll_id;
-            proc->fd_table->fds[fd].offset = 0;
-            proc->fd_table->fds[fd].size   = 0;
-            proc->fd_table->fds[fd].flags  = 0;
+            proc->fd_table->fds[fd] = file;
+            spin_unlock_irqrestore(&proc->fd_table->lock, fl);
             return (int)fd;
         }
     }
+    spin_unlock_irqrestore(&proc->fd_table->lock, fl);
     return -1;
 }
 
-uint32_t epoll_id_from_fd(int fd, aegis_process_t *proc)
+uint32_t epoll_id_from_file(const vfs_file_t *file)
 {
-    vfs_file_t *f = fd_resolve(proc, fd, &s_epoll_ops);
-    return f ? (uint32_t)(uintptr_t)f->priv : EPOLL_NONE;
+    return file && file->ops == &s_epoll_ops
+         ? (uint32_t)(uintptr_t)file->priv : EPOLL_NONE;
 }

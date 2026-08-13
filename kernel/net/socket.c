@@ -447,20 +447,26 @@ void sock_wake(uint32_t sock_id)
     waitq_wake_all(&s->poll_waiters);
 }
 
-int sock_open_fd(uint32_t sock_id, aegis_process_t *proc)
+int sock_open_fd(uint32_t sock_id, aegis_process_t *proc, uint32_t flags)
 {
+    vfs_file_t file = {
+        .ops = &s_sock_ops,
+        .priv = (void *)(uintptr_t)sock_id,
+        .offset = 0,
+        .size = 0,
+        .flags = VFS_O_RDWR | flags,
+        .kflags = 0,
+    };
+    irqflags_t fl = spin_lock_irqsave(&proc->fd_table->lock);
     uint32_t fd;
     for (fd = 0; fd < PROC_MAX_FDS; fd++) {
         if (!proc->fd_table->fds[fd].ops) {
-            proc->fd_table->fds[fd].ops    = &s_sock_ops;
-            proc->fd_table->fds[fd].priv   = (void *)(uintptr_t)sock_id;
-            proc->fd_table->fds[fd].offset = 0;
-            proc->fd_table->fds[fd].size   = 0;
-            proc->fd_table->fds[fd].flags  = VFS_O_RDWR;
-            proc->fd_table->fds[fd].kflags = 0;
+            proc->fd_table->fds[fd] = file;
+            spin_unlock_irqrestore(&proc->fd_table->lock, fl);
             return (int)fd;
         }
     }
+    spin_unlock_irqrestore(&proc->fd_table->lock, fl);
     return -1;  /* EMFILE */
 }
 
@@ -468,6 +474,12 @@ uint32_t sock_id_from_fd(int fd, aegis_process_t *proc)
 {
     vfs_file_t *f = fd_resolve(proc, fd, &s_sock_ops);
     return f ? (uint32_t)(uintptr_t)f->priv : SOCK_NONE;
+}
+
+uint32_t sock_id_from_file(const vfs_file_t *file)
+{
+    return file && file->ops == &s_sock_ops
+         ? (uint32_t)(uintptr_t)file->priv : SOCK_NONE;
 }
 
 /* sock_get_waitq: return the embedded poll_waiters waitq for sock_id, or

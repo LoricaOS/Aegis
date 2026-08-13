@@ -20,11 +20,20 @@ uint64_t
 sys_getdents64(uint64_t fd_num, uint64_t dirp, uint64_t count)
 {
     aegis_process_t *proc = current_proc();
-    if (fd_num >= PROC_MAX_FDS) return SYS_ERR(EBADF);
-    vfs_file_t *f = &proc->fd_table->fds[fd_num];
-    if (!f->ops) return SYS_ERR(EBADF);
-    if (!f->ops->readdir) return SYS_ERR(ENOTDIR);
-    if (!user_ptr_valid(dirp, count)) return SYS_ERR(EFAULT);
+    if (fd_num >= PROC_MAX_FDS)
+        return SYS_ERR(EBADF);
+    fd_table_pin_t pin;
+    if (!fd_table_pin(proc->fd_table, (int)fd_num, &pin))
+        return SYS_ERR(EBADF);
+    vfs_file_t *f = &pin.file;
+    if (!f->ops->readdir) {
+        fd_table_unpin(&pin);
+        return SYS_ERR(ENOTDIR);
+    }
+    if (!user_ptr_valid(dirp, count)) {
+        fd_table_unpin(&pin);
+        return SYS_ERR(EFAULT);
+    }
 
     uint64_t written = 0;
     char name[256];
@@ -56,10 +65,12 @@ sys_getdents64(uint64_t fd_num, uint64_t dirp, uint64_t count)
      * (audit 2026-08-01, A8.) */
     #define GETDENTS_MAX_ENTRIES 512u
     uint32_t produced = 0;
+    uint64_t next_offset = f->offset;
+    int copy_fault = 0;
 
     while (1) {
         if (produced >= GETDENTS_MAX_ENTRIES) break;
-        if (f->ops->readdir(f->priv, f->offset, name, &type) != 0) break;
+        if (f->ops->readdir(f->priv, next_offset, name, &type) != 0) break;
 
         /* Record size: fixed header (19 bytes) + name + null, rounded up to 8 */
         uint64_t namelen = 0;
@@ -72,8 +83,8 @@ sys_getdents64(uint64_t fd_num, uint64_t dirp, uint64_t count)
         /* Build dirent in kernel buffer, then copy_to_user */
         uint8_t kbuf[300];
         linux_dirent64_t *d = (linux_dirent64_t *)kbuf;
-        d->d_ino    = f->offset + 1;
-        d->d_off    = (int64_t)(f->offset + 1);
+        d->d_ino    = next_offset + 1;
+        d->d_off    = (int64_t)(next_offset + 1);
         d->d_reclen = reclen;
         d->d_type   = type;
         uint64_t i;
@@ -81,11 +92,26 @@ sys_getdents64(uint64_t fd_num, uint64_t dirp, uint64_t count)
         /* zero-pad trailing bytes to reach record boundary */
         for (i = 1 + namelen; i < (uint64_t)(reclen - 19); i++) d->d_name[i] = '\0';
 
-        copy_to_user((void *)(uintptr_t)(dirp + written), kbuf, reclen);
+        /* Consume the residual before committing this record. A fault may
+         * occur after the range check (another thread can change mappings),
+         * and advancing here would silently skip a directory entry on retry.
+         * Linux-style short-I/O semantics apply: return completed records if
+         * there are any, otherwise EFAULT. The faulting record is not counted
+         * and its offset is not consumed. */
+        if (copy_to_user((void *)(uintptr_t)(dirp + written),
+                         kbuf, reclen) != 0) {
+            copy_fault = 1;
+            break;
+        }
         written += reclen;
-        f->offset++;
+        next_offset++;
         produced++;
     }
+    fd_table_advance_offset(proc->fd_table, (int)fd_num, &pin,
+                            next_offset - f->offset);
+    fd_table_unpin(&pin);
+    if (copy_fault && written == 0)
+        return SYS_ERR(EFAULT);
     return written;
 }
 

@@ -30,6 +30,16 @@ typedef struct {
     spinlock_t lock;
 } fd_table_t;
 
+/* Stable copy of one descriptor slot. If the backing object is refcounted,
+ * fd_table_pin takes its ->dup reference while holding fd_table.lock, closing
+ * the check/use race with sys_close/dup2. Drivers without ->dup have
+ * lifetime-independent singleton/static priv by vfs_ops_t contract, so their
+ * copied ops/priv pair needs no release. */
+typedef struct {
+    vfs_file_t file;
+    uint8_t    referenced;
+} fd_table_pin_t;
+
 #define FD_TABLE_MAGIC   0xFD7AB1EEu
 #define FD_TABLE_POISON  0xDEADFD7Au
 
@@ -37,5 +47,14 @@ fd_table_t *fd_table_alloc(void);
 void fd_table_ref(fd_table_t *t);
 void fd_table_unref(fd_table_t *t);
 fd_table_t *fd_table_copy(fd_table_t *src);
+int  fd_table_pin(fd_table_t *t, int fd, fd_table_pin_t *out);
+void fd_table_unpin(fd_table_pin_t *pin);
+void fd_table_advance_offset(fd_table_t *t, int fd,
+                             const fd_table_pin_t *pin, uint64_t delta);
+void fd_table_set_offset(fd_table_t *t, int fd,
+                         const fd_table_pin_t *pin, uint64_t offset);
+int fd_table_update_flags(fd_table_t *t, int fd,
+                          const fd_table_pin_t *pin,
+                          uint32_t clear, uint32_t set);
 
 #endif /* FD_TABLE_H */

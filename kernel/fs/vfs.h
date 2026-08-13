@@ -136,11 +136,9 @@ _Static_assert(sizeof(vfs_file_t) == 40, "vfs_file_t must be 40 bytes");
 
 /* VFS_KF_AUTH_GATED — set in vfs_file_t.kflags when a fd is opened onto a file
  * whose OPEN required CAP_KIND_AUTH (/etc/shadow, /etc/aegis/admin — secret
- * content). The AUTH cap is checked once, at open; the resulting fd carries no
- * further check, so passing it over SCM_RIGHTS to a process that lacks AUTH
- * would launder read-access to the secret. sys_recvmsg re-validates the
- * RECEIVER holds AUTH before installing such a fd (no ambient authority: you
- * cannot gain the secret by being handed an fd — you must hold the cap). */
+ * content). Read/write/mmap revalidate AUTH on use, and sys_recvmsg also
+ * revalidates the receiver before installing such a fd (no ambient authority:
+ * neither inheritance nor being handed an fd grants access without the cap). */
 #define VFS_KF_AUTH_GATED 0x2U
 
 /* O_NONBLOCK flag value (Linux x86-64).  Stored in vfs_file_t.flags by

@@ -124,10 +124,11 @@ void sock_wake(uint32_t sock_id);
 int64_t sock_stream_send(sock_t *s, uint64_t ubuf, uint64_t len);
 
 /* sock_open_fd: allocate an fd backed by sock_id. Returns fd >= 0 or -1. */
-int sock_open_fd(uint32_t sock_id, aegis_process_t *proc);
+int sock_open_fd(uint32_t sock_id, aegis_process_t *proc, uint32_t flags);
 
 /* sock_id_from_fd: look up the sock_id from an fd. Returns SOCK_NONE on error. */
 uint32_t sock_id_from_fd(int fd, aegis_process_t *proc);
+uint32_t sock_id_from_file(const vfs_file_t *file);
 
 /* sock_get_waitq: return the embedded poll_waiters for sock_id, or NULL.
  * Used by fd_waitq.c to dispatch sys_poll / sys_epoll_wait waiters. */

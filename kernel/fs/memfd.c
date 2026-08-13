@@ -322,15 +322,22 @@ int memfd_get_page_ref(uint32_t id, uint32_t pi, uint64_t *phys_out)
 int memfd_open_fd(uint32_t id, void *proc_ptr)
 {
     aegis_process_t *proc = (aegis_process_t *)proc_ptr;
+    vfs_file_t file = {
+        .ops = &g_memfd_ops,
+        .priv = (void *)(uintptr_t)id,
+        .offset = 0,
+        .size = 0,
+        .flags = VFS_O_RDWR,
+        .kflags = 0,
+    };
+    irqflags_t fl = spin_lock_irqsave(&proc->fd_table->lock);
     for (int i = 0; i < PROC_MAX_FDS; i++) {
         if (!proc->fd_table->fds[i].ops) {
-            proc->fd_table->fds[i].ops    = &g_memfd_ops;
-            proc->fd_table->fds[i].priv   = (void *)(uintptr_t)id;
-            proc->fd_table->fds[i].offset = 0;
-            proc->fd_table->fds[i].size   = 0;
-            proc->fd_table->fds[i].flags  = VFS_O_RDWR;
+            proc->fd_table->fds[i] = file;
+            spin_unlock_irqrestore(&proc->fd_table->lock, fl);
             return i;
         }
     }
+    spin_unlock_irqrestore(&proc->fd_table->lock, fl);
     return -1;
 }

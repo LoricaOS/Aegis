@@ -3,6 +3,7 @@
 #include "random.h"
 #include "printk.h"
 #include "dev_table.h"
+#include "spinlock.h"
 #include "../include/aegis_errno.h"
 #include <stdint.h>
 
@@ -521,6 +522,18 @@ static vfs_file_t s_null_file = {
 #include "hda.h"
 #endif
 
+static spinlock_t s_audio_ref_lock = SPINLOCK_INIT;
+static uint32_t   s_audio_refs;
+
+static void
+audio_ref_fn(void *priv)
+{
+    (void)priv;
+    irqflags_t flags = spin_lock_irqsave(&s_audio_ref_lock);
+    s_audio_refs++;
+    spin_unlock_irqrestore(&s_audio_ref_lock, flags);
+}
+
 static int
 audio_write_fn(void *priv, const void *buf, uint64_t len)
 {
@@ -538,9 +551,20 @@ static void
 audio_close_fn(void *priv)
 {
     (void)priv;
+    irqflags_t flags = spin_lock_irqsave(&s_audio_ref_lock);
+    if (s_audio_refs == 0) {
+        spin_unlock_irqrestore(&s_audio_ref_lock, flags);
+        return;
+    }
+    s_audio_refs--;
+    if (s_audio_refs != 0) {
+        spin_unlock_irqrestore(&s_audio_ref_lock, flags);
+        return;
+    }
 #ifdef __x86_64__
     hda_audio_close();
 #endif
+    spin_unlock_irqrestore(&s_audio_ref_lock, flags);
 }
 
 static int
@@ -561,7 +585,7 @@ static const vfs_ops_t s_audio_ops = {
     .write   = audio_write_fn,
     .close   = audio_close_fn,
     .readdir = (void *)0,
-    .dup     = (void *)0,
+    .dup     = audio_ref_fn,
     .stat    = audio_stat_fn,
     .poll    = (void *)0,
 };
@@ -783,6 +807,8 @@ initrd_open(const char *path, vfs_file_t *out)
             while (*a && *b && *a == *b) { a++; b++; }
             if (*a == *b) {
                 *out = *e->file;
+                if (e->file == &s_audio_file)
+                    audio_ref_fn(out->priv);
                 return 0;
             }
         }

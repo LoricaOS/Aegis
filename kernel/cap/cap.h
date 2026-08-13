@@ -149,6 +149,14 @@ void cap_apply_policy(cap_slot_t *caps, const char *path, int authenticated,
  * (/apps/ or /etc/aegis/), else 0. */
 int cap_path_is_protected(const char *path);
 
+/* A spawn cap_mask installs an exec-persistent attenuation ceiling. The
+ * compact ceiling is indexed by CAP_KIND_* and stores the maximum rights that
+ * future policy derivations may retain for each kind. */
+void cap_ceiling_from_table(uint32_t ceiling[CAP_KIND_MAX + 1u],
+                            const cap_slot_t *caps);
+void cap_apply_ceiling(cap_slot_t *caps,
+                       const uint32_t ceiling[CAP_KIND_MAX + 1u]);
+
 /* cap_anchor_audit — boot-time check that every trusted-for-granting anchor is
  * also install-protected (anchor ⊆ protected). WARNs (never panics) on drift.
  * MUST be called after ext2 mount + ext2_anchors_reload() so the protected

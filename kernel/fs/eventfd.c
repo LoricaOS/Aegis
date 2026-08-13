@@ -174,13 +174,6 @@ sys_eventfd2(uint64_t initval, uint64_t flags)
 {
     aegis_process_t *proc = current_proc();
 
-    int fd = -1, i;
-    for (i = 0; i < PROC_MAX_FDS; i++) {
-        if (!proc->fd_table->fds[i].ops) { fd = i; break; }
-    }
-    if (fd < 0)
-        return SYS_ERR(EMFILE);
-
     /* The counter invariant is count <= EFD_VALMAX; the write path's overflow
      * check (`val > EFD_VALMAX - count`) wraps and passes if count is already
      * above it. eventfd2(UINT64_MAX, 0) seeded exactly that. (audit L7) */
@@ -195,13 +188,23 @@ sys_eventfd2(uint64_t initval, uint64_t flags)
     e->flags = (uint32_t)flags & EFD_SEMAPHORE;
     refcount_init(&e->refs, 1);
 
-    proc->fd_table->fds[fd].ops    = &g_eventfd_ops;
-    proc->fd_table->fds[fd].priv   = e;
-    proc->fd_table->fds[fd].offset = 0;
-    proc->fd_table->fds[fd].size   = 0;
-    proc->fd_table->fds[fd].flags  =
-        (uint32_t)flags & (VFS_O_NONBLOCK | VFS_FD_CLOEXEC);
-    proc->fd_table->fds[fd].kflags = 0;
-
-    return (uint64_t)fd;
+    vfs_file_t file = {
+        .ops = &g_eventfd_ops,
+        .priv = e,
+        .offset = 0,
+        .size = 0,
+        .flags = (uint32_t)flags & (VFS_O_NONBLOCK | VFS_FD_CLOEXEC),
+        .kflags = 0,
+    };
+    irqflags_t fl = spin_lock_irqsave(&proc->fd_table->lock);
+    for (int fd = 0; fd < PROC_MAX_FDS; fd++) {
+        if (!proc->fd_table->fds[fd].ops) {
+            proc->fd_table->fds[fd] = file;
+            spin_unlock_irqrestore(&proc->fd_table->lock, fl);
+            return (uint64_t)fd;
+        }
+    }
+    spin_unlock_irqrestore(&proc->fd_table->lock, fl);
+    eventfd_close_fn(e);
+    return SYS_ERR(EMFILE);
 }

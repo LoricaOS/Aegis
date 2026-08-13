@@ -70,6 +70,22 @@ sys_audio_position(void)
  * Safe on single-core: syscalls are non-preemptible. */
 int vfs_read_nonblock = 0;
 
+/* An fd is not ambient authority. Sensitive files remain capability-gated at
+ * every content-write sink even after dup, inheritance, exec, or spawn. */
+static int
+fd_content_write_allowed(const aegis_process_t *proc, const vfs_file_t *f)
+{
+    if ((f->kflags & VFS_KF_AUTH_GATED) &&
+        cap_check(proc->caps, CAP_TABLE_SIZE,
+                  CAP_KIND_AUTH, CAP_RIGHTS_WRITE) != 0)
+        return 0;
+    if ((f->kflags & VFS_KF_PROTECTED) &&
+        cap_check(proc->caps, CAP_TABLE_SIZE,
+                  CAP_KIND_INSTALL, CAP_RIGHTS_WRITE) != 0)
+        return 0;
+    return 1;
+}
+
 /*
  * sys_write — syscall 1
  *
@@ -90,16 +106,23 @@ sys_write(uint64_t arg1, uint64_t arg2, uint64_t arg3)
                   CAP_KIND_VFS_WRITE, CAP_RIGHTS_WRITE) != 0)
         return SYS_ERR(ENOCAP);
 
-    if (arg1 >= PROC_MAX_FDS || !proc->fd_table->fds[arg1].ops ||
-        !proc->fd_table->fds[arg1].ops->write)
+    fd_table_pin_t pin;
+    if (!fd_table_pin(proc->fd_table, (int)arg1, &pin))
         return SYS_ERR(EBADF);
+    vfs_file_t *f = &pin.file;
+    if (!f->ops->write) {
+        fd_table_unpin(&pin);
+        return SYS_ERR(EBADF);
+    }
 
     /* Enforce the fd's access mode: an O_RDONLY fd must never write. Found
      * the hard way — a service with stdout closed had its media file land on
      * fd 1, and stdio flushes overwrote the file's first block through the
      * read-only fd. */
-    if ((proc->fd_table->fds[arg1].flags & VFS_O_ACCMODE) == VFS_O_RDONLY)
+    if ((f->flags & VFS_O_ACCMODE) == VFS_O_RDONLY) {
+        fd_table_unpin(&pin);
         return SYS_ERR(EBADF);
+    }
 
     /* Re-validate authority on USE — the write-side mirror of the check in
      * sys_read. An O_RDWR fd onto /etc/shadow or /etc/aegis/admin carries
@@ -113,12 +136,15 @@ sys_write(uint64_t arg1, uint64_t arg2, uint64_t arg3)
      * able to write a forged hash — the attenuation would be decorative. Every
      * policy grant carries R|W|X, so only a deliberately attenuated delegation
      * is affected. Same for the writev/pwrite64 siblings below. */
-    if ((proc->fd_table->fds[arg1].kflags & VFS_KF_AUTH_GATED) &&
-        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_AUTH, CAP_RIGHTS_WRITE) != 0)
+    if (!fd_content_write_allowed(proc, f)) {
+        fd_table_unpin(&pin);
         return SYS_ERR(EACCES);
+    }
 
-    if (!user_ptr_valid(arg2, arg3))
+    if (!user_ptr_valid(arg2, arg3)) {
+        fd_table_unpin(&pin);
         return SYS_ERR(EFAULT);
+    }
 
     /* Copy user buffer to kernel staging area to prevent TOCTOU — the user
      * could modify or unmap the buffer between the user_ptr_valid check and
@@ -131,7 +157,6 @@ sys_write(uint64_t arg1, uint64_t arg2, uint64_t arg3)
      * errno (-EPIPE).  The loop handles both correctly:
      *   - partial positive: advance offset and retry the remainder.
      *   - zero or negative: break and return that value. */
-    vfs_file_t *f = &proc->fd_table->fds[arg1];
     /* Per-task O_NONBLOCK flag for the write path (mirrors read_nonblock): the
      * ops->write callback only gets (priv, buf, len), so this is how the fd's
      * O_NONBLOCK reaches blocking writers (pipe_write_fn). Without it an
@@ -154,14 +179,16 @@ sys_write(uint64_t arg1, uint64_t arg2, uint64_t arg3)
         if (copy_from_user(staging, (const void *)(uintptr_t)(arg2 + total),
                            chunk) != 0) {
             sched_current()->write_nonblock = 0;
-            f->offset += total;
-            return (total > 0) ? total : SYS_ERR(EFAULT);
+            fd_table_advance_offset(proc->fd_table, (int)arg1, &pin, total);
+            fd_table_unpin(&pin);
+            return total ? total : SYS_ERR(EFAULT);
         }
         int r = f->ops->write(f->priv, staging, chunk);
         if (r <= 0) {
             sched_current()->write_nonblock = 0;
-            f->offset += total;   /* advance by what succeeded (see below) */
-            return (total > 0) ? total : (uint64_t)(int64_t)r;
+            fd_table_advance_offset(proc->fd_table, (int)arg1, &pin, total);
+            fd_table_unpin(&pin);
+            return total ? total : (uint64_t)(int64_t)r;
         }
         total += (uint64_t)r;
         if ((uint64_t)r < chunk) break;  /* short write — don't retry */
@@ -173,7 +200,8 @@ sys_write(uint64_t arg1, uint64_t arg2, uint64_t arg3)
      * hook) resets the fs write position to 0 — musl stdio does exactly this
      * between writes, which made every multi-write tool (echo, cp) clobber
      * offset 0 and persist only its last byte. */
-    f->offset += total;
+    fd_table_advance_offset(proc->fd_table, (int)arg1, &pin, total);
+    fd_table_unpin(&pin);
     return total;
 }
 
@@ -201,25 +229,37 @@ sys_writev(uint64_t arg1, uint64_t arg2, uint64_t arg3)
                   CAP_KIND_VFS_WRITE, CAP_RIGHTS_WRITE) != 0)
         return SYS_ERR(ENOCAP);
 
-    if (arg1 >= PROC_MAX_FDS || !proc->fd_table->fds[arg1].ops ||
-        !proc->fd_table->fds[arg1].ops->write)
+    fd_table_pin_t pin;
+    if (!fd_table_pin(proc->fd_table, (int)arg1, &pin))
         return SYS_ERR(EBADF);
+    vfs_file_t *f = &pin.file;
+    if (!f->ops->write) {
+        fd_table_unpin(&pin);
+        return SYS_ERR(EBADF);
+    }
 
-    if ((proc->fd_table->fds[arg1].flags & VFS_O_ACCMODE) == VFS_O_RDONLY)
+    if ((f->flags & VFS_O_ACCMODE) == VFS_O_RDONLY) {
+        fd_table_unpin(&pin);
         return SYS_ERR(EBADF);       /* fd not opened for writing */
+    }
 
     /* AUTH-gated fd re-check on use — see the comment in sys_write. */
-    if ((proc->fd_table->fds[arg1].kflags & VFS_KF_AUTH_GATED) &&
-        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_AUTH, CAP_RIGHTS_WRITE) != 0)
+    if (!fd_content_write_allowed(proc, f)) {
+        fd_table_unpin(&pin);
         return SYS_ERR(EACCES);
+    }
 
     /* Reject unreasonable iovcnt before multiplying to avoid overflow. */
-    if (arg3 > 1024)
+    if (arg3 > 1024) {
+        fd_table_unpin(&pin);
         return SYS_ERR(EINVAL);
+    }
 
     /* Validate the iovec array itself is in user space */
-    if (!user_ptr_valid(arg2, arg3 * sizeof(aegis_iovec_t)))
+    if (!user_ptr_valid(arg2, arg3 * sizeof(aegis_iovec_t))) {
+        fd_table_unpin(&pin);
         return SYS_ERR(EFAULT);
+    }
 
     uint64_t total = 0;
     uint64_t i;
@@ -230,13 +270,13 @@ sys_writev(uint64_t arg1, uint64_t arg2, uint64_t arg3)
         if (copy_from_user(&iov,
                            (const void *)(uintptr_t)(arg2 + i * sizeof(aegis_iovec_t)),
                            sizeof(aegis_iovec_t)) != 0)
-            return (total > 0) ? total : SYS_ERR(EFAULT);
+            goto fault;
 
         if (iov.iov_len == 0)
             continue;
 
         if (!user_ptr_valid(iov.iov_base, iov.iov_len))
-            return SYS_ERR(EFAULT);
+            goto fault;
 
         /* S8: Copy user buffer to kernel staging area to prevent TOCTOU.
          * The user could unmap the page between validation and use.
@@ -251,16 +291,15 @@ sys_writev(uint64_t arg1, uint64_t arg2, uint64_t arg3)
                                (const void *)(uintptr_t)(iov.iov_base + vec_written),
                                chunk) != 0) {
                 if (total == 0)
-                    return SYS_ERR(EFAULT);
+                    goto fault;
                 goto done;
             }
-            int r = proc->fd_table->fds[arg1].ops->write(
-                        proc->fd_table->fds[arg1].priv,
-                        staging,
-                        chunk);
+            int r = f->ops->write(f->priv, staging, chunk);
             if (r <= 0) {
-                if (r < 0 && total == 0)
+                if (r < 0 && total == 0) {
+                    fd_table_unpin(&pin);
                     return (uint64_t)(int64_t)r;
+                }
                 goto done;
             }
             vec_written += (uint64_t)r;
@@ -271,8 +310,13 @@ done:
     /* Advance the file offset by bytes written — same reason as sys_write, and
      * this is the path musl's buffered stdio actually uses (__stdio_write ->
      * writev), so it is what makes redirected `echo`/`cp` persist correctly. */
-    proc->fd_table->fds[arg1].offset += total;
+    fd_table_advance_offset(proc->fd_table, (int)arg1, &pin, total);
+    fd_table_unpin(&pin);
     return total;
+fault:
+    fd_table_advance_offset(proc->fd_table, (int)arg1, &pin, total);
+    fd_table_unpin(&pin);
+    return total ? total : SYS_ERR(EFAULT);
 }
 
 /*
@@ -339,15 +383,18 @@ sys_read(uint64_t arg1, uint64_t arg2, uint64_t arg3)
                   CAP_KIND_VFS_READ, CAP_RIGHTS_READ) != 0)
         return SYS_ERR(ENOCAP);
 
-    if (arg1 >= PROC_MAX_FDS)
+    fd_table_pin_t pin;
+    if (!fd_table_pin(proc->fd_table, (int)arg1, &pin))
         return SYS_ERR(EBADF);
-    vfs_file_t *f = &proc->fd_table->fds[arg1];
-    if (!f->ops)
-        return SYS_ERR(EBADF);
-    if (!f->ops->read)
+    vfs_file_t *f = &pin.file;
+    if (!f->ops->read) {
+        fd_table_unpin(&pin);
         return SYS_ERR(EISDIR);  /* directory fd, not readable */
-    if ((f->flags & VFS_O_ACCMODE) == VFS_O_WRONLY)
+    }
+    if ((f->flags & VFS_O_ACCMODE) == VFS_O_WRONLY) {
+        fd_table_unpin(&pin);
         return SYS_ERR(EBADF);   /* fd not opened for reading */
+    }
     /* Re-validate authority on USE, not just at open: an fd onto /etc/shadow or
      * /etc/aegis/admin carries VFS_KF_AUTH_GATED. If it reached a process that
      * lacks CAP_KIND_AUTH — inherited across exec, or dup'd to a capless child —
@@ -355,10 +402,14 @@ sys_read(uint64_t arg1, uint64_t arg2, uint64_t arg3)
      * such an fd is separately refused at the sender.) No ambient authority:
      * holding the fd is not holding the cap. */
     if ((f->kflags & VFS_KF_AUTH_GATED) &&
-        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_AUTH, CAP_RIGHTS_READ) != 0)
+        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_AUTH, CAP_RIGHTS_READ) != 0) {
+        fd_table_unpin(&pin);
         return SYS_ERR(EACCES);
-    if (!user_ptr_valid(arg2, arg3))
+    }
+    if (!user_ptr_valid(arg2, arg3)) {
+        fd_table_unpin(&pin);
         return SYS_ERR(EFAULT);
+    }
 
     /* Single read call — return whatever the VFS gives us.
      * Pipe reads may block inside f->ops->read() via sched_block().
@@ -386,20 +437,26 @@ sys_read(uint64_t arg1, uint64_t arg2, uint64_t arg3)
     int64_t got = (int64_t)f->ops->read(f->priv, kbuf, f->offset, n);
     sched_current()->read_nonblock = 0;
     vfs_read_nonblock = 0;
-    if (got < 0) return (uint64_t)got;   /* propagate -errno (e.g. -EPIPE) */
-    if (got == 0) return 0;              /* clean EOF */
+    if (got < 0) {
+        fd_table_unpin(&pin);
+        return (uint64_t)got;
+    }
+    if (got == 0) {
+        fd_table_unpin(&pin);
+        return 0;
+    }
     /* Re-validate the user buffer before the copy: f->ops->read above may have
      * BLOCKED (pipe/tty/socket), and a sibling thread (CLONE_VM) could have
-     * munmap'd arg2 during that block. copy_to_user is a raw memcpy with no
-     * fault fixup, so writing to a now-unmapped page would #PF in ring 0 and
-     * panic the kernel. The entry-time user_ptr_valid (line ~248) is stale after
-     * a block; re-check the actually-copied range. (Data already drained from
-     * the source is lost on EFAULT — a self-inflicted buggy-app case, and far
-     * better than a kernel panic.) */
-    if (!user_ptr_valid(arg2, (uint64_t)got))
+     * munmap'd arg2 during that block. The copy is fault-contained, but the
+     * entry-time validation is stale after a block, so re-check the range and
+     * reject any residual below. */
+    if (!user_ptr_valid(arg2, (uint64_t)got) ||
+        copy_to_user((void *)(uintptr_t)arg2, kbuf, (uint64_t)got) != 0) {
+        fd_table_unpin(&pin);
         return SYS_ERR(EFAULT);
-    copy_to_user((void *)(uintptr_t)arg2, kbuf, (uint64_t)got);
-    f->offset += (uint64_t)got;
+    }
+    fd_table_advance_offset(proc->fd_table, (int)arg1, &pin, (uint64_t)got);
+    fd_table_unpin(&pin);
     return (uint64_t)got;
 }
 
@@ -412,18 +469,29 @@ sys_pread64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t off)
     if (cap_check(proc->caps, CAP_TABLE_SIZE,
                   CAP_KIND_VFS_READ, CAP_RIGHTS_READ) != 0)
         return SYS_ERR(ENOCAP);
-    if (fd >= PROC_MAX_FDS) return SYS_ERR(EBADF);
-    vfs_file_t *f = &proc->fd_table->fds[fd];
-    if (!f->ops) return SYS_ERR(EBADF);
-    if (!f->ops->read) return SYS_ERR(EISDIR);
-    if ((f->flags & VFS_O_ACCMODE) == VFS_O_WRONLY)
+    fd_table_pin_t pin;
+    if (!fd_table_pin(proc->fd_table, (int)fd, &pin))
+        return SYS_ERR(EBADF);
+    vfs_file_t *f = &pin.file;
+    if (!f->ops->read) {
+        fd_table_unpin(&pin);
+        return SYS_ERR(EISDIR);
+    }
+    if ((f->flags & VFS_O_ACCMODE) == VFS_O_WRONLY) {
+        fd_table_unpin(&pin);
         return SYS_ERR(EBADF);   /* fd not opened for reading */
+    }
     /* AUTH-gated secret (see sys_read): re-check the caller holds AUTH so a
      * laundered /etc/shadow fd can't be pread by a capless process. */
     if ((f->kflags & VFS_KF_AUTH_GATED) &&
-        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_AUTH, CAP_RIGHTS_READ) != 0)
+        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_AUTH, CAP_RIGHTS_READ) != 0) {
+        fd_table_unpin(&pin);
         return SYS_ERR(EACCES);
-    if (!user_ptr_valid(buf, count)) return SYS_ERR(EFAULT);
+    }
+    if (!user_ptr_valid(buf, count)) {
+        fd_table_unpin(&pin);
+        return SYS_ERR(EFAULT);
+    }
     char kbuf[4096];
     uint64_t page_off = buf & 0xFFFULL;
     uint64_t to_end   = 0x1000ULL - page_off;
@@ -431,14 +499,22 @@ sys_pread64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t off)
     if (n > 4096) n = 4096;
     if (n > to_end) n = to_end;
     int64_t got = (int64_t)f->ops->read(f->priv, kbuf, off, n);
-    if (got < 0) return (uint64_t)got;
-    if (got == 0) return 0;
+    if (got < 0) {
+        fd_table_unpin(&pin);
+        return (uint64_t)got;
+    }
+    if (got == 0) {
+        fd_table_unpin(&pin);
+        return 0;
+    }
     /* Re-validate after a possibly-blocking read (pread on a pipe/socket fd
-     * blocks) — see sys_read: copy_to_user has no fault fixup, and a sibling
-     * munmap during the block would otherwise panic the kernel. */
-    if (!user_ptr_valid(buf, (uint64_t)got))
+     * blocks) and reject any fault-contained short copy — see sys_read. */
+    if (!user_ptr_valid(buf, (uint64_t)got) ||
+        copy_to_user((void *)(uintptr_t)buf, kbuf, (uint64_t)got) != 0) {
+        fd_table_unpin(&pin);
         return SYS_ERR(EFAULT);
-    copy_to_user((void *)(uintptr_t)buf, kbuf, (uint64_t)got);
+    }
+    fd_table_unpin(&pin);
     return (uint64_t)got;   /* pread does NOT advance f->offset */
 }
 
@@ -457,18 +533,31 @@ sys_pwrite64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t off)
     if (cap_check(proc->caps, CAP_TABLE_SIZE,
                   CAP_KIND_VFS_WRITE, CAP_RIGHTS_WRITE) != 0)
         return SYS_ERR(ENOCAP);
-    if (fd >= PROC_MAX_FDS) return SYS_ERR(EBADF);
-    vfs_file_t *f = &proc->fd_table->fds[fd];
-    if (!f->ops || !f->ops->write) return SYS_ERR(EBADF);
-    if ((f->flags & VFS_O_ACCMODE) == VFS_O_RDONLY)
+    fd_table_pin_t pin;
+    if (!fd_table_pin(proc->fd_table, (int)fd, &pin))
+        return SYS_ERR(EBADF);
+    vfs_file_t *f = &pin.file;
+    if (!f->ops->write) {
+        fd_table_unpin(&pin);
+        return SYS_ERR(EBADF);
+    }
+    if ((f->flags & VFS_O_ACCMODE) == VFS_O_RDONLY) {
+        fd_table_unpin(&pin);
         return SYS_ERR(EBADF);           /* fd not opened for writing */
+    }
     /* AUTH-gated fd re-check on use — see the comment in sys_write. */
-    if ((f->kflags & VFS_KF_AUTH_GATED) &&
-        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_AUTH, CAP_RIGHTS_WRITE) != 0)
+    if (!fd_content_write_allowed(proc, f)) {
+        fd_table_unpin(&pin);
         return SYS_ERR(EACCES);
-    if (!f->ops->seek)
+    }
+    if (!f->ops->seek) {
+        fd_table_unpin(&pin);
         return SYS_ERR(ESPIPE);          /* not positionable → can't pwrite */
-    if (!user_ptr_valid(buf, count)) return SYS_ERR(EFAULT);
+    }
+    if (!user_ptr_valid(buf, count)) {
+        fd_table_unpin(&pin);
+        return SYS_ERR(EFAULT);
+    }
     char kbuf[4096];
     uint64_t page_off = buf & 0xFFFULL;
     uint64_t to_end   = 0x1000ULL - page_off;
@@ -477,12 +566,18 @@ sys_pwrite64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t off)
     if (n > to_end) n = to_end;
     /* Same stale-stack leak as sys_write, but written at an attacker-chosen
      * file offset — see the comment there. */
-    if (copy_from_user(kbuf, (const void *)(uintptr_t)buf, n) != 0)
+    if (copy_from_user(kbuf, (const void *)(uintptr_t)buf, n) != 0) {
+        fd_table_unpin(&pin);
         return SYS_ERR(EFAULT);
+    }
     f->ops->seek(f->priv, off);
     int64_t wrote = (int64_t)f->ops->write(f->priv, kbuf, n);
     f->ops->seek(f->priv, f->offset);    /* restore driver cursor to fd offset */
-    if (wrote < 0) return (uint64_t)wrote;
+    if (wrote < 0) {
+        fd_table_unpin(&pin);
+        return (uint64_t)wrote;
+    }
+    fd_table_unpin(&pin);
     return (uint64_t)wrote;              /* pwrite does NOT advance f->offset */
 }
 

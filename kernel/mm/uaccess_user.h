@@ -45,7 +45,8 @@
  *
  * TWO FLAVOURS, and WHY:
  *
- *   COPY_FROM_USER / COPY_TO_USER  — the returning form. On a bad pointer they
+ *   COPY_FROM_USER / COPY_TO_USER  — the returning form. On a bad pointer or
+ *     a fault-contained short copy they
  *     execute `return SYS_ERR(EFAULT);` from the ENCLOSING function. Use ONLY
  *     where that early return frees nothing and skips no cleanup — i.e. the
  *     pointer check is the first thing the syscall does, before allocating a
@@ -54,11 +55,12 @@
  *     out at exit with nothing else held).
  *
  *   copy_from_user_checked / copy_to_user_checked — the non-returning form.
- *     Returns true on success, false on a bad pointer, and does NOT return from
- *     the caller. Use at any site that has ALREADY acquired a resource that the
- *     error path must release (kva_free_pages, fd close, spin_unlock,
- *     refcount_dec): the hidden `return` of the macro form would LEAK it. The
- *     caller writes the cleanup explicitly:
+ *     Returns true on success, false on a bad pointer or fault-contained short
+ *     copy, and does NOT return from the caller. Use at any site that has
+ *     ALREADY acquired a resource that the error path must release
+ *     (kva_free_pages, fd close, spin_unlock, refcount_dec): the hidden
+ *     `return` of the macro form would LEAK it. The caller writes the cleanup
+ *     explicitly:
  *         if (!copy_to_user_checked(uptr, &x)) { kva_free_pages(buf,1);
  *                                                return SYS_ERR(EFAULT); }
  *     This is the "hidden return" trap the migration spec calls out; classify
@@ -88,8 +90,9 @@
     do {                                                                      \
         if (!user_ptr_valid((uint64_t)(uintptr_t)(uptr), sizeof(*(dst))))     \
             return SYS_ERR(EFAULT);                                           \
-        copy_from_user((dst), (const void *)(uintptr_t)(uptr),                \
-                       sizeof(*(dst)));                                       \
+        if (copy_from_user((dst), (const void *)(uintptr_t)(uptr),            \
+                           sizeof(*(dst))) != 0)                              \
+            return SYS_ERR(EFAULT);                                           \
     } while (0)
 
 /*
@@ -101,7 +104,9 @@
     do {                                                                      \
         if (!user_ptr_valid((uint64_t)(uintptr_t)(uptr), sizeof(*(src))))     \
             return SYS_ERR(EFAULT);                                           \
-        copy_to_user((void *)(uintptr_t)(uptr), (src), sizeof(*(src)));       \
+        if (copy_to_user((void *)(uintptr_t)(uptr), (src),                    \
+                         sizeof(*(src))) != 0)                                \
+            return SYS_ERR(EFAULT);                                           \
     } while (0)
 
 /*
@@ -117,8 +122,7 @@ copy_from_user_checked_(void *dst, uint64_t uptr, uint64_t n)
 {
     if (!user_ptr_valid(uptr, n))
         return false;
-    copy_from_user(dst, (const void *)(uintptr_t)uptr, n);
-    return true;
+    return copy_from_user(dst, (const void *)(uintptr_t)uptr, n) == 0;
 }
 
 static inline bool
@@ -126,8 +130,7 @@ copy_to_user_checked_(uint64_t uptr, const void *src, uint64_t n)
 {
     if (!user_ptr_valid(uptr, n))
         return false;
-    copy_to_user((void *)(uintptr_t)uptr, src, n);
-    return true;
+    return copy_to_user((void *)(uintptr_t)uptr, src, n) == 0;
 }
 
 /* Sizeof-binding wrappers so call sites never pass a length (same anti-drift

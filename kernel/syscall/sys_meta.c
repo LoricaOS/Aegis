@@ -374,16 +374,21 @@ sys_fchmod(uint64_t arg1, uint64_t arg2)
                   CAP_KIND_VFS_WRITE, CAP_RIGHTS_WRITE) != 0)
         return SYS_ERR(ENOCAP);
 
-    if (arg1 >= PROC_MAX_FDS) return SYS_ERR(EBADF);
-    vfs_file_t *f = &proc->fd_table->fds[arg1];
-    if (!f->ops) return SYS_ERR(EBADF);
+    fd_table_pin_t pin;
+    if (arg1 >= PROC_MAX_FDS ||
+        !fd_table_pin(proc->fd_table, (int)arg1, &pin))
+        return SYS_ERR(EBADF);
+    vfs_file_t *f = &pin.file;
+    uint64_t ret = 0;
 
     /* fd-based install gate (parity with path-based sys_chmod): an fd onto a
      * file under the install-protected trees can't mutate it without
      * CAP_KIND_INSTALL, even if it was opened O_RDONLY. */
     if ((f->kflags & VFS_KF_PROTECTED) &&
-        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL, CAP_RIGHTS_WRITE) != 0)
-        return SYS_ERR(EPERM);
+        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL, CAP_RIGHTS_WRITE) != 0) {
+        ret = SYS_ERR(EPERM);
+        goto out;
+    }
 
     /* Ownership check via stat: only file owner (or uid 0) may fchmod */
     if (f->ops->stat) {
@@ -394,16 +399,23 @@ sys_fchmod(uint64_t arg1, uint64_t arg2)
              * path chmod would — owner-uid-0 DAC is not it. Keyed on the fd's
              * resolved inode, so it can't be bypassed via an fd opened O_RDONLY. */
             int g = sensitive_write_gate((uint32_t)ks.st_ino);
-            if (g != 0) return (uint64_t)(int64_t)g;
+            if (g != 0) {
+                ret = (uint64_t)(int64_t)g;
+                goto out;
+            }
             /* No uid=0 bypass (see sys_chmod): only the owner may fchmod/fchown. */
-            if (proc->uid != ks.st_uid)
-                return SYS_ERR(EACCES);
+            if (proc->uid != ks.st_uid) {
+                ret = SYS_ERR(EACCES);
+                goto out;
+            }
         }
     }
 
     int r = vfs_fchmod(f, (uint16_t)arg2);
-    if (r < 0) return SYS_ERR(EINVAL); /* EINVAL — not an ext2 fd */
-    return 0;
+    if (r < 0) ret = SYS_ERR(EINVAL); /* EINVAL — not an ext2 fd */
+out:
+    fd_table_unpin(&pin);
+    return ret;
 }
 
 /*
@@ -461,14 +473,19 @@ sys_fchown(uint64_t arg1, uint64_t arg2, uint64_t arg3)
                   CAP_KIND_SETUID, CAP_RIGHTS_WRITE) != 0)
         return SYS_ERR(ENOCAP);
 
-    if (arg1 >= PROC_MAX_FDS) return SYS_ERR(EBADF);
-    vfs_file_t *f = &proc->fd_table->fds[arg1];
-    if (!f->ops) return SYS_ERR(EBADF);
+    fd_table_pin_t pin;
+    if (arg1 >= PROC_MAX_FDS ||
+        !fd_table_pin(proc->fd_table, (int)arg1, &pin))
+        return SYS_ERR(EBADF);
+    vfs_file_t *f = &pin.file;
+    uint64_t ret = 0;
 
     /* fd-based install gate (parity with path-based sys_chown): see sys_fchmod. */
     if ((f->kflags & VFS_KF_PROTECTED) &&
-        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL, CAP_RIGHTS_WRITE) != 0)
-        return SYS_ERR(EPERM);
+        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL, CAP_RIGHTS_WRITE) != 0) {
+        ret = SYS_ERR(EPERM);
+        goto out;
+    }
 
     /* Ownership check via stat: only file owner (or uid 0) may fchown */
     if (f->ops->stat) {
@@ -478,16 +495,23 @@ sys_fchown(uint64_t arg1, uint64_t arg2, uint64_t arg3)
              * an fd onto /etc/shadow, /etc/passwd, … needs the same authority a
              * path chown would. Keyed on the fd's resolved inode. */
             int g = sensitive_write_gate((uint32_t)ks.st_ino);
-            if (g != 0) return (uint64_t)(int64_t)g;
+            if (g != 0) {
+                ret = (uint64_t)(int64_t)g;
+                goto out;
+            }
             /* No uid=0 bypass (see sys_chmod): only the owner may fchmod/fchown. */
-            if (proc->uid != ks.st_uid)
-                return SYS_ERR(EACCES);
+            if (proc->uid != ks.st_uid) {
+                ret = SYS_ERR(EACCES);
+                goto out;
+            }
         }
     }
 
     int r = vfs_fchown(f, (uint16_t)arg2, (uint16_t)arg3);
-    if (r < 0) return SYS_ERR(EINVAL); /* EINVAL — not an ext2 fd */
-    return 0;
+    if (r < 0) ret = SYS_ERR(EINVAL); /* EINVAL — not an ext2 fd */
+out:
+    fd_table_unpin(&pin);
+    return ret;
 }
 
 /*

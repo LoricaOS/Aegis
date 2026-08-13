@@ -367,6 +367,8 @@ reload_binary:
         proc->admin_session_firstboot = 0;
     }
     cap_apply_policy(proc->caps, path, proc->authenticated, proc->admin_session);
+    if (proc->cap_ceiling_active)
+        cap_apply_ceiling(proc->caps, proc->cap_ceiling);
 
     /* First-boot exception: the anchored setup program (caps.d/configure) runs
      * before any login on an unconfigured system, so it has no admin_session to
@@ -374,7 +376,7 @@ reload_binary:
      * g_first_boot (one-shot; the marker it writes flips the exception off) and
      * to the firstboot-tier policy (only configure declares it). This is the
      * session half of the same exception that hands it the AUTH/INSTALL caps. */
-    if (cap_policy_is_firstboot(path)) {
+    if (!proc->cap_ceiling_active && cap_policy_is_firstboot(path)) {
         proc->admin_session = 1;
         proc->admin_session_firstboot = 1;   /* not credential-backed */
     }
@@ -687,11 +689,23 @@ reload_binary:
     {
         int cfd;
         for (cfd = 0; cfd < PROC_MAX_FDS; cfd++) {
-            if (proc->fd_table->fds[cfd].ops &&
-                (proc->fd_table->fds[cfd].flags & VFS_FD_CLOEXEC)) {
-                proc->fd_table->fds[cfd].ops->close(proc->fd_table->fds[cfd].priv);
-                __builtin_memset(&proc->fd_table->fds[cfd], 0, sizeof(vfs_file_t));
+            const vfs_ops_t *ops = (const vfs_ops_t *)0;
+            void *priv = (void *)0;
+            /* A CLONE_FILES peer can close/reuse a slot while exec sweeps it
+             * (notably if the unshare allocation above failed). Detach the
+             * exact CLOEXEC slot under the table lock, then destroy its object
+             * after unlocking: ->close can take object locks and must never
+             * run under this spinlock. */
+            irqflags_t fl = spin_lock_irqsave(&proc->fd_table->lock);
+            vfs_file_t *slot = &proc->fd_table->fds[cfd];
+            if (slot->ops && (slot->flags & VFS_FD_CLOEXEC)) {
+                ops = slot->ops;
+                priv = slot->priv;
+                __builtin_memset(slot, 0, sizeof(*slot));
             }
+            spin_unlock_irqrestore(&proc->fd_table->lock, fl);
+            if (ops && ops->close)
+                ops->close(priv);
         }
     }
 
@@ -1238,6 +1252,17 @@ sys_spawn(uint64_t path_uptr, uint64_t argv_uptr,
                     result = SYS_ERR(EINVAL);
                     goto fail_child;
                 }
+                /* One ceiling entry stores the rights for one kind. Reject
+                 * duplicate kinds rather than ORing disjoint mask slots: the
+                 * live cap checker does not combine rights across slots, so
+                 * combining them only after exec would increase authority. */
+                for (uint32_t mi = 0; mi < ci; mi++) {
+                    if (mask[mi].kind == mask[ci].kind) {
+                        kva_free_pages(kstack, 4);
+                        result = SYS_ERR(EINVAL);
+                        goto fail_child;
+                    }
+                }
                 if (cap_check(parent->caps, CAP_TABLE_SIZE,
                               mask[ci].kind, mask[ci].rights) != 0) {
                     kva_free_pages(kstack, 4);
@@ -1251,6 +1276,18 @@ sys_spawn(uint64_t path_uptr, uint64_t argv_uptr,
                               mask[ci].kind, mask[ci].rights);
                 }
             }
+
+            /* Persist the attenuation across future execs. Session flags are
+             * intentionally inherited, but can no longer regenerate a kind
+             * or right excluded by this mask. A descendant can only inherit
+             * or further narrow this ceiling. */
+            cap_ceiling_from_table(child->cap_ceiling, child->caps);
+            child->cap_ceiling_active = 1;
+        } else if (parent->cap_ceiling_active) {
+            __builtin_memcpy(child->cap_ceiling, parent->cap_ceiling,
+                             sizeof(child->cap_ceiling));
+            child->cap_ceiling_active = 1;
+            cap_apply_ceiling(child->caps, child->cap_ceiling);
         }
 
         /* Inherit authenticated flag + bound identity from parent */
@@ -1259,6 +1296,17 @@ sys_spawn(uint64_t path_uptr, uint64_t argv_uptr,
         child->admin_session_firstboot = parent->admin_session_firstboot;
         child->auth_uid      = parent->auth_uid;
         child->auth_gid      = parent->auth_gid;
+        if (cap_mask_uptr != 0) {
+            /* These flags are latent policy authority, and admin_session is
+             * also consulted directly by account-DB gates. A masked spawn has
+             * already received every explicitly selected cap it may use; do
+             * not carry session state that can restore excluded authority on
+             * exec (or bypass a cap table entirely). The bound identity stays:
+             * exercising it still requires an explicitly retained SETUID cap. */
+            child->authenticated = 0;
+            child->admin_session = 0;
+            child->admin_session_firstboot = 0;
+        }
     }
 
     /* 13. File descriptor table. */
@@ -1270,15 +1318,30 @@ sys_spawn(uint64_t path_uptr, uint64_t argv_uptr,
 
     {
         int64_t sfd = (int64_t)stdio_fd_arg;
-        if (sfd >= 0 && sfd < PROC_MAX_FDS &&
-            parent->fd_table->fds[sfd].ops) {
-            /* Copy the parent's fd to child's fd 0, 1, 2 */
-            int fd_i;
-            for (fd_i = 0; fd_i < 3; fd_i++) {
-                child->fd_table->fds[fd_i] = parent->fd_table->fds[sfd];
-                if (child->fd_table->fds[fd_i].ops->dup)
-                    child->fd_table->fds[fd_i].ops->dup(
-                        child->fd_table->fds[fd_i].priv);
+        if (sfd >= 0 && sfd < PROC_MAX_FDS) {
+            vfs_file_t source;
+            int have_source = 0;
+            /* Snapshot and acquire all three child references while close and
+             * dup2 are excluded from the parent slot. Acquiring refs after an
+             * unlocked struct copy allowed a CLONE_FILES peer to free/recycle
+             * priv before ->dup touched it. */
+            irqflags_t pfl = spin_lock_irqsave(&parent->fd_table->lock);
+            source = parent->fd_table->fds[sfd];
+            if (source.ops && !(source.ops->dup && !source.ops->close)) {
+                if (source.ops->dup) {
+                    source.ops->dup(source.priv);
+                    source.ops->dup(source.priv);
+                    source.ops->dup(source.priv);
+                }
+                have_source = 1;
+            }
+            spin_unlock_irqrestore(&parent->fd_table->lock, pfl);
+
+            if (have_source) {
+                irqflags_t cfl = spin_lock_irqsave(&child->fd_table->lock);
+                for (int fd_i = 0; fd_i < 3; fd_i++)
+                    child->fd_table->fds[fd_i] = source;
+                spin_unlock_irqrestore(&child->fd_table->lock, cfl);
             }
         }
     }

@@ -287,7 +287,8 @@ mmap_free_insert(aegis_process_t *proc, uint64_t base, uint64_t len)
  */
 static uint64_t
 sys_mmap_impl(uint64_t arg1, uint64_t arg2, uint64_t arg3,
-         uint64_t arg4, uint64_t arg5, uint64_t arg6)
+         uint64_t arg4, uint64_t arg5, uint64_t arg6,
+         const vfs_file_t *backing)
 {
     aegis_process_t *proc = current_proc();
     uint64_t addr  = arg1;
@@ -329,8 +330,7 @@ sys_mmap_impl(uint64_t arg1, uint64_t arg2, uint64_t arg3,
      * process lacking CAP_KIND_AUTH (inherited across exec, or dup'd), that
      * process must not read the secret by mmap'ing it either. Without this,
      * mmap was an AUTH-bypass hole the read-path defense didn't cover. */
-    if (file_backed && (uint32_t)fd < PROC_MAX_FDS &&
-        (proc->fd_table->fds[(uint32_t)fd].kflags & VFS_KF_AUTH_GATED) &&
+    if (file_backed && (backing->kflags & VFS_KF_AUTH_GATED) &&
         cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_AUTH, CAP_RIGHTS_READ) != 0)
         return SYS_ERR(EACCES);
 
@@ -348,8 +348,7 @@ sys_mmap_impl(uint64_t arg1, uint64_t arg2, uint64_t arg3,
      * close the concurrent-selection race — see below). */
     if (is_shared && file_backed && !(prot & PROT_WRITE)) {
         extern const vfs_ops_t g_memfd_ops;
-        if (!((uint32_t)fd < PROC_MAX_FDS &&
-              proc->fd_table->fds[(uint32_t)fd].ops == &g_memfd_ops))
+        if (backing->ops != &g_memfd_ops)
             is_shared = 0;  /* treat as MAP_PRIVATE: eager file copy below */
     }
     /* Lazy file-backed decision (cmdline `lazyfile`): a MAP_PRIVATE mapping of
@@ -363,14 +362,12 @@ sys_mmap_impl(uint64_t arg1, uint64_t arg2, uint64_t arg3,
     uint64_t lazy_fsize = 0;
     uint32_t lazy_gen = 0;
     int      lazy_file = 0;
-    if (file_backed && !is_shared && g_lazyfile &&
-        (uint32_t)fd < PROC_MAX_FDS && proc->fd_table->fds[(uint32_t)fd].ops) {
-        uint32_t ino = g_rootfs->ino_of(proc->fd_table->fds[(uint32_t)fd].ops,
-                                       proc->fd_table->fds[(uint32_t)fd].priv);
+    if (file_backed && !is_shared && g_lazyfile) {
+        uint32_t ino = g_rootfs->ino_of(backing->ops, backing->priv);
         if (ino) {
             lazy_file  = 1;
             lazy_ino   = ino;
-            lazy_fsize = proc->fd_table->fds[(uint32_t)fd].size;
+            lazy_fsize = backing->size;
             /* secfix M2: snapshot the inode generation now; the fault path
              * revalidates it so a recycled inode number cannot leak another
              * file's contents through this mapping. */
@@ -550,14 +547,12 @@ sys_mmap_impl(uint64_t arg1, uint64_t arg2, uint64_t arg3,
      * so far). For the fixed path the VMA is inserted at the end as before. */
     if (is_shared && file_backed) {
         extern const vfs_ops_t g_memfd_ops;
-        if ((uint32_t)fd >= PROC_MAX_FDS ||
-            !proc->fd_table->fds[(uint32_t)fd].ops ||
-            proc->fd_table->fds[(uint32_t)fd].ops != &g_memfd_ops) {
+        if (backing->ops != &g_memfd_ops) {
             if (reserved) vma_remove(proc, base, len);
             return SYS_ERR(EINVAL);  /* EINVAL: MAP_SHARED only for memfd */
         }
 
-        uint32_t mid = (uint32_t)(uintptr_t)proc->fd_table->fds[(uint32_t)fd].priv;
+        uint32_t mid = (uint32_t)(uintptr_t)backing->priv;
         extern memfd_t *memfd_get(uint32_t id);
         memfd_t *mf = memfd_get(mid);
         if (!mf) { if (reserved) vma_remove(proc, base, len); return SYS_ERR(EINVAL); }
@@ -670,10 +665,8 @@ sys_mmap_impl(uint64_t arg1, uint64_t arg2, uint64_t arg3,
 
     /* File-backed: copy file content into the mapped pages */
     if (file_backed) {
-        if ((uint32_t)fd < PROC_MAX_FDS &&
-            proc->fd_table->fds[(uint32_t)fd].ops &&
-            proc->fd_table->fds[(uint32_t)fd].ops->read) {
-            vfs_file_t *f = &proc->fd_table->fds[(uint32_t)fd];
+        if (backing->ops->read) {
+            const vfs_file_t *f = backing;
             uint64_t file_bytes = len;
             if (f->size > 0 && off < f->size) {
                 uint64_t avail = f->size - off;
@@ -727,9 +720,19 @@ sys_mmap(uint64_t arg1, uint64_t arg2, uint64_t arg3,
          uint64_t arg4, uint64_t arg5, uint64_t arg6)
 {
     aegis_process_t *proc = current_proc();
+    fd_table_pin_t pin;
+    const vfs_file_t *backing = (const vfs_file_t *)0;
+    if (!(arg4 & MAP_ANONYMOUS) && (int64_t)arg5 != -1) {
+        if (arg5 >= PROC_MAX_FDS ||
+            !fd_table_pin(proc->fd_table, (int)arg5, &pin))
+            return SYS_ERR(EBADF);
+        backing = &pin.file;
+    }
     irqflags_t fl = vma_op_lock(proc);
-    uint64_t r = sys_mmap_impl(arg1, arg2, arg3, arg4, arg5, arg6);
+    uint64_t r = sys_mmap_impl(arg1, arg2, arg3, arg4, arg5, arg6, backing);
     vma_op_unlock(proc, fl);
+    if (backing)
+        fd_table_unpin(&pin);
     return r;
 }
 
@@ -1255,10 +1258,15 @@ uint64_t sys_memfd_create(uint64_t name_ptr, uint64_t flags)
 uint64_t sys_ftruncate(uint64_t fd_arg, uint64_t length)
 {
     aegis_process_t *proc = current_proc();
-    memfd_t *mf = memfd_from_fd((int)fd_arg, proc);
-    if (!mf) return SYS_ERR(EINVAL);  /* EINVAL: not a memfd */
-
-    uint32_t mid = (uint32_t)(uintptr_t)proc->fd_table->fds[(int)fd_arg].priv;
+    fd_table_pin_t pin;
+    if (!fd_table_pin(proc->fd_table, (int)fd_arg, &pin))
+        return SYS_ERR(EINVAL);
+    if (pin.file.ops != &g_memfd_ops) {
+        fd_table_unpin(&pin);
+        return SYS_ERR(EINVAL);
+    }
+    uint32_t mid = (uint32_t)(uintptr_t)pin.file.priv;
     int rc = memfd_truncate(mid, length);
+    fd_table_unpin(&pin);
     return rc < 0 ? (uint64_t)(int64_t)rc : 0;
 }

@@ -125,12 +125,6 @@ sys_open(uint64_t arg1, uint64_t arg2, uint64_t arg3)
         for (uint64_t k = 0; k <= ni; k++) kpath[k] = norm[k];
     }
 
-    uint64_t fd;
-    for (fd = 0; fd < PROC_MAX_FDS; fd++)
-        if (!proc->fd_table->fds[fd].ops) break;
-    if (fd == PROC_MAX_FDS)
-        return SYS_ERR(EMFILE);
-
     /* /etc/shadow and /etc/aegis/admin read gate: both require CAP_KIND_AUTH
      * regardless of uid.  There is no ambient root authority on Aegis — uid=0
      * is cosmetic.  /etc/aegis/admin holds the admin-elevation credential hash
@@ -168,9 +162,9 @@ sys_open(uint64_t arg1, uint64_t arg2, uint64_t arg3)
     /* Install-tree mutation gate. Read-only opens are exempt. The CREATE case
      * (O_CREAT of a new file under a protected tree) is enforced ATOMICALLY
      * inside ext2_create via vfs_open_ex below — closing the symlink-swap
-     * TOCTOU the old separate check had. This pre-check still covers opening an
-     * EXISTING protected file for write, which doesn't route through a mutator;
-     * that narrower open-existing race is a documented residual. */
+     * TOCTOU the old separate check had. This pre-check is only a fast-fail;
+     * vfs_open_ex authoritatively resolves and classifies existing targets in
+     * one backend-lock hold, including symlink aliases. */
     int has_install = (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
                                  CAP_RIGHTS_WRITE) == 0);
     {
@@ -178,19 +172,41 @@ sys_open(uint64_t arg1, uint64_t arg2, uint64_t arg3)
             return SYS_ERR(EPERM); /* installing into the system tree needs CAP_KIND_INSTALL */
     }
 
+    /* Construct the complete descriptor off-table. Publishing ops first and
+     * filling flags/kflags afterward exposed a partially initialized slot to
+     * CLONE_FILES peers; choosing a free slot before vfs_open also let another
+     * opener claim it and be overwritten here. */
+    vfs_file_t opened;
+    __builtin_memset(&opened, 0, sizeof(opened));
     int r = vfs_open_ex(kpath, (int)arg2, (uint16_t)(arg3 & 0xFFF),
-                        &proc->fd_table->fds[fd], has_install);
+                        &opened, has_install);
     if (r < 0)
         return (uint64_t)(int64_t)r;
     /* Mark an AUTH-gated fd so SCM_RIGHTS can't launder secret-read authority
      * (vfs_open set kflags to PROTECTED-or-0; OR our bit in, don't clobber). */
     if (auth_gated)
-        proc->fd_table->fds[fd].kflags |= VFS_KF_AUTH_GATED;
+        opened.kflags |= VFS_KF_AUTH_GATED;
     /* Store open flags in the fd slot for F_GETFL */
-    proc->fd_table->fds[fd].flags = (uint32_t)arg2;
+    opened.flags = (uint32_t)arg2;
     /* Propagate O_CLOEXEC from open flags to fd flags */
     if (arg2 & VFS_O_CLOEXEC)
-        proc->fd_table->fds[fd].flags |= VFS_FD_CLOEXEC;
+        opened.flags |= VFS_FD_CLOEXEC;
+
+    uint64_t fd;
+    irqflags_t fl = spin_lock_irqsave(&proc->fd_table->lock);
+    for (fd = 0; fd < PROC_MAX_FDS; fd++)
+        if (!proc->fd_table->fds[fd].ops)
+            break;
+    if (fd < PROC_MAX_FDS)
+        proc->fd_table->fds[fd] = opened;
+    spin_unlock_irqrestore(&proc->fd_table->lock, fl);
+    if (fd == PROC_MAX_FDS) {
+        /* vfs_open_ex already acquired the backing object reference. Nothing
+         * was published, so release it after the table lock and fail cleanly. */
+        if (opened.ops && opened.ops->close)
+            opened.ops->close(opened.priv);
+        return SYS_ERR(EMFILE);
+    }
     return fd;
 }
 
@@ -451,16 +467,22 @@ uint64_t
 sys_fstat(uint64_t arg1, uint64_t arg2)
 {
     aegis_process_t *proc = current_proc();
-    if (arg1 >= PROC_MAX_FDS) return SYS_ERR(EBADF);
-    vfs_file_t *f = &proc->fd_table->fds[arg1];
-    if (!f->ops) return SYS_ERR(EBADF);
+    if (arg1 >= PROC_MAX_FDS)
+        return SYS_ERR(EBADF);
+    fd_table_pin_t pin;
+    if (!fd_table_pin(proc->fd_table, (int)arg1, &pin))
+        return SYS_ERR(EBADF);
+    vfs_file_t *f = &pin.file;
 
     k_stat_t ks;
     __builtin_memset(&ks, 0, sizeof(ks));
 
     if (f->ops->stat) {
         int rc = f->ops->stat(f->priv, &ks);
-        if (rc != 0) return SYS_ERR(EIO);
+        if (rc != 0) {
+            fd_table_unpin(&pin);
+            return SYS_ERR(EIO);
+        }
     } else {
         /* Synthesize minimal stat for drivers without a stat hook. */
         ks.st_mode  = S_IFREG | 0444;
@@ -469,7 +491,9 @@ sys_fstat(uint64_t arg1, uint64_t arg2)
         ks.st_nlink = 1;
     }
 
-    return emit_stat(arg2, &ks);
+    uint64_t result = emit_stat(arg2, &ks);
+    fd_table_unpin(&pin);
+    return result;
 }
 
 /*
@@ -519,9 +543,10 @@ uint64_t
 sys_ioctl(uint64_t arg1, uint64_t arg2, uint64_t arg3)
 {
     aegis_process_t *proc = current_proc();
-    if (arg1 >= PROC_MAX_FDS) return SYS_ERR(EBADF);
-    vfs_file_t *f = &proc->fd_table->fds[arg1];
-    if (!f->ops) return SYS_ERR(EBADF);
+    fd_table_pin_t pin __attribute__((cleanup(fd_table_unpin))) = {0};
+    if (!fd_table_pin(proc->fd_table, (int)arg1, &pin))
+        return SYS_ERR(EBADF);
+    vfs_file_t *f = &pin.file;
 
     /* Determine if this fd has an associated tty_t */
     tty_t *tty = (tty_t *)0;
@@ -581,17 +606,17 @@ sys_ioctl(uint64_t arg1, uint64_t arg2, uint64_t arg3)
                      * fd flag AND the per-socket nonblocking flag both update. */
         int on = 0;
         COPY_FROM_USER(&on, arg3);
-        if (on)
-            f->flags |= 0x800U;
-        else
-            f->flags &= ~0x800U;
+        if (!fd_table_update_flags(proc->fd_table, (int)arg1, &pin,
+                                   VFS_O_NONBLOCK,
+                                   on ? VFS_O_NONBLOCK : 0))
+            return SYS_ERR(EBADF);
         {
-            uint32_t sid2 = sock_id_from_fd((int)arg1, proc);
+            uint32_t sid2 = sock_id_from_file(f);
             if (sid2 != SOCK_NONE) {
                 sock_t *sk = sock_get(sid2);
                 if (sk) sk->nonblocking = on ? 1 : 0;
             }
-            uint32_t uid2 = unix_sock_id_from_fd((int)arg1, proc);
+            uint32_t uid2 = unix_sock_id_from_file(f);
             if (uid2 != UNIX_NONE) {
                 unix_sock_t *us = unix_sock_get(uid2);
                 if (us) us->nonblocking = on ? 1 : 0;
@@ -621,6 +646,76 @@ sys_ioctl(uint64_t arg1, uint64_t arg2, uint64_t arg3)
     }
 }
 
+/* Duplicate helpers serialize source validation, reference acquisition, and
+ * destination installation with close/dup2/fd_table_copy. Calling ->dup after
+ * dropping the table lock would leave the copied priv pointer freeable in the
+ * gap; installing before taking the reference has the same race. */
+static int
+fd_dup_lowest(fd_table_t *table, uint32_t oldfd, uint32_t floor,
+              int cloexec)
+{
+    irqflags_t fl = spin_lock_irqsave(&table->lock);
+    vfs_file_t source = table->fds[oldfd];
+    if (!source.ops || (source.ops->dup && !source.ops->close)) {
+        spin_unlock_irqrestore(&table->lock, fl);
+        return -EBADF;
+    }
+    uint32_t newfd;
+    for (newfd = floor; newfd < PROC_MAX_FDS; newfd++)
+        if (!table->fds[newfd].ops)
+            break;
+    if (newfd == PROC_MAX_FDS) {
+        spin_unlock_irqrestore(&table->lock, fl);
+        return -EMFILE;
+    }
+    if (source.ops->dup)
+        source.ops->dup(source.priv);
+    source.flags &= ~VFS_FD_CLOEXEC;
+    if (cloexec)
+        source.flags |= VFS_FD_CLOEXEC;
+    table->fds[newfd] = source;
+    spin_unlock_irqrestore(&table->lock, fl);
+    return (int)newfd;
+}
+
+static int
+fd_dup_exact(fd_table_t *table, uint32_t oldfd, uint32_t newfd,
+             int cloexec, int reject_same)
+{
+    const vfs_ops_t *replaced_ops = (const vfs_ops_t *)0;
+    void *replaced_priv = (void *)0;
+
+    irqflags_t fl = spin_lock_irqsave(&table->lock);
+    vfs_file_t source = table->fds[oldfd];
+    if (!source.ops || (source.ops->dup && !source.ops->close)) {
+        spin_unlock_irqrestore(&table->lock, fl);
+        return -EBADF;
+    }
+    if (oldfd == newfd) {
+        spin_unlock_irqrestore(&table->lock, fl);
+        return reject_same ? -EINVAL : (int)newfd;
+    }
+
+    /* Take the source reference before detaching the target. This is required
+     * when both descriptors name the same backing object and target close
+     * would otherwise drop its last reference. */
+    if (source.ops->dup)
+        source.ops->dup(source.priv);
+    replaced_ops  = table->fds[newfd].ops;
+    replaced_priv = table->fds[newfd].priv;
+    source.flags &= ~VFS_FD_CLOEXEC;
+    if (cloexec)
+        source.flags |= VFS_FD_CLOEXEC;
+    table->fds[newfd] = source;
+    spin_unlock_irqrestore(&table->lock, fl);
+
+    /* Object destruction can acquire object locks and must remain outside the
+     * fd-table spinlock. The installed source reference is already durable. */
+    if (replaced_ops && replaced_ops->close)
+        replaced_ops->close(replaced_priv);
+    return (int)newfd;
+}
+
 /*
  * sys_fcntl — syscall 72
  *
@@ -637,31 +732,46 @@ uint64_t
 sys_fcntl(uint64_t arg1, uint64_t arg2, uint64_t arg3)
 {
     aegis_process_t *proc = current_proc();
-    if (arg1 >= PROC_MAX_FDS) return SYS_ERR(EBADF);
-    vfs_file_t *f = &proc->fd_table->fds[arg1];
-    if (!f->ops) return SYS_ERR(EBADF);
+
+    if (arg2 == 0 || arg2 == 1030) {
+        if (arg1 >= PROC_MAX_FDS)
+            return SYS_ERR(EBADF);
+        if (arg3 >= PROC_MAX_FDS)
+            return SYS_ERR(EINVAL);
+        int new_fd = fd_dup_lowest(proc->fd_table, (uint32_t)arg1,
+                                   (uint32_t)arg3, arg2 == 1030);
+        return new_fd < 0 ? (uint64_t)(int64_t)new_fd
+                          : (uint64_t)(uint32_t)new_fd;
+    }
+
+    fd_table_pin_t pin __attribute__((cleanup(fd_table_unpin))) = {0};
+    if (!fd_table_pin(proc->fd_table, (int)arg1, &pin))
+        return SYS_ERR(EBADF);
+    vfs_file_t *f = &pin.file;
 
     switch (arg2) {
     case 1: /* F_GETFD — return FD_CLOEXEC (1) if set, 0 otherwise */
-        return (proc->fd_table->fds[arg1].flags & VFS_FD_CLOEXEC) ? 1 : 0;
+        return (f->flags & VFS_FD_CLOEXEC) ? 1 : 0;
     case 2: /* F_SETFD — set or clear FD_CLOEXEC based on arg3 bit 0 (FD_CLOEXEC=1) */
-        if (arg3 & 1)
-            proc->fd_table->fds[arg1].flags |= VFS_FD_CLOEXEC;
-        else
-            proc->fd_table->fds[arg1].flags &= ~VFS_FD_CLOEXEC;
-        return 0;
+        return fd_table_update_flags(proc->fd_table, (int)arg1, &pin,
+                                     VFS_FD_CLOEXEC,
+                                     (arg3 & 1) ? VFS_FD_CLOEXEC : 0)
+             ? 0 : SYS_ERR(EBADF);
     case 3: /* F_GETFL */ return (uint64_t)f->flags;
     case 4: /* F_SETFL */
-        f->flags = (f->flags & ~0x800U) | ((uint32_t)arg3 & 0x800U);
+        if (!fd_table_update_flags(proc->fd_table, (int)arg1, &pin,
+                                   VFS_O_NONBLOCK,
+                                   (uint32_t)arg3 & VFS_O_NONBLOCK))
+            return SYS_ERR(EBADF);
         /* Also update socket nonblocking flag if fd is a socket */
         {
-            uint32_t sid2 = sock_id_from_fd((int)arg1, proc);
+            uint32_t sid2 = sock_id_from_file(f);
             if (sid2 != SOCK_NONE) {
                 sock_t *sk = sock_get(sid2);
                 if (sk)
                     sk->nonblocking = (arg3 & 0x800U) ? 1 : 0;
             }
-            uint32_t uid2 = unix_sock_id_from_fd((int)arg1, proc);
+            uint32_t uid2 = unix_sock_id_from_file(f);
             if (uid2 != UNIX_NONE) {
                 unix_sock_t *us = unix_sock_get(uid2);
                 if (us)
@@ -669,25 +779,6 @@ sys_fcntl(uint64_t arg1, uint64_t arg2, uint64_t arg3)
             }
         }
         return 0;
-    case 0:   /* F_DUPFD */
-    case 1030: { /* F_DUPFD_CLOEXEC (0x406) — same as F_DUPFD + set FD_CLOEXEC */
-        /* Reject an out-of-range floor rather than truncating it: arg3 is a
-         * 64-bit user value and casting to uint32_t made e.g. 0x1_0000_0000
-         * wrap to 0, so a caller asking for "lowest fd >= 4 billion" got fd 0
-         * — quietly duplicating onto stdin. */
-        if (arg3 >= PROC_MAX_FDS)
-            return SYS_ERR(EINVAL);
-        uint32_t new_fd;
-        for (new_fd = (uint32_t)arg3; new_fd < PROC_MAX_FDS; new_fd++) {
-            if (!proc->fd_table->fds[new_fd].ops) break;
-        }
-        if (new_fd >= PROC_MAX_FDS) return SYS_ERR(EMFILE);
-        proc->fd_table->fds[new_fd] = *f; /* struct copy */
-        proc->fd_table->fds[new_fd].flags &= ~VFS_FD_CLOEXEC;   /* clear first */
-        if (arg2 == 1030) proc->fd_table->fds[new_fd].flags |= VFS_FD_CLOEXEC;
-        if (f->ops->dup) f->ops->dup(f->priv);
-        return (uint64_t)new_fd;
-    }
     /* Advisory record locking. Aegis has no multi-process file locking, but
      * SQLite (Ladybird's cookie/storage store) locks its DB with fcntl and
      * reports "disk I/O error" if the call returns EINVAL. Grant locks as
@@ -728,17 +819,22 @@ uint64_t
 sys_lseek(uint64_t arg1, uint64_t arg2, uint64_t arg3)
 {
     aegis_process_t *proc = current_proc();
-    if (arg1 >= PROC_MAX_FDS || !proc->fd_table->fds[arg1].ops)
+    if (arg1 >= PROC_MAX_FDS)
         return SYS_ERR(EBADF);
-    vfs_file_t *f = &proc->fd_table->fds[arg1];
+    fd_table_pin_t pin;
+    if (!fd_table_pin(proc->fd_table, (int)arg1, &pin))
+        return SYS_ERR(EBADF);
+    vfs_file_t *f = &pin.file;
 
     /* Stream fds (pipe/console/kbd/char devices) are non-seekable: ESPIPE.
      * We only need to disambiguate at size==0 — a non-empty fd is already a
      * real file. A size-0 fd is a stream UNLESS its driver marks itself
      * seekable (a freshly-created regular file, e.g. an .o `as` is about to
      * seek around while writing the ELF). */
-    if (f->size == 0 && !(f->ops && f->ops->seekable))
+    if (f->size == 0 && !f->ops->seekable) {
+        fd_table_unpin(&pin);
         return SYS_ERR(ESPIPE);   /* -ESPIPE */
+    }
 
     int64_t new_off;
     int64_t off = (int64_t)arg2;
@@ -748,30 +844,42 @@ sys_lseek(uint64_t arg1, uint64_t arg2, uint64_t arg3)
         /* S3: Safe signed overflow checks for SEEK_CUR.
          * The old guards used 0x8000000000000000LL which is UB. */
         int64_t cur = (int64_t)f->offset;
-        if (off > 0 && cur > (int64_t)0x7FFFFFFFFFFFFFFFLL - off)
+        if (off > 0 && cur > (int64_t)0x7FFFFFFFFFFFFFFFLL - off) {
+            fd_table_unpin(&pin);
             return (uint64_t)(int64_t)-22;  /* -EINVAL */
-        if (off < 0 && cur < (int64_t)(-0x7FFFFFFFFFFFFFFFLL - 1) - off)
+        }
+        if (off < 0 && cur < (int64_t)(-0x7FFFFFFFFFFFFFFFLL - 1) - off) {
+            fd_table_unpin(&pin);
             return (uint64_t)(int64_t)-22;  /* -EINVAL */
+        }
         new_off = (int64_t)f->offset + off;
     } else if (arg3 == 2) { /* SEEK_END */
         /* Guard against signed overflow: f->size is uint64_t.
          * Reject if f->size itself exceeds INT64_MAX, or if adding a positive
          * off would push the result past INT64_MAX. */
         if (f->size > (uint64_t)0x7FFFFFFFFFFFFFFFLL ||
-            (off > 0 && (int64_t)f->size > (int64_t)0x7FFFFFFFFFFFFFFFLL - off))
+            (off > 0 && (int64_t)f->size > (int64_t)0x7FFFFFFFFFFFFFFFLL - off)) {
+            fd_table_unpin(&pin);
             return SYS_ERR(EINVAL);
+        }
         new_off = (int64_t)f->size + off;
-    } else
+    } else {
+        fd_table_unpin(&pin);
         return SYS_ERR(EINVAL);
+    }
 
-    if (new_off < 0)
+    if (new_off < 0) {
+        fd_table_unpin(&pin);
         return SYS_ERR(EINVAL);
-    f->offset = (uint64_t)new_off;
+    }
     /* Sync the driver's internal write cursor: ops->write takes no offset, so a
      * seek-then-write (e.g. `as` patching an ELF header) would otherwise write
      * at the stale position and corrupt the file. */
     if (f->ops->seek)
         f->ops->seek(f->priv, (uint64_t)new_off);
+    fd_table_set_offset(proc->fd_table, (int)arg1, &pin,
+                        (uint64_t)new_off);
+    fd_table_unpin(&pin);
     return (uint64_t)new_off;
 }
 
@@ -793,18 +901,6 @@ sys_pipe2(uint64_t arg1, uint64_t arg2)
     if (!user_ptr_valid(arg1, 2 * sizeof(int)))
         return SYS_ERR(EFAULT);
 
-    /* Find two free fd slots */
-    int rfd = -1, wfd = -1;
-    int i;
-    for (i = 0; i < PROC_MAX_FDS; i++) {
-        if (!proc->fd_table->fds[i].ops) {
-            if (rfd < 0) { rfd = i; }
-            else         { wfd = i; break; }
-        }
-    }
-    if (wfd < 0)
-        return SYS_ERR(EMFILE);
-
     /* Allocate and zero-initialize pipe_t (exactly one kva page) */
     pipe_t *p = kva_alloc_pages(1);
     if (!p)
@@ -813,24 +909,48 @@ sys_pipe2(uint64_t arg1, uint64_t arg2)
     refcount_init(&p->read_refs, 1);
     refcount_init(&p->write_refs, 1);
 
-    /* Install read end */
-    proc->fd_table->fds[rfd].ops    = &g_pipe_read_ops;
-    proc->fd_table->fds[rfd].priv   = p;
-    proc->fd_table->fds[rfd].offset = 0;
-    proc->fd_table->fds[rfd].size   = 0;
-    proc->fd_table->fds[rfd].flags  = 0;
-
-    /* Install write end */
-    proc->fd_table->fds[wfd].ops    = &g_pipe_write_ops;
-    proc->fd_table->fds[wfd].priv   = p;
-    proc->fd_table->fds[wfd].offset = 0;
-    proc->fd_table->fds[wfd].size   = 0;
-    proc->fd_table->fds[wfd].flags  = VFS_O_WRONLY;
+    /* Build both descriptors completely before either becomes visible. */
+    vfs_file_t read_end;
+    vfs_file_t write_end;
+    __builtin_memset(&read_end, 0, sizeof(read_end));
+    __builtin_memset(&write_end, 0, sizeof(write_end));
+    read_end.ops   = &g_pipe_read_ops;
+    read_end.priv  = p;
+    write_end.ops  = &g_pipe_write_ops;
+    write_end.priv = p;
+    write_end.flags = VFS_O_WRONLY;
 
     /* Propagate O_CLOEXEC to both pipe ends */
     if (pipe_flags & VFS_O_CLOEXEC) {
-        proc->fd_table->fds[rfd].flags |= VFS_FD_CLOEXEC;
-        proc->fd_table->fds[wfd].flags |= VFS_FD_CLOEXEC;
+        read_end.flags  |= VFS_FD_CLOEXEC;
+        write_end.flags |= VFS_FD_CLOEXEC;
+    }
+
+    /* Reserve and publish the pair in one critical section. A concurrent
+     * open/dup can observe neither end or both ends, never claim one of the
+     * preselected slots or see a half-initialized descriptor. */
+    int rfd = -1, wfd = -1;
+    irqflags_t fl = spin_lock_irqsave(&proc->fd_table->lock);
+    for (int i = 0; i < PROC_MAX_FDS; i++) {
+        if (!proc->fd_table->fds[i].ops) {
+            if (rfd < 0)
+                rfd = i;
+            else {
+                wfd = i;
+                break;
+            }
+        }
+    }
+    if (wfd >= 0) {
+        proc->fd_table->fds[rfd] = read_end;
+        proc->fd_table->fds[wfd] = write_end;
+    }
+    spin_unlock_irqrestore(&proc->fd_table->lock, fl);
+    if (wfd < 0) {
+        /* Neither end was published; drop both initial references. */
+        g_pipe_read_ops.close(p);
+        g_pipe_write_ops.close(p);
+        return SYS_ERR(EMFILE);
     }
 
     /* Write [rfd, wfd] to user pipefd array */
@@ -852,24 +972,11 @@ uint64_t
 sys_dup(uint64_t arg1)
 {
     aegis_process_t *proc = current_proc();
-    if (arg1 >= PROC_MAX_FDS || !proc->fd_table->fds[arg1].ops)
+    if (arg1 >= PROC_MAX_FDS)
         return SYS_ERR(EBADF);
-
-    int newfd = -1;
-    int i;
-    for (i = 0; i < PROC_MAX_FDS; i++) {
-        if (!proc->fd_table->fds[i].ops) { newfd = i; break; }
-    }
-    if (newfd < 0)
-        return SYS_ERR(EMFILE);
-
-    /* Copy fd struct by value, then bump refcount via dup hook. */
-    proc->fd_table->fds[newfd] = proc->fd_table->fds[arg1];
-    proc->fd_table->fds[newfd].flags &= ~VFS_FD_CLOEXEC;  /* POSIX: dup clears FD_CLOEXEC */
-    if (proc->fd_table->fds[newfd].ops->dup)
-        proc->fd_table->fds[newfd].ops->dup(proc->fd_table->fds[newfd].priv);
-
-    return (uint64_t)newfd;
+    int newfd = fd_dup_lowest(proc->fd_table, (uint32_t)arg1, 0, 0);
+    return newfd < 0 ? (uint64_t)(int64_t)newfd
+                     : (uint64_t)(uint32_t)newfd;
 }
 
 /*
@@ -884,34 +991,14 @@ uint64_t
 sys_dup2(uint64_t arg1, uint64_t arg2)
 {
     aegis_process_t *proc = current_proc();
-    if (arg1 >= PROC_MAX_FDS || !proc->fd_table->fds[arg1].ops)
+    if (arg1 >= PROC_MAX_FDS)
         return SYS_ERR(EBADF);
     if (arg2 >= PROC_MAX_FDS)
         return SYS_ERR(EBADF);
-    if (arg1 == arg2)
-        return arg2;            /* no-op per POSIX */
-
-    /* Close existing target fd. Detach under the table lock (so a concurrent
-     * fd_table_copy cannot snapshot a slot we are releasing), then close after
-     * the unlock — ops->close must not run under a spinlock. */
-    irqflags_t dfl = spin_lock_irqsave(&proc->fd_table->lock);
-    const vfs_ops_t *oldops = proc->fd_table->fds[arg2].ops;
-    void            *oldpriv = proc->fd_table->fds[arg2].priv;
-    if (oldops)
-        __builtin_memset(&proc->fd_table->fds[arg2], 0, sizeof(vfs_file_t));
-    spin_unlock_irqrestore(&proc->fd_table->lock, dfl);
-    if (oldops && oldops->close)
-        oldops->close(oldpriv);
-
-    /* Copy fd struct by value, then bump refcount via dup hook. */
-    dfl = spin_lock_irqsave(&proc->fd_table->lock);
-    proc->fd_table->fds[arg2] = proc->fd_table->fds[arg1];
-    proc->fd_table->fds[arg2].flags &= ~VFS_FD_CLOEXEC;  /* POSIX: dup2 clears FD_CLOEXEC */
-    if (proc->fd_table->fds[arg2].ops && proc->fd_table->fds[arg2].ops->dup)
-        proc->fd_table->fds[arg2].ops->dup(proc->fd_table->fds[arg2].priv);
-    spin_unlock_irqrestore(&proc->fd_table->lock, dfl);
-
-    return arg2;
+    int newfd = fd_dup_exact(proc->fd_table, (uint32_t)arg1,
+                             (uint32_t)arg2, 0, 0);
+    return newfd < 0 ? (uint64_t)(int64_t)newfd
+                     : (uint64_t)(uint32_t)newfd;
 }
 
 /* sys_dup3 — syscall 292 (x86_64) / 24 (arm64): like dup2 but rejects oldfd==newfd
@@ -921,16 +1008,16 @@ sys_dup2(uint64_t arg1, uint64_t arg2)
 uint64_t
 sys_dup3(uint64_t oldfd, uint64_t newfd, uint64_t flags)
 {
-    if (oldfd == newfd)
+    if (flags & ~0x80000ULL)
         return SYS_ERR(EINVAL);
-    uint64_t r = sys_dup2(oldfd, newfd);
-    if (r != newfd)
-        return r;                       /* dup2 errored (SYS_ERR band) */
-    if (flags & 0x80000u) {             /* O_CLOEXEC */
-        aegis_process_t *proc = current_proc();
-        proc->fd_table->fds[newfd].flags |= VFS_FD_CLOEXEC;
-    }
-    return newfd;
+    if (oldfd >= PROC_MAX_FDS || newfd >= PROC_MAX_FDS)
+        return SYS_ERR(EBADF);
+    aegis_process_t *proc = current_proc();
+    int result = fd_dup_exact(proc->fd_table, (uint32_t)oldfd,
+                              (uint32_t)newfd,
+                              (flags & 0x80000ULL) != 0, 1);
+    return result < 0 ? (uint64_t)(int64_t)result
+                      : (uint64_t)(uint32_t)result;
 }
 
 /* sys_getrusage — syscall 98: resource usage. Aegis keeps no per-process rusage

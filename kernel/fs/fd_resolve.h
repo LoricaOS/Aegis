@@ -11,7 +11,7 @@
  * The raw `fds[fd].ops` compare appears ~60×. The helpers:
  *   - sock_id_from_fd        net/socket.c
  *   - unix_sock_id_from_fd   net/unix_socket.c
- *   - epoll_id_from_fd       net/epoll.c
+ *   - epoll uses fd_table_pin + epoll_id_from_file (close-safe)
  *   - memfd_from_fd          fs/memfd.c
  *   - get_proc_sock (wraps sock_id_from_fd)  syscall/sys_socket.c
  *

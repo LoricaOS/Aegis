@@ -151,10 +151,13 @@ int unix_sock_stage_fds(uint32_t peer_id, unix_passed_fd_t *fds, uint8_t count);
 int unix_sock_recv_fds(uint32_t id, int *fd_out, int max_fds);
 
 /* Open an fd backed by a unix socket. Returns fd or -1. */
-int unix_sock_open_fd(uint32_t sock_id, void *proc);
+int unix_sock_open_fd(uint32_t sock_id, void *proc, uint32_t flags);
+int unix_sock_open_pair_fds(uint32_t sid0, uint32_t sid1, void *proc,
+                            int *fd0_out, int *fd1_out);
 
 /* Get unix_sock_id from an fd. Returns UNIX_NONE if not a unix socket. */
 uint32_t unix_sock_id_from_fd(int fd, void *proc);
+uint32_t unix_sock_id_from_file(const vfs_file_t *file);
 
 /* Get the wait queue for an AF_UNIX socket. Used by sys_poll. */
 waitq_t *unix_sock_get_waitq(uint32_t id);

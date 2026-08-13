@@ -1027,26 +1027,72 @@ int unix_sock_recv_fds(uint32_t id, int *fd_out, int max_fds)
 
 /* ── fd helpers ────────────────────────────────────────────────────────── */
 
-int unix_sock_open_fd(uint32_t sock_id, void *proc_ptr)
+int unix_sock_open_fd(uint32_t sock_id, void *proc_ptr, uint32_t flags)
 {
     aegis_process_t *proc = (aegis_process_t *)proc_ptr;
+    vfs_file_t file = {
+        .ops = &g_unix_sock_ops,
+        .priv = (void *)(uintptr_t)sock_id,
+        .offset = 0,
+        .size = 0,
+        .flags = VFS_O_RDWR | flags,
+        .kflags = 0,
+    };
+    irqflags_t fl = spin_lock_irqsave(&proc->fd_table->lock);
     for (int i = 0; i < PROC_MAX_FDS; i++) {
         if (!proc->fd_table->fds[i].ops) {
-            proc->fd_table->fds[i].ops    = &g_unix_sock_ops;
-            proc->fd_table->fds[i].priv   = (void *)(uintptr_t)sock_id;
-            proc->fd_table->fds[i].offset = 0;
-            proc->fd_table->fds[i].size   = 0;
-            proc->fd_table->fds[i].flags  = VFS_O_RDWR;
+            proc->fd_table->fds[i] = file;
+            spin_unlock_irqrestore(&proc->fd_table->lock, fl);
             return i;
         }
     }
+    spin_unlock_irqrestore(&proc->fd_table->lock, fl);
     return -1;
+}
+
+int
+unix_sock_open_pair_fds(uint32_t sid0, uint32_t sid1, void *proc_ptr,
+                        int *fd0_out, int *fd1_out)
+{
+    aegis_process_t *proc = (aegis_process_t *)proc_ptr;
+    irqflags_t fl = spin_lock_irqsave(&proc->fd_table->lock);
+    int fd0 = -1, fd1 = -1;
+    for (int fd = 0; fd < PROC_MAX_FDS; fd++) {
+        if (proc->fd_table->fds[fd].ops) continue;
+        if (fd0 < 0) fd0 = fd;
+        else { fd1 = fd; break; }
+    }
+    if (fd1 < 0) {
+        spin_unlock_irqrestore(&proc->fd_table->lock, fl);
+        return -1;
+    }
+    vfs_file_t file = {
+        .ops = &g_unix_sock_ops,
+        .offset = 0,
+        .size = 0,
+        .flags = VFS_O_RDWR,
+        .kflags = 0,
+    };
+    file.priv = (void *)(uintptr_t)sid0;
+    proc->fd_table->fds[fd0] = file;
+    file.priv = (void *)(uintptr_t)sid1;
+    proc->fd_table->fds[fd1] = file;
+    spin_unlock_irqrestore(&proc->fd_table->lock, fl);
+    *fd0_out = fd0;
+    *fd1_out = fd1;
+    return 0;
 }
 
 uint32_t unix_sock_id_from_fd(int fd, void *proc_ptr)
 {
     vfs_file_t *f = fd_resolve((aegis_process_t *)proc_ptr, fd, &g_unix_sock_ops);
     return f ? (uint32_t)(uintptr_t)f->priv : UNIX_NONE;
+}
+
+uint32_t unix_sock_id_from_file(const vfs_file_t *file)
+{
+    return file && file->ops == &g_unix_sock_ops
+         ? (uint32_t)(uintptr_t)file->priv : UNIX_NONE;
 }
 
 waitq_t *

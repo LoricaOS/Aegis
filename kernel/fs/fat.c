@@ -27,6 +27,7 @@
 #include "vfs.h"
 #include "blkdev.h"
 #include "printk.h"
+#include "smp.h"
 #include "../lib/string.h"
 #include "../include/aegis_errno.h"
 
@@ -55,7 +56,35 @@ static uint8_t   s_nfats;           /* number of FAT copies (write to all) */
 static uint32_t  s_fat_size;        /* sectors per FAT                     */
 static uint32_t  s_next_free;       /* allocation search hint              */
 
-static irqflags_t s_lock_flags;     /* trivial big lock (single-threaded mount) */
+/* FAT has one mounted volume and no cache-level locking, so serialize path
+ * resolution and mutation with one recursive lock.  The recursion is needed
+ * because syscall gates hold g_rootfs->lock across resolve+mutate and the
+ * mutator also takes this lock when called directly (for example by vfs_open's
+ * create path). */
+static spinlock_t   s_fat_lock = SPINLOCK_INIT;
+static volatile int s_fat_owner = -1;
+static int           s_fat_depth;
+
+static irqflags_t fat_lock_acquire(void) {
+    irqflags_t fl = arch_irq_save();
+    int cpu = (int)percpu_self()->cpu_id;
+    if (s_fat_owner == cpu) {
+        s_fat_depth++;
+        return fl;
+    }
+    spin_lock(&s_fat_lock);
+    s_fat_owner = cpu;
+    s_fat_depth = 1;
+    return fl;
+}
+
+static void fat_lock_release(irqflags_t fl) {
+    if (--s_fat_depth == 0) {
+        s_fat_owner = -1;
+        spin_unlock(&s_fat_lock);
+    }
+    arch_irq_restore(fl);
+}
 
 #ifdef CONFIG_KERNEL_TESTS
 static void fat_selftest(void);     /* create+write+read roundtrip on mount */
@@ -347,8 +376,8 @@ static int  fat_sync(void)                          { return 0; }
 static int  fat_statfs(uint64_t *t, uint64_t *f)    { if (t) *t = (uint64_t)s_total_clusters * s_spc / 2; if (f) *f = 0; return 0; }
 static void fat_mark_clean(void)                    { }
 static const char *fat_devname(void)                { return s_dev ? s_dev->name : "none"; }
-static irqflags_t fat_lock(void)                    { return s_lock_flags; }
-static void fat_unlock(irqflags_t fl)               { (void)fl; }
+static irqflags_t fat_lock(void)                    { return fat_lock_acquire(); }
+static void fat_unlock(irqflags_t fl)               { fat_lock_release(fl); }
 static uint32_t fat_ino_of(const void *o, void *p)  { (void)o; return p ? ((ext2_fd_priv_t *)p)->ino : 0; }
 
 /* ---- fs_ops: path -> inode ------------------------------------------- */
@@ -398,6 +427,19 @@ static int fat_under_prot(const char *path)
         return 0;
     return fat_path_under(path, "/bin")  || fat_path_under(path, "/sbin") ||
            fat_path_under(path, "/apps") || fat_path_under(path, "/etc/aegis");
+}
+
+/* Namespace changes must also protect ancestors: moving /etc aside is as
+ * effective as modifying /etc/aegis directly.  FAT has no symlinks or hard
+ * links, so normalized path intersection is its authoritative identity test. */
+static int fat_path_guarded(const char *path)
+{
+    static const char *trees[] = { "/bin", "/sbin", "/apps", "/etc/aegis" };
+    if (!path || path[0] != '/') return 0;
+    for (uint32_t i = 0; i < sizeof(trees) / sizeof(trees[0]); i++)
+        if (fat_path_under(path, trees[i]) || fat_path_under(trees[i], path))
+            return 1;
+    return 0;
 }
 
 static int fat_open_prot(const char *path, uint32_t *ino, int *prot)
@@ -783,20 +825,44 @@ static int fat_make(const char *path, int dir) {
 
 /* ---- fs_ops: write half ---------------------------------------------- */
 
-static int fat_create(const char *p, uint16_t m, int h) { (void)m; (void)h; return fat_make(p, 0); }
-static int fat_mkdir(const char *p, uint16_t m, int h)  { (void)m; (void)h; return fat_make(p, 1); }
+static int fat_create(const char *p, uint16_t m, int h) {
+    (void)m;
+    irqflags_t fl = fat_lock_acquire();
+    uint32_t existing;
+    int r = (!h && fat_path_guarded(p)) ? -EPERM
+          : (resolve(p, &existing, 0, 0, 0) == 0) ? -EEXIST
+          : fat_make(p, 0);
+    fat_lock_release(fl);
+    return r;
+}
+static int fat_mkdir(const char *p, uint16_t m, int h) {
+    (void)m;
+    irqflags_t fl = fat_lock_acquire();
+    uint32_t existing;
+    int r = (!h && fat_path_guarded(p)) ? -EPERM
+          : (resolve(p, &existing, 0, 0, 0) == 0) ? -EEXIST
+          : fat_make(p, 1);
+    fat_lock_release(fl);
+    return r;
+}
 
 static int fat_unlink(const char *path, int h) {
-    (void)h;
+    irqflags_t fl = fat_lock_acquire();
+    if (!h && fat_path_guarded(path)) {
+        fat_lock_release(fl);
+        return -EPERM;
+    }
     uint32_t ino; fat_dirent_t d;
     int r = resolve(path, &ino, &d, 0, 0);
-    if (r) return r;
-    if (d.attr & ATTR_DIR) return -EISDIR;
+    if (r) { fat_lock_release(fl); return r; }
+    if (d.attr & ATTR_DIR) { fat_lock_release(fl); return -EISDIR; }
     if (d.first_cluster >= 2) fat_free_chain(d.first_cluster);
     uint32_t lba = ino >> 5, idx = ino & 31; uint8_t sec[SECTOR];
-    if (fat_read_lba(lba, sec) != 0) return -EIO;
+    if (fat_read_lba(lba, sec) != 0) { fat_lock_release(fl); return -EIO; }
     sec[idx * DIRENT_SIZE] = 0xE5;
-    return fat_write_lba(lba, sec) == 0 ? 0 : -EIO;
+    r = fat_write_lba(lba, sec) == 0 ? 0 : -EIO;
+    fat_lock_release(fl);
+    return r;
 }
 
 /* inode-level write: extend the chain as needed, RMW partial sectors, grow size */
@@ -865,41 +931,56 @@ static int notempty_cb(const char *name, uint32_t ino, const fat_dirent_t *d, vo
     return 1;   /* found a real entry — stop */
 }
 static int fat_rmdir(const char *path, int h) {
-    (void)h;
+    irqflags_t fl = fat_lock_acquire();
+    if (!h && fat_path_guarded(path)) {
+        fat_lock_release(fl);
+        return -EPERM;
+    }
     uint32_t ino; fat_dirent_t d;
     int r = resolve(path, &ino, &d, 0, 0);
-    if (r) return r;
-    if (!(d.attr & ATTR_DIR)) return -ENOTDIR;
+    if (r) { fat_lock_release(fl); return r; }
+    if (!(d.attr & ATTR_DIR)) { fat_lock_release(fl); return -ENOTDIR; }
     int nonempty = 0;
     walk_dir(d.first_cluster, notempty_cb, &nonempty);
-    if (nonempty) return -ENOTEMPTY;
+    if (nonempty) { fat_lock_release(fl); return -ENOTEMPTY; }
     if (d.first_cluster >= 2) fat_free_chain(d.first_cluster);
     uint32_t lba = ino >> 5, idx = ino & 31; uint8_t sec[SECTOR];
-    if (fat_read_lba(lba, sec) != 0) return -EIO;
+    if (fat_read_lba(lba, sec) != 0) { fat_lock_release(fl); return -EIO; }
     sec[idx * DIRENT_SIZE] = 0xE5;
-    return fat_write_lba(lba, sec) == 0 ? 0 : -EIO;
+    r = fat_write_lba(lba, sec) == 0 ? 0 : -EIO;
+    fat_lock_release(fl);
+    return r;
 }
 /* rename/move: create a new dir entry pointing at the same cluster chain, then
  * delete the old one (the data is NOT freed — it moved). A moved directory's
  * ".." still points at its old parent — a known limitation for now. */
 static int fat_rename(const char *old, const char *neu, int h) {
-    (void)h;
+    irqflags_t fl = fat_lock_acquire();
+    if (!h && (fat_path_guarded(old) || fat_path_guarded(neu))) {
+        fat_lock_release(fl);
+        return -EPERM;
+    }
     uint32_t oino; fat_dirent_t od;
     int r = resolve(old, &oino, &od, 0, 0);
-    if (r) return r;
+    if (r) { fat_lock_release(fl); return r; }
     uint32_t tmp; fat_dirent_t td;
-    if (resolve(neu, &tmp, &td, 0, 0) == 0) return -EEXIST;
+    if (resolve(neu, &tmp, &td, 0, 0) == 0) { fat_lock_release(fl); return -EEXIST; }
     uint32_t pcl; char base[256];
-    if ((r = split_parent(neu, &pcl, base)) != 0) return r;
+    if ((r = split_parent(neu, &pcl, base)) != 0) { fat_lock_release(fl); return r; }
     uint8_t raw[11];
-    if (to_83(base, raw) != 0) return -EINVAL;   /* long dest names: later */
+    if (to_83(base, raw) != 0) { fat_lock_release(fl); return -EINVAL; } /* long dest names: later */
     uint32_t lba, idx;
-    if (find_free_slot(pcl, &lba, &idx) != 0) return -ENOSPC;
-    if ((r = write_entry(lba, idx, raw, od.attr, od.first_cluster, od.size)) != 0) return r;
+    if (find_free_slot(pcl, &lba, &idx) != 0) { fat_lock_release(fl); return -ENOSPC; }
+    if ((r = write_entry(lba, idx, raw, od.attr, od.first_cluster, od.size)) != 0) {
+        fat_lock_release(fl);
+        return r;
+    }
     uint32_t olba = oino >> 5, oidx = oino & 31; uint8_t sec[SECTOR];
-    if (fat_read_lba(olba, sec) != 0) return -EIO;
+    if (fat_read_lba(olba, sec) != 0) { fat_lock_release(fl); return -EIO; }
     sec[oidx * DIRENT_SIZE] = 0xE5;
-    return fat_write_lba(olba, sec) == 0 ? 0 : -EIO;
+    r = fat_write_lba(olba, sec) == 0 ? 0 : -EIO;
+    fat_lock_release(fl);
+    return r;
 }
 static int fat_link(const char *a, const char *b, int h)   { (void)a; (void)b; (void)h; return -EPERM; }
 static int fat_symlink(const char *a, const char *b, int h){ (void)a; (void)b; (void)h; return -EPERM; }
@@ -918,11 +999,15 @@ static ext2_fd_priv_t *fat_pool_alloc(uint32_t ino) {
     for (int i = 0; i < FAT_FDS; i++)
         if (!__atomic_exchange_n(&s_fds[i].in_use, 1, __ATOMIC_ACQ_REL)) {
             s_fds[i].ino = ino; s_fds[i].write_offset = 0;
+            refcount_init(&s_fds[i].ref_count, 1);
             return &s_fds[i];
         }
     return 0;
 }
-static void fat_pool_free(ext2_fd_priv_t *p) { if (p) __atomic_store_n(&p->in_use, 0, __ATOMIC_RELEASE); }
+static void fat_pool_free(ext2_fd_priv_t *p) {
+    if (p && refcount_dec_and_test(&p->ref_count))
+        __atomic_store_n(&p->in_use, 0, __ATOMIC_RELEASE);
+}
 
 static int  fat_f_read(void *priv, void *buf, uint64_t off, uint64_t len) { return fat_read(((ext2_fd_priv_t *)priv)->ino, buf, off, (uint32_t)len); }
 static int  fat_f_write(void *priv, const void *buf, uint64_t len) {
@@ -933,7 +1018,9 @@ static int  fat_f_write(void *priv, const void *buf, uint64_t len) {
 }
 static void fat_f_seek(void *priv, uint64_t off)  { ((ext2_fd_priv_t *)priv)->write_offset = (uint32_t)off; }
 static void fat_f_close(void *priv) { fat_pool_free((ext2_fd_priv_t *)priv); }
-static void fat_f_dup(void *priv)   { (void)priv; }
+static void fat_f_dup(void *priv)   {
+    if (priv) refcount_inc(&((ext2_fd_priv_t *)priv)->ref_count);
+}
 static int  fat_f_readdir(void *priv, uint64_t index, char *name, uint8_t *type) { return fat_readdir(((ext2_fd_priv_t *)priv)->ino, index, name, type); }
 
 static const vfs_ops_t fat_file_ops = {
@@ -955,8 +1042,28 @@ static void fat_selftest(void) {
     static const char msg[] = "AEGIS FAT WRITE OK\n";
     uint32_t wl = (uint32_t)(sizeof(msg) - 1), ino;
 
+    /* Security regressions: the check is inside the same recursive lock as
+     * mutation, INSTALL bypasses only that check, and dup keeps its pool slot
+     * alive until the final close. */
+    int ar = fat_create("/bin/AEGIS-FAT-CAP-TEST.TMP", 0644, 1);
+    int ok = (fat_create("/bin/AEGIS-FAT-DENY.TMP", 0644, 0) == -EPERM)
+          && (fat_mkdir("/etc", 0755, 0) == -EPERM)
+          && (fat_rename("/tmp/x", "/apps/x", 0) == -EPERM)
+          && (ar != -EPERM);
+    if (ar == 0) (void)fat_unlink("/bin/AEGIS-FAT-CAP-TEST.TMP", 1);
+    printk("[FAT] TEST install mutation gate %s\n", ok ? "PASS" : "FAIL");
+
+    ext2_fd_priv_t *held = fat_pool_alloc(0x1234u);
+    fat_f_dup(held);
+    fat_f_close(held);
+    ext2_fd_priv_t *next = fat_pool_alloc(0x5678u);
+    ok = held && next && next != held && held->ino == 0x1234u;
+    fat_f_close(next);
+    fat_f_close(held);
+    printk("[FAT] TEST dup-close lifetime %s\n", ok ? "PASS" : "FAIL");
+
     /* 1. 8.3 create + write + read-back */
-    int ok = (fat_create("/FATTEST.TXT", 0644, 0) == 0)
+    ok = (fat_create("/FATTEST.TXT", 0644, 0) == 0)
           && (fat_open("/FATTEST.TXT", &ino) == 0)
           && (fat_write(ino, msg, 0, wl) == (int)wl);
     if (ok) {
@@ -965,6 +1072,11 @@ static void fat_selftest(void) {
         for (uint32_t i = 0; i < wl && ok; i++) if (rb[i] != msg[i]) ok = 0;
     }
     printk("[FAT] TEST short-name write %s\n", ok ? "PASS" : "FAIL");
+
+    /* O_CREAT collision: refuse the existing name before allocating or
+     * appending another directory entry. */
+    ok = (fat_create("/FATTEST.TXT", 0644, 0) == -EEXIST);
+    printk("[FAT] TEST duplicate create %s\n", ok ? "PASS" : "FAIL");
 
     /* 2. long (VFAT) name: create, then resolve it BY the long name */
     const char *lname = "/A Long Filename.txt";

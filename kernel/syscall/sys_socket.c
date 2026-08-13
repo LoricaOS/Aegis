@@ -83,16 +83,52 @@ typedef struct {
 /* ── Helpers ────────────────────────────────────────────────────────────── */
 
 static uint64_t
-get_proc_sock(uint64_t fd_arg, sock_t **s_out, uint32_t *sid_out)
+get_sock_from_pin(fd_table_pin_t *pin, sock_t **s_out, uint32_t *sid_out)
 {
-    aegis_process_t *proc = current_proc();
-    uint32_t sid = sock_id_from_fd((int)fd_arg, proc);
+    uint32_t sid = sock_id_from_file(&pin->file);
     if (sid == SOCK_NONE) return SYS_ERR(EBADF);
     sock_t *s = sock_get(sid);
     if (!s) return SYS_ERR(EBADF);
     *s_out   = s;
     *sid_out = sid;
     return 0;
+}
+
+static uint64_t
+get_proc_sock(uint64_t fd_arg, fd_table_pin_t *pin,
+              sock_t **s_out, uint32_t *sid_out)
+{
+    aegis_process_t *proc = current_proc();
+    if (!fd_table_pin(proc->fd_table, (int)fd_arg, pin))
+        return SYS_ERR(EBADF);
+    return get_sock_from_pin(pin, s_out, sid_out);
+}
+
+static uint32_t
+get_proc_unix_sock(uint64_t fd_arg, fd_table_pin_t *pin)
+{
+    aegis_process_t *proc = current_proc();
+    if (!fd_table_pin(proc->fd_table, (int)fd_arg, pin))
+        return UNIX_NONE;
+    return unix_sock_id_from_file(&pin->file);
+}
+
+#define SCOPED_FD_PIN(name) \
+    fd_table_pin_t name __attribute__((cleanup(fd_table_unpin))) = {0}
+
+static int
+detach_unix_fd(fd_table_t *table, int fd, uint32_t sid)
+{
+    if (fd < 0 || fd >= PROC_MAX_FDS)
+        return 0;
+    irqflags_t fl = spin_lock_irqsave(&table->lock);
+    vfs_file_t *slot = &table->fds[fd];
+    int same = slot->ops == &g_unix_sock_ops &&
+               (uint32_t)(uintptr_t)slot->priv == sid;
+    if (same)
+        __builtin_memset(slot, 0, sizeof(*slot));
+    spin_unlock_irqrestore(&table->lock, fl);
+    return same;
 }
 
 /* ── sys_socket ────────────────────────────────────────────────────────── */
@@ -150,7 +186,8 @@ sys_socket(uint64_t domain, uint64_t type, uint64_t proto)
             unix_sock_t *us = unix_sock_get((uint32_t)uid);
             if (us) us->nonblocking = 1;
         }
-        int fd = unix_sock_open_fd((uint32_t)uid, proc);
+        uint32_t fd_flags = (type & SOCK_FLAG_CLOEXEC) ? VFS_FD_CLOEXEC : 0;
+        int fd = unix_sock_open_fd((uint32_t)uid, proc, fd_flags);
         if (fd < 0) { unix_sock_free((uint32_t)uid); return SYS_ERR(EMFILE); }
         return (uint64_t)fd;
     }
@@ -171,7 +208,8 @@ sys_socket(uint64_t domain, uint64_t type, uint64_t proto)
         if (s) s->nonblocking = 1;
     }
 
-    int fd = sock_open_fd((uint32_t)sid, proc);
+    uint32_t fd_flags = (type & SOCK_FLAG_CLOEXEC) ? VFS_FD_CLOEXEC : 0;
+    int fd = sock_open_fd((uint32_t)sid, proc, fd_flags);
     if (fd < 0) { sock_free((uint32_t)sid); return SYS_ERR(EMFILE); }
 
     return (uint64_t)fd;
@@ -183,9 +221,10 @@ uint64_t
 sys_bind(uint64_t fd, uint64_t addr, uint64_t addrlen)
 {
     aegis_process_t *proc = current_proc();
+    SCOPED_FD_PIN(pin);
 
     /* AF_UNIX bind */
-    uint32_t uid = unix_sock_id_from_fd((int)fd, proc);
+    uint32_t uid = get_proc_unix_sock(fd, &pin);
     if (uid != UNIX_NONE) {
         if (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_IPC_BIND,
                       CAP_RIGHTS_WRITE) != 0)
@@ -207,7 +246,7 @@ sys_bind(uint64_t fd, uint64_t addr, uint64_t addrlen)
     if (!user_ptr_valid(addr, sizeof(k_sockaddr_in_t))) return SYS_ERR(EFAULT);
 
     sock_t *s; uint32_t sid;
-    uint64_t err = get_proc_sock(fd, &s, &sid);
+    uint64_t err = get_sock_from_pin(&pin, &s, &sid);
     if (err) return err;
 
     k_sockaddr_in_t sa;
@@ -270,15 +309,15 @@ uint64_t
 sys_listen(uint64_t fd, uint64_t backlog)
 {
     (void)backlog;
-    aegis_process_t *proc = current_proc();
-    uint32_t uid = unix_sock_id_from_fd((int)fd, proc);
+    SCOPED_FD_PIN(pin);
+    uint32_t uid = get_proc_unix_sock(fd, &pin);
     if (uid != UNIX_NONE) {
         int rc = unix_sock_listen(uid);
         return rc < 0 ? (uint64_t)(int64_t)rc : 0;
     }
 
     sock_t *s; uint32_t sid;
-    uint64_t err = get_proc_sock(fd, &s, &sid);
+    uint64_t err = get_sock_from_pin(&pin, &s, &sid);
     if (err) return err;
     if (s->type != SOCK_TYPE_STREAM) return SYS_ERR(EOPNOTSUPP);
     if (s->state < SOCK_BOUND) return SYS_ERR(EINVAL);  /* EINVAL: must bind first */
@@ -290,21 +329,27 @@ sys_listen(uint64_t fd, uint64_t backlog)
 
 /* ── sys_accept ────────────────────────────────────────────────────────── */
 
-uint64_t
-sys_accept(uint64_t fd, uint64_t addr, uint64_t addrlen)
+static uint64_t
+do_accept(uint64_t fd, uint64_t addr, uint64_t addrlen, uint64_t flags)
 {
     aegis_process_t *proc_a = current_proc();
-    uint32_t uid = unix_sock_id_from_fd((int)fd, proc_a);
+    SCOPED_FD_PIN(pin);
+    uint32_t uid = get_proc_unix_sock(fd, &pin);
     if (uid != UNIX_NONE) {
         int server_id = unix_sock_accept(uid);
         if (server_id < 0) return (uint64_t)(int64_t)server_id;
-        int new_fd = unix_sock_open_fd((uint32_t)server_id, proc_a);
+        if (flags & SOCK_FLAG_NONBLOCK) {
+            unix_sock_t *us = unix_sock_get((uint32_t)server_id);
+            if (us) us->nonblocking = 1;
+        }
+        uint32_t fd_flags = (flags & SOCK_FLAG_CLOEXEC) ? VFS_FD_CLOEXEC : 0;
+        int new_fd = unix_sock_open_fd((uint32_t)server_id, proc_a, fd_flags);
         if (new_fd < 0) { unix_sock_free((uint32_t)server_id); return SYS_ERR(EMFILE); }
         return (uint64_t)new_fd;
     }
 
     sock_t *ls; uint32_t lsid;
-    uint64_t err = get_proc_sock(fd, &ls, &lsid);
+    uint64_t err = get_sock_from_pin(&pin, &ls, &lsid);
     if (err) return err;
     if (ls->state != SOCK_LISTENING) return SYS_ERR(EINVAL);
 
@@ -344,6 +389,7 @@ sys_accept(uint64_t fd, uint64_t addr, uint64_t addrlen)
             sock_t *ns = sock_get((uint32_t)new_sid);
             ns->state       = SOCK_CONNECTED;
             ns->tcp_conn_id = conn_id;
+            ns->nonblocking = (flags & SOCK_FLAG_NONBLOCK) ? 1 : 0;
 
             /* Copy peer address from tcp_conn_t */
             tcp_conn_get_addr(conn_id, &ns->remote_ip, &ns->remote_port,
@@ -368,7 +414,8 @@ sys_accept(uint64_t fd, uint64_t addr, uint64_t addrlen)
                 copy_to_user((void *)(uintptr_t)addr, &sa, sizeof(sa));
             }
 
-            int new_fd = sock_open_fd((uint32_t)new_sid, proc);
+            uint32_t fd_flags = (flags & SOCK_FLAG_CLOEXEC) ? VFS_FD_CLOEXEC : 0;
+            int new_fd = sock_open_fd((uint32_t)new_sid, proc, fd_flags);
             if (new_fd < 0) {
                 sock_free((uint32_t)new_sid);
                 return (sock_unref(lsid), SYS_ERR(ENOMEM));
@@ -391,6 +438,12 @@ sys_accept(uint64_t fd, uint64_t addr, uint64_t addrlen)
     }
 }
 
+uint64_t
+sys_accept(uint64_t fd, uint64_t addr, uint64_t addrlen)
+{
+    return do_accept(fd, addr, addrlen, 0);
+}
+
 /* ── sys_accept4 ───────────────────────────────────────────────────────────
  * accept4(fd, addr, addrlen, flags): like accept(), but applies SOCK_NONBLOCK
  * and SOCK_CLOEXEC (folded into flags, same bit values as in socket()) to the
@@ -401,32 +454,9 @@ sys_accept(uint64_t fd, uint64_t addr, uint64_t addrlen)
 uint64_t
 sys_accept4(uint64_t fd, uint64_t addr, uint64_t addrlen, uint64_t flags)
 {
-    uint64_t r = sys_accept(fd, addr, addrlen);
-    if ((int64_t)r < 0)
-        return r;   /* accept failed — propagate errno, nothing to flag */
-
-    int new_fd = (int)r;
-    aegis_process_t *proc = current_proc();
-    if (new_fd < 0 || new_fd >= PROC_MAX_FDS)
-        return r;   /* defensive: shouldn't happen */
-
-    if (flags & SOCK_FLAG_CLOEXEC)
-        proc->fd_table->fds[new_fd].flags |= VFS_FD_CLOEXEC;
-
-    if (flags & SOCK_FLAG_NONBLOCK) {
-        /* Set nonblocking on the underlying object (AF_UNIX or AF_INET),
-         * mirroring how socket() applies SOCK_NONBLOCK at creation. */
-        uint32_t uuid = unix_sock_id_from_fd(new_fd, proc);
-        if (uuid != UNIX_NONE) {
-            unix_sock_t *us = unix_sock_get(uuid);
-            if (us) us->nonblocking = 1;
-        } else {
-            sock_t *s; uint32_t sid;
-            if (get_proc_sock((uint64_t)new_fd, &s, &sid) == 0 && s)
-                s->nonblocking = 1;
-        }
-    }
-    return r;
+    if (flags & ~(uint64_t)(SOCK_FLAG_NONBLOCK | SOCK_FLAG_CLOEXEC))
+        return SYS_ERR(EINVAL);
+    return do_accept(fd, addr, addrlen, flags);
 }
 
 /* ── sys_connect ───────────────────────────────────────────────────────── */
@@ -434,8 +464,8 @@ sys_accept4(uint64_t fd, uint64_t addr, uint64_t addrlen, uint64_t flags)
 uint64_t
 sys_connect(uint64_t fd, uint64_t addr, uint64_t addrlen)
 {
-    aegis_process_t *proc_c = current_proc();
-    uint32_t uid = unix_sock_id_from_fd((int)fd, proc_c);
+    SCOPED_FD_PIN(pin);
+    uint32_t uid = get_proc_unix_sock(fd, &pin);
     if (uid != UNIX_NONE) {
         if (addrlen < 4 || !user_ptr_valid(addr, addrlen))
             return SYS_ERR(EFAULT);
@@ -452,7 +482,7 @@ sys_connect(uint64_t fd, uint64_t addr, uint64_t addrlen)
     if (!user_ptr_valid(addr, sizeof(k_sockaddr_in_t))) return SYS_ERR(EFAULT);
 
     sock_t *s; uint32_t sid;
-    uint64_t err = get_proc_sock(fd, &s, &sid);
+    uint64_t err = get_sock_from_pin(&pin, &s, &sid);
     if (err) return err;
 
     k_sockaddr_in_t sa;
@@ -550,6 +580,7 @@ uint64_t
 sys_sendto(uint64_t fd, uint64_t buf, uint64_t len,
            uint64_t flags, uint64_t addr, uint64_t addrlen)
 {
+    SCOPED_FD_PIN(pin);
     /* flags is intentionally ignored: neither the TCP nor UDP send path here
      * ever blocks (both copy into a static TX buffer and hand off to the NIC),
      * so MSG_DONTWAIT is a no-op; we never raise SIGPIPE so MSG_NOSIGNAL is
@@ -565,8 +596,7 @@ sys_sendto(uint64_t fd, uint64_t buf, uint64_t len,
      * TransportSocket data thread. addr is ignored (the socket is connected).
      * Mirror sys_sendmsg's AF_UNIX bounce-and-write loop. */
     {
-        aegis_process_t *uproc = current_proc();
-        uint32_t uuid = unix_sock_id_from_fd((int)fd, uproc);
+        uint32_t uuid = get_proc_unix_sock(fd, &pin);
         if (uuid != UNIX_NONE) {
             uint8_t kbuf[UNIX_BUF_SIZE]; /* bounce chunk == AF_UNIX ring size */
             uint64_t remain = len, off = 0, total = 0;
@@ -589,7 +619,7 @@ sys_sendto(uint64_t fd, uint64_t buf, uint64_t len,
     }
 
     sock_t *s; uint32_t sid;
-    uint64_t err = get_proc_sock(fd, &s, &sid);
+    uint64_t err = get_sock_from_pin(&pin, &s, &sid);
     if (err) return err;
 
     if (s->type == SOCK_TYPE_STREAM) {
@@ -655,6 +685,7 @@ uint64_t
 sys_recvfrom(uint64_t fd, uint64_t buf, uint64_t len,
              uint64_t flags, uint64_t addr, uint64_t addrlen)
 {
+    SCOPED_FD_PIN(pin);
     if (!user_ptr_valid(buf, len)) return SYS_ERR(EFAULT);
 
     /* AF_UNIX stream recv: recv()/recvfrom() on a connected AF_UNIX socket.
@@ -664,8 +695,7 @@ sys_recvfrom(uint64_t fd, uint64_t buf, uint64_t len,
      * honored here (apps that need nonblocking set the fd flag, as Ladybird
      * does). addr/addrlen are left untouched (UNIX peer addr is anonymous). */
     {
-        aegis_process_t *uproc = current_proc();
-        uint32_t uuid = unix_sock_id_from_fd((int)fd, uproc);
+        uint32_t uuid = get_proc_unix_sock(fd, &pin);
         if (uuid != UNIX_NONE) {
             uint8_t kbuf[UNIX_BUF_SIZE]; /* bounce chunk == AF_UNIX ring size */
             uint32_t want = (uint32_t)len > UNIX_BUF_SIZE ? UNIX_BUF_SIZE : (uint32_t)len;
@@ -677,7 +707,7 @@ sys_recvfrom(uint64_t fd, uint64_t buf, uint64_t len,
     }
 
     sock_t *s; uint32_t sid;
-    uint64_t err = get_proc_sock(fd, &s, &sid);
+    uint64_t err = get_sock_from_pin(&pin, &s, &sid);
     if (err) return err;
 
     /* Pin the socket for the whole recv: both the TCP and UDP loops below block
@@ -824,7 +854,8 @@ typedef struct {
 uint64_t sys_sendmsg(uint64_t fd, uint64_t msg_ptr, uint64_t flags)
 {
     aegis_process_t *proc = current_proc();
-    uint32_t uid = unix_sock_id_from_fd((int)fd, proc);
+    SCOPED_FD_PIN(pin);
+    uint32_t uid = get_proc_unix_sock(fd, &pin);
 
     /* AF_INET sendmsg: gather the iovecs and route each through sys_sendto,
      * which already handles TCP/UDP, implicit ephemeral bind, MSG_* flags and
@@ -1002,8 +1033,8 @@ uint64_t sys_sendmsg(uint64_t fd, uint64_t msg_ptr, uint64_t flags)
 
 uint64_t sys_recvmsg(uint64_t fd, uint64_t msg_ptr, uint64_t flags)
 {
-    aegis_process_t *proc = current_proc();
-    uint32_t uid = unix_sock_id_from_fd((int)fd, proc);
+    SCOPED_FD_PIN(pin);
+    uint32_t uid = get_proc_unix_sock(fd, &pin);
 
     /* AF_INET recvmsg: receive into the first non-empty iovec via sys_recvfrom,
      * which fills the source address into msg_name (a separate addrlen scratch
@@ -1140,8 +1171,9 @@ uint64_t
 sys_shutdown(uint64_t fd, uint64_t how)
 {
     (void)how;
+    SCOPED_FD_PIN(pin);
     sock_t *s; uint32_t sid;
-    uint64_t err = get_proc_sock(fd, &s, &sid);
+    uint64_t err = get_proc_sock(fd, &pin, &s, &sid);
     if (err) return err;
 
     if (s->type == SOCK_TYPE_STREAM && s->tcp_conn_id != SOCK_NONE) {
@@ -1159,8 +1191,9 @@ sys_getsockname(uint64_t fd, uint64_t addr, uint64_t addrlen)
     if (!user_ptr_valid(addr, sizeof(k_sockaddr_in_t))) return SYS_ERR(EFAULT);
     if (!addrlen) return SYS_ERR(EFAULT);
     if (!user_ptr_valid(addrlen, sizeof(uint32_t))) return SYS_ERR(EFAULT);
+    SCOPED_FD_PIN(pin);
     sock_t *s; uint32_t sid;
-    uint64_t err = get_proc_sock(fd, &s, &sid);
+    uint64_t err = get_proc_sock(fd, &pin, &s, &sid);
     if (err) return err;
     k_sockaddr_in_t sa;
     sa.sin_family = AF_INET;
@@ -1179,8 +1212,9 @@ sys_getpeername(uint64_t fd, uint64_t addr, uint64_t addrlen)
     if (!user_ptr_valid(addr, sizeof(k_sockaddr_in_t))) return SYS_ERR(EFAULT);
     if (!addrlen) return SYS_ERR(EFAULT);
     if (!user_ptr_valid(addrlen, sizeof(uint32_t))) return SYS_ERR(EFAULT);
+    SCOPED_FD_PIN(pin);
     sock_t *s; uint32_t sid;
-    uint64_t err = get_proc_sock(fd, &s, &sid);
+    uint64_t err = get_proc_sock(fd, &pin, &s, &sid);
     if (err) return err;
     if (s->state != SOCK_CONNECTED) return SYS_ERR(ENOTCONN);
     k_sockaddr_in_t sa;
@@ -1218,23 +1252,20 @@ sys_socketpair(uint64_t domain, uint64_t type, uint64_t proto, uint64_t sv_ptr)
     uint32_t sid0, sid1;
     SC_PROPAGATE(unix_sock_pair(&sid0, &sid1));
 
-    int fd0 = unix_sock_open_fd(sid0, proc);
-    int fd1 = unix_sock_open_fd(sid1, proc);
-    if (fd0 < 0 || fd1 < 0) {
-        if (fd0 >= 0) {
-            proc->fd_table->fds[fd0].ops  = (const vfs_ops_t *)0;
-            proc->fd_table->fds[fd0].priv = (void *)0;
-        }
-        if (fd1 >= 0) {
-            proc->fd_table->fds[fd1].ops  = (const vfs_ops_t *)0;
-            proc->fd_table->fds[fd1].priv = (void *)0;
-        }
+    int fd0, fd1;
+    if (unix_sock_open_pair_fds(sid0, sid1, proc, &fd0, &fd1) != 0) {
         unix_sock_free(sid0);
         unix_sock_free(sid1);
         return SYS_ERR(EMFILE);
     }
     int fds[2] = { fd0, fd1 };
-    copy_to_user((void *)(uintptr_t)sv_ptr, fds, sizeof(fds));
+    if (copy_to_user((void *)(uintptr_t)sv_ptr, fds, sizeof(fds)) != 0) {
+        int own0 = detach_unix_fd(proc->fd_table, fd0, sid0);
+        int own1 = detach_unix_fd(proc->fd_table, fd1, sid1);
+        if (own0) unix_sock_free(sid0);
+        if (own1) unix_sock_free(sid1);
+        return SYS_ERR(EFAULT);
+    }
     return 0;
 }
 
@@ -1247,8 +1278,9 @@ sys_setsockopt(uint64_t fd, uint64_t level, uint64_t optname,
     if (optlen < sizeof(int)) return SYS_ERR(EINVAL);
     if (!user_ptr_valid(optval, sizeof(int))) return SYS_ERR(EFAULT);
 
+    SCOPED_FD_PIN(pin);
     sock_t *s; uint32_t sid;
-    uint64_t err = get_proc_sock(fd, &s, &sid);
+    uint64_t err = get_proc_sock(fd, &pin, &s, &sid);
     if (err) return err;
 
     int val;
@@ -1324,11 +1356,11 @@ uint64_t
 sys_getsockopt(uint64_t fd, uint64_t level, uint64_t optname,
                uint64_t optval, uint64_t optlen)
 {
+    SCOPED_FD_PIN(pin);
     if (!user_ptr_valid(optval, sizeof(int))) return SYS_ERR(EFAULT);
 
     /* AF_UNIX: SO_PEERCRED */
-    aegis_process_t *proc_g = current_proc();
-    uint32_t uid = unix_sock_id_from_fd((int)fd, proc_g);
+    uint32_t uid = get_proc_unix_sock(fd, &pin);
     if (uid != UNIX_NONE && level == SOL_SOCKET && optname == SO_PEERCRED) {
         if (!user_ptr_valid(optval, sizeof(k_ucred_t))) return SYS_ERR(EFAULT);
         uint32_t p_pid, p_uid, p_gid;
@@ -1345,7 +1377,7 @@ sys_getsockopt(uint64_t fd, uint64_t level, uint64_t optname,
     }
 
     sock_t *s; uint32_t sid;
-    uint64_t err = get_proc_sock(fd, &s, &sid);
+    uint64_t err = get_sock_from_pin(&pin, &s, &sid);
     if (err) return err;
 
     /* SO_RCVTIMEO / SO_SNDTIMEO read back a struct timeval (16 bytes), not an

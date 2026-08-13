@@ -89,7 +89,7 @@ int epoll_wait_impl(uint32_t epoll_id, uint64_t events_uptr,
 /* epoll_open_fd: create an fd for this epoll instance in proc->fd_table->fds[]. */
 int epoll_open_fd(uint32_t epoll_id, aegis_process_t *proc);
 
-/* epoll_id_from_fd: reverse-look up epoll_id from a fd. Returns EPOLL_NONE on error. */
-uint32_t epoll_id_from_fd(int fd, aegis_process_t *proc);
+/* Extract the epoll id from a descriptor already stabilised by fd_table_pin. */
+uint32_t epoll_id_from_file(const vfs_file_t *file);
 
 #endif /* EPOLL_H */

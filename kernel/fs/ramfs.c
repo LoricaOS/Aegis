@@ -250,6 +250,16 @@ ramfs_close_fn(void *priv)
     spin_unlock_irqrestore(&n->owner->lock, fl);
 }
 
+static void
+ramfs_dup_fn(void *priv)
+{
+    ramfs_inode_t *n = (ramfs_inode_t *)priv;
+    if (!n || !n->owner) return;
+    irqflags_t fl = spin_lock_irqsave(&n->owner->lock);
+    n->open_count++;
+    spin_unlock_irqrestore(&n->owner->lock, fl);
+}
+
 static int
 ramfs_stat_fn(void *priv, k_stat_t *st)
 {
@@ -273,7 +283,7 @@ static const vfs_ops_t s_ramfs_ops = {
     .write   = ramfs_write_fn,
     .close   = ramfs_close_fn,
     .readdir = 0,
-    .dup     = 0,
+    .dup     = ramfs_dup_fn,
     .stat    = ramfs_stat_fn,
     .poll    = 0,
 };
@@ -314,12 +324,22 @@ ramfs_dir_close_fn(void *priv)
     spin_unlock_irqrestore(&inst->lock, fl);
 }
 
+static void
+ramfs_dir_dup_fn(void *priv)
+{
+    ramfs_t *inst = (ramfs_t *)priv;
+    if (!inst) return;
+    irqflags_t fl = spin_lock_irqsave(&inst->lock);
+    inst->open_dirs++;
+    spin_unlock_irqrestore(&inst->lock, fl);
+}
+
 static const vfs_ops_t s_ramfs_dir_ops = {
     .read    = 0,
     .write   = 0,
     .close   = ramfs_dir_close_fn,
     .readdir = ramfs_dir_readdir_fn,
-    .dup     = 0,
+    .dup     = ramfs_dir_dup_fn,
     .stat    = 0,
     .poll    = 0,
 };

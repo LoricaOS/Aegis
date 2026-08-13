@@ -76,6 +76,23 @@ typedef struct {
 #define POLLHUP  0x0010
 #define POLLNVAL 0x0020
 
+static uint16_t
+poll_fd(aegis_process_t *proc, int fd, uint16_t events)
+{
+    fd_table_pin_t pin;
+    if (!fd_table_pin(proc->fd_table, fd, &pin))
+        return POLLNVAL;
+
+    const vfs_ops_t *ops = pin.file.ops;
+    uint16_t revents;
+    if (ops->poll)
+        revents = ops->poll(pin.file.priv) & (events | POLLERR | POLLHUP);
+    else
+        revents = events & (POLLIN | POLLOUT);
+    fd_table_unpin(&pin);
+    return revents;
+}
+
 uint64_t
 sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms)
 {
@@ -110,9 +127,11 @@ sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms)
     int fds_cached[64];
     for (uint64_t i = 0; i < nfds; i++) {
         k_pollfd_t pfd;
-        copy_from_user(&pfd,
-            (const void *)(uintptr_t)(fds_ptr + i * sizeof(k_pollfd_t)),
-            sizeof(k_pollfd_t));
+        if (copy_from_user(
+                &pfd,
+                (const void *)(uintptr_t)(fds_ptr + i * sizeof(k_pollfd_t)),
+                sizeof(k_pollfd_t)) != 0)
+            return SYS_ERR(EFAULT);
         fds_cached[i] = pfd.fd;
     }
 
@@ -120,42 +139,27 @@ sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms)
         /* Re-validate the user pollfd array each iteration: it was checked once
          * at entry, but this loop blocks (sched_block below) and then re-runs
          * copy_from_user / copy_to_user on it. A sibling thread (CLONE_VM) can
-         * munmap it during the block; copy_*_user are raw memcpy with no fault
-         * fixup, so a post-block access of the unmapped page #PFs in ring 0 and
-         * panics the kernel. Re-checking here closes that TOCTOU (same fix as
-         * epoll_wait). One page-walk per wake. */
+         * unmap it during the block. The copies are fault-contained, and every
+         * residual is checked below because the mapping can also disappear
+         * after this page-table walk. */
         if (!user_ptr_valid(fds_ptr, nfds * sizeof(k_pollfd_t)))
             return SYS_ERR(EFAULT);
         int ready = 0;
         uint64_t i;
         for (i = 0; i < nfds; i++) {
             k_pollfd_t pfd;
-            copy_from_user(&pfd,
-                (const void *)(uintptr_t)(fds_ptr + i * sizeof(k_pollfd_t)),
-                sizeof(k_pollfd_t));
+            if (copy_from_user(
+                    &pfd,
+                    (const void *)(uintptr_t)(fds_ptr + i * sizeof(k_pollfd_t)),
+                    sizeof(k_pollfd_t)) != 0)
+                return SYS_ERR(EFAULT);
             pfd.revents = 0;
-            if (pfd.fd >= 0 && (uint32_t)pfd.fd < PROC_MAX_FDS &&
-                proc->fd_table->fds[pfd.fd].ops) {
-                /* AF_INET + AF_UNIX sockets, pipes, ttys, memfd, etc. all carry
-                 * a vfs_ops_t. AF_INET readiness now lives in sock_vfs_poll
-                 * (socket.c) — the single source of truth shared with epoll,
-                 * replacing the formerly-divergent inline block here (which
-                 * wrongly conflated CLOSE_WAIT with POLLHUP). */
-                const vfs_ops_t *ops = proc->fd_table->fds[pfd.fd].ops;
-                if (ops->poll) {
-                    uint16_t r = ops->poll(proc->fd_table->fds[pfd.fd].priv);
-                    pfd.revents = r & (pfd.events | POLLERR | POLLHUP);
-                } else {
-                    /* No .poll — permissive default */
-                    pfd.revents = pfd.events & (POLLIN | POLLOUT);
-                }
-            } else {
-                pfd.revents = POLLNVAL;
-            }
+            pfd.revents = poll_fd(proc, pfd.fd, pfd.events);
             if (pfd.revents) ready++;
-            copy_to_user(
-                (void *)(uintptr_t)(fds_ptr + i * sizeof(k_pollfd_t)),
-                &pfd, sizeof(k_pollfd_t));
+            if (copy_to_user(
+                    (void *)(uintptr_t)(fds_ptr + i * sizeof(k_pollfd_t)),
+                    &pfd, sizeof(k_pollfd_t)) != 0)
+                return SYS_ERR(EFAULT);
         }
         if (ready > 0 || timeout_ms == 0) return (uint64_t)ready;
         if (deadline && arch_get_ticks() >= deadline) return 0;
@@ -243,17 +247,7 @@ do_poll_k(k_pollfd_t *pf, uint64_t nfds, uint64_t timeout_ms)
         uint64_t i;
         for (i = 0; i < nfds; i++) {
             pf[i].revents = 0;
-            if (pf[i].fd >= 0 && (uint32_t)pf[i].fd < PROC_MAX_FDS &&
-                proc->fd_table->fds[pf[i].fd].ops) {
-                const vfs_ops_t *ops = proc->fd_table->fds[pf[i].fd].ops;
-                if (ops->poll)
-                    pf[i].revents = ops->poll(proc->fd_table->fds[pf[i].fd].priv)
-                                    & (pf[i].events | POLLERR | POLLHUP);
-                else
-                    pf[i].revents = pf[i].events & (POLLIN | POLLOUT);
-            } else {
-                pf[i].revents = POLLNVAL;
-            }
+            pf[i].revents = poll_fd(proc, pf[i].fd, pf[i].events);
             if (pf[i].revents) ready++;
         }
         if (ready > 0 || timeout_ms == 0) return ready;
@@ -292,11 +286,14 @@ do_select(uint64_t nfds, uint64_t rfds, uint64_t wfds, uint64_t efds,
     k_fd_set R, W, E;
     fdset_zero(&R); fdset_zero(&W); fdset_zero(&E);
     if (rfds) { if (!user_ptr_valid(rfds, nbytes)) return SYS_ERR(EFAULT);
-                copy_from_user(&R, (const void *)(uintptr_t)rfds, nbytes); }
+                if (copy_from_user(&R, (const void *)(uintptr_t)rfds, nbytes) != 0)
+                    return SYS_ERR(EFAULT); }
     if (wfds) { if (!user_ptr_valid(wfds, nbytes)) return SYS_ERR(EFAULT);
-                copy_from_user(&W, (const void *)(uintptr_t)wfds, nbytes); }
+                if (copy_from_user(&W, (const void *)(uintptr_t)wfds, nbytes) != 0)
+                    return SYS_ERR(EFAULT); }
     if (efds) { if (!user_ptr_valid(efds, nbytes)) return SYS_ERR(EFAULT);
-                copy_from_user(&E, (const void *)(uintptr_t)efds, nbytes); }
+                if (copy_from_user(&E, (const void *)(uintptr_t)efds, nbytes) != 0)
+                    return SYS_ERR(EFAULT); }
 
     k_pollfd_t pf[64];
     int m = 0;
@@ -322,9 +319,12 @@ do_select(uint64_t nfds, uint64_t rfds, uint64_t wfds, uint64_t efds,
         if ((re & (POLLOUT | POLLERR))         && fdset_isset(&W, fd)) { fdset_set(&WO, fd); count++; }
         if ((re & (POLLERR | POLLHUP))         && fdset_isset(&E, fd)) { fdset_set(&EO, fd); count++; }
     }
-    if (rfds) copy_to_user((void *)(uintptr_t)rfds, &RO, nbytes);
-    if (wfds) copy_to_user((void *)(uintptr_t)wfds, &WO, nbytes);
-    if (efds) copy_to_user((void *)(uintptr_t)efds, &EO, nbytes);
+    if (rfds && copy_to_user((void *)(uintptr_t)rfds, &RO, nbytes) != 0)
+        return SYS_ERR(EFAULT);
+    if (wfds && copy_to_user((void *)(uintptr_t)wfds, &WO, nbytes) != 0)
+        return SYS_ERR(EFAULT);
+    if (efds && copy_to_user((void *)(uintptr_t)efds, &EO, nbytes) != 0)
+        return SYS_ERR(EFAULT);
     return (uint64_t)count;
 }
 
@@ -339,7 +339,9 @@ sys_select(uint64_t nfds, uint64_t rfds, uint64_t wfds,
     if (timeout) {
         struct { long tv_sec; long tv_usec; } tv;
         if (!user_ptr_valid(timeout, sizeof(tv))) return SYS_ERR(EFAULT);
-        copy_from_user(&tv, (const void *)(uintptr_t)timeout, sizeof(tv));
+        if (copy_from_user(&tv, (const void *)(uintptr_t)timeout,
+                           sizeof(tv)) != 0)
+            return SYS_ERR(EFAULT);
         if (tv.tv_sec < 0 || tv.tv_usec < 0) return SYS_ERR(EINVAL);
         timeout_ms = (uint64_t)tv.tv_sec * 1000 + (uint64_t)tv.tv_usec / 1000;
     }
@@ -357,7 +359,9 @@ sys_pselect6(uint64_t nfds, uint64_t rfds, uint64_t wfds,
     if (ts_ptr) {
         struct { long tv_sec; long tv_nsec; } ts;
         if (!user_ptr_valid(ts_ptr, sizeof(ts))) return SYS_ERR(EFAULT);
-        copy_from_user(&ts, (const void *)(uintptr_t)ts_ptr, sizeof(ts));
+        if (copy_from_user(&ts, (const void *)(uintptr_t)ts_ptr,
+                           sizeof(ts)) != 0)
+            return SYS_ERR(EFAULT);
         if (ts.tv_sec < 0 || ts.tv_nsec < 0) return SYS_ERR(EINVAL);
         timeout_ms = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
     }
@@ -384,15 +388,24 @@ uint64_t
 sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd, uint64_t event_ptr)
 {
     aegis_process_t *proc = current_proc();
-    uint32_t eid = epoll_id_from_fd((int)epfd, proc);
-    if (eid == EPOLL_NONE) return SYS_ERR(EBADF);
+    fd_table_pin_t pin;
+    if (!fd_table_pin(proc->fd_table, (int)epfd, &pin))
+        return SYS_ERR(EBADF);
+    uint32_t eid = epoll_id_from_file(&pin.file);
+    if (eid == EPOLL_NONE) {
+        fd_table_unpin(&pin);
+        return SYS_ERR(EBADF);
+    }
 
     k_epoll_event_t ev;
     __builtin_memset(&ev, 0, sizeof(ev));
-    if (event_ptr)
-        COPY_FROM_USER(&ev, event_ptr);
+    if (event_ptr && !copy_from_user_checked(&ev, event_ptr)) {
+        fd_table_unpin(&pin);
+        return SYS_ERR(EFAULT);
+    }
 
     int r = epoll_ctl_impl(eid, (int)op, (int)fd, &ev);
+    fd_table_unpin(&pin);
     return r < 0 ? (uint64_t)(int64_t)r : 0;
 }
 
@@ -402,8 +415,14 @@ uint64_t
 sys_epoll_wait(uint64_t epfd, uint64_t events_ptr, uint64_t maxevents, uint64_t timeout_ms)
 {
     aegis_process_t *proc = current_proc();
-    uint32_t eid = epoll_id_from_fd((int)epfd, proc);
-    if (eid == EPOLL_NONE) return SYS_ERR(EBADF);
+    fd_table_pin_t pin;
+    if (!fd_table_pin(proc->fd_table, (int)epfd, &pin))
+        return SYS_ERR(EBADF);
+    uint32_t eid = epoll_id_from_file(&pin.file);
+    if (eid == EPOLL_NONE) {
+        fd_table_unpin(&pin);
+        return SYS_ERR(EBADF);
+    }
     /* maxevents is the capacity of the caller's OUTPUT buffer, not a bound on
      * how many fds an epoll set may watch. Linux requires only that it be
      * positive. Rejecting anything above EPOLL_MAX_WATCHES conflated the two,
@@ -418,15 +437,21 @@ sys_epoll_wait(uint64_t epfd, uint64_t events_ptr, uint64_t maxevents, uint64_t 
      * Clamping BEFORE the user_ptr_valid below also means we only require the
      * prefix we might actually write to be mapped, which is what Linux does —
      * and it keeps the size computation far from overflowing. */
-    if ((int64_t)maxevents <= 0) return SYS_ERR(EINVAL);
+    if ((int64_t)maxevents <= 0) {
+        fd_table_unpin(&pin);
+        return SYS_ERR(EINVAL);
+    }
     if (maxevents > EPOLL_MAX_WATCHES) maxevents = EPOLL_MAX_WATCHES;
-    if (!user_ptr_valid(events_ptr, (uint64_t)maxevents * sizeof(k_epoll_event_t)))
+    if (!user_ptr_valid(events_ptr, (uint64_t)maxevents * sizeof(k_epoll_event_t))) {
+        fd_table_unpin(&pin);
         return SYS_ERR(EFAULT);
+    }
 
     uint32_t ticks = (timeout_ms == (uint64_t)-1) ? 0xFFFFFFFFU :
                      (timeout_ms == 0) ? 0 :
                      (uint32_t)(timeout_ms / 10);
     int r = epoll_wait_impl(eid, events_ptr, (int)maxevents, ticks);
+    fd_table_unpin(&pin);
     return r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
 }
 

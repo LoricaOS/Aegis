@@ -329,6 +329,7 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
     {
         uint32_t ino = 0;
         int is_protected = 0;
+        int is_auth_gated = 0;
         /* Resolve and classify-as-protected under ONE ext2_lock hold so an SMP
          * symlink-swap can't substitute a different target between the two — see
          * ext2_open_protected. This is the authoritative, atomic replacement for
@@ -361,9 +362,19 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
                     ((shadow_ino != 0 && ino == shadow_ino) ||
                      (admin_ino  != 0 && ino == admin_ino))) {
                     aegis_process_t *pr = current_proc();
+                    int wr = (flags & 1) || (flags & 2) ||
+                             (flags & (int)VFS_O_TRUNC) ||
+                             (flags & (int)VFS_O_APPEND);
                     if (cap_check(pr->caps, CAP_TABLE_SIZE,
-                                  CAP_KIND_AUTH, CAP_RIGHTS_READ) != 0)
+                                  CAP_KIND_AUTH,
+                                  wr ? CAP_RIGHTS_WRITE : CAP_RIGHTS_READ) != 0)
                         return -EACCES;
+                    /* This is authoritative for aliases: sys_open can tag a
+                     * direct credential path, but only this resolved-inode
+                     * check can recognize a symlink to one. Keep the tag on
+                     * the resulting fd so inherited/duplicated use is also
+                     * reauthorized. */
+                    is_auth_gated = 1;
 
                     /* Kernel-enforced brute-force throttle on the admin
                      * ELEVATION credential. `login -elevate` opens this once per
@@ -463,11 +474,19 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
              * resolved, so symlinks/".."/read-only opens are all covered).
              * Reuses the atomically-resolved is_protected (same value
              * cap_path_is_protected would return, minus a redundant walk). */
-            out->kflags = is_protected ? VFS_KF_PROTECTED : 0;
+            out->kflags = (is_protected ? VFS_KF_PROTECTED : 0) |
+                          (is_auth_gated ? VFS_KF_AUTH_GATED : 0);
             return 0;
         }
         /* ext2 ENOENT + O_CREAT → check W+X on parent, then create */
         if (flags & (int)VFS_O_CREAT) {
+            /* Keep the backend's namespace lock from parent authorization
+             * through creation, resolution, classification, and fd-private
+             * allocation. Previously create() dropped its lock and vfs_open
+             * resolved the pathname again; a sibling could replace the new
+             * name with a symlink to a protected inode in that gap. Backend
+             * locks are recursive specifically to support compound ops. */
+            irqflags_t fl = g_rootfs->lock();
             uint32_t parent_ino;
             const char *bname;
             if (g_rootfs->lookup_parent(path, &parent_ino, &bname) == 0 &&
@@ -475,22 +494,44 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
                 aegis_process_t *pr = current_proc();
                 int pperm = g_rootfs->check_perm(parent_ino,
                     (uint16_t)pr->uid, (uint16_t)pr->gid, 2 | 1); /* W+X */
-                if (pperm != 0)
+                if (pperm != 0) {
+                    g_rootfs->unlock(fl);
                     return -EACCES;
+                }
             }
-            if (g_rootfs->create(path, create_mode ? create_mode : 0644, has_install) == 0) {
-                if (g_rootfs->open(path, &ino) >= 0) {
+            int cr = g_rootfs->create(path,
+                                      create_mode ? create_mode : 0644,
+                                      has_install);
+            if (cr == 0) {
+                if (g_rootfs->open_protected(path, &ino, &is_protected) >= 0) {
                     ext2_fd_priv_t *p = g_rootfs->pool_alloc(ino);
-                    if (!p) return -ENOMEM;
+                    if (!p) {
+                        g_rootfs->unlock(fl);
+                        return -ENOMEM;
+                    }
                     out->ops    = ((const vfs_ops_t *)g_rootfs->file_ops);
                     out->priv   = (void *)p;
                     out->offset = 0;
                     out->size   = 0;
                     out->flags  = 0;
-                    out->kflags = cap_path_is_protected(path) ? VFS_KF_PROTECTED : 0;
+                    out->kflags = is_protected ? VFS_KF_PROTECTED : 0;
+                    g_rootfs->unlock(fl);
                     return 0;
                 }
             }
+            g_rootfs->unlock(fl);
+
+            /* Another creator can win between the initial ENOENT lookup and
+             * our compound lock acquisition. O_CREAT without O_EXCL opens the
+             * winner normally; O_EXCL must report the collision. */
+            if (cr == -EEXIST) {
+                if (flags & (int)VFS_O_EXCL)
+                    return -EEXIST;
+                return vfs_open_ex(path, flags & ~(int)VFS_O_CREAT,
+                                   create_mode, out, has_install);
+            }
+            if (cr < 0)
+                return cr;
         }
     }
 

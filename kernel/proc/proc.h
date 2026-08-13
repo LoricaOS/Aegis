@@ -39,6 +39,11 @@ typedef struct aegis_process {
     uint64_t      pml4_phys;              /* physical address of this process's PML4 */
     fd_table_t   *fd_table;               /* shared, refcounted fd table (Phase 29) */
     cap_slot_t    caps[CAP_TABLE_SIZE];   /* Phase 11 — capability table */
+    /* One-way attenuation installed by sys_spawn(cap_mask). Unlike caps[],
+     * this survives exec and bounds every later policy re-derivation. Indexed
+     * by CAP_KIND_*; inactive processes retain the normal policy behavior. */
+    uint32_t      cap_ceiling[CAP_KIND_MAX + 1u];
+    uint32_t      cap_ceiling_active;
     uint32_t      authenticated;          /* 1 if session passed login auth; survives exec */
     uint32_t      admin_session;          /* sudo-style admin session: even root must authenticate
                                            * THIS shell session (a SEPARATE credential, distinct from

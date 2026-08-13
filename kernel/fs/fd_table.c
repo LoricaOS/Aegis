@@ -111,3 +111,80 @@ fd_table_copy(fd_table_t *src)
     dst->magic    = FD_TABLE_MAGIC;
     return dst;
 }
+
+int
+fd_table_pin(fd_table_t *t, int fd, fd_table_pin_t *out)
+{
+    __builtin_memset(out, 0, sizeof(*out));
+    if (!t || fd < 0 || (uint32_t)fd >= PROC_MAX_FDS)
+        return 0;
+
+    fd_table_assert_live(t, "pin");
+    irqflags_t fl = spin_lock_irqsave(&t->lock);
+    vfs_file_t file = t->fds[fd];
+    if (!file.ops || (file.ops->dup && !file.ops->close)) {
+        spin_unlock_irqrestore(&t->lock, fl);
+        return 0;
+    }
+    if (file.ops->dup) {
+        file.ops->dup(file.priv);
+        out->referenced = 1;
+    }
+    out->file = file;
+    spin_unlock_irqrestore(&t->lock, fl);
+    return 1;
+}
+
+void
+fd_table_unpin(fd_table_pin_t *pin)
+{
+    if (!pin->referenced) {
+        pin->file.ops = (const vfs_ops_t *)0;
+        return;
+    }
+    const vfs_ops_t *ops = pin->file.ops;
+    void *priv = pin->file.priv;
+    __builtin_memset(pin, 0, sizeof(*pin));
+    ops->close(priv);
+}
+
+void
+fd_table_advance_offset(fd_table_t *t, int fd,
+                        const fd_table_pin_t *pin, uint64_t delta)
+{
+    if (!delta || !t || fd < 0 || (uint32_t)fd >= PROC_MAX_FDS)
+        return;
+    irqflags_t fl = spin_lock_irqsave(&t->lock);
+    vfs_file_t *slot = &t->fds[fd];
+    if (slot->ops == pin->file.ops && slot->priv == pin->file.priv)
+        slot->offset += delta;
+    spin_unlock_irqrestore(&t->lock, fl);
+}
+
+void
+fd_table_set_offset(fd_table_t *t, int fd,
+                    const fd_table_pin_t *pin, uint64_t offset)
+{
+    if (!t || fd < 0 || (uint32_t)fd >= PROC_MAX_FDS)
+        return;
+    irqflags_t fl = spin_lock_irqsave(&t->lock);
+    vfs_file_t *slot = &t->fds[fd];
+    if (slot->ops == pin->file.ops && slot->priv == pin->file.priv)
+        slot->offset = offset;
+    spin_unlock_irqrestore(&t->lock, fl);
+}
+
+int
+fd_table_update_flags(fd_table_t *t, int fd, const fd_table_pin_t *pin,
+                      uint32_t clear, uint32_t set)
+{
+    if (!t || fd < 0 || (uint32_t)fd >= PROC_MAX_FDS)
+        return 0;
+    irqflags_t fl = spin_lock_irqsave(&t->lock);
+    vfs_file_t *slot = &t->fds[fd];
+    int same = slot->ops == pin->file.ops && slot->priv == pin->file.priv;
+    if (same)
+        slot->flags = (slot->flags & ~clear) | set;
+    spin_unlock_irqrestore(&t->lock, fl);
+    return same;
+}

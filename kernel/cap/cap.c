@@ -75,3 +75,37 @@ cap_check(const cap_slot_t *table, uint32_t n, uint32_t kind, uint32_t rights)
     }
     return -ENOCAP;
 }
+
+void
+cap_ceiling_from_table(uint32_t ceiling[CAP_KIND_MAX + 1u],
+                       const cap_slot_t *caps)
+{
+    uint32_t i;
+    for (i = 0; i <= CAP_KIND_MAX; i++)
+        ceiling[i] = 0;
+    for (i = 0; i < CAP_TABLE_SIZE; i++) {
+        uint32_t kind = caps[i].kind;
+        if (kind != CAP_KIND_NULL && kind <= CAP_KIND_MAX)
+            ceiling[kind] |= caps[i].rights;
+    }
+}
+
+void
+cap_apply_ceiling(cap_slot_t *caps,
+                  const uint32_t ceiling[CAP_KIND_MAX + 1u])
+{
+    uint32_t i;
+    for (i = 0; i < CAP_TABLE_SIZE; i++) {
+        uint32_t kind = caps[i].kind;
+        if (kind == CAP_KIND_NULL)
+            continue;
+        if (kind > CAP_KIND_MAX) {
+            caps[i].kind = CAP_KIND_NULL;
+            caps[i].rights = 0;
+            continue;
+        }
+        caps[i].rights &= ceiling[kind];
+        if (caps[i].rights == 0)
+            caps[i].kind = CAP_KIND_NULL;
+    }
+}
