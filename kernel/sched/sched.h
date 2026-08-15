@@ -27,8 +27,8 @@ typedef struct aegis_task_t {
      * task is safely suspended and may be picked up by another CPU. */
     int32_t              on_cpu;           /* offset 8 */
     uint8_t              is_idle;          /* offset 12 — 1 = per-CPU idle task (never queued) */
-    int8_t               last_cpu;         /* offset 13 — scheduler affinity: last core this task ran on (-1 = none) */
-    uint8_t              _pad_on_cpu[2];   /* offset 14-15 — keep fpu_state 16-aligned */
+    uint8_t              _pad_on_cpu;      /* offset 13 — align last_cpu */
+    int16_t              last_cpu;         /* offset 14 — preferred/last CPU (-1 = none) */
 #if defined(__aarch64__)
     /* fpu_state — AArch64 FP/SIMD save area for this task's user NEON state:
      * 32 × 128-bit V registers (512 bytes) + FPSR + FPCR (2 × 32-bit) at
@@ -94,15 +94,17 @@ typedef struct aegis_task_t {
     int                  read_nonblock;    /* 1 = current sys_read is O_NONBLOCK; per-task, not global */
     int                  write_nonblock;   /* 1 = current sys_write is O_NONBLOCK; per-task, mirrors read_nonblock */
     struct aegis_task_t *next;             /* circular linked list (all tasks) */
-    /* RUNNING-only run queue (P3 audit fix).
+    /* Scheduler run-queue links (P3 audit fix).
      *
      * Separate circular doubly-linked list threaded through tasks whose
      * state == TASK_RUNNING, anchored at a static sentinel in sched.c.
      * sched_tick walks this list instead of the full `next` chain to avoid
      * O(N) scans of blocked/zombie/stopped tasks.
      *
-     * Invariant: a task is in the run list IFF state == TASK_RUNNING AND
-     * next_run != NULL.  next_run == NULL means "not currently in the list".
+     * Under the round-robin policy, a task is in the shared run list IFF
+     * state == TASK_RUNNING and next_run != NULL.  Under the fair policy,
+     * sched_queued identifies membership in one per-CPU queue; the task that
+     * is currently executing is deliberately not queued.
      * Exception: the idle task (sched_spawn_idle) stays TASK_RUNNING with
      * next_run == NULL forever — it is the empty-list fallback, never a
      * list member, so it never consumes a round-robin slice.
@@ -110,6 +112,16 @@ typedef struct aegis_task_t {
      * must call the _locked variants that also update the list. */
     struct aegis_task_t *next_run;
     struct aegis_task_t *prev_run;
+    /* Architecture-neutral fair-scheduler accounting.  These fields live after
+     * every assembly-visible member, so adding them cannot perturb ctx_switch
+     * offsets.  sched_vruntime is nanoseconds of normalized CPU service (all
+     * tasks have equal weight initially); sched_exec_start is the monotonic-ns
+     * timestamp at which the task was last dispatched. */
+    uint64_t             sched_vruntime;
+    uint64_t             sched_exec_start;
+    int16_t              sched_rq_cpu;     /* fair runqueue owner, -1 if not queued */
+    uint8_t              sched_queued;
+    uint8_t              _pad_sched;
 #ifdef AEGIS_LOCK_DEBUG
     /* OR-mask of lock ranks this task currently holds (debug-only lock-order
      * enforcement; see core/lockrank.h).  Placed last so on_cpu/fpu_state
@@ -231,6 +243,9 @@ static inline void fpu_state_restore_live(const aegis_task_t *task) { (void)task
 
 /* Initialize the run queue. No tasks yet. */
 void sched_init(void);
+
+/* Boot-selected scheduling policy name ("fair" or "rr"). */
+const char *sched_policy_name(void);
 
 /* Allocate a TCB and 16KB stack from PMM; wire fn as entry point; add to queue. */
 void sched_spawn(void (*fn)(void));

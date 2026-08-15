@@ -37,6 +37,14 @@ make -f Makefile.pi5native    # the firmware-direct image for a real Raspberry P
 The version is the single value in `VERSION` — stamped into the kernel, not
 derived from git, so builds are reproducible anywhere.
 
+## Scheduler
+
+Aegis uses the same equal-weight, virtual-runtime fair scheduler on x86-64 and
+arm64. It balances runnable work across per-CPU queues while preferring a task's
+last CPU for cache locality. The previous round-robin scheduler remains
+available for comparison and recovery with the `sched=rr` kernel command-line
+option; the active policy is reported by `/proc/scheduler`.
+
 ## Releases
 
 Each tagged version publishes a stripped `aegis.elf`. An OS targeting Aegis

@@ -470,8 +470,9 @@ uint64_t sys_sysinfo(uint64_t buf)
     return 0;
 }
 
-/* sched_getaffinity(204): single online CPU; mask byte 0 = bit 0. Returns the
- * number of bytes written (glibc/musl use it to popcount the CPU count). */
+/* sched_getaffinity(204): report CPUs that can actually run scheduler tasks.
+ * This used to claim only CPU 0 even while AP scheduling was active, causing
+ * musl applications to under-size worker pools on SMP systems. */
 uint64_t sys_sched_getaffinity(uint64_t pid, uint64_t len, uint64_t mask)
 {
     (void)pid;
@@ -481,9 +482,14 @@ uint64_t sys_sched_getaffinity(uint64_t pid, uint64_t len, uint64_t mask)
     if (!user_ptr_valid(mask, n)) return SYS_ERR(EFAULT);
     unsigned char buf[128];
     __builtin_memset(buf, 0, sizeof(buf));
-    buf[0] = 0x01;                            /* CPU 0 online */
+    buf[0] = 0x01;                            /* BSP is always schedulable */
+    if (g_ap_sched_enabled) {
+        for (uint32_t cpu = 1; cpu < MAX_CPUS && cpu < n * 8; cpu++)
+            if (g_ap_online[cpu] && g_percpu[cpu].idle_task)
+                buf[cpu / 8] |= (unsigned char)(1u << (cpu % 8));
+    }
     copy_to_user((void *)(uintptr_t)mask, buf, n);
-    return 8;                                 /* kernel cpumask size */
+    return n;
 }
 
 /* prlimit64(302): query/set resource limits. We only honour the query (old)
@@ -521,4 +527,3 @@ uint64_t sys_inotify_add_watch(uint64_t fd, uint64_t path, uint64_t mask)
     static int wd = 0;
     return (uint64_t)(++wd);
 }
-
