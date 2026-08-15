@@ -17,6 +17,7 @@
 #define LSR_TXEMPTY   (1 << 5)        /* Transmit-hold-register empty */
 #define LSR_DATAREADY (1 << 0)        /* Received data available in RBR/FIFO */
 #define IER_RX_AVAIL  (1 << 0)        /* Enable "received data available" IRQ */
+#define SERIAL_RX_BUDGET 256u         /* bound IRQ/tick work under continuous RX */
 
 /* outb — write byte to I/O port.
  * Clobbers: none (volatile prevents reordering). */
@@ -122,7 +123,12 @@ sysrq_handle(unsigned char cmd)
 void serial_rx_handler(void)
 {
     static int sysrq_pending = 0;
-    while (inb(COM1_LSR) & LSR_DATAREADY) {
+    for (unsigned int n = 0; n < SERIAL_RX_BUDGET; n++) {
+        unsigned char lsr = inb(COM1_LSR);
+        /* An absent legacy UART commonly returns 0xff for every port read.
+         * Treating bit 0 as DATAREADY then spins forever in the timer ISR. */
+        if (lsr == 0xff || !(lsr & LSR_DATAREADY))
+            break;
         unsigned char b = inb(COM1_DATA);
         if (sysrq_pending) {
             sysrq_pending = 0;

@@ -174,35 +174,42 @@ lapic_send_ipi(uint8_t dest_apic_id, uint8_t vector)
     lapic_write(LAPIC_ICR_LOW, (uint32_t)vector);
 }
 
-/*
- * lapic_send_init — send an INIT IPI to the specified APIC ID.
- *
- * Used by smp_start_aps() to reset APs before SIPI. ICR_LOW = 0x4500:
- * delivery mode = INIT (101b in bits 10:8), level = assert, trigger = edge.
- */
-void
-lapic_send_init(uint8_t dest_apic_id)
+static void
+lapic_startup_write(uint8_t dest_apic_id, uint32_t command)
 {
     while (lapic_read(LAPIC_ICR_LOW) & ICR_DELIVERY_STATUS)
         arch_pause();
     lapic_write(LAPIC_ICR_HIGH, (uint32_t)dest_apic_id << 24);
-    lapic_write(LAPIC_ICR_LOW, 0x00004500);
+    lapic_write(LAPIC_ICR_LOW, command);
 }
 
-/*
- * lapic_send_sipi — send a Startup IPI (SIPI) to the specified APIC ID.
- *
- * vector is the page number of the real-mode entry point (e.g. 0x08 for
- * physical address 0x8000). ICR_LOW = 0x4600 | vector: delivery mode = SIPI
- * (110b in bits 10:8), level = assert, trigger = edge.
- */
-void
-lapic_send_sipi(uint8_t dest_apic_id, uint8_t vector)
+static void
+lapic_startup_delay_us(uint32_t us)
 {
-    while (lapic_read(LAPIC_ICR_LOW) & ICR_DELIVERY_STATUS)
+    uint64_t hz = arch_tsc_hz();
+    /* The BSP calibrated the invariant TSC before SMP startup.  The fallback
+     * assumes a deliberately high 10 GHz so an uncalibrated machine waits
+     * longer, never shorter, than the architectural minimum. */
+    uint64_t cycles = hz ? (hz / 1000000ULL) * us : 10000ULL * us;
+    uint64_t start = arch_get_cycles();
+    while (arch_get_cycles() - start < cycles)
         arch_pause();
-    lapic_write(LAPIC_ICR_HIGH, (uint32_t)dest_apic_id << 24);
-    lapic_write(LAPIC_ICR_LOW, 0x00004600 | vector);
+}
+
+/* Reset and start one AP using the architectural INIT-SIPI-SIPI sequence.
+ * Real APICs require level-triggered INIT assert/deassert; the former
+ * edge-triggered shortcut happened to work under QEMU/KVM but left most
+ * bare-metal APs offline. */
+void
+lapic_start_ap(uint8_t dest_apic_id, uint8_t vector)
+{
+    lapic_startup_write(dest_apic_id, 0x0000C500); /* INIT, level, assert */
+    lapic_startup_delay_us(10000);
+    lapic_startup_write(dest_apic_id, 0x00008500); /* INIT, level, deassert */
+
+    lapic_startup_write(dest_apic_id, 0x00004600 | vector);
+    lapic_startup_delay_us(300);
+    lapic_startup_write(dest_apic_id, 0x00004600 | vector);
 }
 
 /*
