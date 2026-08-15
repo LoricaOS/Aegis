@@ -126,17 +126,9 @@ smp_start_aps(void)
      * sched_start — after this function returns, so the shared PIT
      * channel 2 is never contended. */
 
-    /* 3. Bring up the APs.
-     *
-     * The mandatory ~10ms INIT settle delay is BATCHED: send INIT to every AP,
-     * wait ONCE, then SIPI + boot each AP serially. Previously the settle was
-     * paid per AP (loop body ran INIT→wait→SIPI→boot for one AP at a time), so
-     * bring-up cost ~settle × (ncpu-1). Each AP has its own trampoline stack
-     * slot (indexed by LAPIC id) and inherits the BSP's LAPIC/TSC calibration
-     * (no PIT-ch2 contention since that fix), so INIT can safely be broadcast;
-     * the actual SIPI→ap_entry boot still runs one AP at a time. */
-    char started[MAX_CPUS] = {0};
-    int any_started = 0;
+    /* 3. Bring up each AP serially.  Keep the complete INIT-SIPI-SIPI sequence
+     * together: batching INIT across every core was VM-friendly but unreliable
+     * on real APICs, where later APs could remain in the startup wait state. */
     for (uint32_t i = 0; i < g_smp_cpu_count; i++) {
         uint8_t apic_id = g_smp_cpus[i].apic_id;
         if (apic_id == g_bsp_apic_id)      continue;   /* skip BSP */
@@ -174,39 +166,24 @@ smp_start_aps(void)
         p->lapic_id     = apic_id;
         p->kernel_stack = stack_top;
 
-        g_ap_online[i] = 0;             /* clear online flag before IPIs */
-        lapic_send_init(apic_id);       /* INIT — AP now waits for SIPI */
-        started[i] = 1;
-        any_started = 1;
-    }
+        g_ap_online[i] = 0;
+        lapic_start_ap(apic_id, 0x08);
 
-    /* Single INIT settle delay for ALL APs at once (~20M cycles ≥ 10ms at
-     * ≤2GHz). Skipped entirely on a single-core boot (no AP received INIT). */
-    if (any_started) {
-        uint64_t start = arch_get_cycles();
-        while (arch_get_cycles() - start < 20000000ULL)
-            arch_pause();
-    }
-
-    /* SIPI + boot each started AP serially — the real-mode trampoline runs one
-     * AP at a time, so we wait for each to signal online before the next. */
-    for (uint32_t i = 0; i < g_smp_cpu_count; i++) {
-        if (!started[i])
-            continue;
-        uint8_t apic_id = g_smp_cpus[i].apic_id;
-
-        lapic_send_sipi(apic_id, 0x08);            /* first SIPI (vector 0x08) */
-        { volatile uint32_t d = 100000; while (d--) ; }   /* ~200us */
-        lapic_send_sipi(apic_id, 0x08);            /* second SIPI */
-
-        /* Poll for AP online. Budget is raw TSC cycles; the TSC freq varies
-         * (KVM passes ~3-5GHz), so use 2G cycles (~0.4s@5GHz .. 2s@1GHz) —
-         * generous for a ~30-50ms bring-up, and the loop breaks the instant the
-         * AP signals, so it only costs wall-time on a genuine no-show. */
+        /* Poll for AP online for two calibrated seconds.  On a CPU without an
+         * invariant/calibrated TSC, the conservative 10 GHz fallback waits at
+         * least two seconds on shipping hardware. */
         uint64_t poll_start = arch_get_cycles();
+        uint64_t hz = arch_tsc_hz();
+        uint64_t poll_budget = hz ? hz * 2 : 20000000000ULL;
         while (!g_ap_online[i] &&
-               (arch_get_cycles() - poll_start) < 2000000000ULL)
+               (arch_get_cycles() - poll_start) < poll_budget) {
+            /* AP setup allocates guarded TSS/IST stacks.  Once AP1 is online,
+             * unmapping a guard page triggers a kernel TLB shootdown that also
+             * targets the BSP.  IF is still clear here, so service the request
+             * inline or AP2 waits for our ack while we wait for AP2 forever. */
+            tlb_poll_incoming();
             arch_pause();
+        }
         uint64_t waited = arch_get_cycles() - poll_start;
 
         if (g_ap_online[i]) {
