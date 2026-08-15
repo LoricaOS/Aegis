@@ -106,11 +106,33 @@ static aegis_task_t s_run_sentinel = {
     .prev_run         = &s_run_sentinel,
 };
 
+/* Boot-selectable scheduler policies.  Both remain behind sched_lock for this
+ * release: per-CPU queues remove the O(runnable-tasks) hot-path scan without
+ * disturbing the kernel-wide task-lifetime and lost-wakeup ordering that also
+ * relies on this lock. */
+enum sched_policy_id {
+    SCHED_POLICY_FAIR,
+    SCHED_POLICY_RR,
+};
+
+static enum sched_policy_id s_sched_policy = SCHED_POLICY_FAIR;
+
+typedef struct fair_runq {
+    aegis_task_t *head;
+    aegis_task_t *tail;
+    uint32_t      nr_queued;
+    uint64_t      min_vruntime;
+} fair_runq_t;
+
+static fair_runq_t s_fair_rq[MAX_CPUS];
+static uint16_t    s_sched_cpu_ids[MAX_CPUS];
+static uint32_t    s_sched_cpu_count;
+
 /* Insert task at the tail of the run list (just before the sentinel).
  * Idempotent: if the task is already in the list, this is a no-op.
  * Caller must hold sched_lock. */
 static void
-run_list_insert_locked(aegis_task_t *task)
+rr_run_list_insert_locked(aegis_task_t *task)
 {
     if (task->is_idle)
         return;   /* idle is the empty-queue fallback, never queued —
@@ -127,7 +149,7 @@ run_list_insert_locked(aegis_task_t *task)
 /* Remove task from the run list.  Idempotent: if task is not in the list,
  * this is a no-op.  Caller must hold sched_lock. */
 static void
-run_list_remove_locked(aegis_task_t *task)
+rr_run_list_remove_locked(aegis_task_t *task)
 {
     if (task->next_run == (aegis_task_t *)0)
         return;   /* not in list */
@@ -230,7 +252,7 @@ task_pickable(aegis_task_t *t, int me)
 }
 
 static aegis_task_t *
-run_list_next_locked(aegis_task_t *cur)
+rr_run_list_next_locked(aegis_task_t *cur)
 {
     int me = (int)percpu_self()->cpu_id;
     aegis_task_t *start;
@@ -281,7 +303,7 @@ run_list_next_locked(aegis_task_t *cur)
                 steal = (hc && !hc->is_idle && hc != t);
             }
             if (steal) {
-                t->last_cpu = (int8_t)me;   /* migrate: this core is its new home */
+                t->last_cpu = (int16_t)me;  /* migrate: this core is its new home */
                 return t;
             }
         }
@@ -291,14 +313,301 @@ run_list_next_locked(aegis_task_t *cur)
     return this_cpu_idle();   /* nothing pickable — this CPU's idle */
 }
 
+/* ── Fair policy ───────────────────────────────────────────────────────────
+ *
+ * A compact, equal-weight virtual-runtime scheduler.  This deliberately takes
+ * the stable core of Linux's fair schedulers (per-CPU runqueues, measured
+ * runtime, least-served task first, soft CPU affinity) without importing nice,
+ * cgroups, PELT, NUMA domains, or an rbtree.  Aegis admits at most 256 user
+ * processes, so an intrusive sorted list is the smaller and safer first data
+ * structure; pick-next is O(1), and enqueue's O(local runnable tasks) ceiling is
+ * explicit.  `sched_lock` guards every queue.
+ */
+
+static int
+fair_cpu_online(uint32_t cpu)
+{
+    if (cpu >= MAX_CPUS)
+        return 0;
+    if (cpu == 0)
+        return 1;
+    return g_ap_sched_enabled && g_ap_online[cpu] && g_percpu[cpu].idle_task;
+}
+
+static uint32_t
+fair_cpu_load(uint32_t cpu)
+{
+    uint32_t load = s_fair_rq[cpu].nr_queued;
+    aegis_task_t *cur = (aegis_task_t *)g_percpu[cpu].current_task;
+    if (cur && !cur->is_idle && cur->state == TASK_RUNNING)
+        load++;
+    return load;
+}
+
+static void
+fair_update_min_locked(uint32_t cpu)
+{
+    fair_runq_t *rq = &s_fair_rq[cpu];
+    if (rq->head && rq->head->sched_vruntime > rq->min_vruntime)
+        rq->min_vruntime = rq->head->sched_vruntime;
+}
+
+static void
+fair_insert_cpu_locked(aegis_task_t *task, uint32_t cpu)
+{
+    fair_runq_t *rq = &s_fair_rq[cpu];
+    if (task->sched_queued || task->is_idle)
+        return;
+
+    /* A fresh or long-sleeping task starts at this CPU's fairness frontier,
+     * never at zero, so fork/sleep loops cannot mint extra CPU service. */
+    if (task->sched_vruntime < rq->min_vruntime)
+        task->sched_vruntime = rq->min_vruntime;
+
+    aegis_task_t *at = rq->head;
+    while (at && at->sched_vruntime <= task->sched_vruntime)
+        at = at->next_run;
+
+    if (!at) {
+        task->prev_run = rq->tail;
+        task->next_run = NULL;
+        if (rq->tail) rq->tail->next_run = task;
+        else          rq->head = task;
+        rq->tail = task;
+    } else {
+        task->next_run = at;
+        task->prev_run = at->prev_run;
+        if (at->prev_run) at->prev_run->next_run = task;
+        else              rq->head = task;
+        at->prev_run = task;
+    }
+    task->sched_rq_cpu = (int16_t)cpu;
+    task->sched_queued = 1;
+    rq->nr_queued++;
+}
+
+static void
+fair_account_current_locked(aegis_task_t *task)
+{
+    if (!task || task->is_idle || task->sched_exec_start == 0)
+        return;
+    if (task->on_cpu != (int32_t)percpu_self()->cpu_id)
+        return; /* a remote stop/dequeue cannot account another CPU's live task */
+
+    uint64_t now = arch_clock_mono_ns();
+    if (now > task->sched_exec_start)
+        task->sched_vruntime += now - task->sched_exec_start;
+    task->sched_exec_start = 0;
+}
+
+static void
+fair_remove_locked(aegis_task_t *task)
+{
+    if (!task->sched_queued)
+        return;
+    int cpu = task->sched_rq_cpu;
+    if (cpu < 0 || cpu >= (int)MAX_CPUS)
+        panic_halt("[SCHED] FAIL: fair task has invalid runqueue owner");
+
+    fair_runq_t *rq = &s_fair_rq[cpu];
+    if (task->prev_run) task->prev_run->next_run = task->next_run;
+    else                rq->head = task->next_run;
+    if (task->next_run) task->next_run->prev_run = task->prev_run;
+    else                rq->tail = task->prev_run;
+    task->next_run = NULL;
+    task->prev_run = NULL;
+    task->sched_rq_cpu = -1;
+    task->sched_queued = 0;
+    if (rq->nr_queued == 0)
+        panic_halt("[SCHED] FAIL: fair runqueue count underflow");
+    rq->nr_queued--;
+    if (!rq->head && task->sched_vruntime > rq->min_vruntime)
+        rq->min_vruntime = task->sched_vruntime;
+    fair_update_min_locked((uint32_t)cpu);
+}
+
+static uint32_t
+fair_select_cpu_locked(aegis_task_t *task)
+{
+    uint32_t best = 0;
+    uint32_t best_load = fair_cpu_load(0);
+    for (uint32_t i = 1; i < s_sched_cpu_count; i++) {
+        uint32_t cpu = s_sched_cpu_ids[i];
+        if (!fair_cpu_online(cpu))
+            continue;
+        uint32_t load = fair_cpu_load(cpu);
+        if (load < best_load) {
+            best = cpu;
+            best_load = load;
+        }
+    }
+
+    int prev = task->last_cpu;
+    if (prev >= 0 && fair_cpu_online((uint32_t)prev) &&
+        fair_cpu_load((uint32_t)prev) <= best_load + 1)
+        return (uint32_t)prev;
+    return best;
+}
+
+static void
+fair_enqueue_locked(aegis_task_t *task)
+{
+    if (task->state != TASK_RUNNING || task->is_idle || task->sched_queued)
+        return;
+    fair_insert_cpu_locked(task, fair_select_cpu_locked(task));
+}
+
+static void
+fair_put_prev_locked(aegis_task_t *task)
+{
+    fair_account_current_locked(task);
+    if (!task || task->state != TASK_RUNNING || task->is_idle)
+        return;
+    uint32_t cpu = percpu_self()->cpu_id;
+    task->last_cpu = (int16_t)cpu;
+    fair_insert_cpu_locked(task, cpu);
+}
+
+static aegis_task_t *
+fair_pick_from_cpu_locked(uint32_t cpu, int me)
+{
+    for (aegis_task_t *t = s_fair_rq[cpu].head; t; t = t->next_run)
+        if (task_pickable(t, me))
+            return t;
+    return NULL;
+}
+
+static aegis_task_t *
+fair_pick_next_locked(aegis_task_t *cur)
+{
+    (void)cur;
+    uint32_t me = percpu_self()->cpu_id;
+    aegis_task_t *next = fair_pick_from_cpu_locked(me, (int)me);
+
+    if (!next) {
+        /* Idle stealing: choose the busiest queue, but steal only queued work.
+         * The currently executing task is not counted here, so a lone serial
+         * workload remains cache-local while fork/parallel work spreads. */
+        uint32_t busiest = MAX_CPUS;
+        uint32_t most = 0;
+        for (uint32_t i = 0; i < s_sched_cpu_count; i++) {
+            uint32_t cpu = s_sched_cpu_ids[i];
+            if (cpu == me || !fair_cpu_online(cpu))
+                continue;
+            if (s_fair_rq[cpu].nr_queued > most &&
+                fair_pick_from_cpu_locked(cpu, (int)me)) {
+                busiest = cpu;
+                most = s_fair_rq[cpu].nr_queued;
+            }
+        }
+        if (busiest != MAX_CPUS) {
+            next = fair_pick_from_cpu_locked(busiest, (int)me);
+            if (next) {
+                uint64_t lag = next->sched_vruntime >= s_fair_rq[busiest].min_vruntime
+                             ? next->sched_vruntime - s_fair_rq[busiest].min_vruntime
+                             : 0;
+                next->sched_vruntime = s_fair_rq[me].min_vruntime + lag;
+            }
+        }
+    }
+
+    if (!next)
+        return this_cpu_idle();
+    fair_remove_locked(next);
+    next->last_cpu = (int16_t)me;
+    next->sched_exec_start = arch_clock_mono_ns();
+    return next;
+}
+
+static int
+cmdline_sched_is(const char *wanted)
+{
+    const char *p = arch_get_cmdline();
+    while (p && *p) {
+        while (*p == ' ') p++;
+        const char *start = p;
+        while (*p && *p != ' ') p++;
+        const char prefix[] = "sched=";
+        uint32_t n = (uint32_t)(p - start);
+        uint32_t wlen = 0;
+        while (wanted[wlen]) wlen++;
+        if (n == 6 + wlen && __builtin_memcmp(start, prefix, 6) == 0 &&
+            __builtin_memcmp(start + 6, wanted, wlen) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+const char *
+sched_policy_name(void)
+{
+    return s_sched_policy == SCHED_POLICY_RR ? "rr" : "fair";
+}
+
+static void
+run_list_insert_locked(aegis_task_t *task)
+{
+    if (s_sched_policy == SCHED_POLICY_RR)
+        rr_run_list_insert_locked(task);
+    else
+        fair_enqueue_locked(task);
+}
+
+static void
+run_list_remove_locked(aegis_task_t *task)
+{
+    if (s_sched_policy == SCHED_POLICY_RR)
+        rr_run_list_remove_locked(task);
+    else {
+        fair_account_current_locked(task);
+        fair_remove_locked(task);
+    }
+}
+
+static aegis_task_t *
+run_list_next_locked(aegis_task_t *cur)
+{
+    return s_sched_policy == SCHED_POLICY_RR
+         ? rr_run_list_next_locked(cur)
+         : fair_pick_next_locked(cur);
+}
+
+static void
+sched_put_prev_locked(aegis_task_t *task)
+{
+    if (s_sched_policy == SCHED_POLICY_FAIR)
+        fair_put_prev_locked(task);
+}
+
+static void
+sched_take_locked(aegis_task_t *task)
+{
+    if (s_sched_policy == SCHED_POLICY_FAIR) {
+        fair_remove_locked(task);
+        task->last_cpu = (int16_t)percpu_self()->cpu_id;
+        task->sched_exec_start = arch_clock_mono_ns();
+    }
+}
+
 void
 sched_init(void)
 {
+    if (cmdline_sched_is("rr"))
+        s_sched_policy = SCHED_POLICY_RR;
+    else
+        s_sched_policy = SCHED_POLICY_FAIR; /* default; sched=fair is explicit too */
     percpu_set_current((aegis_task_t *)0);
     s_next_tid   = 0;
     s_task_count = 0;
     s_run_sentinel.next_run = &s_run_sentinel;
     s_run_sentinel.prev_run = &s_run_sentinel;
+    __builtin_memset(s_fair_rq, 0, sizeof(s_fair_rq));
+    s_sched_cpu_count = 1;
+    s_sched_cpu_ids[0] = 0;
+    if (g_ap_sched_enabled)
+        for (uint32_t cpu = 1; cpu < MAX_CPUS; cpu++)
+            if (g_ap_online[cpu])
+                s_sched_cpu_ids[s_sched_cpu_count++] = (uint16_t)cpu;
     lockrank_register(&sched_lock, LOCK_RANK_SCHED);  /* debug lock-order check */
 }
 
@@ -371,6 +680,10 @@ sched_spawn_task_locked(void (*fn)(void))
     task->is_idle          = 0;
     task->next_run         = (aegis_task_t *)0;
     task->prev_run         = (aegis_task_t *)0;
+    task->sched_vruntime   = 0;
+    task->sched_exec_start = 0;
+    task->sched_rq_cpu     = -1;
+    task->sched_queued     = 0;
 
     /* Add to circular list */
     aegis_task_t *cur = sched_current();
@@ -448,6 +761,9 @@ sched_add(aegis_task_t *task)
     irqflags_t fl = spin_lock_irqsave(&sched_lock);
     task->next_run = (aegis_task_t *)0;
     task->prev_run = (aegis_task_t *)0;
+    task->sched_exec_start = 0;
+    task->sched_rq_cpu = -1;
+    task->sched_queued = 0;
     /* Processes (aegis_process_t) are memset(0) before sched_add, which would
      * leave on_cpu == 0 ("running on CPU 0").  Force the not-running sentinel
      * so the SMP picker treats the new task as free. */
@@ -457,7 +773,11 @@ sched_add(aegis_task_t *task)
      * make->gcc->cc1->as — on ONE core instead of hopping to whichever core is
      * free). Pass 2 still steals it onto an idle core when the parent's core is
      * busy with other work, so parallel builds spread. */
-    task->last_cpu = (int8_t)percpu_self()->cpu_id;
+    task->last_cpu = (int16_t)percpu_self()->cpu_id;
+    /* Fork/clone/spawn begins at the creator's fairness position rather than
+     * zero, which would let fork-heavy workloads repeatedly jump the queue. */
+    task->sched_vruntime = sched_current() && !sched_current()->is_idle
+                         ? sched_current()->sched_vruntime : 0;
     task->is_idle = 0;
     aegis_task_t *cur = sched_current();
     if (!cur) {
@@ -726,6 +1046,7 @@ sched_exit(void)
             WARN_ONCE(woken_parent->on_cpu >= 0 &&
                       woken_parent->on_cpu != (int)pc->cpu_id,
                       "sched_exit: woken_parent already running on another CPU");
+            sched_take_locked(woken_parent);
             woken_parent->on_cpu = (int)pc->cpu_id;
             percpu_set_current(woken_parent);
             arch_set_kernel_stack(woken_parent->kernel_stack_top);
@@ -931,9 +1252,16 @@ sched_wake_locked(aegis_task_t *task)
      * makes that sched_block() return immediately instead of losing this wake
      * (consumed there). run_list_insert_locked is a no-op if the task is still
      * in the run list (RUNNING, not yet blocked), so this is safe either way. */
+    uint32_t was_running = task->state == TASK_RUNNING;
     task->wake_pending = 1;
     __atomic_store_n(&task->state, TASK_RUNNING, __ATOMIC_RELEASE);
-    run_list_insert_locked(task);
+    /* A wake before sched_block marks the task blocked is represented solely
+     * by wake_pending.  Conversely, a wake after the state flip must remain
+     * queued even if ctx_switch has not cleared on_cpu yet; remote pickers will
+     * skip it until its live stack is safely suspended. */
+    if (!(s_sched_policy == SCHED_POLICY_FAIR && was_running &&
+          task->on_cpu >= 0))
+        run_list_insert_locked(task);
 }
 
 void
@@ -1033,6 +1361,9 @@ sched_yield_to_next(void)
     irqflags_t fl = spin_lock_irqsave(&sched_lock);
 
     aegis_task_t *old = sched_current();
+    /* Fair tasks are not queued while executing. Account and return the
+     * yielding task to its local queue before selecting its successor. */
+    sched_put_prev_locked(old);
     /* old may or may not still be in the run list (zombie callers remove
      * it before invoking us).  run_list_next_locked handles both, and
      * falls back to the idle task when the run list is empty. */
@@ -1088,7 +1419,8 @@ sched_start(void)
 
     s_sched_ready = 1;  /* guard: sched_tick now safe to context-switch */
     first->on_cpu = (int)percpu_self()->cpu_id;  /* BSP claims the first task */
-    printk("[SCHED] OK: scheduler started, %u tasks\n", s_task_count);
+    printk("[SCHED] OK: %s scheduler started, %u tasks\n",
+           sched_policy_name(), s_task_count);
 
     /* One-way switch into the first task.
      *
@@ -1138,7 +1470,7 @@ sched_tick(void)
      * run queue.  The run queue does not contain them, so we cannot use it
      * to find them.  Once a sleeping task's deadline expires we flip its
      * state to TASK_RUNNING and insert it into the run list. */
-    {
+    if (percpu_self()->cpu_id == 0) {
         uint64_t now = arch_get_ticks();
         aegis_task_t *t = cur->next;
         aegis_task_t *stop = cur;
@@ -1154,18 +1486,11 @@ sched_tick(void)
     }
 
     aegis_task_t *old = cur;
-    /* Walk the RUNNING-only run queue — O(R) where R = runnable count.
-     * This is the whole point of the P3 audit fix: we no longer scan
-     * blocked/zombie/stopped tasks here.
-     *
-     * `old` is normally in the run list (it is the currently running
-     * task, which is TASK_RUNNING).  Two exceptions, both handled by
-     * run_list_next_locked starting from the sentinel head: (a) old is
-     * the idle task, which is never linked in — preempting idle therefore
-     * picks the run-list head; (b) old was mid-transition when the tick
-     * fired.  When the list is empty the helper returns the idle task
-     * (== old while idling, so the early-return below keeps idle running
-     * back-to-back). */
+    /* Return the current task to its policy queue, then choose the next task.
+     * Round-robin keeps the current task linked and rotates from its successor;
+     * fair scheduling accounts runtime, inserts it by vruntime, and takes the
+     * least-served task.  Neither policy scans blocked/zombie/stopped tasks. */
+    sched_put_prev_locked(old);
     aegis_task_t *next = run_list_next_locked(old);
     if (next == (aegis_task_t *)0 || next == old) {
         /* Nothing else runnable — stay on `cur`. */

@@ -693,6 +693,16 @@ gen_kcmdline(char *buf, uint32_t bufsz)
     return (uint32_t)(p - buf);
 }
 
+static uint32_t
+gen_scheduler(char *buf, uint32_t bufsz)
+{
+    (void)bufsz;
+    char *p = pfs_strcpy(buf, sched_policy_name());
+    *p++ = '\n';
+    *p = '\0';
+    return (uint32_t)(p - buf);
+}
+
 /* /proc/dmesg — kernel log ring buffer (printk history).
  * The klog ring is 64KB but the procfs generation buffer is one kva page
  * (4096 bytes), so this returns only the newest ~4KB: klog_read copies
@@ -1148,6 +1158,7 @@ static const procfs_root_node_t s_proc_root[] = {
     { "meminfo", 8, S_IFREG | 0444, gen_meminfo,   CAP_KIND_NULL },
     { "version", 8, S_IFREG | 0444, gen_version,   CAP_KIND_NULL },
     { "cmdline", 8, S_IFREG | 0444, gen_kcmdline,  CAP_KIND_NULL },
+    { "scheduler", 8, S_IFREG | 0444, gen_scheduler, CAP_KIND_NULL },
     { "kbdstat", 8, S_IFREG | 0444, gen_kbdstat,   CAP_KIND_NULL },
     { "dmesg",   8, S_IFREG | 0440, gen_dmesg,     CAP_KIND_PROC_READ },
     { "mounts",  8, S_IFREG | 0444, gen_mounts,    CAP_KIND_NULL },

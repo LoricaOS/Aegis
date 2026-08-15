@@ -1329,15 +1329,17 @@ tcp_connect(uint32_t sock_id, ip4_addr_t dst_ip, uint16_t dst_port,
              * fire before we send the SYN.  We must release tcp_lock before
              * tcp_send_segment because ip_send → arp_resolve may block. */
             s_tcp[i].retransmit_at = (uint32_t)arch_get_ticks() + TCP_RTO_INITIAL + 200;
-            spin_unlock_irqrestore(&tcp_lock, fl);
-            tcp_send_syn(dev, &s_tcp[i], TCP_SYN);
-            /* Increment snd_nxt AFTER sending the SYN — the SYN must go out
-             * with seq=ISN (our initial snd_nxt), and snd_nxt then advances to
-             * ISN+1 so the SYN_SENT handler matches ack=ISN+1 from the remote.
-             * Bug: this was before tcp_send_segment, causing SYN seq=ISN+1 and
-             * the remote's ack=ISN+2 to never match snd_nxt=ISN+1. */
+            /* Snapshot the wire-visible fields before dropping tcp_lock.  The
+             * live slot can be closed by RX and reclaimed on another CPU while
+             * ip_send blocks in ARP; packet construction must not follow that
+             * reusable slot after unlock. */
+            tcp_conn_t wire = s_tcp[i];
             s_tcp[i].snd_nxt++;
             s_tcp[i].retransmit_at = (uint32_t)arch_get_ticks() + TCP_RTO_INITIAL;
+            spin_unlock_irqrestore(&tcp_lock, fl);
+            tcp_send_syn(dev, &wire, TCP_SYN);
+            /* wire retained the ISN while the live slot advanced to ISN+1, so
+             * the peer's ACK matches without exposing the slot after unlock. */
             return 0;
         }
     }
@@ -1417,18 +1419,20 @@ tcp_conn_recv(uint32_t sock_id, uint32_t conn_id, void *dst, uint16_t max_len)
      * app (curl → ext2) lags the wire. tcp_send_segment must run WITHOUT
      * tcp_lock (its ip_send → arp path can block with interrupts enabled;
      * holding the lock there deadlocks tcp_tick — see tcp_conn_send), so decide
-     * under the lock, then send after unlocking. c points into static s_tcp[]
-     * and is not freed under us on a single core. */
+     * under the lock, snapshot the packet fields, then send after unlocking. */
     uint32_t used_after = (c->rbuf_tail - c->rbuf_head) & (TCP_RBUF_SIZE - 1);
     uint32_t win_after  = (TCP_RBUF_SIZE - 1) - used_after;
     uint32_t win_before = win_after - n;   /* draining n freed exactly n bytes */
     netdev_t *wu_dev = NULL;
+    tcp_conn_t wire;
     if (c->state == TCP_ESTABLISHED &&
-        win_before < TCP_RX_WUPDATE_THRESH && win_after >= TCP_RX_WUPDATE_THRESH)
+        win_before < TCP_RX_WUPDATE_THRESH && win_after >= TCP_RX_WUPDATE_THRESH) {
         wu_dev = c->dev;
+        wire = *c;
+    }
     spin_unlock_irqrestore(&tcp_lock, fl);
     if (wu_dev)
-        tcp_send_segment(wu_dev, c, TCP_ACK, NULL, 0);
+        tcp_send_segment(wu_dev, &wire, TCP_ACK, NULL, 0);
     return (int)n;
 }
 
@@ -1549,6 +1553,7 @@ tcp_conn_send(uint32_t sock_id, uint32_t conn_id, const void *data, uint16_t len
     /* Arm the retransmit timer for the now-outstanding data. */
     c->retransmit_at    = (uint32_t)arch_get_ticks() + TCP_RTO_INITIAL;
     c->retransmit_count = 0;
+    tcp_conn_t wire = *c;
 
     /* Release tcp_lock before transmitting: ip_send → arp_resolve may block
      * with `sti; hlt; cli` in syscall context; holding tcp_lock across that
@@ -1556,17 +1561,17 @@ tcp_conn_send(uint32_t sock_id, uint32_t conn_id, const void *data, uint16_t len
      * → tcp_tick → spin_lock_irqsave(&tcp_lock) then spins forever on the lock
      * whose owner is parked in hlt.  The data is already in sbuf, so even if a
      * transmit drops (or is withheld by the window), tcp_tick will (re)send it.
-     * c lives in static s_tcp[] and is not freed under us on a single core. */
+     * The packet uses the snapshot above because the live slot is reusable. */
     spin_unlock_irqrestore(&tcp_lock, fl);
 
     /* Transmit the window-permitted prefix from the lock-free snapshot,
      * segmented to one MSS per packet. */
     uint32_t off = 0;
-    uint16_t mss = tcp_snd_mss(c);
+    uint16_t mss = tcp_snd_mss(&wire);
     while (off < sendable) {
         uint32_t chunk = sendable - off;
         if (chunk > mss) chunk = mss;
-        tcp_send_at_seq(dev, c, TCP_PSH | TCP_ACK, send_seq + off,
+        tcp_send_at_seq(dev, &wire, TCP_PSH | TCP_ACK, send_seq + off,
                         snap + off, (uint16_t)chunk);
         off += chunk;
     }
@@ -1593,7 +1598,7 @@ tcp_conn_close(uint32_t sock_id, uint32_t conn_id)
      * accounting expect.  tcp_send_* must run WITHOUT tcp_lock in syscall
      * context (ip_send → arp may block; holding the lock there deadlocks
      * tcp_tick — see tcp_conn_send), so decide and mutate state under the lock,
-     * then send after unlocking.  c lives in static s_tcp[]. */
+     * snapshot the packet fields, then send after unlocking. */
     netdev_t *dev    = NULL;
     uint32_t  finseq = 0;
     if (c->state == TCP_ESTABLISHED || c->state == TCP_CLOSE_WAIT) {
@@ -1604,8 +1609,9 @@ tcp_conn_close(uint32_t sock_id, uint32_t conn_id)
         /* Arm the FIN retransmit timer (it is otherwise unbuffered). */
         c->retransmit_at    = (uint32_t)arch_get_ticks() + TCP_RTO_INITIAL;
         c->retransmit_count = 0;
+        tcp_conn_t wire = *c;
         spin_unlock_irqrestore(&tcp_lock, fl);
-        tcp_send_at_seq(dev, c, TCP_FIN | TCP_ACK, finseq, NULL, 0);
+        tcp_send_at_seq(dev, &wire, TCP_FIN | TCP_ACK, finseq, NULL, 0);
         return 0;
     }
     spin_unlock_irqrestore(&tcp_lock, fl);

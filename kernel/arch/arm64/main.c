@@ -407,8 +407,9 @@ kernel_main_arm64(void)
      * (adopted by the AP in ap_c_entry once sched_start sets the ready
      * flag). Mirrors kernel/core/main.c on x86. */
     if (g_ap_sched_enabled)
-        for (uint32_t c = 1; c < g_cpu_count; c++)
-            sched_spawn_idle_for(c, task_idle);
+        for (uint32_t c = 1; c < MAX_CPUS; c++)
+            if (g_ap_online[c])
+                sched_spawn_idle_for(c, task_idle);
 #if defined(AEGIS_BOOT_NATIVE) && defined(AEGIS_NATIVE_TEST_STOP)
     /* Reached userland: disable the boot watchdog so it can't fire during an
      * interactive login (it did its job protecting the flaky nvme_init boot). */

@@ -56,7 +56,6 @@ void usb_mouse_process_report(const uint8_t *data, uint32_t len);
  * enforce, and cited a 64 KB window the driver stopped using. Validated once at
  * init against the real mapping instead of at each use.
  * (audit 2026-08-01, A6-H3.) */
-static uint32_t s_dboff, s_rtsoff;
 
 /* Maximum slots we support (hardware MaxSlots may be higher). */
 #define XHCI_MAX_SLOTS       32u
@@ -90,8 +89,6 @@ static uint32_t s_dboff, s_rtsoff;
  *   0 = 32-byte contexts (xHCI 0.96/1.0 baseline)
  *   1 = 64-byte contexts (most actual implementations including qemu-xhci)
  * Stored in s_ctx_entry_size during xhci_init. */
-static uint32_t s_ctx_entry_size = 32u;
-#define XHCI_CTX_ENTRY_SIZE  s_ctx_entry_size
 
 /* USB speed values in Slot Context speed field [PORTSC bits 13:10]. */
 #define XHCI_SPEED_FS        1u   /* Full Speed  (12  Mbit/s) */
@@ -134,6 +131,9 @@ struct xhci_ctrl {
     /* SAFETY: cap/op are volatile MMIO pointers — no caching of reg access. */
     volatile xhci_cap_regs_t  *cap;
     volatile xhci_op_regs_t   *op;
+    uint32_t                   dboff;
+    uint32_t                   rtsoff;
+    uint32_t                   ctx_entry_size;
     /* Command Ring */
     xhci_trb_t                *cmd_ring;
     uint64_t                   cmd_ring_phys;
@@ -177,6 +177,10 @@ static uint32_t          s_hc_count = 0;   /* # of controllers brought up */
 #define s_bar0_va         (s_cur->bar0_va)
 #define s_cap             (s_cur->cap)
 #define s_op              (s_cur->op)
+#define s_dboff           (s_cur->dboff)
+#define s_rtsoff          (s_cur->rtsoff)
+#define s_ctx_entry_size  (s_cur->ctx_entry_size)
+#define XHCI_CTX_ENTRY_SIZE  s_ctx_entry_size
 #define s_cmd_ring        (s_cur->cmd_ring)
 #define s_cmd_ring_phys   (s_cur->cmd_ring_phys)
 #define s_cmd_cycle       (s_cur->cmd_cycle)
@@ -689,6 +693,22 @@ issue_disable_slot(uint8_t slot_id)
     (void)poll_cmd_completion();
 }
 
+static void
+free_slot_pages(uint8_t slot_id)
+{
+    if (slot_id == 0 || slot_id >= XHCI_MAX_SLOTS) return;
+    if (s_xfer_ring[slot_id]) kva_free_pages(s_xfer_ring[slot_id], 1);
+    if (s_hid_buf[slot_id])   kva_free_pages(s_hid_buf[slot_id], 1);
+    if (s_dev_ctx[slot_id])   kva_free_pages(s_dev_ctx[slot_id], 1);
+    s_xfer_ring[slot_id] = NULL; s_xfer_ring_phys[slot_id] = 0;
+    s_hid_buf[slot_id]   = NULL; s_hid_buf_phys[slot_id]   = 0;
+    s_dev_ctx[slot_id]   = NULL; s_dev_ctx_phys[slot_id]   = 0;
+    s_hid_slots[slot_id] = 0;
+    s_hid_slot_type[slot_id] = USB_DEV_NONE;
+    s_slot_port[slot_id] = 0;
+    if (s_dcbaa) s_dcbaa[slot_id] = 0;
+}
+
 /* issue_address_device — build a minimal Input Context and issue Address
  * Device command for the given slot.
  *
@@ -779,9 +799,9 @@ issue_address_device(uint8_t slot_id, uint8_t port_num, uint8_t speed)
                 (uint32_t)(XHCI_TRB_ADDRESS_DEVICE << 10) |
                 ((uint32_t)slot_id << 24));
     ring_cmd_doorbell();
-    if (poll_cmd_completion() == 0)
-        return -1;
-    return 0;
+    int ok = poll_cmd_completion() != 0;
+    kva_free_pages(ictx, 1);
+    return ok ? 0 : -1;
 }
 
 /* issue_configure_ep — add EP1 IN to the slot's device context.
@@ -881,9 +901,9 @@ issue_configure_ep(uint8_t slot_id, uint8_t port_num, uint8_t speed)
                 (uint32_t)(XHCI_TRB_CONFIGURE_EP << 10) |
                 ((uint32_t)slot_id << 24));
     ring_cmd_doorbell();
-    if (poll_cmd_completion() == 0)
-        return -1;
-    return 0;
+    int ok = poll_cmd_completion() != 0;
+    kva_free_pages(ictx, 1);
+    return ok ? 0 : -1;
 }
 
 /* -------------------------------------------------------------------------
@@ -1159,6 +1179,7 @@ detect_hid_protocol(uint8_t slot_id)
 typedef struct {
     int      present;
     int      configured;      /* bulk endpoints set up + netdev registered */
+    struct xhci_ctrl *hc;      /* controller that owns slot_id + doorbells */
     uint8_t  slot_id;
     uint8_t  port_num;
     uint8_t  speed;
@@ -1625,7 +1646,9 @@ xhci_eth_configure_bulk(void)
     enqueue_cmd(ictx_phys, 0,
                 (uint32_t)(XHCI_TRB_CONFIGURE_EP << 10) | ((uint32_t)slot << 24));
     ring_cmd_doorbell();
-    if (poll_cmd_completion() == 0)
+    int ok = poll_cmd_completion() != 0;
+    kva_free_pages(ictx, 1);
+    if (!ok)
         return -1;
 
     /* Arm the first interrupt IN so link-status reports start flowing. */
@@ -1797,7 +1820,12 @@ usb_eth_send(netdev_t *dev, const void *pkt, uint16_t len)
     s_eth.tx_inflight = 1;
     s_eth.tx_count++;
 
-    volatile uint32_t *db = (volatile uint32_t *)(s_bar0_va + s_dboff);
+    struct xhci_ctrl *hc = s_eth.hc;
+    if (!hc) {
+        spin_unlock_irqrestore(&s_eth_tx_lock, fl);
+        return -1;
+    }
+    volatile uint32_t *db = (volatile uint32_t *)(hc->bar0_va + hc->dboff);
     arch_wmb();
     db[s_eth.slot_id] = s_eth.bulk_out_dci;
     spin_unlock_irqrestore(&s_eth_tx_lock, fl);
@@ -2030,6 +2058,7 @@ msc_configure_bulk(void)
 static int
 msc_rw(uint64_t lba, uint32_t count, int is_write, uint8_t *ubuf)
 {
+    if (!s_msc.configured) return -1;
     uint32_t max_chunk = 4096u / s_msc.block_size;
     if (max_chunk == 0) max_chunk = 1;
     int rc = 0;
@@ -2258,6 +2287,7 @@ probe_usb_ethernet(uint8_t slot_id, uint8_t port_num, uint8_t speed)
     }
 
     s_eth.present       = 1;
+    s_eth.hc            = s_cur;
     s_eth.slot_id       = slot_id;
     s_eth.port_num      = port_num;
     s_eth.speed         = speed;
@@ -2444,7 +2474,7 @@ enumerate_port(uint32_t port_num)
     {
         uint32_t s;
         for (s = 1; s < XHCI_MAX_SLOTS; s++) {
-            if (s_hid_slots[s] && s_slot_port[s] == (uint8_t)port_num) {
+            if (s_slot_port[s] == (uint8_t)port_num) {
                 pr_dbg("[XHCI] port %u already enumerated as slot %u, skip\n",
                        (unsigned)port_num, (unsigned)s);
                 return;
@@ -2567,18 +2597,21 @@ enumerate_port(uint32_t port_num)
             printk("[XHCI] port %u: Enable Slot failed\n", (unsigned)port_num);
         return;
     }
+    s_slot_port[slot_id] = (uint8_t)port_num;
 
     /* Allocate the Output Device Context and install its PA in DCBAA[slot]
      * BEFORE Address Device (xHCI §4.3.3 step 4). alloc_page returns a zeroed
      * page; reuse the existing one across re-enumeration of the same slot. */
     if (!s_dev_ctx[slot_id])
         s_dev_ctx[slot_id] = (uint8_t *)alloc_page(&s_dev_ctx_phys[slot_id]);
+    if (!s_dev_ctx[slot_id]) goto enum_fail;
     s_dcbaa[slot_id] = s_dev_ctx_phys[slot_id];
 
     /* Allocate transfer ring for this slot */
     {
         xhci_trb_t *xr =
             (xhci_trb_t *)alloc_page(&s_xfer_ring_phys[slot_id]);
+        if (!xr) goto enum_fail;
         s_xfer_ring[slot_id]    = xr;
         s_xfer_enqueue[slot_id] = 0;
         s_xfer_cycle[slot_id]   = 1;
@@ -2592,6 +2625,7 @@ enumerate_port(uint32_t port_num)
     /* Allocate 8-byte HID boot report buffer */
     s_hid_buf[slot_id] =
         (uint8_t *)alloc_page(&s_hid_buf_phys[slot_id]);
+    if (!s_hid_buf[slot_id]) goto enum_fail;
 
     /* Address Device */
     if (issue_address_device(slot_id, (uint8_t)port_num, speed) != 0) {
@@ -2604,7 +2638,7 @@ enumerate_port(uint32_t port_num)
             printk("[XHCI] port %u: Address Device failed (cc=%u usbsts=0x%x)\n",
                    (unsigned)port_num, (unsigned)s_last_cmd_cc,
                    (unsigned)op_read32(XHCI_OP_USBSTS_OFF));
-        return;
+        goto enum_fail;
     }
     pr_dbg("[XHCI] slot %u Address Device OK\n", (unsigned)slot_id);
 
@@ -2656,7 +2690,7 @@ enumerate_port(uint32_t port_num)
             if (!s_post_boot)
                 printk("[XHCI] port %u: Configure Endpoint failed\n",
                        (unsigned)port_num);
-            return;
+            goto enum_fail;
         }
         pr_dbg("[XHCI] slot %u Configure EP OK\n", (unsigned)slot_id);
 
@@ -2676,6 +2710,11 @@ enumerate_port(uint32_t port_num)
     pr_dbg("[XHCI] slot %u HID %s ready, first interrupt-in scheduled\n",
            (unsigned)slot_id,
            s_hid_slot_type[slot_id] == USB_DEV_MOUSE ? "mouse" : "kbd");
+    return;
+
+enum_fail:
+    issue_disable_slot(slot_id);
+    free_slot_pages(slot_id);
 }
 
 /* -------------------------------------------------------------------------
@@ -3178,11 +3217,8 @@ xhci_init_one(const pcie_device_t *dev)
  * and the next tick is 10 ms away. Blocking would serialise four cores behind
  * an enumerate_port that can hold the ring for over a second.
  *
- * NOT the whole fix: threading s_cur through as a local parameter is the
- * structural repair, and usb_eth_send still reads s_bar0_va/dboff from process
- * context while this may be mutating s_cur. Both are larger refactors of this
- * file; this closes the ISR-vs-ISR race, which is the one that runs 100 times
- * a second on four cores. */
+ * Process-context USB Ethernet TX uses its recorded controller directly; this
+ * guard serializes the remaining selector-based ISR work. */
 static volatile uint32_t s_poll_inflight;
 
 void
@@ -3249,6 +3285,7 @@ rearm_hid:;
 
         /* USB ethernet bulk completion: route by Endpoint ID (control[20:16]). */
         if (trb_type == XHCI_TRB_TRANSFER_EVENT && s_eth.present &&
+            s_eth.hc == s_cur &&
             s_eth.configured && slot == s_eth.slot_id) {
             uint8_t  ep_id    = (uint8_t)((ctrl >> 16) & 0x1Fu);
             uint32_t residual = trb->status & 0xFFFFFFu;
@@ -3313,18 +3350,20 @@ rearm_hid:;
                          * driver-side slot. */
                         uint32_t s;
                         for (s = 1; s < XHCI_MAX_SLOTS; s++) {
-                            if (s_slot_port[s] == port_id && s_hid_slots[s]) {
+                            if (s_slot_port[s] == port_id) {
                                 pr_dbg("[XHCI] port %u disconnect, freeing slot %u\n",
                                        (unsigned)port_id, (unsigned)s);
                                 issue_disable_slot((uint8_t)s);
-                                s_hid_slots[s]     = 0;
-                                s_hid_slot_type[s] = USB_DEV_NONE;
-                                s_slot_port[s]     = 0;
-                                if (s_dcbaa)
-                                    s_dcbaa[s] = 0;
-                                /* Note: leaks transfer ring + HID buf
-                                 * pages — Aegis has no reverse free path.
-                                 * Acceptable for short-lived hotplug. */
+                                if (s_eth.hc == s_cur && s_eth.slot_id == s) {
+                                    s_eth.present = 0;
+                                    s_eth.configured = 0;
+                                    s_eth.tx_inflight = 0;
+                                }
+                                if (s_msc.slot_id == s) {
+                                    s_msc.present = 0;
+                                    s_msc.configured = 0;
+                                }
+                                free_slot_pages((uint8_t)s);
                                 break;
                             }
                         }

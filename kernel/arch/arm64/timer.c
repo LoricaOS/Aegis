@@ -1,9 +1,10 @@
 /*
  * timer.c — ARM64 generic timer (virtual timer, PPI 27) + timekeeping.
  *
- * One 100 Hz source does both jobs the x86 side splits between PIT
- * (timekeeping/polling) and LAPIC (preemption): each tick runs the
- * poller/waitq work (timer_bsp_tick equivalent) and then sched_tick.
+ * Every CPU receives a 100 Hz local preemption tick.  CPU 0 alone performs
+ * global timekeeping, polling, and timer-waiter wakeups, matching x86's
+ * BSP-PIT/local-LAPIC split.  Running global work from every PPI made the
+ * clock advance N times too fast and raced single-producer pollers on SMP.
  */
 
 #include "arch.h"
@@ -93,21 +94,23 @@ void
 timer_irq(void)
 {
     rearm();
-    s_ticks++;
+    uint32_t cpu = percpu_self()->cpu_id;
+    if (cpu == 0) {
+        s_ticks++;
 #ifdef AEGIS_BOOT_NATIVE
-    native_watchdog_tick();     /* pet the BCM2712 watchdog while petting window open */
-    {
-        /* Temperature-based fan governor, ~1 Hz (MMIO-only, IRQ-context safe). */
-        static uint32_t s_fan_ticks = 0;
-        if (++s_fan_ticks >= TIMER_HZ) {
-            s_fan_ticks = 0;
-            pi5_fan_governor();
+        native_watchdog_tick(); /* pet BCM2712 watchdog during its boot window */
+        {
+            static uint32_t s_fan_ticks = 0;
+            if (++s_fan_ticks >= TIMER_HZ) {
+                s_fan_ticks = 0;
+                pi5_fan_governor();
+            }
         }
-    }
 #endif
-    random_add_interrupt_entropy();
-    poll_sources_run();
-    waitq_wake_all(&g_timer_waitq);
+        random_add_interrupt_entropy();
+        poll_sources_run();
+        waitq_wake_all(&g_timer_waitq);
+    }
     if (s_shutdown)
         arch_debug_exit(0x01);
     sched_tick();

@@ -551,8 +551,9 @@ kernel_main(uint32_t mb_magic, void *mb_info)
      * can adopt theirs in ap_entry.  Skipped when APs halt (default) — no
      * point allocating idle TCBs/stacks the parked APs never use. */
     if (g_ap_sched_enabled)
-        for (uint32_t c = 1; c < g_cpu_count; c++)
-            sched_spawn_idle_for(c, task_idle);
+        for (uint32_t c = 1; c < MAX_CPUS; c++)
+            if (g_ap_online[c])
+                sched_spawn_idle_for(c, task_idle);
     bph("sched");
     /* Boot stopwatch readout + per-phase breakdown (µs per phase, ms total).
      * kernel entry → here = all in-kernel init done, about to enter ring 3.
