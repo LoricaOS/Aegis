@@ -22,16 +22,13 @@ void random_init(void);
  * Safe to call from ISR context — no locks, no allocation. */
 void random_add_entropy(const void *data, size_t len);
 
-/* Fill buf with len cryptographically random bytes.
- * Always succeeds (pool is seeded at boot). Returns 0. */
+/* Fill buf with cryptographically random bytes. Returns 0, or -EAGAIN while
+ * the pool has only untrusted boot timing state. */
 int random_get_bytes(void *buf, size_t len);
 
 /* random_is_ready — 1 once the pool has been seeded from a real entropy source
  * (the CPU's hardware RNG at init, or enough accumulated interrupt/device
- * entropy since). Deliberately advisory: random_get_bytes does NOT block on
- * it, because it is called from early boot paths (ASLR at process spawn) where
- * blocking would hang the machine rather than degrade it. It exists so callers
- * that CAN wait, and the boot log, can tell the difference. */
+ * entropy since). */
 int random_is_ready(void);
 
 /* Called from interrupt handlers to mix in cycle-counter jitter.

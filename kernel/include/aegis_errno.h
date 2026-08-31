@@ -82,11 +82,13 @@
 #define EOPNOTSUPP      95   /* Operation not supported on socket   (~1) */
 #define EAFNOSUPPORT    97   /* Address family not supported        (~2) */
 #define EADDRINUSE      98   /* Address already in use              (~4) */
+#define EADDRNOTAVAIL   99   /* Cannot assign requested address          */
 #define ENETDOWN       100   /* Network is down                     (~2) */
 #define EISCONN        106   /* Transport endpoint already connected(~1) */
 #define ENOTCONN       107   /* Transport endpoint not connected    (~2) */
 #define ETIMEDOUT      110   /* Connection timed out (wait_event rc)(~2) */
 #define ECONNREFUSED   111   /* Connection refused                  (~1) */
+#define EHOSTUNREACH   113   /* No route to host                         */
 #define EALREADY       114   /* Operation already in progress       (~1) */
 #define EINPROGRESS    115   /* Operation now in progress           (~1) */
 

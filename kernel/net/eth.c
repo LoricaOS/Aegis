@@ -1,6 +1,7 @@
 /* kernel/net/eth.c — Ethernet framing, ARP table, ARP send/resolve */
 #include "eth.h"
 #include "ip.h"     /* ip_rx(), net_get_config() */
+#include "ipv6.h"
 #include "arch.h"   /* arch_get_ticks() */
 #include "printk.h"
 #include "spinlock.h"
@@ -240,6 +241,8 @@ void eth_rx(netdev_t *dev, const void *frame, uint16_t len)
         arp_rx_pkt(dev, (const arp_pkt_t *)payload);
     } else if (et == ETHERTYPE_IP) {
         ip_rx(dev, frame, payload, payload_len);
+    } else if (et == ETHERTYPE_IPV6) {
+        ipv6_rx(dev, frame, payload, payload_len);
     }
     /* Other ethertypes: drop silently */
 }

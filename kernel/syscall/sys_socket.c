@@ -13,29 +13,31 @@
 #include "udp.h"
 #include "tcp.h"
 #include "ip.h"
+#include "ipv6.h"
 #include "unix_socket.h"
 #include "fd_waitq.h"
 #include "signal.h"
 #include "memfd.h"
 #include "pipe.h"
+#include "fs_ops.h"
 
 /* scm_fd_passable — may this fd cross a process boundary via SCM_RIGHTS?
  *
- * Only no-authority IPC / shared-memory primitives may. A filesystem fd (ext2)
- * carries its open-time authority — AUTH for /etc/shadow and /etc/aegis/admin,
- * INSTALL for the write-protected trees, plus ext2 DAC — and a device fd
- * (console/pty/fb) carries device access; the RECEIVER may hold none of those
- * caps, so passing such an fd would launder the authority to a capless process
- * (a confused-deputy privesc). The receiver must open the object itself and
- * pass the gate. memfd (shared RAM), pipes and unix sockets carry no such
- * authority. Allowlist + fail closed: anything not listed here cannot be
- * passed. (Today only lumen's window-surface memfd is ever legitimately sent.) */
+ * No-authority IPC/shared-memory primitives and explicitly confined ext2
+ * directory capabilities may pass. Ordinary filesystem and device fds remain
+ * blocked. A confined directory carries its root/rights metadata, while
+ * AUTH/INSTALL are rechecked on every derived open. */
 static int
-scm_fd_passable(const vfs_ops_t *ops)
+scm_fd_passable(const vfs_file_t *f)
 {
-    return ops == &g_memfd_ops ||
-           ops == &g_pipe_read_ops || ops == &g_pipe_write_ops ||
-           ops == &g_unix_sock_ops;
+    if (f->ops == &g_memfd_ops ||
+        f->ops == &g_pipe_read_ops || f->ops == &g_pipe_write_ops ||
+        f->ops == &g_unix_sock_ops)
+        return 1;
+    if (!(f->kflags & VFS_KF_CAP_CONFINED))
+        return 0;
+    uint32_t ino = g_rootfs->ino_of(f->ops, f->priv);
+    return ino != 0 && g_rootfs->is_dir(ino);
 }
 
 /* ── Constants ─────────────────────────────────────────────────────────── */
@@ -59,12 +61,8 @@ scm_fd_passable(const vfs_ops_t *ops)
 #define IPPROTO_TCP    6
 #define TCP_NODELAY    1
 
-/* send/recv flags (Linux ABI). Only MSG_DONTWAIT changes control flow; the
- * rest are accepted-and-ignored so that programs passing them (curl, musl)
- * don't fail. MSG_NOSIGNAL is implicitly always-on here (we never raise
- * SIGPIPE from the socket layer). MSG_PEEK/MSG_WAITALL are not yet honored —
- * see the per-call notes; ignoring them degrades gracefully (a normal
- * consuming read) rather than erroring. */
+/* send/recv flags (Linux ABI). Receive calls support MSG_DONTWAIT only and
+ * reject every other flag rather than silently changing its semantics. */
 #define MSG_OOB        0x0001
 #define MSG_PEEK       0x0002
 #define MSG_DONTWAIT   0x0040
@@ -92,6 +90,12 @@ get_sock_from_pin(fd_table_pin_t *pin, sock_t **s_out, uint32_t *sid_out)
     *s_out   = s;
     *sid_out = sid;
     return 0;
+}
+
+static int
+recv_flags_supported(uint64_t flags)
+{
+    return (flags & ~(uint64_t)MSG_DONTWAIT) == 0;
 }
 
 static uint64_t
@@ -192,9 +196,12 @@ sys_socket(uint64_t domain, uint64_t type, uint64_t proto)
         return (uint64_t)fd;
     }
 
-    /* AF_INET path */
-    if (domain != AF_INET) return SYS_ERR(EAFNOSUPPORT);
+    /* Internet sockets: IPv6 currently exposes UDP over link-local/NDP. TCPv6
+     * is rejected honestly until tcp.c has 128-bit endpoints. */
+    if (domain != AF_INET && domain != AF_INET6) return SYS_ERR(EAFNOSUPPORT);
     if (base_type != SOCK_STREAM && base_type != SOCK_DGRAM)
+        return SYS_ERR(EPROTONOSUPPORT);
+    if (domain == AF_INET6 && base_type != SOCK_DGRAM)
         return SYS_ERR(EPROTONOSUPPORT);
 
     aegis_process_t *proc = current_proc();
@@ -203,6 +210,10 @@ sys_socket(uint64_t domain, uint64_t type, uint64_t proto)
 
     int sid = sock_alloc((uint8_t)(base_type == SOCK_STREAM ? SOCK_TYPE_STREAM : SOCK_TYPE_DGRAM));
     if (sid < 0) return SYS_ERR(EMFILE);
+    {
+        sock_t *s = sock_get((uint32_t)sid);
+        if (s) s->domain = (uint8_t)domain;
+    }
     if (nonblock) {
         sock_t *s = sock_get((uint32_t)sid);
         if (s) s->nonblocking = 1;
@@ -241,13 +252,35 @@ sys_bind(uint64_t fd, uint64_t addr, uint64_t addrlen)
         return rc < 0 ? sc_ret(rc) : 0;
     }
 
-    /* AF_INET bind */
-    if (addrlen < sizeof(k_sockaddr_in_t)) return SYS_ERR(EINVAL);
-    if (!user_ptr_valid(addr, sizeof(k_sockaddr_in_t))) return SYS_ERR(EFAULT);
-
     sock_t *s; uint32_t sid;
     uint64_t err = get_sock_from_pin(&pin, &s, &sid);
     if (err) return err;
+
+    if (s->domain == AF_INET6) {
+        if (addrlen < sizeof(k_sockaddr_in6_t)) return SYS_ERR(EINVAL);
+        if (!user_ptr_valid(addr, sizeof(k_sockaddr_in6_t))) return SYS_ERR(EFAULT);
+        k_sockaddr_in6_t sa;
+        copy_from_user(&sa, (const void *)(uintptr_t)addr, sizeof(sa));
+        if (sa.sin6_family != AF_INET6) return SYS_ERR(EINVAL);
+        static const ip6_addr_t any;
+        ip6_addr_t local; ipv6_get_linklocal(&local);
+        if (!ipv6_addr_equal(&sa.sin6_addr, &any) &&
+            !ipv6_addr_equal(&sa.sin6_addr, &local)) return SYS_ERR(EADDRNOTAVAIL);
+        s->local_ip6 = sa.sin6_addr;
+        uint16_t port = ntohs(sa.sin6_port);
+        if (port == 0) {
+            if (udp_ensure_local_port(s, sid) != 0) return SYS_ERR(EADDRINUSE);
+        } else {
+            s->local_port = port;
+            if (udp_bind(port, sid) != 0) return SYS_ERR(EADDRINUSE);
+        }
+        s->state = SOCK_BOUND;
+        return 0;
+    }
+
+    /* AF_INET bind */
+    if (addrlen < sizeof(k_sockaddr_in_t)) return SYS_ERR(EINVAL);
+    if (!user_ptr_valid(addr, sizeof(k_sockaddr_in_t))) return SYS_ERR(EFAULT);
 
     k_sockaddr_in_t sa;
     copy_from_user(&sa, (const void *)(uintptr_t)addr, sizeof(sa));
@@ -388,6 +421,7 @@ do_accept(uint64_t fd, uint64_t addr, uint64_t addrlen, uint64_t flags)
             if (new_sid < 0) return (sock_unref(lsid), SYS_ERR(ENOMEM));
             sock_t *ns = sock_get((uint32_t)new_sid);
             ns->state       = SOCK_CONNECTED;
+            ns->domain      = AF_INET;
             ns->tcp_conn_id = conn_id;
             ns->nonblocking = (flags & SOCK_FLAG_NONBLOCK) ? 1 : 0;
 
@@ -478,12 +512,26 @@ sys_connect(uint64_t fd, uint64_t addr, uint64_t addrlen)
         return rc < 0 ? (uint64_t)(int64_t)rc : 0;
     }
 
-    if (addrlen < sizeof(k_sockaddr_in_t)) return SYS_ERR(EINVAL);
-    if (!user_ptr_valid(addr, sizeof(k_sockaddr_in_t))) return SYS_ERR(EFAULT);
-
     sock_t *s; uint32_t sid;
     uint64_t err = get_sock_from_pin(&pin, &s, &sid);
     if (err) return err;
+
+    if (s->domain == AF_INET6) {
+        if (addrlen < sizeof(k_sockaddr_in6_t)) return SYS_ERR(EINVAL);
+        if (!user_ptr_valid(addr, sizeof(k_sockaddr_in6_t))) return SYS_ERR(EFAULT);
+        k_sockaddr_in6_t sa6;
+        copy_from_user(&sa6, (const void *)(uintptr_t)addr, sizeof(sa6));
+        if (sa6.sin6_family != AF_INET6) return SYS_ERR(EINVAL);
+        s->remote_ip6 = sa6.sin6_addr;
+        s->remote_port = ntohs(sa6.sin6_port);
+        if (ipv6_addr_equal(&s->local_ip6, &(ip6_addr_t){0}))
+            ipv6_get_linklocal(&s->local_ip6);
+        s->state = SOCK_CONNECTED;
+        return 0;
+    }
+
+    if (addrlen < sizeof(k_sockaddr_in_t)) return SYS_ERR(EINVAL);
+    if (!user_ptr_valid(addr, sizeof(k_sockaddr_in_t))) return SYS_ERR(EFAULT);
 
     k_sockaddr_in_t sa;
     copy_from_user(&sa, (const void *)(uintptr_t)addr, sizeof(sa));
@@ -635,6 +683,31 @@ sys_sendto(uint64_t fd, uint64_t buf, uint64_t len,
     }
 
     /* UDP send */
+    if (s->domain == AF_INET6) {
+        ip6_addr_t dst;
+        uint16_t dst_port;
+        if (addr && addrlen >= sizeof(k_sockaddr_in6_t)) {
+            if (!user_ptr_valid(addr, sizeof(k_sockaddr_in6_t))) return SYS_ERR(EFAULT);
+            k_sockaddr_in6_t sa;
+            copy_from_user(&sa, (const void *)(uintptr_t)addr, sizeof(sa));
+            if (sa.sin6_family != AF_INET6) return SYS_ERR(EINVAL);
+            dst = sa.sin6_addr; dst_port = ntohs(sa.sin6_port);
+        } else if (s->state == SOCK_CONNECTED) {
+            dst = s->remote_ip6; dst_port = s->remote_port;
+        } else return SYS_ERR(EDESTADDRREQ);
+        if (len > 1452) len = 1452;
+        uint8_t udpbuf6[1452];
+        if (copy_from_user(udpbuf6, (const void *)(uintptr_t)buf, len) != 0)
+            return SYS_ERR(EFAULT);
+        netdev_t *dev = netdev_get("eth0");
+        if (!dev) return SYS_ERR(ENETDOWN);
+        if (udp_ensure_local_port(s, sid) != 0) return SYS_ERR(EADDRINUSE);
+        if (ipv6_addr_equal(&s->local_ip6, &(ip6_addr_t){0}))
+            ipv6_get_linklocal(&s->local_ip6);
+        int r = udp6_send(dev, s->local_port, &dst, dst_port, udpbuf6, (uint16_t)len);
+        return r < 0 ? SYS_ERR(EHOSTUNREACH) : len;
+    }
+
     ip4_addr_t dst_ip;
     uint16_t   dst_port;
     if (addr && addrlen >= sizeof(k_sockaddr_in_t)) {
@@ -685,6 +758,7 @@ uint64_t
 sys_recvfrom(uint64_t fd, uint64_t buf, uint64_t len,
              uint64_t flags, uint64_t addr, uint64_t addrlen)
 {
+    if (!recv_flags_supported(flags)) return SYS_ERR(EOPNOTSUPP);
     SCOPED_FD_PIN(pin);
     if (!user_ptr_valid(buf, len)) return SYS_ERR(EFAULT);
 
@@ -722,9 +796,7 @@ sys_recvfrom(uint64_t fd, uint64_t buf, uint64_t len,
     /* MSG_DONTWAIT forces this single call to be nonblocking regardless of the
      * socket's O_NONBLOCK flag (Linux semantics). musl/curl pass it on their
      * "drain whatever is ready" reads; without honoring it a blocking socket
-     * would sleep inside the syscall and stall the caller's event loop.
-     * MSG_PEEK / MSG_WAITALL are not yet implemented; they are accepted and
-     * ignored (a normal consuming read) — flagged for review, see report. */
+     * would sleep inside the syscall and stall the caller's event loop. */
     uint8_t nonblock = s->nonblocking || (flags & MSG_DONTWAIT) ? 1 : 0;
 
     uint32_t deadline = 0;
@@ -796,9 +868,20 @@ sys_recvfrom(uint64_t fd, uint64_t buf, uint64_t len,
             s->udp_rx_head = (s->udp_rx_head + 1) & (UDP_RX_SLOTS - 1);
             uint32_t copy_len = slot->len < (uint32_t)len ? slot->len : (uint32_t)len;
             copy_to_user((void *)(uintptr_t)buf, slot->data, copy_len);
-            if (addr && addrlen &&
-                user_ptr_valid(addr, sizeof(k_sockaddr_in_t)) &&
+            if (addr && addrlen && s->domain == AF_INET6 &&
+                user_ptr_valid(addr, sizeof(k_sockaddr_in6_t)) &&
                 user_ptr_valid(addrlen, sizeof(uint32_t))) {
+                k_sockaddr_in6_t sa;
+                __builtin_memset(&sa, 0, sizeof(sa));
+                sa.sin6_family = AF_INET6;
+                sa.sin6_port = htons(slot->src_port);
+                sa.sin6_addr = slot->src_ip6;
+                uint32_t outlen = sizeof(sa);
+                copy_to_user((void *)(uintptr_t)addrlen, &outlen, sizeof(outlen));
+                copy_to_user((void *)(uintptr_t)addr, &sa, sizeof(sa));
+            } else if (addr && addrlen &&
+                       user_ptr_valid(addr, sizeof(k_sockaddr_in_t)) &&
+                       user_ptr_valid(addrlen, sizeof(uint32_t))) {
                 k_sockaddr_in_t sa;
                 sa.sin_family = AF_INET;
                 sa.sin_port   = htons(slot->src_port);
@@ -999,18 +1082,16 @@ uint64_t sys_sendmsg(uint64_t fd, uint64_t msg_ptr, uint64_t flags)
                     /* Authority-laundering guard: refuse to pass an fd that
                      * carries filesystem/device authority (see scm_fd_passable).
                      * Unwind the refs already dup'd this message, then EPERM. */
-                    if (!scm_fd_passable(f->ops)) { denied = 1; break; }
+                    if (!scm_fd_passable(f)) { denied = 1; break; }
                     if (f->ops->dup) f->ops->dup(f->priv);
-                    staged[count].ops   = f->ops;
-                    staged[count].priv  = f->priv;
-                    staged[count].flags = f->flags;
+                    staged[count].file = *f;
                     count++;
                 }
                 spin_unlock_irqrestore(&proc->fd_table->lock, ffl);
                 if (denied) {
                     for (uint8_t k = 0; k < count; k++)
-                        if (staged[k].ops && staged[k].ops->close)
-                            staged[k].ops->close(staged[k].priv);
+                        if (staged[k].file.ops && staged[k].file.ops->close)
+                            staged[k].file.ops->close(staged[k].file.priv);
                     return SYS_ERR(EPERM);
                 }
                 if (count > 0) {
@@ -1020,8 +1101,8 @@ uint64_t sys_sendmsg(uint64_t fd, uint64_t msg_ptr, uint64_t flags)
                          * release the refs we just dup'd, else they leak
                          * (the memfd/socket slot would never reach 0). */
                         for (uint8_t k = 0; k < count; k++)
-                            if (staged[k].ops && staged[k].ops->close)
-                                staged[k].ops->close(staged[k].priv);
+                            if (staged[k].file.ops && staged[k].file.ops->close)
+                                staged[k].file.ops->close(staged[k].file.priv);
                     }
                 }
             }
@@ -1033,6 +1114,7 @@ uint64_t sys_sendmsg(uint64_t fd, uint64_t msg_ptr, uint64_t flags)
 
 uint64_t sys_recvmsg(uint64_t fd, uint64_t msg_ptr, uint64_t flags)
 {
+    if (!recv_flags_supported(flags)) return SYS_ERR(EOPNOTSUPP);
     SCOPED_FD_PIN(pin);
     uint32_t uid = get_proc_unix_sock(fd, &pin);
 
@@ -1081,7 +1163,6 @@ uint64_t sys_recvmsg(uint64_t fd, uint64_t msg_ptr, uint64_t flags)
         return r;
     }
 
-    (void)flags;
     if (!user_ptr_valid(msg_ptr, sizeof(k_msghdr_t))) return SYS_ERR(EFAULT);
     k_msghdr_t mh;
     if (copy_from_user(&mh, (const void *)(uintptr_t)msg_ptr, sizeof(mh)))
@@ -1188,13 +1269,23 @@ sys_shutdown(uint64_t fd, uint64_t how)
 uint64_t
 sys_getsockname(uint64_t fd, uint64_t addr, uint64_t addrlen)
 {
-    if (!user_ptr_valid(addr, sizeof(k_sockaddr_in_t))) return SYS_ERR(EFAULT);
     if (!addrlen) return SYS_ERR(EFAULT);
     if (!user_ptr_valid(addrlen, sizeof(uint32_t))) return SYS_ERR(EFAULT);
     SCOPED_FD_PIN(pin);
     sock_t *s; uint32_t sid;
     uint64_t err = get_proc_sock(fd, &pin, &s, &sid);
     if (err) return err;
+    if (s->domain == AF_INET6) {
+        if (!user_ptr_valid(addr, sizeof(k_sockaddr_in6_t))) return SYS_ERR(EFAULT);
+        k_sockaddr_in6_t sa; __builtin_memset(&sa, 0, sizeof(sa));
+        sa.sin6_family = AF_INET6; sa.sin6_port = htons(s->local_port);
+        sa.sin6_addr = s->local_ip6;
+        uint32_t outlen = sizeof(sa);
+        copy_to_user((void *)(uintptr_t)addrlen, &outlen, sizeof(outlen));
+        copy_to_user((void *)(uintptr_t)addr, &sa, sizeof(sa));
+        return 0;
+    }
+    if (!user_ptr_valid(addr, sizeof(k_sockaddr_in_t))) return SYS_ERR(EFAULT);
     k_sockaddr_in_t sa;
     sa.sin_family = AF_INET;
     sa.sin_port   = htons(s->local_port);
@@ -1209,7 +1300,6 @@ sys_getsockname(uint64_t fd, uint64_t addr, uint64_t addrlen)
 uint64_t
 sys_getpeername(uint64_t fd, uint64_t addr, uint64_t addrlen)
 {
-    if (!user_ptr_valid(addr, sizeof(k_sockaddr_in_t))) return SYS_ERR(EFAULT);
     if (!addrlen) return SYS_ERR(EFAULT);
     if (!user_ptr_valid(addrlen, sizeof(uint32_t))) return SYS_ERR(EFAULT);
     SCOPED_FD_PIN(pin);
@@ -1217,6 +1307,17 @@ sys_getpeername(uint64_t fd, uint64_t addr, uint64_t addrlen)
     uint64_t err = get_proc_sock(fd, &pin, &s, &sid);
     if (err) return err;
     if (s->state != SOCK_CONNECTED) return SYS_ERR(ENOTCONN);
+    if (s->domain == AF_INET6) {
+        if (!user_ptr_valid(addr, sizeof(k_sockaddr_in6_t))) return SYS_ERR(EFAULT);
+        k_sockaddr_in6_t sa; __builtin_memset(&sa, 0, sizeof(sa));
+        sa.sin6_family = AF_INET6; sa.sin6_port = htons(s->remote_port);
+        sa.sin6_addr = s->remote_ip6;
+        uint32_t outlen = sizeof(sa);
+        copy_to_user((void *)(uintptr_t)addrlen, &outlen, sizeof(outlen));
+        copy_to_user((void *)(uintptr_t)addr, &sa, sizeof(sa));
+        return 0;
+    }
+    if (!user_ptr_valid(addr, sizeof(k_sockaddr_in_t))) return SYS_ERR(EFAULT);
     k_sockaddr_in_t sa;
     sa.sin_family = AF_INET;
     sa.sin_port   = htons(s->remote_port);
@@ -1473,7 +1574,7 @@ typedef struct {
 } wifi_net_pub_t;
 extern int iwl_wifi_present(void);
 extern int iwl_wifi_list(wifi_net_pub_t *out, int max);
-extern int iwl_wifi_connect(const char *ssid);
+extern int iwl_wifi_connect(const char *ssid,const char *pass,uint8_t pass_len);
 extern int iwl_wifi_rescan(void);
 
 uint64_t
@@ -1557,25 +1658,28 @@ sys_netcfg(uint64_t op, uint64_t arg1, uint64_t arg2, uint64_t arg3)
         return n < 0 ? SYS_ERR(EIO) : (uint64_t)n;
     }
     if (op == 3) {
-        /* op=3 (connect to SSID): arg1 = user SSID string. Active control that
+        /* op=3: arg1 points to {ssid[33], passphrase[64]}. Credentials never
+         * leave this call and the driver wipes its temporary copy. Active control that
          * changes the host's network association -> NET_ADMIN (same class as
          * op=0), intentionally not held by the plain netman GUI. */
         if (cap_check(proc->caps, CAP_TABLE_SIZE,
                       CAP_KIND_NET_ADMIN, CAP_RIGHTS_WRITE) != 0)
             return SYS_ERR(ENOCAP);
         if (!iwl_wifi_present()) return SYS_ERR(ENODEV);
-        char ssid[33];
+        struct { char ssid[33]; char pass[64]; } req;
         /* Validate the FULL range we copy, not just 1 byte — the exception-table
          * copy_from_user faults gracefully on the shipped arches, but the
          * validated and copied lengths must agree (and the generic memcpy
          * fallback would over-read). */
-        if (!user_ptr_valid(arg1, sizeof(ssid) - 1)) return SYS_ERR(EFAULT);
-        __builtin_memset(ssid, 0, sizeof(ssid));
-        if (copy_from_user(ssid, (const void *)(uintptr_t)arg1, sizeof(ssid) - 1) != 0)
+        if(!user_ptr_valid(arg1,sizeof(req)))return SYS_ERR(EFAULT);
+        __builtin_memset(&req,0,sizeof(req));
+        if(copy_from_user(&req,(const void *)(uintptr_t)arg1,sizeof(req))!=0)
             return SYS_ERR(EFAULT);
-        ssid[32] = 0;
-        int rc = iwl_wifi_connect(ssid);
-        return rc == 0 ? 0 : SYS_ERR(EIO);
+        req.ssid[32]=0;req.pass[63]=0;uint8_t plen=0;
+        while(plen<63&&req.pass[plen])plen++;
+        int rc=iwl_wifi_connect(req.ssid,req.pass,plen);
+        __builtin_memset(&req,0,sizeof(req));
+        return rc==0?0:SYS_ERR(rc==-4?EINVAL:rc==-5?EBUSY:EIO);
     }
 #endif /* __x86_64__ */
     return SYS_ERR(EINVAL);

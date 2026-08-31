@@ -28,7 +28,7 @@ AUTOCONF_H   := $(BUILD)/generated/autoconf.h
 AUTOCONF_MK  := $(BUILD)/auto.conf
 export KCONFIG_CONFIG := .config
 # Don't drag in config generation for clean/menuconfig/defconfig goals.
-ifeq ($(filter clean distclean %config,$(MAKECMDGOALS)),)
+ifeq ($(filter clean distclean %config test-wpa2-crypto test-cryptroot-crypto,$(MAKECMDGOALS)),)
 -include $(AUTOCONF_MK)
 endif
 
@@ -160,7 +160,7 @@ TTY_SRCS    = kernel/tty/tty.c kernel/tty/pty.c
 FS_SRCS = \
     kernel/fs/fd_table.c kernel/fs/vfs.c kernel/fs/initrd.c \
     kernel/fs/console.c kernel/fs/kbd_vfs.c kernel/fs/pipe.c \
-    kernel/fs/blkdev.c kernel/fs/gpt.c \
+    kernel/fs/blkdev.c kernel/fs/gpt.c kernel/fs/cryptroot.c kernel/fs/cryptroot_crypto.c \
     kernel/fs/ext2.c kernel/fs/ext2_cache.c kernel/fs/ext2_dir.c kernel/fs/ext2_vfs.c \
     kernel/fs/ext2_ops.c \
     kernel/fs/ramfs.c kernel/fs/procfs.c kernel/fs/memfd.c kernel/fs/eventfd.c \
@@ -180,7 +180,7 @@ DRIVER_SRCS = \
     kernel/drivers/virtio_vsock.c \
     kernel/drivers/rtl8169.c kernel/drivers/rtl8139.c \
     kernel/drivers/e1000.c kernel/drivers/vmxnet3.c \
-    kernel/drivers/iwl_ax200.c \
+    kernel/drivers/iwl_ax200.c kernel/drivers/wpa2_crypto.c \
     kernel/drivers/hda.c kernel/drivers/pvpanic.c \
     kernel/drivers/pvscsi.c \
     kernel/drivers/vmbus.c kernel/drivers/storvsc.c kernel/drivers/netvsc.c \
@@ -190,7 +190,7 @@ DRIVER_SRCS = \
     kernel/drivers/fb.c kernel/drivers/ramdisk.c
 
 NET_SRCS = \
-    kernel/net/netdev.c kernel/net/eth.c kernel/net/ip.c \
+    kernel/net/netdev.c kernel/net/eth.c kernel/net/ip.c kernel/net/ipv6.c \
     kernel/net/udp.c kernel/net/tcp.c kernel/net/socket.c \
     kernel/net/unix_socket.c kernel/net/epoll.c
 
@@ -230,7 +230,7 @@ USERSPACE_SRCS := $(filter-out kernel/syscall/sys_socket.c,$(USERSPACE_SRCS))
 DRIVER_SRCS    := $(filter-out \
     kernel/drivers/rtl8169.c kernel/drivers/rtl8139.c \
     kernel/drivers/e1000.c kernel/drivers/vmxnet3.c kernel/drivers/netvsc.c \
-    kernel/drivers/iwl_ax200.c, $(DRIVER_SRCS))
+    kernel/drivers/iwl_ax200.c kernel/drivers/wpa2_crypto.c, $(DRIVER_SRCS))
 endif
 
 ifneq ($(CONFIG_AUDIO_HDA),y)
@@ -368,7 +368,7 @@ ALL_OBJS = $(BOOT_OBJ) $(ARCH_OBJS) $(ARCH_ASM_OBJS) $(CORE_OBJS) $(SIGNAL_OBJS)
            $(NET_OBJS) $(USERSPACE_OBJS)
 
 
-.PHONY: all iso test clean version sym dist arm64 arm64-iso test-arm64
+.PHONY: all iso test test-wpa2-crypto clean version sym dist arm64 arm64-iso test-arm64
 .PHONY: syncconfig allnoconfig allyesconfig oldconfig
 all: $(BUILD)/aegis.elf
 
@@ -601,6 +601,21 @@ test: $(BUILD)/aegis-test.iso iso $(BUILD)/aegis-mb2.iso
 	bash tools/captest.sh $(BUILD)/aegis-test.iso
 	bash tools/ktest.sh $(BUILD)/aegis.iso
 	bash tools/ktest.sh $(BUILD)/aegis-mb2.iso
+
+$(BUILD)/wpa2-crypto-test: test/wpa2_crypto_test.c kernel/drivers/wpa2_crypto.c
+	@mkdir -p $(@D)
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -Ikernel/drivers $^ -o $@
+
+test-wpa2-crypto: $(BUILD)/wpa2-crypto-test
+	$<
+
+$(BUILD)/cryptroot-crypto-test: test/cryptroot_crypto_test.c kernel/fs/cryptroot_crypto.c
+	@mkdir -p $(@D)
+	$(HOSTCC) -std=c99 -O2 -Wall -Wextra -Werror -Ikernel/fs $^ -o $@
+
+.PHONY: test-cryptroot-crypto
+test-cryptroot-crypto: $(BUILD)/cryptroot-crypto-test
+	$<
 
 # Full userspace in a microVM: build the microvm tier (PVH, no PCI/ACPI,
 # virtio-mmio) and a test rootfs, then boot it in QEMU's `microvm` machine with

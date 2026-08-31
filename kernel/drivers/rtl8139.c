@@ -98,16 +98,7 @@ static inline void w32(uint32_t o, uint32_t v) { *(volatile uint32_t *)(s_mmio +
 static uint8_t *
 map_ram(uint64_t pa, uint32_t n_pages)
 {
-    uintptr_t va = (uintptr_t)kva_alloc_pages(n_pages);
-    if (!va)
-        return NULL;
-    for (uint32_t i = 0; i < n_pages; i++) {
-        uintptr_t pv = va + (uint64_t)i * 4096;
-        vmm_unmap_page(pv);
-        vmm_map_page(pv, pa + (uint64_t)i * 4096,
-                     VMM_FLAG_PRESENT | VMM_FLAG_WRITABLE);  /* WB cached */
-    }
-    return (uint8_t *)va;
+    return (uint8_t *)kva_map_phys_pages(pa, n_pages);
 }
 
 static int  rtl8139_send(netdev_t *dev, const void *pkt, uint16_t len);

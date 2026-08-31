@@ -385,7 +385,7 @@ void
 fb_init(void)
 {
     arch_fb_info_t info;
-    uint32_t fb_pages, i;
+    uint32_t fb_pages;
     uint8_t *region;
 
     if (!arch_get_fb_info(&info))
@@ -415,24 +415,10 @@ fb_init(void)
         uint64_t fb_bytes = (uint64_t)info.pitch * (uint64_t)info.height;
         fb_pages = (uint32_t)((fb_bytes + 0xFFFu) / 0x1000u);
     }
-    region   = (uint8_t *)kva_alloc_pages((uint64_t)fb_pages);
+    region = (uint8_t *)kva_map_mmio(info.addr, fb_pages);
     if (!region) {
         serial_write_string("[FB] WARN: kva alloc failed\n");
         return;
-    }
-
-    for (i = 0; i < fb_pages; i++) {
-        uint64_t va     = (uint64_t)region + (uint64_t)i * 0x1000u;
-        uint64_t old_pa = kva_page_phys((void *)va);
-        /* kva_alloc_pages already mapped va to a PMM frame.
-         * SAFETY: vmm_unmap_page removes the existing PTE so that the
-         * following vmm_map_page does not panic on a double-map.
-         * The PMM frame is freed back to the allocator. */
-        vmm_unmap_page(va);
-        pmm_free_page(old_pa);
-        vmm_map_page(va,
-                     info.addr + (uint64_t)i * 0x1000u,
-                     VMM_FLAG_PRESENT | VMM_FLAG_WRITABLE | VMM_FLAG_WC);
     }
 
     s_fb_va    = (volatile uint32_t *)region;

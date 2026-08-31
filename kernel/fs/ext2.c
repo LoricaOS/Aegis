@@ -110,7 +110,8 @@ static uint32_t ext2_now(void)
 static uint32_t ext2_block_num_impl(const ext2_inode_t *inode, uint32_t file_block);
 static uint32_t ext2_ind_get(uint32_t blk, uint32_t idx);
 static int      ext2_read_symlink_target_impl(uint32_t ino, char *buf, uint32_t bufsiz);
-static int      ext2_walk_impl(const char *path, uint32_t *inode_out,
+static int      ext2_walk_impl(uint32_t start_ino, uint32_t root_ino,
+                               const char *path, uint32_t *inode_out,
                                int follow_final, int *touched);
 static void     icache_clear(void);   /* parsed-inode cache; defined below */
 
@@ -150,7 +151,8 @@ static int ext2_walk(const char *path, uint32_t *inode_out, int follow_final,
                      int *touched)
 {
     irqflags_t fl = ext2_lock_acquire();
-    int r = ext2_walk_impl(path, inode_out, follow_final, touched);
+    int r = ext2_walk_impl(EXT2_ROOT_INODE, EXT2_ROOT_INODE, path, inode_out,
+                           follow_final, touched);
     ext2_lock_release(fl);
     return r;
 }
@@ -163,7 +165,7 @@ blkdev_t *s_dev;
 ext2_superblock_t s_sb;
 uint32_t s_block_size;
 uint32_t s_num_groups;
-ext2_bgd_t s_bgd[32];   /* support up to 32 block groups */
+ext2_bgd_t s_bgd[EXT2_MAX_GROUPS];
 int s_mounted = 0;
 
 /* Per-group allocation resume-hints (block + inode bitmaps).  The bitmap scan
@@ -174,8 +176,8 @@ int s_mounted = 0;
  * records the next bit to try; the scan resumes there and only wraps to
  * [0, hint) if the tail is full, so a freed low bit is still found (correctness
  * preserved) while sequential allocation is amortized O(1).  Reset at mount. */
-static uint32_t s_blk_hint[32];
-static uint32_t s_ino_hint[32];
+static uint32_t s_blk_hint[EXT2_MAX_GROUPS];
+static uint32_t s_ino_hint[EXT2_MAX_GROUPS];
 
 /* Largest file this driver can address, derived from the mounted block size:
  * direct (12) + single-indirect (ppb) + double-indirect (ppb*ppb) data blocks,
@@ -416,7 +418,7 @@ int ext2_mount(const char *devname)
     }
 
     /* Reset per-group allocation resume-hints for this mount. */
-    for (i = 0; i < 32; i++) {
+    for (i = 0; i < EXT2_MAX_GROUPS; i++) {
         s_blk_hint[i] = 0;
         s_ino_hint[i] = 0;
     }
@@ -511,8 +513,14 @@ int ext2_mount(const char *devname)
 
     s_num_groups = (s_sb.s_blocks_count + s_sb.s_blocks_per_group - 1)
                    / s_sb.s_blocks_per_group;
-    if (s_num_groups > 32)
-        s_num_groups = 32;
+    uint32_t max_groups = s_block_size / sizeof(ext2_bgd_t);
+    if (max_groups > EXT2_MAX_GROUPS)
+        max_groups = EXT2_MAX_GROUPS;
+    if (s_num_groups > max_groups) {
+        printk("[EXT2] FAIL: %u groups exceeds descriptor-block maximum %u\n",
+               (unsigned)s_num_groups, (unsigned)max_groups);
+        goto mount_out;
+    }
 
     /* BGD table is at the block immediately after the superblock.
      * For 1024-byte blocks: superblock is in block 1, BGD at block 2.
@@ -709,7 +717,7 @@ static int ext2_read_inode_impl(uint32_t ino, ext2_inode_t *out)
         return 0;                /* parsed-inode cache hit */
     uint32_t group       = (ino - 1) / s_sb.s_inodes_per_group;
     uint32_t index       = (ino - 1) % s_sb.s_inodes_per_group;
-    if (group >= s_num_groups || group >= 32) {
+    if (group >= s_num_groups || group >= EXT2_MAX_GROUPS) {
         return -1;
     }
     uint32_t inode_size  = (s_sb.s_rev_level >= 1)
@@ -741,7 +749,7 @@ static int ext2_write_inode_impl(uint32_t ino, const ext2_inode_t *inode)
 {
     uint32_t group       = (ino - 1) / s_sb.s_inodes_per_group;
     uint32_t index       = (ino - 1) % s_sb.s_inodes_per_group;
-    if (group >= s_num_groups || group >= 32) {
+    if (group >= s_num_groups || group >= EXT2_MAX_GROUPS) {
         return -1;
     }
     uint32_t inode_size  = (s_sb.s_rev_level >= 1)
@@ -1201,8 +1209,9 @@ static int ext2_read_symlink_target_impl(uint32_t ino, char *buf, uint32_t bufsi
  * /etc/aegis, /bin, /sbin) — symlink- and ".."-safe, and set even when the
  * final component doesn't resolve (e.g. an O_CREAT target), so callers can gate
  * creates too. */
-static int ext2_walk_impl(const char *path, uint32_t *inode_out, int follow_final,
-                     int *touched)
+static int ext2_walk_impl(uint32_t start_ino, uint32_t root_ino,
+                          const char *path, uint32_t *inode_out,
+                          int follow_final, int *touched)
 {
     if (!s_mounted)
         return -1;
@@ -1210,6 +1219,7 @@ static int ext2_walk_impl(const char *path, uint32_t *inode_out, int follow_fina
     char resolved[512];
     uint32_t depth = 0;
     uint32_t plen, i;
+    uint32_t walk_start = start_ino;
 
     /* Copy path into resolved buffer */
     plen = 0;
@@ -1222,7 +1232,7 @@ static int ext2_walk_impl(const char *path, uint32_t *inode_out, int follow_fina
 restart_walk:
     {
         const char *p = resolved;
-        uint32_t current_ino = EXT2_ROOT_INODE;
+        uint32_t current_ino = walk_start;
 
         /* skip leading slashes */
         while (*p == '/')
@@ -1255,7 +1265,12 @@ restart_walk:
 
             int is_final = (*p == '\0');
 
-            /* ".." is NOT special-cased here. It used to be clamped to
+            /* ".." is normally a real ext2 entry. For an inode-rooted walk,
+             * however, following it at the capability root would escape the
+             * authority represented by the dirfd, so fail closed there.
+             * Filesystem-root walks retain the usual clamp-at-/ behavior.
+             *
+             * It used to be clamped to
              * EXT2_ROOT_INODE, which silently disagreed with the lexical
              * canonicalizer the VFS confinement check uses (that one pops a
              * single component), so the path that was approved and the path
@@ -1267,6 +1282,12 @@ restart_walk:
              * Syscall paths are canonicalized at the boundary now, so a ".."
              * should not reach here at all; this just makes it harmless if
              * one does. */
+            if (component[0] == '.' && component[1] == '.' &&
+                component[2] == '\0' && current_ino == root_ino) {
+                if (root_ino != EXT2_ROOT_INODE)
+                    return -EACCES;
+                continue;
+            }
 
             /* Read current directory inode */
             ext2_inode_t dir_inode;
@@ -1422,6 +1443,13 @@ restart_walk:
                     resolved[i] = newpath[i];
                 resolved[np] = '\0';
 
+                /* Absolute links are interpreted relative to the confined
+                 * root (openat2 RESOLVE_IN_ROOT semantics), never filesystem
+                 * root. Relative links restart from the original dirfd and
+                 * retain their textual directory prefix. */
+                if (target[0] == '/')
+                    walk_start = root_ino;
+
                 goto restart_walk;
             }
 
@@ -1436,6 +1464,22 @@ restart_walk:
 int ext2_open_ex(const char *path, uint32_t *inode_out, int follow_final)
 {
     return ext2_walk(path, inode_out, follow_final, (int *)0);
+}
+
+int ext2_openat_protected(uint32_t start_ino, uint32_t root_ino,
+                          const char *path, uint32_t *inode_out,
+                          int *is_protected)
+{
+    if (!path || path[0] == '/' || !ext2_is_dir(start_ino) ||
+        !ext2_is_dir(root_ino))
+        return -EINVAL;
+    irqflags_t fl = ext2_lock_acquire();
+    int touched = *is_protected;
+    int rc = ext2_walk_impl(start_ino, root_ino, path, inode_out, 1, &touched);
+    if (rc >= 0)
+        *is_protected = touched;
+    ext2_lock_release(fl);
+    return rc;
 }
 
 int ext2_path_under_protected(const char *path)
@@ -1924,13 +1968,9 @@ uint32_t ext2_alloc_block(uint32_t preferred_group)
         uint32_t blocks_in_group = (grp == s_num_groups - 1)
             ? (s_sb.s_blocks_count - grp * s_sb.s_blocks_per_group)
             : s_sb.s_blocks_per_group;
-        /* s_num_groups is clamped to 32 at mount while s_blocks_count keeps its
-         * true (larger) value, so on a >32-group fs the "last group" formula
-         * yields a count FAR bigger than one bitmap block — driving bitmap[i/8]
-         * tens of KiB past the 4096-byte cache slot (OOB read+write). A group's
-         * block count can never exceed blocks_per_group (one bitmap's worth of
-         * bits), so clamp. (Blocks beyond group 31 stay unreachable — a
-         * pre-existing capacity limit — but never corrupt memory.) */
+        /* A group's block count can never exceed blocks_per_group (one
+         * bitmap's worth of bits), so keep a defensive clamp even though mount
+         * now rejects filesystems beyond EXT2_MAX_GROUPS. */
         if (blocks_in_group > s_sb.s_blocks_per_group)
             blocks_in_group = s_sb.s_blocks_per_group;
         if (blocks_in_group > 8u * s_block_size)
@@ -2050,6 +2090,7 @@ static void ext2_ind_set(uint32_t blk, uint32_t idx, uint32_t val)
 static uint32_t ext2_bmap_alloc(ext2_inode_t *inode, uint32_t file_block)
 {
     uint32_t ppb = s_block_size / 4;
+    uint32_t sectors_per_block = s_block_size / 512;
 
     if (file_block < 12) {
         if (inode->i_block[file_block] == 0) {
@@ -2058,6 +2099,7 @@ static uint32_t ext2_bmap_alloc(ext2_inode_t *inode, uint32_t file_block)
                 return 0;
             ext2_zero_block(b);
             inode->i_block[file_block] = b;
+            inode->i_blocks += sectors_per_block;
         }
         return inode->i_block[file_block];
     }
@@ -2072,6 +2114,7 @@ static uint32_t ext2_bmap_alloc(ext2_inode_t *inode, uint32_t file_block)
                 return 0;
             ext2_zero_block(ib);
             inode->i_block[12] = ib;
+            inode->i_blocks += sectors_per_block;
         }
         data = ext2_ind_get(inode->i_block[12], off);
         if (data == 0) {
@@ -2080,6 +2123,7 @@ static uint32_t ext2_bmap_alloc(ext2_inode_t *inode, uint32_t file_block)
                 return 0;
             ext2_zero_block(data);
             ext2_ind_set(inode->i_block[12], off, data);
+            inode->i_blocks += sectors_per_block;
         }
         return data;
     }
@@ -2096,6 +2140,7 @@ static uint32_t ext2_bmap_alloc(ext2_inode_t *inode, uint32_t file_block)
                 return 0;
             ext2_zero_block(db);
             inode->i_block[13] = db;
+            inode->i_blocks += sectors_per_block;
         }
         ind = ext2_ind_get(inode->i_block[13], outer_off);
         if (ind == 0) {
@@ -2104,6 +2149,7 @@ static uint32_t ext2_bmap_alloc(ext2_inode_t *inode, uint32_t file_block)
                 return 0;
             ext2_zero_block(ind);
             ext2_ind_set(inode->i_block[13], outer_off, ind);
+            inode->i_blocks += sectors_per_block;
         }
         data = ext2_ind_get(ind, inner_off);
         if (data == 0) {
@@ -2112,6 +2158,7 @@ static uint32_t ext2_bmap_alloc(ext2_inode_t *inode, uint32_t file_block)
                 return 0;
             ext2_zero_block(data);
             ext2_ind_set(ind, inner_off, data);
+            inode->i_blocks += sectors_per_block;
         }
         return data;
     }
@@ -2172,7 +2219,6 @@ int ext2_write(uint32_t inode_num, const void *buf,
                 uint32_t actual_end = (uint32_t)((uint64_t)offset +
                                                  (uint64_t)bytes_written);
                 inode.i_size = (actual_end > orig_size) ? actual_end : orig_size;
-                inode.i_blocks = (uint32_t)(((uint64_t)inode.i_size + 511u) / 512u);
                 ext2_write_inode(inode_num, &inode);
                 ext2_lock_release(fl);
                 return (bytes_written > 0) ? (int)bytes_written : -EIO;
@@ -2190,13 +2236,12 @@ int ext2_write(uint32_t inode_num, const void *buf,
         bytes_written += can_write;
     }
 
-    /* update inode size and 512-byte sector count.  end is bounded by
-     * EXT2_MAX_FILE_SIZE (checked above), so the uint32_t store is exact. */
+    /* Update inode size.  i_blocks is maintained by ext2_bmap_alloc from the
+     * blocks actually allocated (including indirect metadata), not file size:
+     * ext2 records 512-byte sectors and sparse files need not match i_size. */
     uint32_t end = (uint32_t)((uint64_t)offset + (uint64_t)bytes_written);
-    if (end > inode.i_size) {
+    if (end > inode.i_size)
         inode.i_size = end;
-        inode.i_blocks = (uint32_t)(((uint64_t)inode.i_size + 511u) / 512u);
-    }
     inode.i_mtime = inode.i_ctime = ext2_now();   /* content changed */
     ext2_write_inode(inode_num, &inode);
     ext2_lock_release(fl);
@@ -2675,7 +2720,8 @@ int ext2_rename(const char *old_path, const char *new_path, int has_install)
      * new entry — otherwise ext2_dir_add_entry appends a SECOND dirent with the
      * same name (duplicate entry) and the old target's inode + blocks leak. */
     uint32_t dst_ino = 0;
-    if (ext2_walk_impl(new_path, &dst_ino, 0 /*don't follow final*/, 0) == 0 &&
+    if (ext2_walk_impl(EXT2_ROOT_INODE, EXT2_ROOT_INODE, new_path, &dst_ino,
+                       0 /*don't follow final*/, 0) == 0 &&
         dst_ino != 0) {
         /* Ancestor-guard (round-2): renaming something OVER a guarded inode
          * (protected root / sensitive file / anchor / ancestor dir) requires

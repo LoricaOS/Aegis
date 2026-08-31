@@ -36,12 +36,10 @@ pvpanic_init(void)
     uint32_t cmd = pcie_read32(d->bus, d->dev, d->fn, 0x04);
     pcie_write32(d->bus, d->dev, d->fn, 0x04, cmd | (1u << 1));   /* mem space */
 
-    uintptr_t va = (uintptr_t)kva_alloc_pages(1);
+    uint64_t pa = d->bar[0] & ~0xFFFULL;
+    uintptr_t va = (uintptr_t)kva_map_mmio(pa, 1);
     if (!va)
         return;
-    uint64_t pa = d->bar[0] & ~0xFFFULL;
-    vmm_unmap_page(va);
-    vmm_map_page(va, pa, VMM_FLAG_WRITABLE | VMM_FLAG_WC | VMM_FLAG_UCMINUS);
     s_reg = (volatile uint8_t *)(va + (d->bar[0] & 0xFFFULL));
 
     uint8_t events = *s_reg;

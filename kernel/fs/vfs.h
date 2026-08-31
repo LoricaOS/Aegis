@@ -10,7 +10,7 @@
  * memfd_create (1.2.0). fd_table_t is allocated from KVA; fd_table_alloc
  * (fd_table.c) now sizes the allocation as ceil(PROC_MAX_FDS *
  * sizeof(vfs_file_t) / PAGE_SIZE) pages, so a future bump needs no alloc
- * change. 64 * sizeof(vfs_file_t=40) = 2560 B still fits one page today.
+ * change. 64 * sizeof(vfs_file_t=56) = 3584 B still fits one page today.
  * (Was 8 pre-Phase-16, 16 through 1.1.x.)
  * Value single-sourced in limits.h (AEGIS_PROC_MAX_FDS). */
 #define PROC_MAX_FDS AEGIS_PROC_MAX_FDS
@@ -123,9 +123,12 @@ typedef struct {
     uint64_t         size;   /* file size in bytes; 0 for devices/directories */
     uint32_t         flags;  /* open flags: O_RDONLY(0)/O_WRONLY(1)/O_RDWR(2)/O_NONBLOCK */
     uint32_t         kflags; /* kernel-internal fd flags (VFS_KF_*); was _pad */
+    uint64_t         cap_root_inode; /* confined directory capability root */
+    uint32_t         cap_rights;     /* CAP_RIGHTS_* ceiling for openat */
+    uint32_t         _cap_pad;
 } vfs_file_t;
 
-_Static_assert(sizeof(vfs_file_t) == 40, "vfs_file_t must be 40 bytes");
+_Static_assert(sizeof(vfs_file_t) == 56, "vfs_file_t must be 56 bytes");
 
 /* VFS_KF_PROTECTED — set in vfs_file_t.kflags at open time when the file
  * resolves under an install-protected tree (/bin,/sbin,/apps,/etc/aegis).
@@ -140,6 +143,10 @@ _Static_assert(sizeof(vfs_file_t) == 40, "vfs_file_t must be 40 bytes");
  * revalidates the receiver before installing such a fd (no ambient authority:
  * neither inheritance nor being handed an fd grants access without the cap). */
 #define VFS_KF_AUTH_GATED 0x2U
+
+/* A confined directory fd is authority for relative openat resolution. Its
+ * root and rights are copied by dup/fork/SCM_RIGHTS and can only be narrowed. */
+#define VFS_KF_CAP_CONFINED 0x4U
 
 /* O_NONBLOCK flag value (Linux x86-64).  Stored in vfs_file_t.flags by
  * fcntl(F_SETFL).  sys_read sets vfs_read_nonblock before calling a VFS
@@ -195,17 +202,17 @@ _Static_assert(VFS_O_CLOEXEC == VFS_FD_CLOEXEC,
  * Called by sys_open to resolve path to a vfs_file_t. */
 int vfs_open(const char *path, int flags, uint16_t create_mode, vfs_file_t *out);
 
-/* VFS confinement (sys_vfs_confine): path_canonicalize collapses ./../// in an
- * absolute path; vfs_scope_allows returns 1 if `path` is within the calling
- * process's confinement scope (or it is unconfined / kernel-internal). */
+/* Collapse ./../// in an absolute path. */
 void path_canonicalize(const char *in, char *out, uint32_t outsz);
-int  vfs_scope_allows(const char *path);
 /* Like vfs_open but the caller declares whether it is authorized to create
  * under an install-protected tree (has_install: holds CAP_KIND_INSTALL, or is
  * a POWER-authorized admin path like sys_adminconf). The ext2 create enforces
  * it atomically under the fs lock — see the has_install note in ext2.h. */
 int vfs_open_ex(const char *path, int flags, uint16_t create_mode,
                 vfs_file_t *out, int has_install);
+int vfs_openat_ext2(uint32_t start_ino, uint32_t root_ino, const char *path,
+                    int flags, vfs_file_t *out, int has_install,
+                    int starts_protected);
 
 /* vfs_ramfs_unlink / vfs_ramfs_rename — route /tmp and /run (ramfs) paths to
  * the ramfs delete/rename. Return 1 and set *out_rc if the path(s) are on a

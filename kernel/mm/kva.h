@@ -10,8 +10,9 @@ void kva_init(void);
 
 /* kva_alloc_pages — allocate n 4KB pages, map them to consecutive higher-half
  * virtual addresses, and return the base VA as a pointer.
- * Panics on PMM exhaustion. Never pass VMM_FLAG_USER — kva pages are kernel-only;
- * USER must be absent so the MMU denies ring-3 access to kernel objects. */
+ * Returns NULL on physical-memory or page-table exhaustion and rolls back the
+ * complete request. Never pass VMM_FLAG_USER — kva pages are kernel-only; USER
+ * must be absent so the MMU denies ring-3 access to kernel objects. */
 void *kva_alloc_pages(uint64_t n);
 
 /* kva_alloc_pages_low — like kva_alloc_pages, but the backing physical pages
@@ -32,13 +33,14 @@ void *kva_alloc_pages_low_nc(uint64_t n);
 /* kva_map_phys_pages — map num_pages of existing physical memory starting at
  * phys_base into contiguous kernel VA. Does NOT allocate physical pages from
  * PMM — the pages must already exist (e.g. GRUB-loaded module).
- * phys_base must be 4KB-aligned. Returns the virtual base address. */
+ * phys_base must be 4KB-aligned. Returns NULL on page-table exhaustion. */
 void *kva_map_phys_pages(uint64_t phys_base, uint32_t num_pages);
 
 /* kva_map_mmio — map a device BAR (num_pages of MMIO at phys_base) into fresh
  * kernel VA as uncached (WC|UC-) registers. Like kva_map_phys_pages but with
  * MMIO cache flags; replaces the per-driver static map_mmio() copies. Does NOT
- * allocate frames. phys_base must be 4KB-aligned. Returns the virtual base. */
+ * allocate frames. phys_base must be 4KB-aligned. Returns NULL on page-table
+ * exhaustion. */
 void *kva_map_mmio(uint64_t phys_base, uint32_t num_pages);
 
 /* kva_page_phys — return the physical address of the page mapped at va.
@@ -50,8 +52,7 @@ uint64_t kva_page_phys(void *va);
  *
  * For each page i in [0, n): recover phys via vmm_phys_of, unmap the VA
  * via vmm_unmap_page, then return the frame via pmm_free_page. The virtual
- * address range is permanently abandoned — the bump cursor is not rewound;
- * VA space is not the scarce resource.
+ * address range is returned to the KVA freelist.
  *
  * va must be the base of a contiguous kva allocation. Panics if any page
  * is not mapped (calling with an unallocated VA is a kernel bug). */

@@ -25,6 +25,7 @@
 
 #include "eth.h"
 #include "ip.h"
+#include "ipv6.h"
 #include "netdev.h"
 
 uint64_t g_fake_ticks = 0;
@@ -57,6 +58,12 @@ void udp_rx(netdev_t *dev, ip4_addr_t s, ip4_addr_t d,
 
 void udp_init(void) {}
 void tcp_init(void) {}
+void ipv6_init(netdev_t *dev) { (void)dev; }
+void ipv6_selftest(netdev_t *dev) { (void)dev; }
+void ipv6_rx(netdev_t *dev, const void *frame, const void *data, uint16_t len)
+{
+    (void)dev; (void)frame; (void)data; (void)len;
+}
 netdev_t *netdev_get(const char *name) { (void)name; return NULL; }
 
 /* ---- fake NIC --------------------------------------------------------- */

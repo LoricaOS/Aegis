@@ -154,15 +154,11 @@ ioapic_init(void)
         return;
 
     /* Map the I/O APIC MMIO page into kernel VA — same pattern as LAPIC. */
-    void *va = kva_alloc_pages(1);
+    void *va = kva_map_mmio(g_ioapic_addr, 1);
     if (!va) {
         printk("[IOAPIC] FAIL: kva_alloc_pages returned NULL\n");
         return;
     }
-    vmm_unmap_page((uintptr_t)va);
-    vmm_map_page((uintptr_t)va, g_ioapic_addr,
-                 VMM_FLAG_WRITABLE | VMM_FLAG_WC | VMM_FLAG_UCMINUS);
-
     s_ioapic_base = (volatile uint32_t *)va;
 
     /* Read version register to get max redirection entry count */

@@ -1,7 +1,6 @@
-/* acpi.h — ACPI table parser for PCIe MCFG and MADT
+/* acpi.h — ACPI table parser for PCIe, interrupts, and power data
  *
- * Minimal static parser: no AML, no power management.
- * Finds MCFG (PCIe config space base) and MADT (interrupt routing).
+ * Finds MCFG/MADT/FADT and decodes a bounded constant-only AML subset.
  */
 #ifndef ACPI_H
 #define ACPI_H
@@ -93,6 +92,18 @@ typedef struct {
 
 extern madt_iso_t g_madt_iso[MADT_MAX_ISO];
 extern uint32_t   g_madt_iso_count;
+
+typedef struct {
+    uint64_t phys;
+    uint32_t length;
+    uint32_t rate_off;
+    uint32_t remaining_off;
+    uint32_t full_off;
+} acpi_battery_mmio_t;
+
+/* Return the battery SystemMemory region and byte offsets discovered from
+ * constant OperationRegion/Field declarations in the DSDT. */
+int acpi_get_battery_mmio(acpi_battery_mmio_t *out);
 
 /* Initialize ACPI: parse RSDP -> RSDT/XSDT -> find MCFG + MADT + FADT.
  * Enables power button SCI if FADT is found.

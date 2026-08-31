@@ -359,8 +359,8 @@ vmm_init(void)
 
 /* ── Kernel (TTBR1) mappings — kva backend ─────────────────────────────── */
 
-void
-vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags)
+int
+vmm_try_map_page(uint64_t virt, uint64_t phys, uint64_t flags)
 {
     if ((virt & ~VMM_PAGE_MASK) || (phys & ~VMM_PAGE_MASK))
         panic_halt("[VMM] FAIL: vmm_map_page misaligned");
@@ -368,7 +368,13 @@ vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags)
     irqflags_t fl = spin_lock_irqsave(&vmm_lock);
     int r = map_page_in(s_ttbr1_phys, virt, phys, flags, 0);
     spin_unlock_irqrestore(&vmm_lock, fl);
-    if (r < 0)
+    return r;
+}
+
+void
+vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags)
+{
+    if (vmm_try_map_page(virt, phys, flags) < 0)
         panic_halt("[VMM] FAIL: out of memory in vmm_map_page");
 }
 

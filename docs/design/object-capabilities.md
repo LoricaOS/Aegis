@@ -6,6 +6,12 @@ Scope: the capability model in `kernel/cap/` and the file-authority path in
 `kernel/fs/` + `kernel/syscall/sys_file.c`. Does **not** touch the Linux syscall
 ABI, the monolithic architecture, or the uid-0-is-cosmetic model.
 
+Implementation update (2026-08-17): syscall 518 (`vfs_confine`) is reserved but
+returns `EOPNOTSUPP`. Its lexical process-wide scope followed in-scope symlinks
+outside the promised root. Inode-rooted directory capabilities remain supported
+through `openat` + `cap_rights_limit`; process-wide confinement must reuse that
+resolver for every path operation before it can return.
+
 ---
 
 ## 1. The problem this closes
@@ -32,8 +38,8 @@ Consequences visible today:
 - The high-value objects are fenced off by **minting a kind per protected path**:
   `CAP_KIND_AUTH` (inode-scoped gate on `/etc/shadow` + `/etc/aegis/admin`,
   enforced post-symlink in `vfs_open`), `CAP_KIND_INSTALL` (the `/apps` +
-  `/etc/aegis` protected trees), plus `sys_vfs_confine` (process-wide unveil).
-  These *work* — but they are a growing set of special cases, not one mechanism.
+  `/etc/aegis` protected trees). These work, but they are a growing set of
+  special cases, not one mechanism.
 
 ### What this is NOT (correcting the Linux-comparison framing)
 
@@ -76,8 +82,7 @@ monolithic, POSIX fds):
 The closest match: **Unix file descriptors *are* capabilities**, in a real
 POSIX kernel.
 - Rights on an fd are reduced — never expanded — by `cap_rights_limit(2)`
-  (monotonic attenuation). This is exactly the one-way property `sys_vfs_confine`
-  already has.
+  (monotonic attenuation), matching Aegis's inode-rooted directory capabilities.
 - In *capability mode* (`cap_enter(2)`) there is **no global namespace**: `open()`
   by absolute path is forbidden; you may only derive new fds from fds you already
   hold via the `*at()` calls (`openat`, `connectat`, `accept`, `recvmsg` fd
@@ -139,11 +144,11 @@ uint32_t cap_rights;       /* CAP_RIGHTS_* ceiling for anything derived from it 
 uint8_t  cap_confined;     /* 1 = *at() via this fd cannot escape the subtree    */
 ```
 
-This is `proc->vfs_scope` (process-wide unveil) generalized to **per-fd and
-delegable**. Nothing changes for fds without `cap_confined`. The two **compose**:
-a lookup must satisfy both the process-wide `vfs_confine` scope *and* the
-directory-fd capability's subtree — both only ever remove authority, so their
-intersection is the reachable set, and neither can widen the other.
+Implementation note (2026-08-17): `cap_confined` is stored in
+`VFS_KF_CAP_CONFINED`, and syscall 520 implements `sys_cap_rights_limit`.
+Ext2 existing-file lookup and SCM_RIGHTS delegation are live. Relative
+`O_CREAT` fails closed until inode-relative create exists. The older lexical
+process scope is retired; nothing changes for fds without `cap_confined`.
 
 ### 3.2 `openat` honors `dirfd` (the core change)
 
@@ -151,26 +156,21 @@ Today `sys_openat` ignores `dirfd` and forwards to `sys_open` (path-only). New
 behavior:
 
 - `dirfd == AT_FDCWD` or absolute path → **unchanged** (ABI-compatible; existing
-  programs keep working). Still gated by the process's `VFS_OPEN` cap + any
-  process-wide `vfs_confine` scope. **This is the default (decision 1):** a confined
-  process keeps coarse `VFS_OPEN` for absolute paths — POSIX-friendly, doesn't break
-  absolute-path programs. A hard `cap_enter`-style mode that forbids global `open()`
-  entirely (Capsicum-faithful) is left as opt-in future work, added only if a
-  consumer wants that strictness.
+  programs keep working). Still gated by the process's `VFS_OPEN` capability.
+  A hard `cap_enter`-style mode that forbids global `open()` entirely
+  (Capsicum-faithful) is left as opt-in future work.
 - `dirfd` is a **capability directory fd** (`cap_confined`) → resolve the path
   *relative to `cap_root_inode`*, reject any resolution (incl. `..` and symlinks)
   that ascends above the root (reuse the post-symlink inode check that `AUTH`
   already uses), and clamp the resulting fd's rights to `min(cap_rights, requested)`.
 
-Escape-proofing reuses machinery that already exists: `path_canonicalize` (collapses
-`.`/`..`/`//`) and the inode-based post-symlink gate in `vfs_open` that makes
-`/etc/../etc/shadow` and symlink tricks fail for `AUTH`.
+Escape-proofing uses the inode-rooted ext2 walk: `..` cannot ascend above the
+capability root, and absolute symlinks restart at that root.
 
 ### 3.3 Attenuation — `cap_rights_limit` analog
 
-A new Aegis-private syscall (unused Aegis number, e.g. next after `vfs_confine`
-518) monotonically narrows a directory fd's `cap_rights` and may set `cap_confined`.
-One-way, like `vfs_confine`; never widens. This is `seL4_CNode_Mint` /
+Aegis-private syscall 520 monotonically narrows a directory fd's `cap_rights`
+and may set `cap_confined`; it never widens. This is `seL4_CNode_Mint` /
 `cap_rights_limit` / `zx_handle_duplicate`-with-lesser-rights for Aegis.
 
 `cap_rights` uses the existing 3-bit `CAP_RIGHTS_{READ,WRITE,EXEC}` set
@@ -225,12 +225,11 @@ opposite trajectory to the one the Linux comparison warned about.
 
 - **The Linux syscall ABI.** `openat` stays `openat`; unconfined absolute-path opens
   behave exactly as today. The only new syscalls are Aegis-private (rights-limit,
-  later revoke), in the Aegis-private number range — same pattern as `vfs_confine`.
+  later revoke), in the Aegis-private number range.
 - **Operation caps** (`POWER`, `NET_ADMIN`, `SETUID`, …) — unchanged; they have no
   object to name.
-- **`uid 0` is cosmetic; no ambient authority; fail closed.** This proposal only
-  *removes* ambient reach (a confined process reaches less), so it cannot weaken the
-  model — same additive/monotonic property that made `vfs_confine` safe to ship.
+- **`uid 0` is cosmetic; no ambient authority; fail closed.** Directory
+  capabilities only remove ambient reach and are monotonically attenuated.
 
 ---
 

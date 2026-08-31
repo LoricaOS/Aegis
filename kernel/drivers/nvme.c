@@ -444,7 +444,6 @@ static int nvme_write_one(struct blkdev *dev, uint64_t lba, uint32_t count,
 void
 nvme_init(void)
 {
-    uint32_t i;
     uint32_t timeout;
 
     /* Step 1: Find NVMe controller via PCIe
@@ -455,28 +454,15 @@ nvme_init(void)
         return;
     }
 
-    /* Step 2: Map BAR0 into kernel VA.
-     * NVMe BAR0 is at minimum 16KB; map 4 pages (16KB) to be safe.
-     * kva_alloc_pages allocates PMM frames and maps them — we then overwrite
-     * those mappings to point at the actual MMIO physical address range with
-     * no-cache flags (PWT+PCD). The PMM frames allocated by kva_alloc_pages
-     * are leaked; at one NVMe controller this is an acceptable Phase 20 cost. */
+    /* Step 2: Map BAR0 directly into kernel VA. NVMe BAR0 is at minimum
+     * 16KB; map 4 pages (16KB) to be safe. */
     {
         uint64_t  bar0_phys  = dev->bar[0];
         uint32_t  bar0_pages = 4u;
-        uintptr_t bar0_va    = (uintptr_t)kva_alloc_pages(bar0_pages);
-        for (i = 0; i < bar0_pages; i++) {
-            uintptr_t va = bar0_va + (uintptr_t)i * 4096u;
-            /* kva_alloc_pages mapped each page to a PMM frame; unmap first
-             * so vmm_map_page does not panic on a double-map.
-             * SAFETY: va is a kva-allocated page that is present in the PT
-             * (kva_alloc_pages guarantees this); vmm_unmap_page succeeds. */
-            vmm_unmap_page(va);
-            /* SAFETY: BAR0 is MMIO — map uncached via arch-neutral flags.
-             * vmm_map_page installs the MMIO physical address at this VA;
-             * the old PMM frame is leaked (see above). */
-            vmm_map_page(va, bar0_phys + (uint64_t)i * 4096u,
-                         VMM_FLAG_WRITABLE | VMM_FLAG_WC | VMM_FLAG_UCMINUS);
+        uintptr_t bar0_va = (uintptr_t)kva_map_mmio(bar0_phys, bar0_pages);
+        if (!bar0_va) {
+            printk("[NVME] FAIL: out of memory mapping BAR0\n");
+            return;
         }
         /* SAFETY: bar0_va is a kernel VA mapped to NVMe BAR0 MMIO registers;
          * volatile cast prevents the compiler caching register reads/writes. */

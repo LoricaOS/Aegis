@@ -1345,8 +1345,11 @@ procfs_open_file(uint32_t (*gen)(char *, uint32_t, aegis_process_t *),
 {
     procfs_file_priv_t *fp = (procfs_file_priv_t *)kva_alloc_pages(1);
     char *buf = (char *)kva_alloc_pages(1);
-    if (!fp || !buf)
+    if (!fp || !buf) {
+        if (fp) kva_free_pages(fp, 1);
+        if (buf) kva_free_pages(buf, 1);
         return -ENOMEM;
+    }
     fp->buf = buf;
     /* Resolve the PCB and run the generator inside ONE sched_lock hold. PCBs
      * carry no refcount, so a pointer resolved by the caller and passed in here
@@ -1384,8 +1387,11 @@ procfs_open_global(uint32_t (*gen)(char *, uint32_t), vfs_file_t *out)
 {
     procfs_file_priv_t *fp = (procfs_file_priv_t *)kva_alloc_pages(1);
     char *buf = (char *)kva_alloc_pages(1);
-    if (!fp || !buf)
+    if (!fp || !buf) {
+        if (fp) kva_free_pages(fp, 1);
+        if (buf) kva_free_pages(buf, 1);
         return -ENOMEM;
+    }
     fp->buf = buf;
     fp->len = gen(buf, 4096);
     fp->refs = 1;

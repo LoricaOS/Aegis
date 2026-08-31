@@ -409,7 +409,8 @@ urandom_read_fn(void *priv, void *buf, uint64_t off, uint64_t len)
 {
     (void)priv; (void)off;
     if (len > 4096) len = 4096;
-    random_get_bytes(buf, (size_t)len);
+    if (random_get_bytes(buf, (size_t)len) != 0)
+        return -EAGAIN;
     return (int)len;
 }
 

@@ -8,7 +8,7 @@
  * PROC_MAX_FDS vfs_file_t inline, so a PROC_MAX_FDS bump grows it past one
  * page; compute ceil(sizeof(fd_table_t) / PAGE_SIZE) so a future capacity
  * change (limits.h, AEGIS_PROC_MAX_FDS) needs NO edit here. At 64 fds:
- * sizeof(fd_table_t) = 64*40 + 4 (+pad) = 2564 B → 1 page, identical to the
+ * sizeof(fd_table_t) = 64*56 + metadata = 3592 B → 1 page, identical to the
  * old hard-coded kva_alloc_pages(1). Both alloc and free use this count. */
 #define FD_TABLE_PAGES \
     ((sizeof(fd_table_t) + AEGIS_PAGE_SIZE - 1) / AEGIS_PAGE_SIZE)
@@ -23,6 +23,8 @@ fd_table_alloc(void)
         t->fds[i].ops    = (const vfs_ops_t *)0;
         t->fds[i].kflags = 0;   /* kva pages aren't guaranteed zeroed; keep the
                                  * "free slot ⇒ kflags==0" invariant from birth */
+        t->fds[i].cap_root_inode = 0;
+        t->fds[i].cap_rights = 0;
     }
     t->refcount = 1;
     t->magic    = FD_TABLE_MAGIC;

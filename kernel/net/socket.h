@@ -19,6 +19,7 @@
 
 /* AF_INET */
 #define AF_INET  2
+#define AF_INET6 10
 /* INADDR_ANY */
 #define INADDR_ANY 0
 
@@ -34,7 +35,9 @@ typedef enum {
 typedef struct {
     uint8_t    data[UDP_RX_MAXBUF];
     uint16_t   len;
+    uint8_t    family;
     ip4_addr_t src_ip;
+    ip6_addr_t src_ip6;
     uint16_t   src_port;
     uint8_t    in_use;
 } udp_rx_slot_t;
@@ -49,10 +52,13 @@ typedef struct {
      * (cross-connection UAF). See docs/refcount-migration-spec.md §5. */
     refcount_t    refcount;
     uint8_t       type;          /* SOCK_TYPE_STREAM or SOCK_TYPE_DGRAM */
+    uint8_t       domain;        /* AF_INET or AF_INET6 */
     uint8_t       nonblocking;
     ip4_addr_t    local_ip;
     uint16_t      local_port;
     ip4_addr_t    remote_ip;
+    ip6_addr_t    local_ip6;
+    ip6_addr_t    remote_ip6;
     uint16_t      remote_port;
     /* Own index in s_socks[]. Set once by sock_alloc, never changes. Exists so
      * a sock_t can prove ownership of the tcp slot it points at — see
@@ -144,5 +150,16 @@ typedef struct {
 
 _Static_assert(sizeof(k_sockaddr_in_t) == 16,
     "k_sockaddr_in_t must be 16 bytes");
+
+typedef struct {
+    uint16_t sin6_family;
+    uint16_t sin6_port;
+    uint32_t sin6_flowinfo;
+    ip6_addr_t sin6_addr;
+    uint32_t sin6_scope_id;
+} k_sockaddr_in6_t;
+
+_Static_assert(sizeof(k_sockaddr_in6_t) == 28,
+    "k_sockaddr_in6_t must be 28 bytes");
 
 #endif /* SOCKET_H */

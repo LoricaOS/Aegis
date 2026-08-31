@@ -48,8 +48,10 @@ uint64_t sys_netcfg(uint64_t op, uint64_t arg1, uint64_t arg2, uint64_t arg3) { 
 /* fd -> socket lookups (fcntl/ioctl): always "not a socket". */
 sock_t  *sock_get(uint32_t sock_id) { return 0; }
 uint32_t sock_id_from_fd(int fd, aegis_process_t *proc) { return SOCK_NONE; }
+uint32_t sock_id_from_file(const vfs_file_t *file) { return SOCK_NONE; }
 unix_sock_t *unix_sock_get(uint32_t id) { return 0; }
 uint32_t unix_sock_id_from_fd(int fd, void *proc) { return SOCK_NONE; }
+uint32_t unix_sock_id_from_file(const vfs_file_t *file) { return UNIX_NONE; }
 
 /* NIC registration path (xHCI USB-ethernet gadget): inert. */
 int       netdev_register(netdev_t *dev) { return -1; }

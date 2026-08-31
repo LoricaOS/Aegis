@@ -20,26 +20,12 @@
 #include "printk.h"
 #include <stddef.h>
 
-/* Arch-neutral VMM flags for uncached MMIO mapping. */
-#define VIRTIO_MAP_FLAGS (VMM_FLAG_WRITABLE | VMM_FLAG_WC | VMM_FLAG_UCMINUS)
-
 /* ── uncached-MMIO mapper (shared by both transports) ───────────────────────
  * Map n_pages at physical base pa into KVA as uncached device memory. */
 uintptr_t
 virtio_map_mmio(uint64_t pa, uint32_t n_pages)
 {
-    uintptr_t va = (uintptr_t)kva_alloc_pages(n_pages);
-    if (!va)
-        return 0;
-    for (uint32_t i = 0; i < n_pages; i++) {
-        uintptr_t page_va = va + (uint64_t)i * 4096;
-        /* kva_alloc_pages already mapped each page to a PMM frame; unmap before
-         * remapping to the device PA so vmm_map_page doesn't panic on a
-         * double-map. */
-        vmm_unmap_page(page_va);
-        vmm_map_page(page_va, pa + (uint64_t)i * 4096, VIRTIO_MAP_FLAGS);
-    }
-    return va;
+    return (uintptr_t)kva_map_mmio(pa, n_pages);
 }
 
 /* ── <4GB DMA-page allocator (shared) ───────────────────────────────────────

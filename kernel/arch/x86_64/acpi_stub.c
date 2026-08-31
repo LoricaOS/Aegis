@@ -32,6 +32,12 @@ uint32_t  g_ioapic_gsi_base = 0;
 madt_iso_t g_madt_iso[MADT_MAX_ISO];
 uint32_t   g_madt_iso_count = 0;
 
+int acpi_get_battery_mmio(acpi_battery_mmio_t *out)
+{
+    (void)out;
+    return 0;
+}
+
 void acpi_init(void)
 {
     printk("[ACPI] disabled (CONFIG_ACPI off) — no MADT/MCFG, LAPIC-only\n");

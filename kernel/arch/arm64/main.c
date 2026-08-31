@@ -35,6 +35,7 @@
 #include "ramdisk.h"
 #include "ip.h"
 #include "blkdev.h"
+#include "cryptroot.h"
 #include "random.h"
 #include "poll.h"
 #include <stdint.h>
@@ -50,6 +51,12 @@ void pi5_thermal_report(void); /* native/pi5_thermal.c — SoC temp via AVS moni
 int  rp1_init(void);           /* native/rp1.c — RP1 southbridge (USB/eth/fan) */
 void nvme_set_dma_offset(uint64_t off);
 void nvme_set_dma_noncoherent(int nc);
+
+static int mount_disk_root(const char *devname)
+{
+    const char *root = cryptroot_open(devname);
+    return root ? ext2_mount(root) : -1;
+}
 
 #if defined(AEGIS_BOOT_NATIVE) && \
     (defined(AEGIS_NATIVE_TEST_STOP) || defined(AEGIS_NATIVE_REPRO) || \
@@ -147,6 +154,7 @@ void
 kernel_main_arm64(void)
 {
     smp_percpu_init_bsp();    /* TPIDR_EL1 — before any sched_current() */
+    arm64_pan_init();          /* PAN + bounded uaccess windows             */
     idt_init();               /* VBAR_EL1 — catch faults from here on   */
 
     {
@@ -278,6 +286,7 @@ kernel_main_arm64(void)
 #endif
     random_init();
     pcie_init();              /* ECAM enumerate — [PCIE] OK or skip     */
+    virtio_rng_init();        /* host entropy on QEMU/UTM, silent on Pi */
 #ifdef AEGIS_BOOT_NATIVE
     /* TEMP: the Pi 5 PCIe/NVMe bring-up still has an intermittent hang, and
      * the rootfs comes from the initramfs (not nvme), so the clean interactive
@@ -374,9 +383,9 @@ kernel_main_arm64(void)
 #ifdef CONFIG_FS_EXT2
     if (blkdev_get("ramdisk0")) {
         ext2_mount("ramdisk0");
-    } else if (ext2_mount("vblk0p1") == 0) {
+    } else if (mount_disk_root("vblk0p1") == 0) {
         /* Aegis partition on a virtio-blk disk */
-    } else if (ext2_mount("vblk0") == 0) {
+    } else if (mount_disk_root("vblk0") == 0) {
         /* whole-disk ext2 on virtio-blk */
     } else {
         printk("[VFS] WARN: no ramdisk and no virtio-blk root — initrd only\n");

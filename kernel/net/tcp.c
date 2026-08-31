@@ -9,16 +9,15 @@
 #include "spinlock.h"
 #include "random.h" /* random_get_bytes() — unpredictable ISN */
 #include "kva.h"    /* kva_alloc_pages — per-connection ring buffers */
+#include "../include/aegis_errno.h"
 #include <stddef.h>                 /* NULL */
 
 /* tcp_isn — draw a 32-bit initial sequence number from the kernel CSPRNG.
  * Replaces the old (uint32_t)arch_get_ticks() seed, which was low-entropy
  * and externally predictable (RFC 6528 / blind-injection hardening). */
-static uint32_t tcp_isn(void)
+static int tcp_isn(uint32_t *isn)
 {
-    uint32_t isn = 0;
-    random_get_bytes(&isn, sizeof(isn));
-    return isn;
+    return random_get_bytes(isn, sizeof(*isn));
 }
 
 /* S2: RFC 793 serial number arithmetic for TCP sequence numbers.
@@ -116,17 +115,22 @@ void tcp_init(void)
 }
 
 /* tcp_attach_buffers — attach this slot's rx/tx rings if not already present.
- * No-op for a reused slot that still holds its buffers.  Uses kva_alloc_pages,
- * which panics only on genuine kernel OOM (consistent with every other kva
- * caller) — but that can now happen only under real connection load, never at
- * boot.  The connection-count ceiling itself stays graceful: tcp_alloc returns
- * NULL when all slots are busy and callers already handle that. */
-static void tcp_attach_buffers(tcp_conn_t *c)
+ * No-op for a reused slot; returns -ENOMEM without a partial allocation. */
+static int tcp_attach_buffers(tcp_conn_t *c)
 {
     if (c->rbuf)
-        return;                                  /* reused slot: keep buffers */
-    c->rbuf = kva_alloc_pages(TCP_RBUF_SIZE / 4096);   /* 64 pages */
-    c->sbuf = kva_alloc_pages(TCP_SBUF_SIZE / 4096);   /* 16 pages */
+        return 0;                                /* reused slot: keep buffers */
+    uint8_t *rbuf = kva_alloc_pages(TCP_RBUF_SIZE / 4096);
+    if (!rbuf)
+        return -ENOMEM;
+    uint8_t *sbuf = kva_alloc_pages(TCP_SBUF_SIZE / 4096);
+    if (!sbuf) {
+        kva_free_pages(rbuf, TCP_RBUF_SIZE / 4096);
+        return -ENOMEM;
+    }
+    c->rbuf = rbuf;
+    c->sbuf = sbuf;
+    return 0;
 }
 
 /* tcp_adv_window — compute the (network-order) 16-bit window field to advertise.
@@ -406,7 +410,8 @@ static tcp_conn_t *tcp_alloc(void)
     for (i = 0; i < TCP_MAX_CONNS; i++) {
         if (s_tcp[i].state == TCP_CLOSED) {
             tcp_claim_slot((uint32_t)i);
-            tcp_attach_buffers(&s_tcp[i]);
+            if (tcp_attach_buffers(&s_tcp[i]) < 0)
+                return NULL;
             return &s_tcp[i];
         }
     }
@@ -522,6 +527,8 @@ void tcp_rx(netdev_t *dev, ip4_addr_t src_ip, ip4_addr_t dst_ip,
                         s_tcp[hi].listener_id == listener->sock_id) half_open++;
                 if (half_open >= TCP_SYN_BACKLOG_MAX) goto out;
             }
+            uint32_t isn;
+            if (tcp_isn(&isn) != 0) goto out;
             conn = tcp_alloc();
             if (!conn) goto out;
             conn->state       = TCP_SYN_RCVD;
@@ -531,7 +538,7 @@ void tcp_rx(netdev_t *dev, ip4_addr_t src_ip, ip4_addr_t dst_ip,
             conn->remote_ip   = src_ip;
             conn->remote_port = remote_port;
             conn->rcv_nxt     = seq + 1;
-            conn->snd_nxt     = tcp_isn();
+            conn->snd_nxt     = isn;
             conn->snd_una     = conn->snd_nxt;
             conn->snd_wnd     = ntohs(seg->window);   /* SYN window: unscaled */
             conn->listener_id = listener->sock_id;
@@ -1181,7 +1188,8 @@ tcp_pick_local_port(ip4_addr_t dst_ip, uint16_t dst_port)
 {
     if (s_tcp_ephem == 0) {
         uint16_t r = 0;
-        random_get_bytes(&r, sizeof(r));
+        if (random_get_bytes(&r, sizeof(r)) != 0)
+            return 0;
         s_tcp_ephem = (uint16_t)(TCP_EPHEM_BASE + (r & (TCP_EPHEM_COUNT - 1u)));
     }
     for (uint32_t tries = 0; tries < TCP_EPHEM_COUNT; tries++) {
@@ -1293,12 +1301,18 @@ tcp_connect(uint32_t sock_id, ip4_addr_t dst_ip, uint16_t dst_port,
             uint32_t *conn_id_out)
 {
     extern netdev_t *netdev_get(const char *name);
+    uint32_t isn;
+    if (tcp_isn(&isn) != 0)
+        return -EAGAIN;
     irqflags_t fl = spin_lock_irqsave(&tcp_lock);
     uint32_t i;
     for (i = 0; i < TCP_MAX_CONNS; i++) {
         if (s_tcp[i].state == TCP_CLOSED) {
             tcp_claim_slot(i);
-            tcp_attach_buffers(&s_tcp[i]);
+            if (tcp_attach_buffers(&s_tcp[i]) < 0) {
+                spin_unlock_irqrestore(&tcp_lock, fl);
+                return -ENOMEM;
+            }
             s_tcp[i].state       = TCP_SYN_SENT;
             net_get_config(&s_tcp[i].local_ip, (ip4_addr_t *)0, (ip4_addr_t *)0);
             /* Loopback: use 127.0.0.1 as local IP (net_get_config returns
@@ -1316,7 +1330,7 @@ tcp_connect(uint32_t sock_id, ip4_addr_t dst_ip, uint16_t dst_port,
             s_tcp[i].remote_ip   = dst_ip;
             s_tcp[i].remote_port = dst_port;
             s_tcp[i].sock_id     = sock_id;
-            s_tcp[i].snd_nxt     = tcp_isn();
+            s_tcp[i].snd_nxt     = isn;
             s_tcp[i].snd_una     = s_tcp[i].snd_nxt;
             /* RFC 7323: offer window scaling on our SYN.  rcv_wscale set now so
              * tcp_send_syn emits the WScale option; the SYN-ACK handler keeps it

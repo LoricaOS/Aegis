@@ -621,12 +621,18 @@ sched_spawn_task_locked(void (*fn)(void))
 {
     /* Allocate TCB (one kva page — higher-half VA, no identity-map dependency). */
     aegis_task_t *task = kva_alloc_pages(1);
+    if (!task)
+        return NULL;
 
     /* Allocate stack: STACK_PAGES usable pages plus one unmapped guard page
      * at the bottom.  Stack grows downward; the guard page causes a #PF on
      * overflow instead of silently corrupting adjacent KVA allocations.
      * The guard VA is permanently abandoned (bump allocator does not rewind). */
     uint8_t *stack_region = kva_alloc_pages(STACK_PAGES + 1);
+    if (!stack_region) {
+        kva_free_pages(task, 1);
+        return NULL;
+    }
     uint64_t guard_phys   = kva_page_phys(stack_region);
     vmm_unmap_page((uint64_t)(uintptr_t)stack_region);
     pmm_free_page(guard_phys);
@@ -707,6 +713,11 @@ sched_spawn(void (*fn)(void))
     irqflags_t fl = spin_lock_irqsave(&sched_lock);
 
     aegis_task_t *task = sched_spawn_task_locked(fn);
+    if (!task) {
+        spin_unlock_irqrestore(&sched_lock, fl);
+        printk("[SCHED] FAIL: out of memory spawning kernel task\n");
+        return;
+    }
 
     /* Insert into the RUNNING-only run queue. */
     run_list_insert_locked(task);
@@ -720,6 +731,8 @@ sched_spawn_idle(void (*fn)(void))
     irqflags_t fl = spin_lock_irqsave(&sched_lock);
 
     aegis_task_t *task = sched_spawn_task_locked(fn);
+    if (!task)
+        panic_halt("[SCHED] FAIL: out of memory spawning BSP idle task");
 
     /* Register as THIS CPU's idle fallback — deliberately NOT inserted into
      * the RUNNING-only run queue (is_idle == 1 makes run_list_insert_locked
@@ -743,6 +756,8 @@ sched_spawn_idle_for(uint32_t cpu, void (*fn)(void))
 {
     irqflags_t fl = spin_lock_irqsave(&sched_lock);
     aegis_task_t *task = sched_spawn_task_locked(fn);
+    if (!task)
+        panic_halt("[SCHED] FAIL: out of memory spawning AP idle task");
     task->is_idle = 1;
     g_percpu[cpu].idle_task = task;
     spin_unlock_irqrestore(&sched_lock, fl);

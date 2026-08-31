@@ -8,8 +8,8 @@
  *   1. The kernel command line, Linux-compatible `virtio_mmio.device=` entries
  *      (`<size>@<base>:<irq>`). The VMM passes one per device — Firecracker does
  *      this automatically — so this is the portable, base-agnostic mechanism.
- *   2. A fixed-window scan of QEMU microvm's transport array (0xfeb00000, up to
- *      32 slots) as a fallback for when the cmdline carries no entries.
+ *   2. A fixed-window scan of QEMU's x86 microvm or ARM virt transport array as
+ *      a fallback for when the cmdline carries no entries.
  *
  * Either way we probe each candidate for the "virt" magic + modern (v2) version
  * and record its device type. Register access + the handshake live in
@@ -24,6 +24,7 @@
 /* QEMU microvm transport array (fallback scan). 24 transports today; scan a
  * generous 32. Each slot is 0x200; 32 × 0x200 = 0x4000 = 4 pages. */
 #define VMMIO_WINDOW_BASE   0xFEB00000ULL
+#define VMMIO_ARM_BASE      0x0A000000ULL
 #define VMMIO_SLOT_STRIDE   0x200u
 #define VMMIO_SCAN_SLOTS    32u
 #define VMMIO_SCAN_PAGES    4u
@@ -114,6 +115,9 @@ probe(void)
         }
     }
 
+#if defined(__x86_64__)
+    /* This fixed window belongs to QEMU's x86 microvm machine. Reading an
+     * absent MMIO address on ARM raises a synchronous external abort. */
     if (s_ndevs == 0) {              /* fallback: scan QEMU microvm's array */
         uintptr_t win = virtio_map_mmio(VMMIO_WINDOW_BASE, VMMIO_SCAN_PAGES);
         if (win) {
@@ -129,6 +133,25 @@ probe(void)
             }
         }
     }
+#elif defined(__aarch64__) && !defined(AEGIS_BOOT_NATIVE)
+    /* QEMU virt exposes 32 virtio-mmio transports at 0x0a000000. Native Pi
+     * builds must not probe this absent window: an unmapped device read aborts. */
+    if (s_ndevs == 0) {
+        uintptr_t win = virtio_map_mmio(VMMIO_ARM_BASE, VMMIO_SCAN_PAGES);
+        if (win) {
+            for (uint32_t i = 0; i < VMMIO_SCAN_SLOTS && s_ndevs < MAX_MMIO_DEVS; i++) {
+                volatile uint8_t *slot = (volatile uint8_t *)(win + i * VMMIO_SLOT_STRIDE);
+                if (rd(slot, VMMIO_MAGIC_VALUE) != VIRTIO_MMIO_MAGIC) continue;
+                if (rd(slot, VMMIO_VERSION) != 2u)                   continue;
+                uint32_t id = rd(slot, VMMIO_DEVICE_ID);
+                if (id == 0)                                         continue;
+                s_devs[s_ndevs].base = slot;
+                s_devs[s_ndevs].devid = (uint16_t)id;
+                s_ndevs++;
+            }
+        }
+    }
+#endif
 
     if (s_ndevs)
         printk("[VMMIO] %d device(s) discovered\n", s_ndevs);

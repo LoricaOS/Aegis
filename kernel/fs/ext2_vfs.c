@@ -195,7 +195,7 @@ ext2_vfs_stat_fn(void *priv, k_stat_t *st)
     st->st_gid     = (uint32_t)inode.i_gid;
     st->st_size    = (int64_t)sz;
     st->st_blksize = 4096;
-    st->st_blocks  = (int64_t)(((uint64_t)sz + 511) / 512);
+    st->st_blocks  = (int64_t)inode.i_blocks;
     st->st_atime   = (int64_t)inode.i_atime;
     st->st_mtime   = (int64_t)inode.i_mtime;
     st->st_ctime   = (int64_t)inode.i_ctime;

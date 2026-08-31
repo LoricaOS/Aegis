@@ -118,6 +118,11 @@ ramdisk_init(uint64_t phys_base, uint64_t size)
 
     uint32_t num_pages = (uint32_t)((true_size + 4095) / 4096);
     s_base = (uint8_t *)kva_alloc_pages(num_pages);
+    if (!s_base) {
+        unmap_module((uint8_t *)src, src_pages);
+        printk("[RAMDISK] FAIL: out of memory copying rootfs\n");
+        return;
+    }
     s_size = true_size;
     {
         uint64_t i;
@@ -240,6 +245,11 @@ ramdisk_init2(uint64_t phys_base, uint64_t size)
     }
     uint32_t num_pages = (uint32_t)((size + 4095) / 4096);
     s_base2 = (uint8_t *)kva_alloc_pages(num_pages);
+    if (!s_base2) {
+        unmap_module((uint8_t *)src, src_pages);
+        printk("[RAMDISK] FAIL: out of memory copying ESP\n");
+        return;
+    }
     s_size2 = size;
     {
         uint64_t i;

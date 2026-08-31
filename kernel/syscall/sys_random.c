@@ -15,8 +15,7 @@
  *
  * arg1 = user pointer to output buffer
  * arg2 = buffer length in bytes
- * arg3 = flags (GRND_NONBLOCK, GRND_RANDOM — both treated identically
- *         since our pool is always seeded)
+ * arg3 = flags (GRND_NONBLOCK, GRND_RANDOM)
  *
  * Returns number of bytes written on success, negative errno on failure.
  * Capped at 256 bytes per call (matches Linux behavior for small reads;
@@ -25,7 +24,8 @@
 uint64_t
 sys_getrandom(uint64_t arg1, uint64_t arg2, uint64_t arg3)
 {
-    (void)arg3;  /* flags — pool is always seeded, GRND_NONBLOCK is a no-op */
+    if (arg3 & ~(uint64_t)(GRND_NONBLOCK | GRND_RANDOM))
+        return SYS_ERR(EINVAL);
 
     uint64_t len = arg2;
     if (len == 0)
@@ -41,7 +41,8 @@ sys_getrandom(uint64_t arg1, uint64_t arg2, uint64_t arg3)
 
     /* Generate into a kernel buffer, then copy to userspace. */
     uint8_t kbuf[256];
-    random_get_bytes(kbuf, (size_t)len);
+    if (random_get_bytes(kbuf, (size_t)len) != 0)
+        return SYS_ERR(EAGAIN);
     copy_to_user((void *)(uintptr_t)arg1, kbuf, (uint32_t)len);
 
     return len;

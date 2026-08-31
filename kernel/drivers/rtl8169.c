@@ -187,24 +187,20 @@ static inline void wr32(uint16_t off, uint32_t v) { *(volatile uint32_t *)(s_pri
 static uintptr_t
 map_bar(uint64_t pa, uint32_t n_pages)
 {
-    uintptr_t va = (uintptr_t)kva_alloc_pages(n_pages);
-    uint32_t i;
-    for (i = 0; i < n_pages; i++) {
-        uintptr_t page_va = va + (uint64_t)i * 4096;
-        vmm_unmap_page(page_va);
-        vmm_map_page(page_va, pa + (uint64_t)i * 4096, MMIO_FLAGS);
-    }
-    return va;
+    return (uintptr_t)kva_map_mmio(pa, n_pages);
 }
 
-static void
+static int
 alloc_dma_page(uint64_t *phys_out, uintptr_t *virt_out)
 {
     uintptr_t va = (uintptr_t)kva_alloc_pages(1);
+    if (!va)
+        return -1;
     uint64_t  pa = kva_page_phys((void *)va);
     _memset((void *)va, 0, 4096);
     *phys_out = pa;
     *virt_out = va;
+    return 0;
 }
 
 /* Spin for ~us microseconds via tight loop. PIT/LAPIC timer not
@@ -330,6 +326,10 @@ rtl8169_init(void)
     {
         uint64_t pa = found->bar[2] & ~0xFFFULL;
         uintptr_t va = map_bar(pa, 1);
+        if (!va) {
+            printk("[RTL8169] FAIL: out of memory mapping BAR2\n");
+            return;
+        }
         s_priv.mmio = (volatile uint8_t *)(va + (found->bar[2] & 0xFFFULL));
     }
 
@@ -388,10 +388,10 @@ rtl8169_init(void)
     {
         uint64_t  pa;
         uintptr_t va;
-        alloc_dma_page(&pa, &va);
+        if (alloc_dma_page(&pa, &va) < 0) return;
         s_priv.rx_ring    = (rtl_desc_t *)va;
         s_priv.rx_ring_pa = pa;
-        alloc_dma_page(&pa, &va);
+        if (alloc_dma_page(&pa, &va) < 0) return;
         s_priv.tx_ring    = (rtl_desc_t *)va;
         s_priv.tx_ring_pa = pa;
     }
@@ -400,14 +400,14 @@ rtl8169_init(void)
     for (i = 0; i < NUM_RX_DESC; i++) {
         uint64_t  pa;
         uintptr_t va;
-        alloc_dma_page(&pa, &va);
+        if (alloc_dma_page(&pa, &va) < 0) return;
         s_priv.rx_buf_va[i] = (uint8_t *)va;
         s_priv.rx_buf_pa[i] = pa;
     }
     for (i = 0; i < NUM_TX_DESC; i++) {
         uint64_t  pa;
         uintptr_t va;
-        alloc_dma_page(&pa, &va);
+        if (alloc_dma_page(&pa, &va) < 0) return;
         s_priv.tx_buf_va[i] = (uint8_t *)va;
         s_priv.tx_buf_pa[i] = pa;
     }

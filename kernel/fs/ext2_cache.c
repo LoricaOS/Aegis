@@ -176,6 +176,47 @@ int ext2_sync(void)
             flushed++;
         }
     }
+    /* Allocation changes update s_sb/s_bgd in memory while their bitmaps and
+     * inode tables flow through the block cache. Persist the summaries only
+     * AFTER all dirty bitmap/data writes succeed: an older high free-count is
+     * safe because the bitmap remains authoritative, while publishing a new
+     * count before its bitmap could lose reusable space after a crash.
+     *
+     * The primary GDT is one 4 KiB block for EXT2_MAX_GROUPS descriptors. The
+     * superblock lives at byte 1024 (512-byte LBAs 2-3) for every supported
+     * block size. Backup copies are recovery snapshots and need not be updated
+     * during normal operation. */
+    if (!s_fs_io_error) {
+        uint32_t bgd_block = (s_sb.s_first_data_block == 1) ? 2 : 1;
+        uint8_t *bgd = cache_get_slot(bgd_block);
+        if (!bgd) {
+            s_fs_io_error = 1;
+        } else {
+            uint32_t n = s_num_groups * sizeof(ext2_bgd_t);
+            uint32_t j;
+            for (j = 0; j < n; j++)
+                bgd[j] = ((uint8_t *)s_bgd)[j];
+            uint64_t lba = (uint64_t)bgd_block * (s_block_size / 512);
+            s_cache_dev_writes++;
+            if (s_dev->write(s_dev, lba, s_block_size / 512, bgd) != 0)
+                s_fs_io_error = 1;
+        }
+    }
+    if (!s_fs_io_error) {
+        uint8_t sb_buf[1024];
+        if (s_dev->read(s_dev, 2, 2, sb_buf) != 0) {
+            s_fs_io_error = 1;
+        } else {
+            uint8_t *src = (uint8_t *)&s_sb;
+            uint32_t j;
+            /* Totals + free counts are the first five uint32 fields. */
+            for (j = 0; j < 5 * sizeof(uint32_t); j++)
+                sb_buf[j] = src[j];
+            if (s_dev->write(s_dev, 2, 2, sb_buf) != 0)
+                s_fs_io_error = 1;
+        }
+    }
+
     int err = s_fs_io_error;
     s_fs_io_error = 0;              /* consume-on-report */
     ext2_lock_release(fl);
@@ -219,6 +260,10 @@ void ext2_perfbench(void)
 
     /* Scratch buffer (PMM-backed, not BSS). */
     uint8_t *buf = (uint8_t *)kva_alloc_pages(PERFBENCH_CHUNK / 4096);
+    if (!buf) {
+        printk("[PERFBENCH] skip: out of memory for scratch buffer\n");
+        return;
+    }
     uint32_t i;
     for (i = 0; i < PERFBENCH_CHUNK; i++)
         buf[i] = (uint8_t)(i * 7 + 1);

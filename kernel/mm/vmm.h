@@ -88,6 +88,11 @@ void vmm_init(void);
  * virt and phys must be 4KB-aligned. flags is a combination of VMM_FLAG_*. */
 void vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags);
 
+/* Fallible form used by recoverable kernel allocators. Returns 0 on success or
+ * -1 when an intermediate page table cannot be allocated. Programmer errors
+ * (misalignment and double mapping) remain fatal. */
+int vmm_try_map_page(uint64_t virt, uint64_t phys, uint64_t flags);
+
 /* vmm_unmap_page — unmap a single 4KB page and invalidate its TLB entry.
  * virt must be 4KB-aligned and must currently be mapped.
  * Valid for 4KB mappings only. Must not be called on addresses backed by

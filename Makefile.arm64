@@ -99,7 +99,7 @@ SHARED_SRCS = \
     kernel/tty/tty.c kernel/tty/pty.c \
     kernel/fs/fd_table.c kernel/fs/vfs.c kernel/fs/initrd.c \
     kernel/fs/console.c kernel/fs/kbd_vfs.c kernel/fs/pipe.c \
-    kernel/fs/blkdev.c kernel/fs/gpt.c \
+    kernel/fs/blkdev.c kernel/fs/gpt.c kernel/fs/cryptroot.c kernel/fs/cryptroot_crypto.c \
     kernel/fs/ext2.c kernel/fs/ext2_cache.c kernel/fs/ext2_dir.c \
     kernel/fs/ext2_vfs.c kernel/fs/ext2_ops.c kernel/fs/ramfs.c kernel/fs/procfs.c \
     kernel/fs/memfd.c kernel/fs/eventfd.c kernel/fs/poll_test.c \
@@ -108,10 +108,10 @@ SHARED_SRCS = \
     kernel/drivers/virtio_core.c kernel/drivers/virtio_pci.c \
     kernel/drivers/virtio_mmio.c kernel/drivers/virtqueue.c \
     kernel/drivers/virtio_blk.c kernel/drivers/virtio_input.c \
-    kernel/drivers/virtio_gpu.c kernel/drivers/virtio_net.c \
+    kernel/drivers/virtio_gpu.c kernel/drivers/virtio_net.c kernel/drivers/virtio_rng.c \
     kernel/drivers/usb_mouse.c \
     kernel/drivers/xhci.c kernel/drivers/usb_hid.c \
-    kernel/net/netdev.c kernel/net/eth.c kernel/net/ip.c \
+    kernel/net/netdev.c kernel/net/eth.c kernel/net/ip.c kernel/net/ipv6.c \
     kernel/net/udp.c kernel/net/tcp.c kernel/net/socket.c \
     kernel/net/unix_socket.c kernel/net/epoll.c \
     kernel/syscall/syscall.c kernel/syscall/sys_io.c \
@@ -144,7 +144,7 @@ SHARED_SRCS = \
 # Networking: the stack, the socket syscall, and every NIC (useless without it).
 ifneq ($(CONFIG_NET),y)
 SHARED_SRCS := $(filter-out \
-    kernel/net/netdev.c kernel/net/eth.c kernel/net/ip.c kernel/net/udp.c \
+    kernel/net/netdev.c kernel/net/eth.c kernel/net/ip.c kernel/net/ipv6.c kernel/net/udp.c \
     kernel/net/tcp.c kernel/net/socket.c kernel/net/unix_socket.c \
     kernel/syscall/sys_socket.c kernel/drivers/virtio_net.c, $(SHARED_SRCS))
 SHARED_SRCS += kernel/net/net_stub.c
@@ -158,6 +158,7 @@ SHARED_SRCS := $(filter-out \
     $(if $(CONFIG_VIRTIO_BLK),,kernel/drivers/virtio_blk.c) \
     $(if $(CONFIG_VIRTIO_GPU),,kernel/drivers/virtio_gpu.c) \
     $(if $(CONFIG_VIRTIO_INPUT),,kernel/drivers/virtio_input.c) \
+    $(if $(CONFIG_VIRTIO_RNG),,kernel/drivers/virtio_rng.c) \
     $(if $(CONFIG_VIRTIO_NET),,kernel/drivers/virtio_net.c) \
     , $(SHARED_SRCS))
 

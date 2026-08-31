@@ -175,9 +175,9 @@ config VIRTIO_MMIO
 	  Discover virtio devices as flat MMIO register blocks at fixed physical
 	  addresses (spec §4.2) instead of on a PCI bus — the transport microVMs
 	  use (Firecracker, QEMU `-machine microvm`). Probes the standard transport
-	  window (0xfeb00000, 8 slots); each virtio device driver then works over
-	  either transport unchanged. Enable for a microVM target (typically with
-	  CONFIG_PCI off); harmless alongside PCI otherwise.
+	  windows (x86 microvm and ARM virt, up to 32 slots); each virtio device
+	  driver then works over either transport unchanged. Enable for a VM target,
+	  typically with CONFIG_PCI off; harmless alongside PCI otherwise.
 
 config VIRTIO_BLK
 	bool "virtio-blk (block device)"

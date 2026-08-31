@@ -61,11 +61,18 @@
 #include "ramdisk.h"
 #include "ip.h"
 #include "blkdev.h"
+#include "cryptroot.h"
 #include "random.h"
 #include "bootinfo.h"
 #include <stdint.h>
 
 void poll_test(void);
+
+static int mount_disk_root(const char *devname)
+{
+    const char *root = cryptroot_open(devname);
+    return root ? g_rootfs->mount(root) : -1;
+}
 
 /*
  * kernel_main — top-level kernel entry point.
@@ -470,6 +477,8 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     hv_kvp_init();          /* Hyper-V KVP/data-exchange IC → guest OS info to host; silent if absent */
 #endif
     bph("dev-probe");
+    /* USB input/storage must exist before an encrypted-root prompt. */
+    xhci_init();
     gpt_scan("nvme0");      /* GPT partitions — [GPT] OK or silent (no NVMe) */
     gpt_scan("sata0");      /* GPT on AHCI/SATA — silent if absent           */
     gpt_scan("vblk0");      /* GPT on virtio-blk — silent if absent          */
@@ -477,6 +486,7 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     gpt_scan("pvscsi0");    /* GPT on VMware PVSCSI — silent if absent        */
     gpt_scan("hvdisk0");    /* GPT on Hyper-V StorVSC — silent if absent      */
     gpt_scan("pmem0");      /* GPT on virtio-pmem — silent if absent         */
+    gpt_scan("usb0");       /* GPT on USB mass storage — silent if absent    */
     /* Mount ext2 root filesystem.
      * If a ramdisk module is present (live USB/CDROM boot), ALWAYS use it —
      * never silently pick up an NVMe install which may be stale or broken.
@@ -484,28 +494,32 @@ kernel_main(uint32_t mb_magic, void *mb_info)
      * from its own disk without GRUB modules). */
     if (blkdev_get("ramdisk0")) {
         g_rootfs->mount("ramdisk0");
-    } else if (g_rootfs->mount("nvme0p1") == 0) {
+    } else if (mount_disk_root("nvme0p1") == 0) {
         /* installed system on NVMe */
-    } else if (g_rootfs->mount("sata0p1") == 0) {
+    } else if (mount_disk_root("sata0p1") == 0) {
         /* Aegis partition on an AHCI/SATA disk */
-    } else if (g_rootfs->mount("sata0") == 0) {
+    } else if (mount_disk_root("sata0") == 0) {
         /* whole-disk ext2 on SATA */
-    } else if (g_rootfs->mount("vblk0p1") == 0) {
+    } else if (mount_disk_root("vblk0p1") == 0) {
         /* Aegis partition on virtio-blk (cloud/QEMU disk) */
-    } else if (g_rootfs->mount("vblk0") == 0) {
+    } else if (mount_disk_root("vblk0") == 0) {
         /* whole-disk ext2 on virtio-blk (unpartitioned cloud image) */
-    } else if (g_rootfs->mount("scsi0p1") == 0) {
+    } else if (mount_disk_root("scsi0p1") == 0) {
         /* Aegis partition on a virtio-scsi disk */
-    } else if (g_rootfs->mount("scsi0") == 0) {
+    } else if (mount_disk_root("scsi0") == 0) {
         /* whole-disk ext2 on virtio-scsi */
-    } else if (g_rootfs->mount("pvscsi0p1") == 0) {
+    } else if (mount_disk_root("pvscsi0p1") == 0) {
         /* Aegis partition on a VMware PVSCSI disk */
-    } else if (g_rootfs->mount("pvscsi0") == 0) {
+    } else if (mount_disk_root("pvscsi0") == 0) {
         /* whole-disk ext2 on VMware PVSCSI */
-    } else if (g_rootfs->mount("hvdisk0p1") == 0) {
+    } else if (mount_disk_root("hvdisk0p1") == 0) {
         /* Aegis partition on a Hyper-V StorVSC disk (Gen 2 VM) */
-    } else if (g_rootfs->mount("hvdisk0") == 0) {
+    } else if (mount_disk_root("hvdisk0") == 0) {
         /* whole-disk ext2 on Hyper-V StorVSC */
+    } else if (mount_disk_root("usb0p1") == 0) {
+        /* installed system on USB */
+    } else if (mount_disk_root("usb0") == 0) {
+        /* whole-disk ext2 on USB */
     } else {
         printk("[VFS] WARN: no ramdisk and no Aegis root on NVMe/virtio-blk — running from initrd only\n");
     }
@@ -517,8 +531,6 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     poll_test();            /* VFS .poll self-test — [POLL] OK               */
 #endif
     bph("mount+cap");
-    xhci_init();            /* xHCI USB host — [XHCI] OK or silent skip     */
-    gpt_scan("usb0");       /* GPT on a USB mass-storage device — silent if absent */
 #ifdef CONFIG_VIRTIO_NET
     virtio_net_init();      /* virtio-net NIC (NET+VIRTIO)                   */
 #endif

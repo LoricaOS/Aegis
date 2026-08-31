@@ -348,8 +348,8 @@ vmm_init(void)
     printk("[VMM] OK: mapped-window allocator active\n");
 }
 
-void
-vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags)
+int
+vmm_try_map_page(uint64_t virt, uint64_t phys, uint64_t flags)
 {
     if (virt & ~VMM_PAGE_MASK) {
         printk("[VMM] FAIL: vmm_map_page virt not aligned\n");
@@ -385,12 +385,20 @@ vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags)
     vmm_window_unmap();
 
     spin_unlock_irqrestore(&vmm_window_lock, fl);
-    return;
+    return 0;
 
 oom:
     spin_unlock_irqrestore(&vmm_window_lock, fl);
-    printk("[VMM] FAIL: out of memory in vmm_map_page\n");
-    panic_halt("[VMM] FAIL: out of memory in vmm_map_page");
+    return -1;
+}
+
+void
+vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags)
+{
+    if (vmm_try_map_page(virt, phys, flags) < 0) {
+        printk("[VMM] FAIL: out of memory in vmm_map_page\n");
+        panic_halt("[VMM] FAIL: out of memory in vmm_map_page");
+    }
 }
 
 /* unmap_page_inner — clear the PTE + local invlpg; returns 1 if a present

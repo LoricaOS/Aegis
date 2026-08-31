@@ -21,7 +21,7 @@ typedef struct {
 
 int iwl_wifi_present(void);                            /* 1 if an AX200 was found */
 int iwl_wifi_list(wifi_net_pub_t *out, int max);      /* returns #networks copied */
-int iwl_wifi_connect(const char *ssid);               /* 0 = associated, <0 = error */
+int iwl_wifi_connect(const char *ssid,const char *pass,uint8_t pass_len);
 int iwl_wifi_rescan(void);                             /* re-run the scan (blocking) */
 
 #endif /* IWL_AX200_H */

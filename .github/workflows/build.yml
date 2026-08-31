@@ -68,7 +68,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-            build-essential nasm curl python3-venv
+            build-essential nasm curl python3-venv e2fsprogs xorriso \
+            qemu-system-arm qemu-efi-aarch64
       - name: Generate kernel config (kconfiglib)
         run: |
           python3 -m venv /tmp/kcvenv
@@ -85,6 +86,8 @@ jobs:
           touch .config build/auto.conf build/generated/autoconf.h
       - name: Build kernel (AArch64)
         run: make -f Makefile.arm64 -j"$(nproc)"
+      - name: Boot + capability tests (captest + ktest under QEMU/TCG)
+        run: make -f Makefile.arm64 test
       - name: Stage release artifact
         run: cp build/arm64/aegis-arm64.elf aegis-arm64.elf
       - uses: actions/upload-artifact@v4

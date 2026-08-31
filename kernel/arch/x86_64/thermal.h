@@ -1,10 +1,9 @@
 #ifndef AEGIS_THERMAL_H
 #define AEGIS_THERMAL_H
 
-/* Current CPU die temperature in °C, or -1 if unavailable (non-AMD CPU, or no
- * Data Fabric present — e.g. under a VM). When non-NULL, *tjmax_out receives
- * the nominal throttle ceiling in °C. AMD Zen/Zen2/Zen3 via a k10temp-style
- * SMN read; Intel DTS is a separate TODO. */
+/* Current CPU die temperature in °C, or -1 if unavailable. When non-NULL,
+ * *tjmax_out receives the throttle ceiling. Supports Intel architectural DTS
+ * and AMD Zen/Zen2/Zen3 via a k10temp-style SMN read. */
 int cpu_temp_read(int *tjmax_out);
 
 /* Battery state. Returns 1 and fills *percent (0-100), *charging (0/1), *ac

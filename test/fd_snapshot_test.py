@@ -65,6 +65,9 @@ assert "sock_id_from_file(&pin->file)" in SOCKET_SYSCALLS
 assert "unix_sock_id_from_file(&pin->file)" in SOCKET_SYSCALLS
 assert "sock_id_from_file(const vfs_file_t *file)" in SOCKET
 assert "unix_sock_id_from_file(const vfs_file_t *file)" in UNIX_SOCKET
+assert "f->kflags & VFS_KF_CAP_CONFINED" in SOCKET_SYSCALLS
+assert "staged[count].file = *f;" in SOCKET_SYSCALLS
+assert "vfs_file_t incoming = take[i].file;" in UNIX_SOCKET
 for source, signature in (
     (SOCKET, "sock_open_fd(uint32_t sock_id"),
     (UNIX_SOCKET, "unix_sock_open_fd(uint32_t sock_id"),

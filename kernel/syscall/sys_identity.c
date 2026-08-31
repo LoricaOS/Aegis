@@ -268,17 +268,12 @@ sys_umask(uint64_t mask)
     return (uint64_t)old;
 }
 
-/* sys_getrlimit — syscall 97: return {RLIM_INFINITY, RLIM_INFINITY}.
- * struct rlimit = {uint64_t rlim_cur, rlim_max} = 16 bytes. */
+/* sys_getrlimit — syscall 97. Keep this on the same implementation as
+ * prlimit64 so reported fixed kernel ceilings cannot drift. */
 uint64_t
 sys_getrlimit(uint64_t resource, uint64_t rlim_ptr)
 {
-    (void)resource;
-    if (!user_ptr_valid(rlim_ptr, 16))
-        return SYS_ERR(EFAULT);
-    uint64_t inf[2] = { ~0ULL, ~0ULL };
-    copy_to_user((void *)(uintptr_t)rlim_ptr, inf, 16);
-    return 0;
+    return sys_prlimit64(0, resource, 0, rlim_ptr);
 }
 
 /*
@@ -492,38 +487,46 @@ uint64_t sys_sched_getaffinity(uint64_t pid, uint64_t len, uint64_t mask)
     return n;
 }
 
-/* prlimit64(302): query/set resource limits. We only honour the query (old)
- * side with generous limits; sets are accepted as no-ops. */
+/* prlimit64(302): report the limits Aegis actually enforces. Per-process
+ * mutable limits do not exist yet, so reject changes instead of lying about
+ * accepting them. */
 uint64_t sys_prlimit64(uint64_t pid, uint64_t res, uint64_t newp, uint64_t oldp)
 {
-    (void)pid; (void)newp;
+    if (res >= 16)
+        return SYS_ERR(EINVAL);
+    if (pid && pid != sys_getpid())
+        return SYS_ERR(ESRCH);
+    if (newp) {
+        if (!user_ptr_valid(newp, 16))
+            return SYS_ERR(EFAULT);
+        return SYS_ERR(EOPNOTSUPP);
+    }
     if (oldp) {
         struct rl { unsigned long cur, max; } k;
         if (!user_ptr_valid(oldp, sizeof(k))) return SYS_ERR(EFAULT);
         unsigned long INF = ~0UL;
-        if (res == 7) { k.cur = 1024; k.max = 1024; }            /* RLIMIT_NOFILE */
-        else if (res == 3) { k.cur = 8UL*1024*1024; k.max = INF; } /* RLIMIT_STACK */
+        if (res == 7) { k.cur = PROC_MAX_FDS; k.max = PROC_MAX_FDS; }
+        else if (res == 6) { k.cur = MAX_PROCESSES; k.max = MAX_PROCESSES; }
+        else if (res == 3) {
+            k.cur = USER_STACK_NPAGES * AEGIS_PAGE_SIZE;
+            k.max = k.cur;
+        }
         else { k.cur = INF; k.max = INF; }
         copy_to_user((void *)(uintptr_t)oldp, &k, sizeof(k));
     }
     return 0;
 }
 
-/* inotify_init1(294): return a benign, never-firing fd (eventfd-backed). File
- * watchers poll it and simply never see events. */
-extern uint64_t sys_eventfd2(uint64_t initval, uint64_t flags);
+/* inotify is not implemented.  Report that honestly so callers can fall back
+ * instead of accepting watches that can never produce an event. */
 uint64_t sys_inotify_init1(uint64_t flags)
 {
-    /* eventfd flags share the same EFD_NONBLOCK/EFD_CLOEXEC bit values. */
-    return sys_eventfd2(0, flags);
+    (void)flags;
+    return SYS_ERR(ENOSYS);
 }
 
-/* inotify_add_watch(254): inotify is an inert stub (init1 hands back a
- * never-firing eventfd). Return a positive watch descriptor so file watchers
- * believe the watch was registered; no events are ever delivered. */
 uint64_t sys_inotify_add_watch(uint64_t fd, uint64_t path, uint64_t mask)
 {
     (void)fd; (void)path; (void)mask;
-    static int wd = 0;
-    return (uint64_t)(++wd);
+    return SYS_ERR(ENOSYS);
 }

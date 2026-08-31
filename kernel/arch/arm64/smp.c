@@ -111,6 +111,7 @@ ap_c_entry(uint64_t cpu)
     g_percpu[cpu].self   = &g_percpu[cpu];
     g_percpu[cpu].cpu_id = (uint8_t)cpu;
     __asm__ volatile("msr tpidr_el1, %0" : : "r"(&g_percpu[cpu]));
+    arm64_pan_init();
 
     /* Drop the identity map: run on the empty master user table in TTBR0. */
     arch_vmm_load_pml4(vmm_get_master_pml4());

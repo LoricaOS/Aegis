@@ -62,13 +62,16 @@ assert "fd_dup_exact" in dup3, "dup3 CLOEXEC installation must be atomic"
 
 open_body = body(file_src, "sys_open")
 open_build = open_body.index("vfs_file_t opened")
-open_lock = open_body.index("spin_lock_irqsave(&proc->fd_table->lock)", open_build)
-open_install = open_body.index("proc->fd_table->fds[fd] = opened", open_lock)
-open_unlock = open_body.index("spin_unlock_irqrestore", open_install)
-assert open_build < open_lock < open_install < open_unlock
-assert open_body.index("opened.kflags", open_build) < open_lock
-assert open_body.index("opened.flags", open_build) < open_lock
-assert open_body.index("opened.ops->close(opened.priv)", open_unlock) > open_unlock
+publish = body(file_src, "install_opened")
+open_lock = publish.index("spin_lock_irqsave(&proc->fd_table->lock)")
+open_install = publish.index("proc->fd_table->fds[fd] = *opened", open_lock)
+open_unlock = publish.index("spin_unlock_irqrestore", open_install)
+assert open_lock < open_install < open_unlock
+assert publish.index("opened->flags = flags") < open_lock
+assert publish.index("opened->ops->close", open_unlock) > open_unlock
+assert open_body.index("opened.kflags", open_build) < open_body.index(
+    "install_opened(proc, &opened", open_build
+)
 
 pipe2 = body(file_src, "sys_pipe2")
 pipe_lock = pipe2.index("spin_lock_irqsave(&proc->fd_table->lock)")

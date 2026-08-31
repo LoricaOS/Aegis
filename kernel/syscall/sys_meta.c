@@ -9,29 +9,7 @@
 #include "arch.h"
 #include "../lib/string.h"
 
-/* ── Helper: resolve a user path to a canonical, in-scope absolute path ──
- *
- * Every path-taking syscall in this file routes through here, so this is the
- * one place the two confinement bugs had to be fixed:
- *
- *  1. It only prepended cwd — it never consulted the VFS scope. symlink, link,
- *     readlink, chmod, chown, lchown and utimensat therefore ignored
- *     sys_vfs_confine entirely: from a confined process,
- *     link("/etc/shadow", "/home/u/copy") simply worked. (Only sys_open was
- *     immune, because it pre-normalizes and calls vfs_scope_allows itself.)
- *
- *  2. It emitted the path with ".." still in it. path_canonicalize (what the
- *     scope check uses) pops ONE component per "..", but ext2_walk CLAMPED ".."
- *     to the filesystem root — so the string that was checked and the string
- *     that was walked could differ. A process confined to /home/u asking for
- *     "/home/u/x/../etc/shadow" got "/home/u/etc/shadow" approved by the
- *     checker while ext2 walked ".." to root and opened the real /etc/shadow.
- *     Canonicalizing HERE means the bytes checked are byte-for-byte the bytes
- *     walked, and no ".." ever reaches the filesystem. (ext2_walk's clamp is
- *     removed as well, so the two can no longer diverge.)
- *
- * Returns 0, or -ENAMETOOLONG / -EACCES (out of scope). Fails closed.
- */
+/* Resolve a user path to a canonical absolute path. */
 int
 resolve_path(const char *kpath, const char *cwd, char *out, uint32_t outsz)
 {
@@ -59,10 +37,8 @@ resolve_path(const char *kpath, const char *cwd, char *out, uint32_t outsz)
         __builtin_memcpy(abs + cwdlen + sep, kpath, pathlen + 1);
     }
 
-    /* Canonicalize BEFORE the scope check, and hand the caller the canonical
-     * form — the filesystem must walk exactly what was approved. */
     path_canonicalize(abs, out, outsz);
-    return vfs_scope_allows(out) ? 0 : -EACCES;
+    return 0;
 }
 
 /* meta_gate_locked — owner + sensitive-inode authority for a path mutation.

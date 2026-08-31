@@ -4,6 +4,7 @@
 #include "eth.h"
 #include "udp.h"
 #include "tcp.h"
+#include "ipv6.h"
 #include "printk.h"
 #include "spinlock.h"
 #include "arch.h"   /* arch_get_ticks() */
@@ -415,6 +416,8 @@ void net_init(void)
         return;
     }
     eth_init();
+    ipv6_init(dev);
     udp_init();
     tcp_init();
+    ipv6_selftest(dev);
 }

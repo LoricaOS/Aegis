@@ -27,6 +27,7 @@
 
 #include "eth.h"
 #include "ip.h"
+#include "ipv6.h"
 #include "netdev.h"
 #include "tcp.h"
 #include "udp.h"
@@ -47,6 +48,19 @@ netdev_t *netdev_get(const char *n)  { (void)n; return NULL; }
 void waitq_wake_all(waitq_t *q)      { (void)q; }
 void  sock_wake(uint32_t id)     { (void)id; }
 void  epoll_notify(uint32_t id, uint32_t ev) { (void)id; (void)ev; }
+void ipv6_init(netdev_t *dev) { (void)dev; }
+void ipv6_selftest(netdev_t *dev) { (void)dev; }
+void ipv6_get_linklocal(ip6_addr_t *out) { if (out) memset(out, 0, sizeof(*out)); }
+int ipv6_addr_equal(const ip6_addr_t *a, const ip6_addr_t *b)
+{ return memcmp(a, b, sizeof(*a)) == 0; }
+int ipv6_send(netdev_t *dev, const ip6_addr_t *dst, uint8_t next,
+              const void *payload, uint16_t len)
+{ (void)dev; (void)dst; (void)next; (void)payload; (void)len; return -1; }
+void ipv6_rx(netdev_t *dev, const void *frame, const void *data, uint16_t len)
+{ (void)dev; (void)frame; (void)data; (void)len; }
+uint16_t ipv6_l4_checksum(const ip6_addr_t *src, const ip6_addr_t *dst,
+                          uint8_t next, const void *payload, uint16_t len)
+{ (void)src; (void)dst; (void)next; (void)payload; (void)len; return 1; }
 
 /* Real backing memory — TCP rings are indexed with & (SIZE-1) and genuinely
  * written, so handing back a short buffer would fake a bug. */

@@ -117,6 +117,9 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
                                   * dispatch and hit sys_access — so epoll_ctl
                                   * was UNREACHABLE on arm64 and silently did
                                   * something else entirely. */
+    case  26: num = 294; break;  /* inotify_init1 */
+    case  27: num = 254; break;  /* inotify_add_watch */
+    case  28: num = 255; break;  /* inotify_rm_watch (unimplemented) */
     case 220: num = 56;  break;  /* clone */
     case 221: num = 59;  break;  /* execve */
     case 216: num = 25;  break;  /* mremap (aarch64 __NR_mremap == 216) */
@@ -321,7 +324,7 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 202: return sys_futex(arg1, arg2, arg3, arg4, arg5, arg6);
     case 510: return sys_blkdev_list(arg1, arg2);
     case 511: return sys_blkdev_io(arg1, arg2, arg3, arg4, arg5);
-    case 518: return sys_vfs_confine(arg1);   /* Aegis: confine to a subtree */
+    case 518: return sys_vfs_confine(arg1);   /* retired: lexical scope was escapable */
     case 512: return sys_gpt_rescan(arg1);
     case 513: return sys_fb_map(arg1);
     case 514: return sys_spawn(arg1, arg2, arg3, arg4, arg5);
@@ -329,6 +332,7 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 516: return sys_install_commit();
     case 517: return sys_admin_session(arg1);
     case 519: return sys_admin_session_active();  /* Aegis: query own admin session */
+    case 520: return sys_cap_rights_limit(arg1, arg2, arg3);
     case 362: return sys_cap_query(arg1, arg2, arg3);
     /* 363 (sys_cap_grant_runtime) removed: retired in Phase 46c, zero callers,
      * and a live "inject a cap into any PID" primitive is attack surface. */
@@ -344,7 +348,7 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 151: return 0;  /* mlockall */
     case 152: return 0;  /* munlockall */
     case 157: return 0;                       /* prctl — no-op */
-    case 160: return 0;                       /* setrlimit — no-op */
+    case 160: return sys_prlimit64(0, arg1, arg2, 0); /* setrlimit */
     case 239: return 0;                       /* get_mempolicy — no NUMA */
     case  99: return sys_sysinfo(arg1);
     case 204: return sys_sched_getaffinity(arg1, arg2, arg3);

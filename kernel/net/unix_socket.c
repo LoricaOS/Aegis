@@ -349,8 +349,8 @@ int unix_sock_pair(uint32_t *a, uint32_t *b)
 static void unix_close_staged(const unix_passed_fd_t *staged, uint8_t n)
 {
     for (uint8_t i = 0; i < n; i++)
-        if (staged[i].ops && staged[i].ops->close)
-            staged[i].ops->close(staged[i].priv);
+        if (staged[i].file.ops && staged[i].file.ops->close)
+            staged[i].file.ops->close(staged[i].file.priv);
 }
 
 void unix_sock_free(uint32_t id)
@@ -995,25 +995,21 @@ int unix_sock_recv_fds(uint32_t id, int *fd_out, int max_fds)
         }
         if (free_fd < 0) break;  /* fd table full */
 
-        proc->fd_table->fds[free_fd].priv   = take[i].priv;
-        proc->fd_table->fds[free_fd].offset = 0;
-        proc->fd_table->fds[free_fd].size   = 0;
-        /* Received fds carry no filesystem/device authority (sys_sendmsg's
-         * scm_fd_passable allowlist permits only memfd/pipe/unix-socket), so
-         * the receiver's fd holds no authority marker. Set kflags explicitly
-         * rather than trust the reused slot to have been left clean. */
-        proc->fd_table->fds[free_fd].kflags = 0;
+        vfs_file_t incoming = take[i].file;
+        const vfs_ops_t *ops = incoming.ops;
+        incoming.ops = (const vfs_ops_t *)0;
+        incoming.offset = 0;
         /* Inherit the sender's file *status* flags (O_NONBLOCK etc., which
          * belong to the shared open file description) but NOT FD_CLOEXEC,
          * which is a per-fd-table property the receiver owns. Linux clears
          * close-on-exec on received SCM_RIGHTS fds unless the receiver asked
          * for MSG_CMSG_CLOEXEC; carrying the sender's bit through could close
          * a passed fd across the receiver's next execve. */
-        proc->fd_table->fds[free_fd].flags  =
-            take[i].flags & ~VFS_FD_CLOEXEC;
+        incoming.flags &= ~VFS_FD_CLOEXEC;
+        proc->fd_table->fds[free_fd] = incoming;
         /* ops LAST: it is the slot's in-use marker, so the slot is fully
          * populated before any other holder of this table can see it taken. */
-        proc->fd_table->fds[free_fd].ops    = take[i].ops;
+        proc->fd_table->fds[free_fd].ops    = ops;
         fd_out[installed++] = free_fd;
     }
     spin_unlock_irqrestore(&proc->fd_table->lock, ffl);

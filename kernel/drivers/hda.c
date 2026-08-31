@@ -143,12 +143,7 @@ static inline void w32(uint32_t o,uint32_t v){ *(volatile uint32_t *)(s_mmio+o)=
 static volatile uint8_t *
 map_mmio(uint64_t pa, uint32_t n)
 {
-    uintptr_t va = (uintptr_t)kva_alloc_pages(n);
-    if (!va) return NULL;
-    for (uint32_t i=0;i<n;i++){ uintptr_t p=va+(uint64_t)i*4096;
-        vmm_unmap_page(p);
-        vmm_map_page(p, pa+(uint64_t)i*4096, VMM_FLAG_WRITABLE|VMM_FLAG_WC|VMM_FLAG_UCMINUS); }
-    return (volatile uint8_t *)va;
+    return (volatile uint8_t *)kva_map_mmio(pa, n);
 }
 
 /* Map n contiguous physical pages at `pa` as write-back (cached) memory — for
@@ -156,14 +151,7 @@ map_mmio(uint64_t pa, uint32_t n)
 static volatile uint8_t *
 map_dma(uint64_t pa, uint32_t n)
 {
-    uintptr_t va = (uintptr_t)kva_alloc_pages(n);
-    if (!va) return NULL;
-    for (uint32_t i = 0; i < n; i++) {
-        uintptr_t p = va + (uint64_t)i * 4096;
-        vmm_unmap_page(p);
-        vmm_map_page(p, pa + (uint64_t)i * 4096, VMM_FLAG_WRITABLE);
-    }
-    return (volatile uint8_t *)va;
+    return (volatile uint8_t *)kva_map_phys_pages(pa, n);
 }
 
 /* Send one codec verb via the immediate command interface; return the 32-bit

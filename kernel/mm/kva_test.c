@@ -21,6 +21,7 @@
  */
 #include "kva.h"
 #include "vmm.h"
+#include "pmm.h"
 #include "../core/printk.h"
 #include <stdint.h>
 
@@ -96,6 +97,31 @@ kva_test_run(void)
 
     printk("[KVATEST] start: %d slots, %d rounds, 1..%d pages\n",
            SLOTS, ROUNDS, MAX_PAGES);
+
+    /* Overflow-sized requests must fail without moving the bump cursor or
+     * touching PMM; this is the cheap regression check for the fallible path. */
+    if (kva_alloc_pages(UINT64_MAX / 4096ULL + 1) != (void *)0) {
+        printk("[KVATEST] FAIL: overflow allocation unexpectedly succeeded\n");
+        fails++;
+    }
+
+    /* On small test machines, force real PMM exhaustion in one transaction.
+     * Page-table pages created along the way remain reusable, so allow that
+     * small retained cost while requiring the data pages to roll back. */
+    uint64_t free_before = pmm_free_pages();
+    if (free_before < 65536) {
+        if (kva_alloc_pages(free_before + 1) != (void *)0) {
+            printk("[KVATEST] FAIL: overcommit allocation unexpectedly succeeded\n");
+            fails++;
+        } else {
+            uint64_t free_after = pmm_free_pages();
+            if (free_after + 256 < free_before) {
+                printk("[KVATEST] FAIL: rollback leaked %lu pages\n",
+                       (unsigned long)(free_before - free_after));
+                fails++;
+            }
+        }
+    }
 
     for (int i = 0; i < SLOTS; i++)
         s_slot[i].va = (uint8_t *)0;

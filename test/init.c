@@ -50,7 +50,8 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
 #define SYS_exit         60
 #define SYS_sethostname  170   /* gated on CAP_KIND_POWER — init HOLDS this */
 #define SYS_blkdev_list  510   /* gated on CAP_KIND_DISK_ADMIN — init LACKS this */
-#define SYS_vfs_confine  518   /* Aegis: confine self to a subtree (no cap) */
+#define SYS_vfs_confine  518   /* reserved; unsafe lexical version retired */
+#define SYS_cap_rights_limit 520
 
 /* Colliding syscalls: the x86 number would be MIS-translated on aarch64, so
  * use each arch's real Linux number (aarch64's are translated to the x86
@@ -89,6 +90,11 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
 #define SYS_getdents64   61
 #define SYS_read         63
 #define SYS_exit_group   94
+#define SYS_recvfrom     207
+#define SYS_getrandom    278
+#define SYS_inotify_init1 26
+#define SYS_inotify_add_watch 27
+#define SYS_inotify_rm_watch 28
 #else
 #define SYS_getpid       39
 #define SYS_mount        165
@@ -120,6 +126,11 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
 #define SYS_getdents64   217
 #define SYS_read         0
 #define SYS_exit_group   231
+#define SYS_recvfrom     45
+#define SYS_getrandom    318
+#define SYS_inotify_init1 294
+#define SYS_inotify_add_watch 254
+#define SYS_inotify_rm_watch 255
 #endif
 
 #define AT_FDCWD             -100
@@ -186,6 +197,11 @@ static unsigned k_stat_mode(const void *st)
 #else
     return *(const unsigned *)((const char *)st + 24);
 #endif
+}
+/* st_blocks is at byte 64 in both supported userspace stat layouts. */
+static long k_stat_blocks(const void *st)
+{
+    return *(const long *)((const char *)st + 64);
 }
 #define K_IFMT  0170000
 #define K_IFDIR 0040000
@@ -258,6 +274,33 @@ void _start(void)
     if (sys3(SYS_write, 1, (long)"ok\n", 3) == 3) { pass++; out("[KTEST] PASS write\n"); }
     else out("[KTEST] FAIL write\n");
 
+    total++;
+    {
+        char random[16];
+        long got = sys3(SYS_getrandom, (long)random, sizeof(random), 0);
+        long bad = sys3(SYS_getrandom, (long)random, sizeof(random), 0x80000000);
+        if (got == (long)sizeof(random) && bad == -22) {
+            pass++; out("[KTEST] PASS getrandom ready + flags validated\n");
+        } else out("[KTEST] FAIL getrandom\n");
+    }
+
+    /* Unsupported compatibility surfaces must fail explicitly: a successful
+     * inert inotify fd hangs watchers forever, while ignoring MSG_PEEK consumes
+     * data the caller asked to leave queued. */
+    total++;
+    {
+        char byte;
+        long ino = sys3(SYS_inotify_init1, 0, 0, 0);
+        long add = sys3(SYS_inotify_add_watch, -1, 0, 0);
+        long rm = sys3(SYS_inotify_rm_watch, -1, -1, 0);
+        long peek = sys6(SYS_recvfrom, -1, (long)&byte, 1, 0x2, 0, 0);
+        long waitall = sys6(SYS_recvfrom, -1, (long)&byte, 1, 0x100, 0, 0);
+        if (ino == -38 && add == -38 && rm == -38 &&
+            peek == -95 && waitall == -95) {
+            pass++; out("[KTEST] PASS unsupported syscall semantics fail honestly\n");
+        } else out("[KTEST] FAIL unsupported syscall semantics accepted\n");
+    }
+
     /* 3. POSITIVE control: sethostname needs CAP_KIND_POWER, which init DOES
      *    hold, so it must SUCCEED — proving granted capabilities actually work
      *    (the model isn't just "deny everything"). */
@@ -280,77 +323,13 @@ void _start(void)
         { pass++; out("[KTEST] PASS mount-denied\n"); }
     else out("[KTEST] FAIL mount-NOT-denied (privesc!)\n");
 
-    /* 4c. VFS confinement — a CHILD confines itself to /tmp (so init stays
-     *     unconfined for the tests below), then: an in-scope create succeeds, an
-     *     out-of-scope open is refused (EACCES), and widening back out is
-     *     refused (one-way). Purely additive authority-dropping, no cap. */
+    /* 4c. The old process-wide path scope followed in-scope symlinks outside
+     * its root. It is retired until every operation uses the inode-rooted dirfd
+     * resolver; fake confinement is worse than an explicit refusal. */
     total++;
-    {
-        long cpid = sys6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);
-        if (cpid == 0) {
-            int ok = 1;
-            if (sys3(SYS_vfs_confine, (long)"/tmp", 0, 0) != 0) ok = 0;
-            /* in-scope create → valid fd */
-            if (sys6(SYS_openat, AT_FDCWD, (long)"/tmp/cjail", 0x40 | 1, 0644, 0, 0) < 0)
-                ok = 0;
-            /* out-of-scope open must be denied */
-            if (sys6(SYS_openat, AT_FDCWD, (long)"/", 0, 0, 0, 0) >= 0)
-                ok = 0;
-            /* one-way: widening the scope must be refused */
-            if (sys3(SYS_vfs_confine, (long)"/", 0, 0) == 0)
-                ok = 0;
-            /* The METADATA syscalls must honour the scope too. symlink, link,
-             * readlink, chmod, chown, lchown and utimensat all resolve through
-             * resolve_path(), which used to only prepend cwd — it never
-             * consulted the scope, so all seven ignored confinement outright.
-             * Creating a symlink in /etc from a process confined to /tmp must
-             * be refused. */
-            if (k_symlink("t", "/etc/ktest_escape") == 0)
-                ok = 0;
-            /* Same syscall, but escaping via "..". This is the divergence
-             * between the two path resolvers: the lexical canonicalizer behind
-             * the scope check pops ONE component per "..", while ext2_walk used
-             * to CLAMP ".." to the filesystem root. So the checker saw
-             * "/etc/..." only if it canonicalized -- and the version that
-             * didn't handed ext2 the raw string, which walked ".." to root and
-             * created the link outside the scope anyway. Both resolvers agree
-             * now, and the path is canonicalized before it is checked. */
-            if (k_symlink("t", "/tmp/../etc/ktest_escape2") == 0)
-                ok = 0;
-            /* descendants inherit confinement: a grandchild must ALSO be denied
-             * "/" (it inherited /tmp scope across fork). */
-            long gpid = sys6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);
-            if (gpid == 0)
-                sys3(SYS_exit,
-                     (sys6(SYS_openat, AT_FDCWD, (long)"/", 0, 0, 0, 0) < 0) ? 0 : 1,
-                     0, 0);
-            long gstatus = -1;
-            sys6(SYS_wait4, gpid, (long)&gstatus, 0, 0, 0, 0);
-            if (((gstatus >> 8) & 0xff) != 0) ok = 0;   /* grandchild escaped scope */
-            sys3(SYS_exit, ok ? 0 : 1, 0, 0);
-        }
-        long cstatus = -1;
-        sys6(SYS_wait4, cpid, (long)&cstatus, 0, 0, 0, 0);
-        int cok = (((cstatus >> 8) & 0xff) == 0);
-        /* Belt and braces, from the UNCONFINED parent: neither escape may have
-         * left anything behind in /etc. If the child's syscall "failed" but the
-         * link exists, the deny was cosmetic. */
-        {
-            char st[256];
-            if (k_stat_at("/etc/ktest_escape",  st, 1) == 0) cok = 0;
-            if (k_stat_at("/etc/ktest_escape2", st, 1) == 0) cok = 0;
-            /* Positive control: ".." must still RESOLVE for an unconfined
-             * process. ext2_walk no longer special-cases it (it clamped ".."
-             * to the fs root, which is why the two resolvers disagreed) and
-             * instead looks it up as the ordinary directory entry it is. This
-             * is the check that the replacement lookup actually works — and
-             * note the old clamp was plainly wrong for real paths too:
-             * "/a/b/../c" resolved to "/c". */
-            if (k_stat_at("/bin/../bin/exectest", st, 0) != 0) cok = 0;
-        }
-        if (cok) { pass++; out("[KTEST] PASS vfs-confine\n"); }
-        else out("[KTEST] FAIL vfs-confine (confinement escapable!)\n");
-    }
+    if (sys3(SYS_vfs_confine, (long)"/tmp", 0, 0) == -95)
+        { pass++; out("[KTEST] PASS unsafe vfs-confine retired\n"); }
+    else out("[KTEST] FAIL unsafe vfs-confine still active\n");
 
     /* 5. FP/SIMD state survives a context switch (arm64 only — this
      *    test-init is built -mno-sse on x86, where the FXSAVE path is
@@ -849,6 +828,54 @@ void _start(void)
         if (ok) { pass++; out("[KTEST] PASS symlink (lstat/stat/unlink)\n"); }
         else out("[KTEST] FAIL symlink\n");
 
+        /* ext2 i_blocks counts allocated 512-byte sectors, not file bytes. */
+        ok = 1;
+        long bfd = sys6(SYS_openat, AT_FDCWD, (long)"/kt-blocks",
+                        0x40 /*O_CREAT*/ | 1 /*O_WRONLY*/, 0644, 0, 0);
+        ok &= (bfd >= 0);
+        if (bfd >= 0) {
+            ok &= (sys3(SYS_write, bfd, (long)"x", 1) == 1);
+            ok &= (sys3(SYS_close, bfd, 0, 0) == 0);
+        }
+        ok &= (k_stat_at("/kt-blocks", st, 0) == 0);
+        ok &= (k_stat_blocks(st) == 8); /* one 4 KiB block */
+        ok &= (k_unlink("/kt-blocks") == 0);
+        total++;
+        if (ok) { pass++; out("[KTEST] PASS ext2 block accounting\n"); }
+        else out("[KTEST] FAIL ext2 block accounting\n");
+
+        /* A directory fd is a real inode-relative root. Once confined its
+         * rights only shrink and neither .. nor writes can escape that root. */
+        ok = 1;
+        ok &= (k_mkdir("/ktcap") == 0);
+        long cfd = sys6(SYS_openat, AT_FDCWD, (long)"/ktcap/file",
+                        0x40 | 1, 0644, 0, 0);
+        ok &= (cfd >= 0);
+        if (cfd >= 0) {
+            ok &= (sys3(SYS_write, cfd, (long)"x", 1) == 1);
+            sys3(SYS_close, cfd, 0, 0);
+        }
+        long dfd = sys6(SYS_openat, AT_FDCWD, (long)"/ktcap", 0, 0, 0, 0);
+        ok &= (dfd >= 0);
+        long rfd = dfd >= 0
+                 ? sys6(SYS_openat, dfd, (long)"file", 0, 0, 0, 0) : -1;
+        ok &= (rfd >= 0);
+        if (rfd >= 0) sys3(SYS_close, rfd, 0, 0);
+        ok &= (dfd >= 0 && sys3(SYS_cap_rights_limit, dfd,
+                                 1 /*READ*/ | 4 /*EXEC*/, 0) == 0);
+        ok &= (sys6(SYS_openat, dfd, (long)"file", 1 /*O_WRONLY*/, 0, 0, 0) < 0);
+        ok &= (sys3(SYS_cap_rights_limit, dfd,
+                    1 /*READ*/ | 4 /*EXEC*/, 1) == 0);
+        ok &= (sys6(SYS_openat, dfd, (long)"../bin/sh", 0, 0, 0, 0) < 0);
+        ok &= (sys3(SYS_cap_rights_limit, dfd, 1 /*READ*/, 0) == 0);
+        ok &= (sys6(SYS_openat, dfd, (long)"file", 0, 0, 0, 0) < 0);
+        if (dfd >= 0) sys3(SYS_close, dfd, 0, 0);
+        ok &= (k_unlink("/ktcap/file") == 0);
+        ok &= (k_rmdir("/ktcap") == 0);
+        total++;
+        if (ok) { pass++; out("[KTEST] PASS confined directory openat\n"); }
+        else out("[KTEST] FAIL confined directory openat\n");
+
         /* /tmp is ramfs, a different backend with its own routing. */
         ok = 1;
         ok &= (k_mkdir("/tmp/ktdir") == 0);
@@ -1209,7 +1236,7 @@ void _start(void)
         sys6(362, 0, KPTR, HUGE, 0, 0, 0);
         sys6(362, NEG1, NONCAN, HUGE, 0, 0, 0);
         sys3(364, NEG1, NEG1, 0);
-        /* vfs_confine (518) with hostile path pointers. */
+        /* Retired vfs_confine (518) must ignore hostile path pointers safely. */
         sys3(518, KPTR, 0, 0);
         sys3(518, NONCAN, 0, 0);
         /* Structured buffers: ppoll (huge nfds + kernel fds), getdents64. */

@@ -86,6 +86,36 @@ freelist_insert(uint64_t va, uint64_t n)
     s_nfree = (int)fl.count;
 }
 
+/* Undo a partially mapped allocation and return its whole reserved VA range.
+ * No allocator locks nest: VMM/PMM work finishes before taking kva_lock. */
+static void
+rollback_alloc(uint64_t base, uint64_t reserved, uint64_t mapped)
+{
+    for (uint64_t i = 0; i < mapped; i++) {
+        uint64_t va = base + i * 4096UL;
+        uint64_t phys = vmm_phys_of(va);
+        vmm_unmap_page_noshoot(va);
+        pmm_free_page(phys);
+    }
+    if (mapped)
+        tlb_shootdown_kernel(base, base + mapped * 4096UL);
+    irqflags_t fl = spin_lock_irqsave(&kva_lock);
+    freelist_insert(base, reserved);
+    spin_unlock_irqrestore(&kva_lock, fl);
+}
+
+static void
+rollback_mapping(uint64_t base, uint64_t reserved, uint64_t mapped)
+{
+    for (uint64_t i = 0; i < mapped; i++)
+        vmm_unmap_page_noshoot(base + i * 4096UL);
+    if (mapped)
+        tlb_shootdown_kernel(base, base + mapped * 4096UL);
+    irqflags_t fl = spin_lock_irqsave(&kva_lock);
+    freelist_insert(base, reserved);
+    spin_unlock_irqrestore(&kva_lock, fl);
+}
+
 void *
 kva_alloc_pages(uint64_t n)
 {
@@ -95,6 +125,10 @@ kva_alloc_pages(uint64_t n)
     irqflags_t fl = spin_lock_irqsave(&kva_lock);
     uint64_t base = freelist_alloc(n);
     if (!base) {
+        if (n > (UINT64_MAX - s_kva_next) / 4096UL) {
+            spin_unlock_irqrestore(&kva_lock, fl);
+            return NULL;
+        }
         base = s_kva_next;
         s_kva_next += n * 4096UL;
     }
@@ -104,11 +138,15 @@ kva_alloc_pages(uint64_t n)
     for (i = 0; i < n; i++) {
         uint64_t phys = pmm_alloc_page();
         if (!phys) {
-            printk("[KVA] FAIL: PMM exhausted (kva_next=0x%x, free=%u)\n",
-                   (unsigned)(base >> 12), (unsigned)pmm_free_pages());
-            panic_halt("[KVA] FAIL: out of memory");
+            rollback_alloc(base, n, i);
+            return NULL;
         }
-        vmm_map_page(base + i * 4096UL, phys, VMM_FLAG_WRITABLE);
+        if (vmm_try_map_page(base + i * 4096UL, phys,
+                             VMM_FLAG_WRITABLE) < 0) {
+            pmm_free_page(phys);
+            rollback_alloc(base, n, i);
+            return NULL;
+        }
     }
     return (void *)base;
 }
@@ -130,6 +168,10 @@ kva_alloc_pages_low_flags(uint64_t n, uint64_t map_flags)
     irqflags_t fl = spin_lock_irqsave(&kva_lock);
     uint64_t base = freelist_alloc(n);
     if (!base) {
+        if (n > (UINT64_MAX - s_kva_next) / 4096UL) {
+            spin_unlock_irqrestore(&kva_lock, fl);
+            return NULL;
+        }
         base = s_kva_next;
         s_kva_next += n * 4096UL;
     }
@@ -153,17 +195,14 @@ kva_alloc_pages_low_flags(uint64_t n, uint64_t map_flags)
              * freelist insert takes kva_lock. They must NOT nest, so the
              * freelist_insert runs AFTER the loop with no other lock held —
              * identical to the kva_free_pages discipline below. */
-            for (uint64_t j = 0; j < i; j++) {
-                uint64_t p = vmm_phys_of(base + j * 4096UL);
-                vmm_unmap_page(base + j * 4096UL);
-                if (p) pmm_free_page(p);
-            }
-            irqflags_t ufl = spin_lock_irqsave(&kva_lock);
-            freelist_insert(base, n);
-            spin_unlock_irqrestore(&kva_lock, ufl);
+            rollback_alloc(base, n, i);
             return NULL;
         }
-        vmm_map_page(base + i * 4096UL, phys, map_flags);
+        if (vmm_try_map_page(base + i * 4096UL, phys, map_flags) < 0) {
+            pmm_free_page(phys);
+            rollback_alloc(base, n, i);
+            return NULL;
+        }
     }
     return (void *)base;
 }
@@ -188,15 +227,25 @@ kva_map_phys_pages(uint64_t phys_base, uint32_t num_pages)
     if (num_pages == 0) return NULL;
 
     irqflags_t fl = spin_lock_irqsave(&kva_lock);
-    uint64_t base = s_kva_next;
-    s_kva_next += (uint64_t)num_pages * 4096UL;
+    uint64_t base = freelist_alloc(num_pages);
+    if (!base) {
+        if (num_pages > (UINT64_MAX - s_kva_next) / 4096UL) {
+            spin_unlock_irqrestore(&kva_lock, fl);
+            return NULL;
+        }
+        base = s_kva_next;
+        s_kva_next += (uint64_t)num_pages * 4096UL;
+    }
     spin_unlock_irqrestore(&kva_lock, fl);
 
     uint32_t i;
     for (i = 0; i < num_pages; i++) {
-        vmm_map_page(base + (uint64_t)i * 4096UL,
-                     phys_base + (uint64_t)i * 4096UL,
-                     VMM_FLAG_WRITABLE);
+        if (vmm_try_map_page(base + (uint64_t)i * 4096UL,
+                             phys_base + (uint64_t)i * 4096UL,
+                             VMM_FLAG_WRITABLE) < 0) {
+            rollback_mapping(base, num_pages, i);
+            return NULL;
+        }
     }
     return (void *)base;
 }
@@ -207,8 +256,15 @@ kva_map_mmio(uint64_t phys_base, uint32_t num_pages)
     if (num_pages == 0) return NULL;
 
     irqflags_t fl = spin_lock_irqsave(&kva_lock);
-    uint64_t base = s_kva_next;
-    s_kva_next += (uint64_t)num_pages * 4096UL;
+    uint64_t base = freelist_alloc(num_pages);
+    if (!base) {
+        if (num_pages > (UINT64_MAX - s_kva_next) / 4096UL) {
+            spin_unlock_irqrestore(&kva_lock, fl);
+            return NULL;
+        }
+        base = s_kva_next;
+        s_kva_next += (uint64_t)num_pages * 4096UL;
+    }
     spin_unlock_irqrestore(&kva_lock, fl);
 
     /* Map the device BAR directly into fresh KVA as uncached MMIO
@@ -218,9 +274,13 @@ kva_map_mmio(uint64_t phys_base, uint32_t num_pages)
      * VA is virgin, mapped straight to phys. */
     uint32_t i;
     for (i = 0; i < num_pages; i++) {
-        vmm_map_page(base + (uint64_t)i * 4096UL,
-                     phys_base + (uint64_t)i * 4096UL,
-                     VMM_FLAG_WRITABLE | VMM_FLAG_WC | VMM_FLAG_UCMINUS);
+        if (vmm_try_map_page(base + (uint64_t)i * 4096UL,
+                             phys_base + (uint64_t)i * 4096UL,
+                             VMM_FLAG_WRITABLE | VMM_FLAG_WC |
+                             VMM_FLAG_UCMINUS) < 0) {
+            rollback_mapping(base, num_pages, i);
+            return NULL;
+        }
     }
     return (void *)base;
 }

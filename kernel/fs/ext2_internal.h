@@ -16,7 +16,7 @@ extern blkdev_t *s_dev;
 extern ext2_superblock_t s_sb;
 extern uint32_t s_block_size;
 extern uint32_t s_num_groups;
-extern ext2_bgd_t s_bgd[32];
+extern ext2_bgd_t s_bgd[EXT2_MAX_GROUPS];
 extern int s_mounted;
 extern spinlock_t ext2_lock;
 

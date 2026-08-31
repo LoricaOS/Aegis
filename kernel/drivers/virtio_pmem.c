@@ -33,13 +33,7 @@ static blkdev_t     s_blk;
 static uint8_t *
 map_ram(uint64_t pa, uint64_t n_pages)
 {
-    uintptr_t va = (uintptr_t)kva_alloc_pages(n_pages);
-    if (!va)
-        return NULL;
-    for (uint64_t i=0;i<n_pages;i++){ uintptr_t p=va+i*4096;
-        vmm_unmap_page(p);
-        vmm_map_page(p, pa+i*4096, VMM_FLAG_PRESENT | VMM_FLAG_WRITABLE); }
-    return (uint8_t *)va;
+    return (uint8_t *)kva_map_phys_pages(pa, (uint32_t)n_pages);
 }
 
 static int

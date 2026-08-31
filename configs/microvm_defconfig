@@ -22,7 +22,7 @@ CONFIG_FS_EXT2=y
 # CONFIG_TRACE is not set
 # CONFIG_KERNEL_TESTS is not set
 
-# virtio over mmio: block + net only.
+# virtio over mmio: block + net + host entropy.
 CONFIG_VIRTIO=y
 CONFIG_VIRTIO_MMIO=y
 CONFIG_VIRTIO_BLK=y
@@ -30,7 +30,7 @@ CONFIG_VIRTIO_NET=y
 # CONFIG_VIRTIO_SCSI is not set
 # CONFIG_VIRTIO_GPU is not set
 # CONFIG_VIRTIO_INPUT is not set
-# CONFIG_VIRTIO_RNG is not set
+CONFIG_VIRTIO_RNG=y
 # CONFIG_VIRTIO_BALLOON is not set
 # CONFIG_VIRTIO_PMEM is not set
 # CONFIG_VIRTIO_CONSOLE is not set

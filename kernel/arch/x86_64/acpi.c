@@ -1,8 +1,9 @@
-/* acpi.c — ACPI table parser (MCFG + MADT + FADT)
+/* acpi.c — ACPI table parser (MCFG + MADT + FADT + bounded AML data)
  *
  * Phase 19: MCFG for PCIe ECAM, MADT for interrupt routing.
  * Phase 35: FADT for power button shutdown (SCI interrupt + PM1a registers).
- * No AML interpreter — _S5_ sleep type is extracted by scanning DSDT bytecode.
+ * No control-method interpreter: static DSDT objects used by power and battery
+ * telemetry are decoded only when their values are constant and unambiguous.
  */
 #include "acpi.h"
 #include "fs_ops.h"
@@ -45,6 +46,8 @@ static uint16_t s_slp_typb    = 0;     /* SLP_TYPb value for S5 */
 static int      s_acpi_pm_ok  = 0;     /* 1 if power management is ready */
 static uint32_t s_smi_cmd     = 0;     /* SMI Command port (FADT offset 48) */
 static uint8_t  s_acpi_enable = 0;     /* ACPI Enable value (FADT offset 52) */
+static acpi_battery_mmio_t s_battery_mmio;
+static int s_battery_mmio_ok;
 
 /* -----------------------------------------------------------------------
  * Single-page KVA window for temporary ACPI table access.
@@ -131,6 +134,173 @@ static int acpi_checksum_phys(uint64_t phys, uint32_t len)
     for (i = 0; i < len; i++)
         sum += phys_read8(phys + i);
     return sum == 0;
+}
+
+/* Decode the small, non-executable AML subset needed to locate the battery
+ * fields already exposed by Lenovo DSDTs: constant SystemMemory
+ * OperationRegion declarations and Field bit offsets. Unsupported TermArgs
+ * are rejected; this is intentionally not a permissive AML interpreter. */
+typedef struct {
+    char name[4];
+    uint64_t base;
+    uint32_t length;
+} aml_region_t;
+
+static int
+aml_nameseg(uint64_t *pos, uint64_t end, char out[4])
+{
+    uint64_t p = *pos;
+    while (p < end && (phys_read8(p) == 0x5c || phys_read8(p) == 0x5e)) p++;
+    if (p >= end) return 0;
+    uint8_t lead = phys_read8(p);
+    uint32_t count = 1;
+    if (lead == 0x2e) { count = 2; p++; }
+    else if (lead == 0x2f) {
+        if (++p >= end) return 0;
+        count = phys_read8(p++);
+        if (count == 0) return 0;
+    }
+    if (p + (uint64_t)count * 4 > end) return 0;
+    p += (uint64_t)(count - 1) * 4;
+    for (uint32_t i = 0; i < 4; i++) out[i] = (char)phys_read8(p + i);
+    *pos = p + 4;
+    return 1;
+}
+
+static int
+aml_integer(uint64_t *pos, uint64_t end, uint64_t *value)
+{
+    uint64_t p = *pos;
+    if (p >= end) return 0;
+    uint8_t op = phys_read8(p++);
+    if (op == 0x00 || op == 0x01 || op == 0xff) {
+        *value = op == 0xff ? ~(uint64_t)0 : op;
+        *pos = p;
+        return 1;
+    }
+    uint32_t n = op == 0x0a ? 1 : op == 0x0b ? 2 :
+                 op == 0x0c ? 4 : op == 0x0e ? 8 : 0;
+    if (!n || p + n > end) return 0;
+    uint64_t v = 0;
+    for (uint32_t i = 0; i < n; i++) v |= (uint64_t)phys_read8(p + i) << (i * 8);
+    *value = v;
+    *pos = p + n;
+    return 1;
+}
+
+static int
+aml_pkglen(uint64_t *pos, uint64_t end, uint32_t *length)
+{
+    uint64_t p = *pos;
+    if (p >= end) return 0;
+    uint8_t lead = phys_read8(p++);
+    uint32_t follow = lead >> 6;
+    uint32_t v = follow ? (lead & 0x0f) : (lead & 0x3f);
+    if (p + follow > end) return 0;
+    for (uint32_t i = 0; i < follow; i++)
+        v |= (uint32_t)phys_read8(p++) << (4 + i * 8);
+    if (!v) return 0;
+    *pos = p;
+    *length = v;
+    return 1;
+}
+
+static int
+aml_name_eq(const char a[4], const char b[4])
+{
+    return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3];
+}
+
+static void
+scan_dsdt_battery(uint64_t dsdt_phys, uint32_t dsdt_len)
+{
+    aml_region_t regions[16];
+    uint32_t nregions = 0;
+    uint64_t begin = dsdt_phys + 36, end = dsdt_phys + dsdt_len;
+
+    for (uint64_t p = begin; p + 8 < end; p++) {
+        if (phys_read8(p) != 0x5b || phys_read8(p + 1) != 0x80) continue;
+        uint64_t q = p + 2, base, length;
+        char name[4];
+        if (!aml_nameseg(&q, end, name) || q >= end || phys_read8(q++) != 0 ||
+            !aml_integer(&q, end, &base) || !aml_integer(&q, end, &length) ||
+            !length || length > 0x100000 || nregions == 16)
+            continue;
+        for (uint32_t i = 0; i < 4; i++) regions[nregions].name[i] = name[i];
+        regions[nregions].base = base;
+        regions[nregions].length = (uint32_t)length;
+        nregions++;
+    }
+
+    uint32_t rate = UINT32_MAX, remaining = UINT32_MAX, full = UINT32_MAX;
+    int region_index = -1;
+    for (uint64_t p = begin; p + 8 < end; p++) {
+        if (phys_read8(p) != 0x5b || phys_read8(p + 1) != 0x81) continue;
+        uint64_t pkg = p + 2, q = pkg;
+        uint32_t pkg_len;
+        if (!aml_pkglen(&q, end, &pkg_len)) continue;
+        uint64_t pkg_end = pkg + pkg_len;
+        if (pkg_end > end || pkg_end <= q) continue;
+        char region_name[4];
+        if (!aml_nameseg(&q, pkg_end, region_name) || q >= pkg_end) continue;
+        q++;                            /* FieldFlags */
+        int ri = -1;
+        for (uint32_t i = 0; i < nregions; i++)
+            if (aml_name_eq(region_name, regions[i].name)) { ri = (int)i; break; }
+        if (ri < 0) continue;
+
+        uint64_t bit = 0;
+        while (q < pkg_end) {
+            uint8_t op = phys_read8(q);
+            if (op == 0x00) {           /* ReservedField */
+                uint32_t bits; q++;
+                if (!aml_pkglen(&q, pkg_end, &bits)) break;
+                bit += bits;
+            } else if (op == 0x01) {    /* AccessField */
+                if (q + 3 > pkg_end) break;
+                q += 3;
+            } else if (op == 0x03) {    /* ExtendedAccessField */
+                if (q + 4 > pkg_end) break;
+                q += 4;
+            } else {
+                char field[4]; uint32_t bits;
+                if (!aml_nameseg(&q, pkg_end, field) ||
+                    !aml_pkglen(&q, pkg_end, &bits)) break;
+                if ((bit & 7) == 0 && bits >= 16) {
+                    uint32_t off = (uint32_t)(bit >> 3);
+                    if (aml_name_eq(field, "SBAC")) rate = off;
+                    if (aml_name_eq(field, "SBRC")) remaining = off;
+                    if (aml_name_eq(field, "SBFC")) full = off;
+                    if (rate != UINT32_MAX && remaining != UINT32_MAX &&
+                        full != UINT32_MAX) region_index = ri;
+                }
+                bit += bits;
+            }
+        }
+        if (region_index >= 0) break;
+    }
+
+    if (region_index >= 0) {
+        aml_region_t *r = &regions[region_index];
+        uint32_t max = rate > remaining ? rate : remaining;
+        if (full > max) max = full;
+        if (max + 2 <= r->length) {
+            s_battery_mmio.phys = r->base;
+            s_battery_mmio.length = r->length;
+            s_battery_mmio.rate_off = rate;
+            s_battery_mmio.remaining_off = remaining;
+            s_battery_mmio.full_off = full;
+            s_battery_mmio_ok = 1;
+        }
+    }
+}
+
+int
+acpi_get_battery_mmio(acpi_battery_mmio_t *out)
+{
+    if (!out || !s_battery_mmio_ok) return 0;
+    *out = s_battery_mmio;
+    return 1;
 }
 
 /* ── FADT + DSDT parsing for power management ──────────────────────── */
@@ -224,6 +394,12 @@ parse_fadt(uint64_t hdr_phys)
 
     if (dsdt_phys != 0)
         scan_dsdt_s5(dsdt_phys);
+    if (dsdt_phys != 0) {
+        uint32_t dsdt_len = phys_read32(dsdt_phys + 4);
+        if (dsdt_len >= 40 && dsdt_len <= 0x100000 &&
+            acpi_checksum_phys(dsdt_phys, dsdt_len))
+            scan_dsdt_battery(dsdt_phys, dsdt_len);
+    }
 
     if (s_pm1a_evt != 0 && s_pm1a_cnt != 0) {
         s_acpi_pm_ok = 1;
@@ -391,14 +567,14 @@ void acpi_init(void)
         return;
     }
 
-    /* Allocate a single KVA window page used for all physical reads.
-     * SAFETY: kva_alloc_pages(1) returns a valid kernel VA backed by a PMM
-     * page; we immediately remap it via vmm_map_page for each physical page
-     * we need to access.  The page is abandoned after acpi_init returns
-     * (bump allocator — no free path).  This is one leaked PMM frame; at
-     * one-time ACPI init cost this is acceptable. */
-    s_win_va   = kva_alloc_pages(1);
-    s_win_phys = (uint64_t)-1;
+    /* Map the RSDP page as the reusable physical-read window. Subsequent table
+     * reads remap this VA, so no disposable PMM backing page is needed. */
+    s_win_va = kva_map_phys_pages(rsdp_phys & ~0xFFFULL, 1);
+    if (!s_win_va) {
+        printk("[ACPI] FAIL: out of memory for table window\n");
+        return;
+    }
+    s_win_phys = rsdp_phys & ~0xFFFULL;
 
     {
         char rsdp_sig[8];

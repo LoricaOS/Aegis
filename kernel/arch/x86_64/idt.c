@@ -214,11 +214,9 @@ isr_dispatch(cpu_state_t *s)
         __asm__ volatile("mov %%dr6, %0" : "=r"(dr6));
         printk("[HWWATCH] cpu%u WRITE-HIT DR6=0x%lx writer RIP=0x%lx CS=0x%lx rbp=0x%lx\n",
                (unsigned)lapic_id(), dr6, s->rip, s->cs, s->rbp);
-        printk("[HWWATCH] self[0]=0x%lx self[1]=0x%lx self[2]=0x%lx self[3]=0x%lx\n",
-               (uint64_t)(uintptr_t)g_percpu[0].self,
-               (uint64_t)(uintptr_t)g_percpu[1].self,
-               (uint64_t)(uintptr_t)g_percpu[2].self,
-               (uint64_t)(uintptr_t)g_percpu[3].self);
+        for (uint32_t i = 0; i < MAX_CPUS && i < 4; i++)
+            printk("[HWWATCH] self[%u]=0x%lx\n", i,
+                   (uint64_t)(uintptr_t)g_percpu[i].self);
         if (s->cs == ARCH_KERNEL_CS)
             panic_backtrace(s->rbp);
         __asm__ volatile("mov %0, %%dr6" :: "r"((uint64_t)0));   /* clear status */

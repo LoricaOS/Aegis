@@ -7,22 +7,22 @@
  * reported-temperature register (SMN 0x59800) encodes Tctl in bits [31:21] at
  * 0.125 °C/LSB, with a -49 °C range offset applied when bit 19 is set.
  *
- * Returns -1 when unavailable: an Intel/other CPU, or no Data Fabric — in a VM
- * the 00:18.3 device is absent, so this is boot-safe there and only yields real
- * readings on hardware. Intel DTS (MSR 0x19C) would be a separate path.
+ * Intel uses the architectural Digital Thermal Sensor: IA32_THERM_STATUS gives
+ * degrees below the TCC activation target from IA32_TEMPERATURE_TARGET.
+ * Returns -1 when the running CPU exposes neither supported sensor.
  */
 #include <stdint.h>
 #include "thermal.h"
+#include "acpi.h"
 #include "pcie.h"
 #include "kva.h"
 
-#define DF_F3_BUS   0
-#define DF_F3_DEV   0x18
-#define DF_F3_FN    3
 #define SMN_INDEX   0x60
 #define SMN_DATA    0x64
 #define ZEN_REPORTED_TEMP_CTRL   0x00059800u
 #define ZEN_TEMP_RANGE_SEL       (1u << 19)
+#define IA32_THERM_STATUS        0x19Cu
+#define IA32_TEMPERATURE_TARGET  0x1A2u
 
 static inline void
 cpuid_leaf(uint32_t leaf, uint32_t *a, uint32_t *b, uint32_t *c, uint32_t *d)
@@ -32,13 +32,39 @@ cpuid_leaf(uint32_t leaf, uint32_t *a, uint32_t *b, uint32_t *c, uint32_t *d)
                      : "a"(leaf), "c"(0));
 }
 
+static inline uint64_t
+rdmsr(uint32_t msr)
+{
+    uint32_t lo, hi;
+    __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return ((uint64_t)hi << 32) | lo;
+}
+
 int
 cpu_temp_read(int *tjmax_out)
 {
     uint32_t a, b, c, d;
 
-    /* Vendor must be "AuthenticAMD" (EBX/EDX/ECX of leaf 0). */
+    /* Intel DTS is architectural when CPUID.06H:EAX[0] is set. Restrict the
+     * MSR reads to that advertised path so an unsupported CPU cannot #GP. */
     cpuid_leaf(0, &a, &b, &c, &d);
+    if (b == 0x756E6547u && d == 0x49656E69u && c == 0x6C65746Eu && a >= 6) {
+        cpuid_leaf(6, &a, &b, &c, &d);
+        if (a & 1u) {
+            uint64_t status = rdmsr(IA32_THERM_STATUS);
+            uint64_t target = rdmsr(IA32_TEMPERATURE_TARGET);
+            if (status & (1UL << 31)) {
+                int tjmax = (int)((target >> 16) & 0xFFu);
+                int temp = tjmax - (int)((status >> 16) & 0x7Fu);
+                if (tjmax >= 70 && tjmax <= 125 && temp > 0 && temp <= tjmax) {
+                    if (tjmax_out) *tjmax_out = tjmax;
+                    return temp;
+                }
+            }
+        }
+        return -1;
+    }
+
     if (!(b == 0x68747541u && d == 0x69746E65u && c == 0x444D4163u))
         return -1;
 
@@ -74,43 +100,41 @@ cpu_temp_read(int *tjmax_out)
     return t;
 }
 
-/* Battery — ThinkPad (Ryzen 4750U) exposes battery data in a memory-mapped EC
- * region (from its DSDT: OperationRegion ECOE, SystemMemory, 0xFE00DE00). 16-bit
- * LE fields: SBAC(rate)@0x1A, SBRC(remaining)@0x1E, SBFC(full-charge)@0x22.
+/* Battery — some ThinkPads expose battery data in a SystemMemory operation
+ * region. acpi.c discovers the region and fields from the DSDT rather than
+ * fixing them to one machine. 16-bit LE fields provide rate, remaining charge,
+ * and full charge.
  * percent = SBRC*100/SBFC; charging from SBAC's sign (>=0x8000 = discharging).
  *
- * Gated by AMD + a plausibility check, so on any other machine or a VM (where
- * that physical address isn't battery data) it reads back as "no battery".
- * ponytail: the address is this ThinkPad's; a machine-general path would need an
- * AML interpreter to evaluate each system's own _BST — out of scope for now. */
-#define ECOE_PHYS   0xFE00DE00u
-#define ECOE_PAGE   (ECOE_PHYS & ~0xFFFu)
-#define ECOE_OFF    (ECOE_PHYS & 0xFFFu)
-
-static volatile uint8_t *s_ecoe;        /* cached mapping of the ECOE region */
+ * Other firmware exposes _BST through executable AML; those machines remain
+ * unavailable instead of guessing at registers. */
+static volatile uint8_t *s_battery;
+static acpi_battery_mmio_t s_battery_desc;
 
 static uint16_t rd16(volatile uint8_t *p, int off) { return (uint16_t)(p[off] | (p[off + 1] << 8)); }
 
 int
 battery_read(int *percent, int *charging, int *ac)
 {
-    uint32_t a, b, c, d;
-    cpuid_leaf(0, &a, &b, &c, &d);
-    if (!(b == 0x68747541u && d == 0x69746E65u && c == 0x444D4163u))
-        return 0;                       /* not AuthenticAMD */
-
-    if (!s_ecoe) {
-        void *va = kva_map_mmio(ECOE_PAGE, 1);
+    if (!s_battery) {
+        if (!acpi_get_battery_mmio(&s_battery_desc)) return 0;
+        uint64_t page = s_battery_desc.phys & ~0xFFFUL;
+        uint64_t off = s_battery_desc.phys & 0xFFFUL;
+        uint32_t last = s_battery_desc.rate_off;
+        if (s_battery_desc.remaining_off > last) last = s_battery_desc.remaining_off;
+        if (s_battery_desc.full_off > last) last = s_battery_desc.full_off;
+        uint32_t pages = (uint32_t)((off + last + 2 + 0xFFF) >> 12);
+        void *va = kva_map_mmio(page, pages);
         if (!va) return 0;
-        s_ecoe = (volatile uint8_t *)va + ECOE_OFF;
+        s_battery = (volatile uint8_t *)va + off;
     }
 
-    uint16_t sbac = rd16(s_ecoe, 0x1A);
-    uint16_t sbrc = rd16(s_ecoe, 0x1E);
-    uint16_t sbfc = rd16(s_ecoe, 0x22);
+    uint16_t sbac = rd16(s_battery, (int)s_battery_desc.rate_off);
+    uint16_t sbrc = rd16(s_battery, (int)s_battery_desc.remaining_off);
+    uint16_t sbfc = rd16(s_battery, (int)s_battery_desc.full_off);
 
     /* Reject implausible reads (0 / 0xFFFF / remaining>full) — i.e. this isn't
-     * the ThinkPad's battery memory. */
+     * battery data. */
     if (sbfc < 100 || sbfc >= 0xFFF0 || sbrc == 0xFFFF || sbrc > sbfc + sbfc / 20)
         return 0;
 

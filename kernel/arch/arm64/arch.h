@@ -224,13 +224,12 @@ arch_set_fs_base(uint64_t addr)
     (void)addr;
 }
 
-/* SMAP-equivalent stubs. arm64 v1 runs with PAN disabled so plain
- * copy_to/from_user (uaccess.h memcpy path) reaches user pages through
- * TTBR0. TODO(security): enable PAN + LDTR/STTR uaccess with an exception
- * table, matching the x86 SMAP + __ex_table posture. */
+/* PAN is kept set in kernel context. uaccess.S opens only a bounded leaf-copy
+ * window and restores PAN on both normal and exception-table fixup returns. */
 extern int arch_smap_enabled;
 static inline void arch_stac(void) {}
 static inline void arch_clac(void) {}
+void arm64_pan_init(void);
 
 /* -------------------------------------------------------------------------
  * Arch-portable helpers

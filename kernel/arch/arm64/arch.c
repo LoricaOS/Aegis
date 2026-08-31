@@ -29,7 +29,28 @@ arch_init(void)
 
 /* Per-CPU/SMP data + bring-up now live in kernel/arch/arm64/smp.c. */
 
-int arch_smap_enabled = 0;    /* PAN not enabled yet (see arch.h TODO) */
+int arch_smap_enabled = 0;
+
+void
+arm64_pan_init(void)
+{
+    uint64_t mmfr1;
+    __asm__ volatile("mrs %0, id_aa64mmfr1_el1" : "=r"(mmfr1));
+    if (((mmfr1 >> 20) & 0xFUL) == 0) {
+        if (percpu_self()->cpu_id == 0)
+            printk("[PAN] WARN: CPU does not implement privileged access-never\n");
+        return;
+    }
+    uint64_t sctlr;
+    __asm__ volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
+    sctlr &= ~(1UL << 23);       /* SPAN=0: exceptions from EL0 enter with PAN. */
+    __asm__ volatile("msr sctlr_el1, %0\n\tisb\n\t"
+                     ".arch_extension pan\n\tmsr pan, #1\n\tisb"
+                     : : "r"(sctlr) : "memory");
+    arch_smap_enabled = 1;
+    if (percpu_self()->cpu_id == 0)
+        printk("[PAN] OK: kernel user-page access restricted to uaccess\n");
+}
 
 /* ── Address-space + kernel-stack hooks (sched/proc contract) ──────────── */
 

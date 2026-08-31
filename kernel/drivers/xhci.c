@@ -2873,19 +2873,10 @@ xhci_init_one(const pcie_device_t *dev)
      * Map with WC+UCMINUS (uncached MMIO). */
     {
         uint64_t  bar0_phys = dev->bar[0];
-        uintptr_t bar0_kva  = (uintptr_t)kva_alloc_pages(XHCI_BAR0_PAGES);
-
-        for (i = 0; i < XHCI_BAR0_PAGES; i++) {
-            uintptr_t va = bar0_kva + (uintptr_t)i * 4096u;
-            /* Unmap the PMM-backed page kva_alloc_pages installed so that
-             * vmm_map_page does not panic on a double-map.
-             * SAFETY: va is a present kva page; vmm_unmap_page is valid. */
-            vmm_unmap_page(va);
-            /* SAFETY: map BAR0 MMIO uncached (WC+UCMINUS = PWT+PCD).
-             * The PA is device MMIO; the kernel VA is the intended accessor. */
-            vmm_map_page(va, bar0_phys + (uint64_t)i * 4096u,
-                         VMM_FLAG_WRITABLE | VMM_FLAG_WC | VMM_FLAG_UCMINUS);
-        }
+        uintptr_t bar0_kva = (uintptr_t)kva_map_mmio(bar0_phys,
+                                                      XHCI_BAR0_PAGES);
+        if (!bar0_kva)
+            return -1;
         s_bar0_va = (uint8_t *)bar0_kva;
     }
 

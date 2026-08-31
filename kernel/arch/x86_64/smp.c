@@ -49,10 +49,21 @@ hwwatch_arm_local(void)
     if (!g_hwwatch)
         return;
     __asm__ volatile("mov %0, %%dr0" :: "r"((uint64_t)(uintptr_t)&g_percpu[0].self));
+#if MAX_CPUS > 1
     __asm__ volatile("mov %0, %%dr1" :: "r"((uint64_t)(uintptr_t)&g_percpu[1].self));
+#endif
+#if MAX_CPUS > 2
     __asm__ volatile("mov %0, %%dr2" :: "r"((uint64_t)(uintptr_t)&g_percpu[2].self));
+#endif
+#if MAX_CPUS > 3
     __asm__ volatile("mov %0, %%dr3" :: "r"((uint64_t)(uintptr_t)&g_percpu[3].self));
-    __asm__ volatile("mov %0, %%dr7" :: "r"((uint64_t)0x99990255UL) : "memory");
+#endif
+    uint64_t dr7 = 1UL << 9;
+    for (uint32_t i = 0; i < MAX_CPUS && i < 4; i++) {
+        dr7 |= 1UL << (i * 2);
+        dr7 |= 9UL << (16 + i * 4);
+    }
+    __asm__ volatile("mov %0, %%dr7" :: "r"(dr7) : "memory");
 }
 
 /* Physical address where the trampoline is copied */

@@ -38,18 +38,19 @@ copy_to_user(void *dst, const void *src, uint64_t len)
 /* ARM64: exception-table-backed byte copy in uaccess.S. A fault on the
  * user side (e.g. a sibling munmap during a blocking syscall) is caught by
  * arm64_fault_el1 and redirected to the fixup instead of panicking. */
-uint64_t arm64_uaccess_copy(void *dst, const void *src, uint64_t len);
+uint64_t arm64_copy_from_user(void *dst, const void *src, uint64_t len);
+uint64_t arm64_copy_to_user(void *dst, const void *src, uint64_t len);
 
 static inline uint64_t
 copy_from_user(void *dst, const void *src, uint64_t len)
 {
-    return arm64_uaccess_copy(dst, src, len);
+    return arm64_copy_from_user(dst, src, len);
 }
 
 static inline uint64_t
 copy_to_user(void *dst, const void *src, uint64_t len)
 {
-    return arm64_uaccess_copy(dst, src, len);
+    return arm64_copy_to_user(dst, src, len);
 }
 #else
 /* Other arches: plain copy, no fault fixup. */

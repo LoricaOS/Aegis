@@ -56,15 +56,7 @@ vfs_init(void)
  * Returns 0 on success, -2 (ENOENT) if not found, -12 (ENOMEM) if the
  * ext2 fd pool is exhausted.
  */
-/* ── VFS confinement (sys_vfs_confine) ───────────────────────────────────
- * path_canonicalize collapses ".", ".." and duplicate slashes in an absolute
- * path; vfs_scope_allows checks a path against the calling process's scope.
- * The check is LEXICAL (post-canonicalization) — it blocks absolute-path and
- * ".."-traversal escape. A symlink inside the scope that points outside is a
- * known v1 limitation; because confinement only ever REMOVES authority, that
- * gap merely degrades to the unconfined baseline for that one path and can
- * never weaken the model. Sensitive files stay protected by the existing
- * inode gates (shadow/admin/passwd/install) regardless of scope. */
+/* Collapse ".", ".." and duplicate slashes in an absolute path. */
 void
 path_canonicalize(const char *in, char *out, uint32_t outsz)
 {
@@ -88,57 +80,6 @@ path_canonicalize(const char *in, char *out, uint32_t outsz)
     }
     if (oi == 0) out[oi++] = '/';              /* root */
     out[oi] = '\0';
-}
-
-/* vfs_scope_allows — 1 if `path` is within the calling process's confinement
- * scope (or the process is unconfined / kernel-internal), else 0. Relative
- * paths are resolved against cwd first, then canonicalized. */
-int
-vfs_scope_allows(const char *path)
-{
-    if (!sched_current()->is_user) return 1;           /* kernel: unconfined */
-    aegis_process_t *proc = current_proc();
-    if (!proc || proc->vfs_scope_len == 0) return 1;   /* unconfined */
-
-    /* Sized for cwd + '/' + path. This used to be abs[256], which SILENTLY
-     * TRUNCATED: cwd is char[256] and path is up to 255 chars, so the joined
-     * form reaches 511. The truncated string was then canonicalized and
-     * prefix-matched, while the backend (g_rootfs->open) received the FULL
-     * untruncated path — so a confined process could pass a path whose first
-     * 255 bytes canonicalize inside its scope while the real suffix escaped it
-     * via "..". Keep the bounds checks anyway and fail CLOSED if anything
-     * still does not fit: a path we cannot fully evaluate is not one we can
-     * declare in-scope. */
-    char abs[512];
-    uint32_t i = 0;
-    if (path[0] == '/') {
-        for (; path[i]; i++) {
-            if (i >= sizeof(abs) - 1) return 0;
-            abs[i] = path[i];
-        }
-    } else {
-        for (; proc->cwd[i]; i++) {
-            if (i >= sizeof(abs) - 1) return 0;
-            abs[i] = proc->cwd[i];
-        }
-        if (i == 0 || abs[i - 1] != '/') {
-            if (i >= sizeof(abs) - 1) return 0;
-            abs[i++] = '/';
-        }
-        for (uint32_t j = 0; path[j]; j++) {
-            if (i >= sizeof(abs) - 1) return 0;
-            abs[i++] = path[j];
-        }
-    }
-    abs[i] = '\0';
-
-    char canon[512];
-    path_canonicalize(abs, canon, sizeof(canon));
-
-    uint32_t L = proc->vfs_scope_len;
-    for (uint32_t k = 0; k < L; k++)
-        if (canon[k] != proc->vfs_scope[k]) return 0;
-    return (canon[L] == '\0' || canon[L] == '/');      /* boundary match */
 }
 
 /* is_ramfs_path — returns the ramfs instance backing a "/tmp/..." or
@@ -246,6 +187,90 @@ vfs_ramfs_rename(const char *oldp, const char *newp, int *out_rc)
     return 1;
 }
 
+/* Apply every post-resolution gate in one place so path opens and dirfd opens
+ * cannot diverge at the syscall trust boundary. */
+static int
+vfs_open_ext2_inode(uint32_t ino, int is_protected, int flags,
+                    vfs_file_t *out, int has_install)
+{
+    int is_auth_gated = 0;
+    if ((flags & (int)VFS_O_CREAT) && (flags & (int)VFS_O_EXCL))
+        return -EEXIST;
+    if (sched_current()->is_user) {
+        aegis_process_t *pr = current_proc();
+        int want = 4;
+        if (flags & 1) want = 2;
+        if (flags & 2) want = 4 | 2;
+        if (g_rootfs->check_perm(ino, (uint16_t)pr->uid,
+                                 (uint16_t)pr->gid, want) != 0)
+            return -EACCES;
+    }
+    {
+        uint32_t shadow_ino = g_rootfs->get_shadow_ino();
+        uint32_t admin_ino  = g_rootfs->get_admin_ino();
+        if (sched_current()->is_user &&
+            ((shadow_ino != 0 && ino == shadow_ino) ||
+             (admin_ino  != 0 && ino == admin_ino))) {
+            aegis_process_t *pr = current_proc();
+            int wr = (flags & 1) || (flags & 2) ||
+                     (flags & (int)VFS_O_TRUNC) ||
+                     (flags & (int)VFS_O_APPEND);
+            if (cap_check(pr->caps, CAP_TABLE_SIZE, CAP_KIND_AUTH,
+                          wr ? CAP_RIGHTS_WRITE : CAP_RIGHTS_READ) != 0)
+                return -EACCES;
+            is_auth_gated = 1;
+            if (admin_ino != 0 && ino == admin_ino && pr->admin_session == 0) {
+                uint64_t now  = arch_get_ticks();
+                uint64_t last = __atomic_load_n(&s_admin_cred_last_read,
+                                                __ATOMIC_RELAXED);
+                if (last != 0 && (now - last) < ADMIN_CRED_MIN_TICKS)
+                    return -EAGAIN;
+                __atomic_store_n(&s_admin_cred_last_read, now,
+                                 __ATOMIC_RELAXED);
+            }
+        }
+    }
+    {
+        uint32_t passwd_ino = g_rootfs->get_passwd_ino();
+        uint32_t group_ino  = g_rootfs->get_group_ino();
+        if (sched_current()->is_user &&
+            ((passwd_ino != 0 && ino == passwd_ino) ||
+             (group_ino  != 0 && ino == group_ino))) {
+            int wr = (flags & 1) || (flags & 2) ||
+                     (flags & (int)VFS_O_TRUNC) ||
+                     (flags & (int)VFS_O_APPEND);
+            if (wr && current_proc()->admin_session == 0)
+                return -EACCES;
+        }
+    }
+    {
+        int wr = (flags & 1) || (flags & 2) ||
+                 (flags & (int)VFS_O_TRUNC) ||
+                 (flags & (int)VFS_O_APPEND);
+        if (sched_current()->is_user && is_protected && wr && !has_install)
+            return -EACCES;
+    }
+    if (flags & (int)VFS_O_TRUNC)
+        g_rootfs->truncate(ino);
+    ext2_fd_priv_t *p = g_rootfs->pool_alloc(ino);
+    if (!p) return -ENOMEM;
+    int sz = g_rootfs->file_size(ino);
+    if (sz < 0) sz = 0;
+    if (flags & (int)VFS_O_APPEND)
+        p->write_offset = (uint32_t)sz;
+    out->ops = (const vfs_ops_t *)g_rootfs->file_ops;
+    out->priv = p;
+    out->offset = 0;
+    out->size = (uint64_t)sz;
+    out->flags = 0;
+    out->kflags = (is_protected ? VFS_KF_PROTECTED : 0) |
+                  (is_auth_gated ? VFS_KF_AUTH_GATED : 0);
+    out->cap_root_inode = 0;
+    out->cap_rights = 0;
+    out->_cap_pad = 0;
+    return 0;
+}
+
 /* vfs_open — read-only / non-authorized wrapper. Callers that don't create
  * under install-protected trees use this (has_install=0 is safe because a
  * non-O_CREAT open never reaches the ext2 create path). Create-with-authority
@@ -258,16 +283,40 @@ vfs_open(const char *path, int flags, uint16_t create_mode, vfs_file_t *out)
 }
 
 int
+vfs_openat_ext2(uint32_t start_ino, uint32_t root_ino, const char *path,
+                int flags, vfs_file_t *out, int has_install,
+                int starts_protected)
+{
+#ifndef CONFIG_FS_EXT2
+    (void)start_ino; (void)root_ino; (void)path; (void)flags;
+    (void)out; (void)has_install; (void)starts_protected;
+    return -EOPNOTSUPP;
+#else
+    /* Creating by inode needs an atomic parent-relative create primitive; do
+     * not fake it with a reconstructed pathname. Existing files cover the
+     * capability delegation path without introducing a rename race. */
+    if (flags & (int)VFS_O_CREAT)
+        return -EOPNOTSUPP;
+    uint32_t ino = 0;
+    int is_protected = starts_protected;
+    int rc = ext2_openat_protected(start_ino, root_ino, path, &ino,
+                                   &is_protected);
+    if (rc < 0)
+        return rc == -1 ? -ENOENT : rc;
+    return vfs_open_ext2_inode(ino, is_protected, flags, out, has_install);
+#endif
+}
+
+int
 vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
             int has_install)
 {
     /* Default: not protected. Non-ext2 backends below don't touch kflags, so
      * this prevents a stale VFS_KF_PROTECTED bit leaking from a reused slot. */
     out->kflags = 0;
-
-    /* VFS confinement: a scoped process may only reach paths inside its scope. */
-    if (!vfs_scope_allows(path))
-        return -EACCES;
+    out->cap_root_inode = 0;
+    out->cap_rights = 0;
+    out->_cap_pad = 0;
 
     /* /dev/ptmx → allocate PTY master */
     if (path[0]=='/' && path[1]=='d' && path[2]=='e' && path[3]=='v' && path[4]=='/' &&
@@ -329,155 +378,13 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
     {
         uint32_t ino = 0;
         int is_protected = 0;
-        int is_auth_gated = 0;
         /* Resolve and classify-as-protected under ONE ext2_lock hold so an SMP
          * symlink-swap can't substitute a different target between the two — see
          * ext2_open_protected. This is the authoritative, atomic replacement for
          * sys_open's racy cap_path_is_protected() pre-check. */
-        if (g_rootfs->open_protected(path, &ino, &is_protected) >= 0) {
-            /* O_CREAT|O_EXCL on an existing file: fail EEXIST (atomic create). */
-            if ((flags & (int)VFS_O_CREAT) && (flags & (int)VFS_O_EXCL))
-                return -EEXIST;
-            /* DAC permission check */
-            if (sched_current()->is_user) {
-                aegis_process_t *pr = current_proc();
-                int want = 4;  /* R_OK by default (O_RDONLY=0) */
-                if (flags & 1) want = 2;       /* O_WRONLY */
-                if (flags & 2) want = 4 | 2;   /* O_RDWR */
-                int perm = g_rootfs->check_perm(ino,
-                    (uint16_t)pr->uid, (uint16_t)pr->gid, want);
-                if (perm != 0)
-                    return -EACCES;
-            }
-            /* Post-resolution capability gate: /etc/shadow and the admin
-             * credential /etc/aegis/admin both require CAP_KIND_AUTH even for
-             * uid=0.  This check runs AFTER ext2_open resolves symlinks, so
-             * "ln -s /etc/shadow /tmp/x" + open("/tmp/x") cannot bypass it.
-             * The resolved inode is compared against the shadow/admin inodes
-             * recorded at mount time. */
-            {
-                uint32_t shadow_ino = g_rootfs->get_shadow_ino();
-                uint32_t admin_ino  = g_rootfs->get_admin_ino();
-                if (sched_current()->is_user &&
-                    ((shadow_ino != 0 && ino == shadow_ino) ||
-                     (admin_ino  != 0 && ino == admin_ino))) {
-                    aegis_process_t *pr = current_proc();
-                    int wr = (flags & 1) || (flags & 2) ||
-                             (flags & (int)VFS_O_TRUNC) ||
-                             (flags & (int)VFS_O_APPEND);
-                    if (cap_check(pr->caps, CAP_TABLE_SIZE,
-                                  CAP_KIND_AUTH,
-                                  wr ? CAP_RIGHTS_WRITE : CAP_RIGHTS_READ) != 0)
-                        return -EACCES;
-                    /* This is authoritative for aliases: sys_open can tag a
-                     * direct credential path, but only this resolved-inode
-                     * check can recognize a symlink to one. Keep the tag on
-                     * the resulting fd so inherited/duplicated use is also
-                     * reauthorized. */
-                    is_auth_gated = 1;
-
-                    /* Kernel-enforced brute-force throttle on the admin
-                     * ELEVATION credential. `login -elevate` opens this once per
-                     * password guess, and the userland serialization it relied
-                     * on (flock on a /run lock) is INERT: flock() and fcntl()
-                     * record locks are unimplemented in this kernel (ENOSYS /
-                     * fake-success), and /run is world-writable so any lock file
-                     * there is attacker-manipulable anyway. With uid cosmetically
-                     * 0, the kernel is the only arbiter a local attacker cannot
-                     * subvert. Pace non-admin reads of the credential to at most
-                     * one per window, GLOBALLY: reject the rest with -EAGAIN
-                     * WITHOUT advancing the clock, so a parallel re-exec storm of
-                     * `login -elevate` is capped to one guess per window no
-                     * matter how it is driven. Admin sessions are exempt (adminpw
-                     * / the installer re-reading during an already-elevated flow).
-                     * Only the admin credential is throttled — /etc/shadow reads
-                     * on the normal login path must stay unpaced. login fails
-                     * closed on the -EAGAIN (open<0), so a throttled guess simply
-                     * does not verify. (Red-team finding, 2026-08-09.) */
-                    if (admin_ino != 0 && ino == admin_ino &&
-                        pr->admin_session == 0) {
-                        uint64_t now  = arch_get_ticks();
-                        uint64_t last = __atomic_load_n(&s_admin_cred_last_read,
-                                                        __ATOMIC_RELAXED);
-                        if (last != 0 &&
-                            (now - last) < ADMIN_CRED_MIN_TICKS)
-                            return -EAGAIN;
-                        __atomic_store_n(&s_admin_cred_last_read, now,
-                                         __ATOMIC_RELAXED);
-                    }
-                }
-            }
-            /* Account-DB write gate: /etc/passwd and /etc/group are world-
-             * readable (login/id/ls -l read them) but admin-managed.  The live
-             * user is cosmetic uid 0 and OWNS these uid-0 files, so ext2 DAC
-             * alone would grant owner-write — letting a baseline session append
-             * a uid-0 account or clobber the DB.  Require an admin_session for
-             * any WRITE-intent open (O_WRONLY/O_RDWR/O_TRUNC/O_APPEND); reads are
-             * untouched.  Keyed on the resolved inode (post symlink/".."), so a
-             * symlink alias cannot bypass it.  Mirrors the shadow/admin gate
-             * above; the same inodes are also gated in the sys_dir/sys_meta
-             * mutators (rename-over/unlink/chmod/…). */
-            {
-                uint32_t passwd_ino = g_rootfs->get_passwd_ino();
-                uint32_t group_ino  = g_rootfs->get_group_ino();
-                if (sched_current()->is_user &&
-                    ((passwd_ino != 0 && ino == passwd_ino) ||
-                     (group_ino  != 0 && ino == group_ino))) {
-                    int wr = (flags & 1) || (flags & 2) ||
-                             (flags & (int)VFS_O_TRUNC) ||
-                             (flags & (int)VFS_O_APPEND);
-                    if (wr && current_proc()->admin_session == 0)
-                        return -EACCES;
-                }
-            }
-            /* Install-protected write gate: overwriting an EXISTING trusted
-             * binary (anything under /bin, /sbin, /apps, /etc/aegis, or a
-             * registered anchor) needs CAP_KIND_INSTALL, exactly like creating
-             * one does (sys_open's create path + ext2_create's has_install arg).
-             * The live session is cosmetic uid 0 and OWNS these uid-0 files, so
-             * ext2 DAC alone would grant owner-write — letting a baseline
-             * process open("/bin/login", O_WRONLY) and swap init/login/aegisctl
-             * for a trojan (full privesc). `is_protected` was resolved under the
-             * same ext2_lock hold as the inode (ext2_open_protected), so unlike
-             * the old sys_open pre-check this cannot be raced by an SMP
-             * symlink-swap. Runs only for user opens; kernel-internal writers
-             * (!is_user) and INSTALL-holders (installer/herald) are unaffected.
-             * Mirrors the shadow/admin (CAP_AUTH) and passwd/group
-             * (admin_session) gates above. */
-            {
-                int wr = (flags & 1) || (flags & 2) ||
-                         (flags & (int)VFS_O_TRUNC) ||
-                         (flags & (int)VFS_O_APPEND);
-                if (sched_current()->is_user && is_protected && wr &&
-                    !has_install)
-                    return -EACCES;
-            }
-            /* O_TRUNC: drop to length 0 AND free the data blocks.  Setting
-             * i_size = 0 alone (the old behaviour) leaked every data/indirect
-             * block of the file on each truncate. */
-            if (flags & (int)VFS_O_TRUNC)
-                g_rootfs->truncate(ino);
-            ext2_fd_priv_t *p = g_rootfs->pool_alloc(ino);
-            if (!p) return -ENOMEM;
-            int sz = g_rootfs->file_size(ino);
-            if (sz < 0) sz = 0;
-            /* O_APPEND: start writing at end of file */
-            if (flags & (int)VFS_O_APPEND)
-                p->write_offset = (uint32_t)sz;
-            out->ops    = ((const vfs_ops_t *)g_rootfs->file_ops);
-            out->priv   = (void *)p;
-            out->offset = 0;
-            out->size   = (uint64_t)sz;
-            out->flags  = 0;
-            /* Tag fds onto install-protected files so fd-based fchmod/fchown/
-             * ftruncate can't bypass the path-based install gate (the inode is
-             * resolved, so symlinks/".."/read-only opens are all covered).
-             * Reuses the atomically-resolved is_protected (same value
-             * cap_path_is_protected would return, minus a redundant walk). */
-            out->kflags = (is_protected ? VFS_KF_PROTECTED : 0) |
-                          (is_auth_gated ? VFS_KF_AUTH_GATED : 0);
-            return 0;
-        }
+        if (g_rootfs->open_protected(path, &ino, &is_protected) >= 0)
+            return vfs_open_ext2_inode(ino, is_protected, flags, out,
+                                       has_install);
         /* ext2 ENOENT + O_CREAT → check W+X on parent, then create */
         if (flags & (int)VFS_O_CREAT) {
             /* Keep the backend's namespace lock from parent authorization
@@ -515,6 +422,9 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
                     out->size   = 0;
                     out->flags  = 0;
                     out->kflags = is_protected ? VFS_KF_PROTECTED : 0;
+                    out->cap_root_inode = 0;
+                    out->cap_rights = 0;
+                    out->_cap_pad = 0;
                     g_rootfs->unlock(fl);
                     return 0;
                 }
@@ -587,7 +497,6 @@ int
 vfs_stat_path(const char *path, k_stat_t *out)
 {
     if (!path || !out) return -ENOENT;
-    if (!vfs_scope_allows(path)) return -EACCES;   /* confinement */
 
     /* /proc → procfs stat */
     if (path[0]=='/' && path[1]=='p' && path[2]=='r' && path[3]=='o' &&
@@ -688,7 +597,7 @@ vfs_stat_path(const char *path, k_stat_t *out)
             out->st_gid     = (uint32_t)inode.i_gid;
             out->st_size    = (int64_t)sz;
             out->st_blksize = 4096;
-            out->st_blocks  = (int64_t)(((uint64_t)sz + 511) / 512);
+            out->st_blocks  = (int64_t)inode.i_blocks;
             /* Real inode times (ext2 stores 32-bit unix seconds) so `ls -l`,
              * make, and git see actual dates instead of the epoch. */
             out->st_atime   = (int64_t)inode.i_atime;
@@ -720,7 +629,6 @@ int
 vfs_stat_path_ex(const char *path, k_stat_t *out, int follow)
 {
     if (!path || !out) return -ENOENT;
-    if (!vfs_scope_allows(path)) return -EACCES;   /* confinement */
 
     /* Dynamic mounts (tmpfs): no symlinks, delegate to vfs_stat_path */
     {
@@ -762,12 +670,12 @@ vfs_stat_path_ex(const char *path, k_stat_t *out, int follow)
                 out->st_atime = (int64_t)inode.i_atime;
                 out->st_mtime = (int64_t)inode.i_mtime;
                 out->st_ctime = (int64_t)inode.i_ctime;
+                out->st_blocks = (int64_t)inode.i_blocks;
             } else {
                 out->st_mode = S_IFREG | 0644;
             }
             out->st_size    = (int64_t)sz;
             out->st_blksize = 4096;
-            out->st_blocks  = (int64_t)(((uint64_t)sz + 511) / 512);
             return 0;
         }
     }

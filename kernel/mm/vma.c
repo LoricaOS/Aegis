@@ -4,6 +4,7 @@
 #include "proc.h"
 #include "kva.h"
 #include "spinlock.h"
+#include "tlb.h"
 #include "../limits.h"
 #include "../lib/refcount.h"
 
@@ -65,7 +66,16 @@ static inline spinlock_t *vlock(struct aegis_process *proc) {
 }
 
 irqflags_t vma_op_lock(struct aegis_process *proc) {
-    return spin_lock_irqsave(&vma_hdr(proc)->op_lock);
+    irqflags_t flags = arch_irq_save();
+    spinlock_t *lock = &vma_hdr(proc)->op_lock;
+    while (!spin_trylock(lock)) {
+        /* munmap/mprotect can hold op_lock while waiting for this CPU's TLB
+         * shootdown ACK.  Faults arrive with IF=0, so a plain spin_lock would
+         * never take the IPI and deadlock both CPUs. */
+        tlb_poll_incoming();
+        arch_pause();
+    }
+    return flags;
 }
 
 void vma_op_unlock(struct aegis_process *proc, irqflags_t flags) {
@@ -182,14 +192,19 @@ int vma_range_covered(struct aegis_process *proc, uint64_t addr, uint64_t len) {
     return 1;
 }
 
-void vma_init(struct aegis_process *proc) {
+int vma_init(struct aegis_process *proc) {
     vma_entry_t *table = (vma_entry_t *)kva_alloc_pages(VMA_TABLE_PAGES);
+    if (!table)
+        return -1;
+    if (proc->vma_table)
+        vma_free(proc);
     proc->vma_table    = table;
     proc->vma_capacity = (uint32_t)VMA_CAPACITY;
     refcount_init(vma_rc(proc), 1);
     *vcnt(proc) = 0;
     { spinlock_t init = SPINLOCK_INIT; vma_hdr(proc)->lock = init; }
     { spinlock_t init = SPINLOCK_INIT; vma_hdr(proc)->op_lock = init; }
+    return 0;
 }
 
 /* vma_insert_nolock — caller holds vlock. Returns 0 on success (inserted/merged),
@@ -612,8 +627,10 @@ void vma_clear(struct aegis_process *proc) {
     spin_unlock_irqrestore(lk, fl);
 }
 
-void vma_clone(struct aegis_process *dst, struct aegis_process *src) {
+int vma_clone(struct aegis_process *dst, struct aegis_process *src) {
     vma_entry_t *new_table = (vma_entry_t *)kva_alloc_pages(VMA_TABLE_PAGES);
+    if (!new_table)
+        return -1;
     uint32_t count = *vcnt(src);
 
     if (count > 0)
@@ -628,6 +645,7 @@ void vma_clone(struct aegis_process *dst, struct aegis_process *src) {
     *vcnt(dst) = count;
     { spinlock_t init = SPINLOCK_INIT; vma_hdr(dst)->lock = init; }
     { spinlock_t init = SPINLOCK_INIT; vma_hdr(dst)->op_lock = init; }
+    return 0;
 }
 
 void vma_share(struct aegis_process *child, struct aegis_process *parent) {

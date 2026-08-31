@@ -245,19 +245,10 @@ void pcie_init(void)
         uint32_t  scan_buses = (n_buses < PCIE_MAX_SCAN_BUSES)
                                ? n_buses : PCIE_MAX_SCAN_BUSES;
         uint32_t  n_pages  = scan_buses * 256u; /* 32 devs × 8 fns × 4KB = 256 pages/bus */
-        uintptr_t va_base  = (uintptr_t)kva_alloc_pages(n_pages);
-        uint32_t  i;
-        for (i = 0; i < n_pages; i++) {
-            uint64_t pa = g_mcfg_base + (uint64_t)i * 4096;
-            uintptr_t va = va_base + (uintptr_t)i * 4096;
-            /* kva_alloc_pages mapped each page to a PMM frame; unmap first
-             * so vmm_map_page does not panic on a double-map.
-             * SAFETY: va is a kva-allocated page that is present in the PT
-             * (kva_alloc_pages guarantees this); vmm_unmap_page succeeds. */
-            vmm_unmap_page(va);
-            /* SAFETY: ECAM MMIO — map uncached via arch-neutral VMM flags. */
-            vmm_map_page(va, pa,
-                         VMM_FLAG_WRITABLE | VMM_FLAG_WC | VMM_FLAG_UCMINUS);
+        uintptr_t va_base = (uintptr_t)kva_map_mmio(g_mcfg_base, n_pages);
+        if (!va_base) {
+            printk("[PCIE] FAIL: out of memory mapping ECAM\n");
+            return;
         }
         s_ecam_base = (volatile uint8_t *)va_base;
 

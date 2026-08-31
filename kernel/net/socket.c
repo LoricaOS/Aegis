@@ -331,6 +331,7 @@ int sock_alloc(uint8_t type)
             __builtin_memset(&s_socks[i], 0, sizeof(s_socks[i]));
             s_socks[i].state       = SOCK_CREATED;
             s_socks[i].type        = type;
+            s_socks[i].domain      = AF_INET;
             s_socks[i].sock_id     = i;
             s_socks[i].tcp_conn_id = SOCK_NONE;
             s_socks[i].epoll_id    = SOCK_NONE;

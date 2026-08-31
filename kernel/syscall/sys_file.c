@@ -14,6 +14,38 @@
 #include "pty.h"
 #include "nvme.h"
 
+static void
+init_directory_cap(vfs_file_t *f)
+{
+    uint32_t ino = g_rootfs->ino_of(f->ops, f->priv);
+    if (ino != 0 && g_rootfs->is_dir(ino)) {
+        f->cap_root_inode = ino;
+        f->cap_rights = CAP_RIGHTS_READ | CAP_RIGHTS_WRITE | CAP_RIGHTS_EXEC;
+    }
+}
+
+static uint64_t
+install_opened(aegis_process_t *proc, vfs_file_t *opened, uint32_t flags)
+{
+    opened->flags = flags;
+    if (flags & VFS_O_CLOEXEC)
+        opened->flags |= VFS_FD_CLOEXEC;
+    uint64_t fd;
+    irqflags_t fl = spin_lock_irqsave(&proc->fd_table->lock);
+    for (fd = 0; fd < PROC_MAX_FDS; fd++)
+        if (!proc->fd_table->fds[fd].ops)
+            break;
+    if (fd < PROC_MAX_FDS)
+        proc->fd_table->fds[fd] = *opened;
+    spin_unlock_irqrestore(&proc->fd_table->lock, fl);
+    if (fd == PROC_MAX_FDS) {
+        if (opened->ops && opened->ops->close)
+            opened->ops->close(opened->priv);
+        return SYS_ERR(EMFILE);
+    }
+    return fd;
+}
+
 /*
  * sys_open — syscall 2
  *
@@ -186,28 +218,8 @@ sys_open(uint64_t arg1, uint64_t arg2, uint64_t arg3)
      * (vfs_open set kflags to PROTECTED-or-0; OR our bit in, don't clobber). */
     if (auth_gated)
         opened.kflags |= VFS_KF_AUTH_GATED;
-    /* Store open flags in the fd slot for F_GETFL */
-    opened.flags = (uint32_t)arg2;
-    /* Propagate O_CLOEXEC from open flags to fd flags */
-    if (arg2 & VFS_O_CLOEXEC)
-        opened.flags |= VFS_FD_CLOEXEC;
-
-    uint64_t fd;
-    irqflags_t fl = spin_lock_irqsave(&proc->fd_table->lock);
-    for (fd = 0; fd < PROC_MAX_FDS; fd++)
-        if (!proc->fd_table->fds[fd].ops)
-            break;
-    if (fd < PROC_MAX_FDS)
-        proc->fd_table->fds[fd] = opened;
-    spin_unlock_irqrestore(&proc->fd_table->lock, fl);
-    if (fd == PROC_MAX_FDS) {
-        /* vfs_open_ex already acquired the backing object reference. Nothing
-         * was published, so release it after the table lock and fail cleanly. */
-        if (opened.ops && opened.ops->close)
-            opened.ops->close(opened.priv);
-        return SYS_ERR(EMFILE);
-    }
-    return fd;
+    init_directory_cap(&opened);
+    return install_opened(proc, &opened, (uint32_t)arg2);
 }
 
 /*
@@ -218,27 +230,80 @@ sys_open(uint64_t arg1, uint64_t arg2, uint64_t arg3)
  * arg3 = flags
  * arg4 = mode
  *
- * We only support AT_FDCWD (absolute paths and CWD-relative).  Paths starting
- * with '/' are absolute and dirfd is irrelevant.  For now we forward to
- * sys_open unconditionally — the shell only calls openat with AT_FDCWD.
+ * Absolute paths and AT_FDCWD retain ordinary path semantics. A real ext2
+ * directory fd resolves relative to its inode, so renames do not retarget it.
  */
 uint64_t
 sys_openat(uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4)
 {
-    /* dirfd is not implemented: paths resolve against cwd. Silently ignoring
-     * it is an authority-shape LIE — a caller that opened a directory fd and
-     * passed it believes resolution is anchored there, which matters under
-     * VFS confinement. Accept only AT_FDCWD (or an absolute path, where dirfd
-     * is ignored by definition) and refuse anything else rather than resolving
-     * somewhere the caller did not ask for. */
-    if ((int64_t)(int32_t)arg1 != -100 /* AT_FDCWD */) {
-        char probe;
-        if (user_ptr_valid(arg2, 1) &&
-            copy_from_user(&probe, (const void *)(uintptr_t)arg2, 1) == 0 &&
-            probe != '/')
-            return SYS_ERR(ENOSYS);   /* relative + real dirfd: unsupported */
+    char path[256];
+    uint32_t i;
+    for (i = 0; i < sizeof(path) - 1; i++) {
+        if (!user_ptr_valid(arg2 + i, 1))
+            return SYS_ERR(EFAULT);
+        if (copy_from_user(&path[i], (const void *)(uintptr_t)(arg2 + i), 1) != 0)
+            return SYS_ERR(EFAULT);
+        if (path[i] == '\0') break;
     }
-    return sys_open(arg2, arg3, arg4);
+    path[sizeof(path) - 1] = '\0';
+    if (path[0] == '/' || (int64_t)(int32_t)arg1 == -100)
+        return sys_open(arg2, arg3, arg4);
+    if (path[0] == '\0')
+        return SYS_ERR(ENOENT);
+
+    aegis_process_t *proc = current_proc();
+    fd_table_pin_t pin;
+    if (!fd_table_pin(proc->fd_table, (int)arg1, &pin))
+        return SYS_ERR(EBADF);
+    uint32_t start = g_rootfs->ino_of(pin.file.ops, pin.file.priv);
+    if (start == 0 || !g_rootfs->is_dir(start)) {
+        fd_table_unpin(&pin);
+        return SYS_ERR(ENOTDIR);
+    }
+
+    int confined = (pin.file.kflags & VFS_KF_CAP_CONFINED) != 0;
+    if (!confined && cap_check(proc->caps, CAP_TABLE_SIZE,
+                               CAP_KIND_VFS_OPEN, CAP_RIGHTS_READ) != 0) {
+        fd_table_unpin(&pin);
+        return SYS_ERR(ENOCAP);
+    }
+
+    uint32_t need = CAP_RIGHTS_EXEC;
+    switch ((uint32_t)arg3 & VFS_O_ACCMODE) {
+    case VFS_O_WRONLY: need |= CAP_RIGHTS_WRITE; break;
+    case VFS_O_RDWR:   need |= CAP_RIGHTS_READ | CAP_RIGHTS_WRITE; break;
+    default:           need |= CAP_RIGHTS_READ; break;
+    }
+    if (arg3 & (VFS_O_CREAT | VFS_O_TRUNC | VFS_O_APPEND))
+        need |= CAP_RIGHTS_WRITE;
+    if ((pin.file.cap_rights & need) != need) {
+        fd_table_unpin(&pin);
+        return SYS_ERR(EACCES);
+    }
+
+    int has_install = cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_INSTALL,
+                                CAP_RIGHTS_WRITE) == 0;
+    vfs_file_t opened;
+    __builtin_memset(&opened, 0, sizeof(opened));
+    int rc = vfs_openat_ext2(start,
+        confined ? (uint32_t)pin.file.cap_root_inode : EXT2_ROOT_INODE,
+        path, (int)arg3, &opened, has_install,
+        (pin.file.kflags & VFS_KF_PROTECTED) != 0);
+    if (rc >= 0) {
+        uint32_t ino = g_rootfs->ino_of(opened.ops, opened.priv);
+        if (confined) {
+            opened.kflags |= VFS_KF_CAP_CONFINED;
+            opened.cap_root_inode = pin.file.cap_root_inode;
+            opened.cap_rights = pin.file.cap_rights;
+        } else if (ino != 0 && g_rootfs->is_dir(ino)) {
+            opened.cap_root_inode = ino;
+            opened.cap_rights = pin.file.cap_rights;
+        }
+    }
+    fd_table_unpin(&pin);
+    if (rc < 0)
+        return (uint64_t)(int64_t)rc;
+    return install_opened(proc, &opened, (uint32_t)arg3);
 }
 
 /* ── stat / access / nanosleep ────────────────────────────────────────── */
@@ -1084,7 +1149,7 @@ copy_path_resolved(char *kpath, uint64_t user_ptr, uint32_t bufsz)
     if (r != 0)
         return r;
     if (kpath[0] == '/' || kpath[0] == '\0')
-        return vfs_scope_allows(kpath) ? 0 : -EACCES;   /* confinement gate */
+        return 0;
 
     aegis_process_t *proc = current_proc();
     char tmp[256];
@@ -1099,59 +1164,56 @@ copy_path_resolved(char *kpath, uint64_t user_ptr, uint32_t bufsz)
     if (sep) tmp[cwdlen] = '/';
     __builtin_memcpy(tmp + cwdlen + sep, kpath, plen + 1);
     __builtin_memcpy(kpath, tmp, cwdlen + sep + plen + 1);
-    return vfs_scope_allows(kpath) ? 0 : -EACCES;   /* confinement gate */
+    return 0;
 }
 
 /*
- * sys_vfs_confine — voluntarily confine this process (and, by inheritance, its
- * descendants) to the subtree `path`. One-way: an already-confined process may
- * only NARROW its scope, never widen or clear it. No capability is required —
- * dropping your own authority never needs one — and it is purely additive
- * (removes reach, never grants it), so it cannot weaken the security model.
- * Aegis syscall 511.
+ * Process-wide path-string confinement was lexical and therefore followed an
+ * in-scope symlink outside its promised root. Keep the syscall number reserved,
+ * but fail honestly until it can share the inode-rooted *at resolver.
  */
 uint64_t
 sys_vfs_confine(uint64_t path_u)
 {
+    (void)path_u;
+    return SYS_ERR(EOPNOTSUPP);
+}
+
+/* Monotonically turn an ext2 directory fd into a delegable subtree
+ * capability. Neither rights nor confinement can ever be widened. */
+uint64_t
+sys_cap_rights_limit(uint64_t fd_u, uint64_t rights_u, uint64_t confine_u)
+{
+    const uint32_t all = CAP_RIGHTS_READ | CAP_RIGHTS_WRITE | CAP_RIGHTS_EXEC;
+    if ((rights_u & ~((uint64_t)all)) != 0 || confine_u > 1)
+        return SYS_ERR(EINVAL);
+
     aegis_process_t *proc = current_proc();
-    char raw[128];
-    if (copy_path_from_user(raw, path_u, sizeof(raw)) != 0)
-        return SYS_ERR(EFAULT);
-
-    /* Build absolute (relative → against cwd), then canonicalize. */
-    char abs[256];
-    uint32_t i = 0;
-    if (raw[0] == '/') {
-        for (; raw[i] && i < sizeof(abs) - 1; i++) abs[i] = raw[i];
-    } else {
-        for (; proc->cwd[i] && i < sizeof(abs) - 1; i++) abs[i] = proc->cwd[i];
-        if (i == 0 || abs[i - 1] != '/') { if (i < sizeof(abs) - 1) abs[i++] = '/'; }
-        for (uint32_t j = 0; raw[j] && i < sizeof(abs) - 1; j++) abs[i++] = raw[j];
-    }
-    abs[i] = '\0';
-
-    char canon[256];
-    path_canonicalize(abs, canon, sizeof(canon));
-    uint32_t L = 0;
-    while (canon[L]) L++;
-    if (L == 0 || L >= sizeof(proc->vfs_scope))
-        return SYS_ERR(ENAMETOOLONG);
-
-    /* One-way: if already confined, the new scope must lie within the old. */
-    if (proc->vfs_scope_len != 0) {
-        uint32_t O = proc->vfs_scope_len;
-        int within = 1;
-        for (uint32_t k = 0; k < O; k++)
-            if (canon[k] != proc->vfs_scope[k]) { within = 0; break; }
-        if (within && !(canon[O] == '\0' || canon[O] == '/')) within = 0;
-        if (!within)
-            return SYS_ERR(EACCES);          /* cannot widen confinement */
+    fd_table_pin_t pin;
+    int fd = (int)fd_u;
+    if (!fd_table_pin(proc->fd_table, fd, &pin))
+        return SYS_ERR(EBADF);
+    uint32_t ino = g_rootfs->ino_of(pin.file.ops, pin.file.priv);
+    if (ino == 0 || !g_rootfs->is_dir(ino)) {
+        fd_table_unpin(&pin);
+        return SYS_ERR(ENOTDIR);
     }
 
-    for (uint32_t k = 0; k < L; k++) proc->vfs_scope[k] = canon[k];
-    proc->vfs_scope[L] = '\0';
-    proc->vfs_scope_len = L;
-    return 0;
+    irqflags_t fl = spin_lock_irqsave(&proc->fd_table->lock);
+    vfs_file_t *slot = (fd >= 0 && (uint32_t)fd < PROC_MAX_FDS)
+                     ? &proc->fd_table->fds[fd] : (vfs_file_t *)0;
+    int same = slot && slot->ops == pin.file.ops && slot->priv == pin.file.priv;
+    if (same) {
+        slot->cap_rights &= (uint32_t)rights_u;
+        if (confine_u) {
+            if (!(slot->kflags & VFS_KF_CAP_CONFINED))
+                slot->cap_root_inode = ino;
+            slot->kflags |= VFS_KF_CAP_CONFINED;
+        }
+    }
+    spin_unlock_irqrestore(&proc->fd_table->lock, fl);
+    fd_table_unpin(&pin);
+    return same ? 0 : SYS_ERR(EBADF);
 }
 
 /*

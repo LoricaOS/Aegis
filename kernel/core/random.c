@@ -116,7 +116,7 @@ static uint32_t s_seed_credits;
 static int      s_rng_ready;
 #define RNG_READY_CREDITS 64u
 
-#ifdef __x86_64__
+#if defined(__x86_64__)
 /* CPUID.01H:ECX[30] = RDRAND. Present on essentially every x86-64 since Ivy
  * Bridge, and unlike virtio-rng it needs no device — which is exactly the
  * case this closes: a deterministic VM with no virtio-rng seeded the entire
@@ -137,6 +137,28 @@ static int hw_rng_read(uint64_t *out)
     /* RDRAND may transiently fail; the ISA recommends ~10 retries. */
     for (int i = 0; i < 10; i++) {
         __asm__ volatile("rdrand %0; setc %1" : "=r"(v), "=qm"(ok) : : "cc");
+        if (ok) { *out = v; return 1; }
+    }
+    return 0;
+}
+#elif defined(__aarch64__)
+/* Armv8.5-A RNG extension: ID_AA64ISAR0_EL1.RNDR advertises RNDR. RNDR sets
+ * Z on a transient failure, just like RDRAND clears CF. Use the architectural
+ * encoding so older cross-assemblers do not need the RNDR register name. */
+static int hw_rng_supported(void)
+{
+    uint64_t isar0;
+    __asm__ volatile("mrs %0, ID_AA64ISAR0_EL1" : "=r"(isar0));
+    return ((isar0 >> 60) & 0xfu) != 0;
+}
+
+static int hw_rng_read(uint64_t *out)
+{
+    for (int i = 0; i < 10; i++) {
+        uint64_t v;
+        uint32_t ok;
+        __asm__ volatile("mrs %0, S3_3_C2_C4_0; cset %w1, ne"
+                         : "=r"(v), "=r"(ok) : : "cc");
         if (ok) { *out = v; return 1; }
     }
     return 0;
@@ -247,17 +269,16 @@ refill_buf(void)
 int
 random_get_bytes(void *buf, size_t len)
 {
-    /* Advisory readiness notice (audit L15). Deliberately does NOT block:
-     * this is called from early-boot paths (per-process ASLR at spawn), and
-     * blocking there hangs the machine instead of degrading it. Warn once so
-     * an entropy-starved boot is visible rather than silent. */
+    /* Never label deterministic timing state as random. Callers that cannot
+     * wait fail with EAGAIN; boot-critical callers check readiness before their
+     * point of no return. */
     if (!random_is_ready()) {
         static int warned;
         if (!warned) {
             warned = 1;
-            printk("[RNG] WARN: serving bytes before the pool is fully seeded "
-                   "(no hardware RNG; entropy still accumulating)\n");
+            printk("[RNG] WARN: random bytes unavailable until pool is seeded\n");
         }
+        return -11; /* -EAGAIN */
     }
 
     irqflags_t fl = spin_lock_irqsave(&rng_lock);

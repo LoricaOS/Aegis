@@ -10,6 +10,7 @@
 
 /* Network-byte-order address types. Stored in wire (big-endian) order. */
 typedef uint32_t ip4_addr_t;          /* network byte order */
+typedef struct { uint8_t b[16]; } ip6_addr_t;
 typedef struct { uint8_t b[6]; } mac_addr_t;
 
 /* Byte-order conversion via GCC builtins — no libc needed. */

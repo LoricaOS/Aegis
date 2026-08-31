@@ -7,6 +7,7 @@
 
 #define ETHERTYPE_IP  0x0800
 #define ETHERTYPE_ARP 0x0806
+#define ETHERTYPE_IPV6 0x86DD
 
 /* Ethernet frame header (14 bytes, no VLAN tag). */
 typedef struct __attribute__((packed)) {

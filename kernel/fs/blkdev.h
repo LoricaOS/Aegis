@@ -19,7 +19,7 @@ typedef struct blkdev {
     void    *priv;              /* driver-private data */
 } blkdev_t;
 
-#define BLKDEV_MAX 8
+#define BLKDEV_MAX 16
 
 /* Register a block device. Returns 0 on success, -1 if table full. */
 int       blkdev_register(blkdev_t *dev);

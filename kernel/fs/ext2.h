@@ -17,6 +17,10 @@
 #define EXT2_ROOT_INODE     2
 #define EXT2_DIRECT_BLOCKS  12
 #define EXT2_NAME_LEN       255
+/* One 4 KiB group-descriptor block holds 128 standard 32-byte descriptors.
+ * At 32768 4 KiB blocks/group this gives an installed-filesystem ceiling of
+ * 16 GiB without adding multi-block GDT support. */
+#define EXT2_MAX_GROUPS     128
 
 /* Superblock — at byte offset 1024 from partition start */
 typedef struct __attribute__((packed)) {
@@ -122,6 +126,12 @@ typedef struct __attribute__((packed)) {
 /* Mount an ext2 filesystem from the named block device.
  * Returns 0 on success, -1 on failure. */
 int ext2_mount(const char *devname);
+
+/* Resolve a relative path from an ext2 directory inode. Resolution may not
+ * ascend above root_ino; symlinks are resolved inside that same root. */
+int ext2_openat_protected(uint32_t start_ino, uint32_t root_ino,
+                          const char *path, uint32_t *inode_out,
+                          int *is_protected);
 
 /* Re-read /etc/aegis/anchors and record each listed dir as a dynamic install
  * anchor (trusted-path + write-protected). Call at boot after mount and after a

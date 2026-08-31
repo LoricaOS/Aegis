@@ -225,6 +225,8 @@ int memfd_truncate(uint32_t id, uint64_t size)
      * kva_alloc_pages takes kva_lock; call it without memfd_lock held. */
     if (_need_arr) {
         uint64_t *_arr = (uint64_t *)kva_alloc_pages(MEMFD_PHYS_ARR_PAGES);
+        if (!_arr)
+            return -ENOMEM;
         kmemset(_arr, 0, MEMFD_PAGES_MAX * sizeof(uint64_t));
         fl = spin_lock_irqsave(&memfd_lock);
         mf = memfd_get(id);

@@ -21,6 +21,9 @@
 #include "pmm.h"
 #include "ramdisk.h"
 #include "printk.h"
+#include "random.h"
+#include "netdev.h"
+#include "wpa2_crypto.h"
 #include <stdint.h>
 
 #define AX200_VENDOR   0x8086
@@ -78,6 +81,7 @@
 #define CTXT_INFO_TFD_FORMAT_LONG  0x0100
 #define CTXT_INFO_RB_SIZE_4K       0x4
 #define NRBDS                   512    /* RX free-buffer ring depth (cb_size=9) */
+#define RX_DESC_SIZE            48
 
 /* RX/command doorbell (HBUS_BASE+0x060). Low 16 bits = write pointer, high bits
  * select the queue: (q<<16) for TX, ((q+512)<<16) for RX. */
@@ -131,11 +135,15 @@ static volatile uint8_t *s_mmio;   /* BAR0 kernel VA */
 
 /* RX queue state (kept so we can read FW->host notifications). */
 static uint8_t          *s_rx_buf_va[512];   /* KVA of each RX buffer (NRBDS) */
+static uint64_t          s_rx_buf_phys[512];
+static volatile uint64_t *s_free_rbd;
 static volatile uint8_t *s_rb_stts;          /* KVA of the RB status block */
 static volatile uint8_t *s_used_bd;          /* KVA of the used-RBD completion ring */
 static volatile uint8_t *s_cmd_ring;         /* KVA of the command TFD ring */
 static uint16_t          s_cmd_wr;           /* command queue write pointer */
 static uint16_t          s_rx_read;          /* next RX buffer index to examine */
+static uint16_t          s_rx_write = NRBDS - 8;
+static uint8_t           s_rx_copy[4096];
 
 static inline uint32_t csr_rd(uint32_t off) { return *(volatile uint32_t *)(s_mmio + off); }
 static inline void     csr_wr(uint32_t off, uint32_t v) { *(volatile uint32_t *)(s_mmio + off) = v; }
@@ -244,13 +252,7 @@ static int power_up(void)
 static uintptr_t
 map_bar(uint64_t pa, uint32_t n_pages)
 {
-    uintptr_t va = (uintptr_t)kva_alloc_pages(n_pages);
-    for (uint32_t i = 0; i < n_pages; i++) {
-        uintptr_t page_va = va + (uint64_t)i * 4096;
-        vmm_unmap_page(page_va);
-        vmm_map_page(page_va, pa + (uint64_t)i * 4096, MMIO_FLAGS);
-    }
-    return va;
+    return (uintptr_t)kva_map_mmio(pa, n_pages);
 }
 
 /* Find the Power Management capability's PMCSR offset (cap+4), or 0. */
@@ -302,6 +304,12 @@ static int      s_ap_found;                       /* target AP seen in scan */
 static uint8_t  s_ap_bssid[6];                     /* target AP BSSID (addr3) */
 static uint8_t  s_ap_channel;                      /* target AP channel (DS param) */
 static char     s_target_ssid[33];                /* SSID for the assoc request */
+static uint8_t  s_ap_sec;
+static uint8_t  s_passphrase[64];
+static uint8_t  s_passphrase_len;
+static uint8_t  s_ptk[64];
+static netdev_t s_wifi_dev;
+static int      s_netdev_registered;
 
 /* Scan results table — populated by do_scan(), read out via iwl_wifi_list()
  * (sys_netcfg WiFi ops) so the network manager can show a live network list. */
@@ -340,12 +348,48 @@ static void wifi_add(const char *ssid, const uint8_t *bssid, uint8_t ch, uint8_t
 static uint8_t  s_scan_req_ver, s_scan_req_grp;   /* SCAN_REQ_UMAC (cmd 0x0d) */
 static uint8_t  s_scan_cfg_ver, s_scan_cfg_grp;   /* SCAN_CFG_CMD (cmd 0x0c) */
 static uint8_t  s_scd_qcfg_ver;                   /* SCD_QUEUE_CONFIG_CMD (0x17/g5) */
+static uint8_t  s_sta_key_ver;
 
 static inline uint32_t rd_le32(const uint8_t *p)
 {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
+
+static inline uint16_t rd_le16(const uint8_t *p)
+{ return (uint16_t)(p[0] | ((uint16_t)p[1] << 8)); }
+static inline uint16_t rd_be16(const uint8_t *p)
+{ return (uint16_t)(((uint16_t)p[0] << 8) | p[1]); }
+static inline void wr_be16(uint8_t *p, uint16_t v)
+{ p[0]=(uint8_t)(v>>8); p[1]=(uint8_t)v; }
+
+/* AX200 completion entries are 32-bit VIDs, not the 32-byte AX210 format.
+ * Return the actual packet buffer for a completion-ring index. */
+static const uint8_t *rx_at(uint16_t idx)
+{
+    uint16_t vid=(uint16_t)(rd_le32((const uint8_t *)s_used_bd+((idx&511)*4))&0x0fff);
+    return (vid && vid<=NRBDS)?s_rx_buf_va[vid-1]:0;
+}
+
+static void rx_restock(uint16_t idx)
+{
+    uint16_t vid=(uint16_t)(rd_le32((const uint8_t *)s_used_bd+((idx&511)*4))&0x0fff);
+    if(!vid||vid>NRBDS)return;
+    s_free_rbd[s_rx_write&511]=s_rx_buf_phys[vid-1]|vid;
+    s_rx_write=(uint16_t)((s_rx_write+1)&511);
+    if((s_rx_write&7)==0)csr_wr(RFH_Q0_FRBDCB_WIDX_TRG,s_rx_write);
+}
+
+static const uint8_t *rx_take(void)
+{
+    const uint8_t *r=rx_at(s_rx_read);
+    if(r)for(unsigned i=0;i<sizeof(s_rx_copy);i++)s_rx_copy[i]=r[i];
+    rx_restock(s_rx_read);
+    s_rx_read=(uint16_t)((s_rx_read+1)&511);
+    return r?s_rx_copy:0;
+}
+static void rx_skip_pending(void)
+{ uint16_t c=*(volatile uint16_t *)s_rb_stts&511;while(s_rx_read!=c)(void)rx_take(); }
 
 /* Count sections from `start` until a separator (== iwl_pcie_get_num_sections). */
 static int sec_count_from(int start)
@@ -407,6 +451,7 @@ static int parse_firmware(void)
                 /* connect-path commands live in LONG_GROUP (g1): PHY_CTXT 0x8 v3,
                  * ADD_STA 0x18 v12, TX 0x1c v7, MAC_CTXT 0x28 v5, BINDING 0x2b v2 */
                 if (c == 0x17 && g == 0x05) s_scd_qcfg_ver = v;   /* new txq path */
+                if(c==0x17&&g==0x00)s_sta_key_ver=v;
                 /* DATA_PATH_GROUP(5): TLC 0x0f, RLC 0x08, STA_HE 0x07 */
                 if (g == 0x05 && (c==0x0f||c==0x08||c==0x07||c==0x0d||c==0x17))
                     printk("[AX200] dpcmdver 0x%x/g%u=v%u\n", c, g, v);
@@ -468,12 +513,11 @@ dma_alloc(uint64_t bytes, uint64_t *phys_out)
     uint64_t phys = pmm_alloc_contig_low(pages);
     if (!phys)
         return 0;
-    uintptr_t va = (uintptr_t)kva_alloc_pages(pages);
-    if (!va)
+    uintptr_t va = (uintptr_t)kva_map_phys_pages(phys, pages);
+    if (!va) {
+        for (uint64_t i = 0; i < pages; i++)
+            pmm_free_page(phys + i * 4096);
         return 0;
-    for (uint64_t i = 0; i < pages; i++) {
-        vmm_unmap_page(va + i * 4096);
-        vmm_map_page(va + i * 4096, phys + i * 4096, VMM_FLAG_WRITABLE);
     }
     for (uint64_t i = 0; i < pages * 4096; i++)
         ((volatile uint8_t *)va)[i] = 0;
@@ -513,7 +557,7 @@ process_rx_alive(void)
 {
     uint16_t closed = 0;
     for (int t = 0; t < 20000; t++) {             /* up to ~200ms for the ntf */
-        closed = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
+        closed = *(volatile uint16_t *)s_rb_stts & 511;
         if (closed != 0)
             break;
         busy_wait_us(10);
@@ -564,13 +608,14 @@ set_tfd_tb(volatile uint8_t *tfd, uint64_t addr, uint16_t len)
 }
 
 /* Send a host command (id = (group_id<<8)|opcode) with an optional payload.
- * Builds the wide-header command in DMA, copies its first 20 bytes into a
- * first-TB buffer, builds a 2-TB TFD in the command queue, rings the doorbell. */
+ * AX200 uses the 8-byte wide header, including for legacy IDs remapped into
+ * LONG_GROUP. Copy its first 20 bytes into a first-TB buffer, then ring it. */
 static void
 send_cmd(uint16_t cmd_id, const void *payload, uint16_t plen)
 {
+    const uint16_t hdr_len=8;
     uint64_t cmd_phys = 0, ftb_phys = 0;
-    uint8_t *cmd = dma_alloc((uint64_t)8 + plen + 64, &cmd_phys);
+    uint8_t *cmd = dma_alloc((uint64_t)hdr_len + plen + 64, &cmd_phys);
     uint8_t *ftb = dma_alloc(64, &ftb_phys);
     if (!cmd || !ftb) {
         printk("[AX200] send_cmd: DMA alloc failed\n");
@@ -584,11 +629,11 @@ send_cmd(uint16_t cmd_id, const void *payload, uint16_t plen)
     cmd[3] = (uint8_t)((seq >> 8) & 0xff);       /* sequence (le16) */
     cmd[4] = (uint8_t)(plen & 0xff);
     cmd[5] = (uint8_t)((plen >> 8) & 0xff);      /* length (le16) */
-    cmd[6] = 0; cmd[7] = 0;                       /* reserved, version */
+    cmd[6] = 0; cmd[7] = 0;                      /* reserved, version */
     if (plen)
-        mcopy(cmd + 8, payload, plen);
+        mcopy(cmd + hdr_len, payload, plen);
 
-    uint16_t copy_size = (uint16_t)(8 + plen);
+    uint16_t copy_size = (uint16_t)(hdr_len + plen);
     uint16_t tb0 = copy_size < IWL_FIRST_TB_SIZE ? copy_size : IWL_FIRST_TB_SIZE;
     mcopy(ftb, cmd, tb0);
 
@@ -615,17 +660,19 @@ static void wr_le32b(uint8_t *p, uint32_t v)
 /* Wait for a FW notification with the given cmd/group to arrive via RX, scanning
  * each new RB in order (buffer i = RB i). Returns the buffer index, or -1. */
 static int
-wait_notif(uint8_t want_cmd, uint8_t want_grp, int timeout_ms)
+wait_notif(uint8_t want_cmd, uint8_t want_grp, int timeout_ms,uint32_t *status)
 {
     for (int t = 0; t < timeout_ms * 100; t++) {
-        uint16_t closed = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
+        uint16_t closed = *(volatile uint16_t *)s_rb_stts & 511;
         while (s_rx_read != closed) {
-            const uint8_t *r = s_rx_buf_va[s_rx_read & 511];
+            const uint8_t *r = rx_take();
+            if (!r) continue;
             uint8_t c = r[4], g = r[5];
             printk("[AX200]   ntf cmd=0x%x grp=0x%x\n", c, g);
-            s_rx_read++;
-            if (c == want_cmd && g == want_grp)
-                return (s_rx_read - 1) & 511;
+            if (c == want_cmd && g == want_grp) {
+                if(status)*status=rd_le32(r+8);
+                return 0;
+            }
         }
         uint32_t ie = csr_rd(CSR_INT);
         if (ie & (CSR_INT_BIT_SW_ERR | CSR_INT_BIT_HW_ERR)) {
@@ -664,7 +711,8 @@ send_check(uint16_t cmd_id, const void *pl, uint16_t plen, const char *tag)
 static int
 init_after_alive(void)
 {
-    s_rx_read = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;   /* skip past the alive ntf */
+    uint16_t closed=*(volatile uint16_t *)s_rb_stts&511;
+    while(s_rx_read!=closed){rx_restock(s_rx_read);s_rx_read=(uint16_t)((s_rx_read+1)&511);}
 
     uint8_t buf[28];
     /* 1. INIT_EXTENDED_CFG_CMD (SYSTEM_GROUP 0x2, cmd 0x03): flag NVM access. */
@@ -679,7 +727,7 @@ init_after_alive(void)
      * no-op for the unified ucode (returns early), and sending it asserts. */
 
     /* 3. Wait for INIT_COMPLETE_NOTIF (cmd 0x04, legacy group 0x0). */
-    if (wait_notif(0x04, 0x00, 3000) < 0) {
+    if (wait_notif(0x04, 0x00, 3000,0) < 0) {
         printk("[AX200] no INIT_COMPLETE (rb_stts=%u)\n",
                *(volatile uint16_t *)s_rb_stts & 0x0FFFu);
         return -1;
@@ -758,53 +806,37 @@ do_scan(void)
     send_cmd(0x10d, cmd, 1940);              /* SCAN_REQ_UMAC, group 1 */
     printk("[AX200] SCAN_REQ_UMAC sent (passive, ch 1-13); watching for beacons...\n");
 
-    s_rx_read = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
+    rx_skip_pending();
     int found = 0;
     for (int t = 0; t < 600000; t++) {        /* up to ~6s */
-        uint16_t closed = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
+        uint16_t closed = *(volatile uint16_t *)s_rb_stts & 511;
         while (s_rx_read != closed) {
-            const uint8_t *r = s_rx_buf_va[s_rx_read & 511];
+            const uint8_t *r = rx_take();
+            if (!r) continue;
             uint8_t c = r[4], g = r[5];
-            s_rx_read++;
-            /* Parse any beacon in this notif into the scan table. Beacon signature:
-             * FC=0x80 0x00, broadcast DA (addr1), and the SSID IE (id 0) first at
-             * frame+36 (24 hdr + 8 tsf + 2 bcn-int + 2 cap). */
-            if (c == 0xc1) for (int p = 8; p < 4000; p++) {
-                if (r[p] != 0x80 || r[p+1] != 0x00) continue;
-                if (r[p+4]!=0xff || r[p+5]!=0xff || r[p+9]!=0xff) continue;
-                if (r[p+36] != 0x00) continue;            /* first IE must be SSID */
-                uint8_t slen = r[p+37];
-                if (slen == 0 || slen > 32) break;        /* hidden / bogus */
-                char ss[33]; int ok = 1;
-                for (int j = 0; j < slen; j++) {
-                    uint8_t ch = r[p+38+j];
-                    if (ch < 0x20 || ch > 0x7e) { ok = 0; break; }
-                    ss[j] = (char)ch;
+            if(c==0xc1){
+                const uint8_t *d=r+8,*f=d+RX_DESC_SIZE;
+                uint16_t n=rd_le16(d);
+                if(n>=36&&n<=4000&&f[0]==0x80&&f[1]==0){
+                    char ss[33]={0};uint8_t chan=d[34];
+                    uint8_t sec=(rd_le16(f+34)&0x10)?1:0;
+                    for(uint16_t q=36;q+2<=n;){
+                        uint8_t id=f[q],ln=f[q+1];if((uint32_t)q+2+ln>n)break;
+                        if(id==0&&ln&&ln<=32){int ok=1;for(uint8_t j=0;j<ln;j++){
+                            if(f[q+2+j]<0x20||f[q+2+j]>0x7e){ok=0;break;}
+                            ss[j]=(char)f[q+2+j];}if(!ok)ss[0]=0;}
+                        if(id==3&&ln)chan=f[q+2];
+                        if(id==61&&ln&&!chan)chan=f[q+2];
+                        if(id==48)sec=1;
+                        if(id==221&&ln>=4&&f[q+2]==0&&f[q+3]==0x50&&
+                           f[q+4]==0xf2&&f[q+5]==1)sec=1;
+                        q=(uint16_t)(q+2+ln);
+                    }
+                    if(ss[0]){uint8_t bssid[6];for(int k=0;k<6;k++)bssid[k]=f[16+k];
+                        int before=s_net_count;wifi_add(ss,bssid,chan,sec);
+                        if(s_net_count!=before)printk("[AX200] scan: '%s' ch=%u %s\n",
+                            ss,chan,sec?"[secured]":"[open]");found=1;}
                 }
-                if (!ok) break;
-                ss[slen] = 0;
-                uint16_t cap = (uint16_t)(r[p+34] | (r[p+35] << 8));
-                uint8_t sec = (cap & 0x0010) ? 1 : 0;     /* Privacy bit */
-                uint8_t chan = s_ap_channel;              /* fallback if no DS param */
-                int q = p + 36;                            /* walk IEs */
-                for (int gd = 0; gd < 40 && q < 4090; gd++) {
-                    uint8_t id = r[q], ln = r[q+1];
-                    if (id == 3 && ln >= 1) chan = r[q+2];      /* DS param -> channel (2.4GHz) */
-                    if (id == 61 && ln >= 1 && chan == 0)
-                        chan = r[q+2];                            /* HT Operation -> primary ch (5GHz) */
-                    if (id == 48) sec = 1;                       /* RSN IE -> secured (WPA2/3) */
-                    if (id == 221 && ln >= 4 && r[q+2]==0x00 && r[q+3]==0x50 &&
-                        r[q+4]==0xf2 && r[q+5]==0x01) sec = 1;   /* WPA1 vendor IE -> secured */
-                    q += 2 + ln;
-                }
-                uint8_t bssid[6];
-                for (int k = 0; k < 6; k++) bssid[k] = r[p+16+k];
-                int before = s_net_count;
-                wifi_add(ss, bssid, chan, sec);
-                if (s_net_count != before)
-                    printk("[AX200] scan: '%s' ch=%u %s\n", ss, chan, sec ? "[secured]" : "[open]");
-                found = 1;
-                break;
             }
             if (c == 0x0f && g == 0x00) {
                 printk("[AX200] SCAN_COMPLETE (found Hart=%d)\n", found);
@@ -822,29 +854,31 @@ do_scan(void)
     printk("[AX200] scan timeout (found Hart=%d)\n", found);
 }
 
-/* Data TX queue (allocated dynamically; the FW returns its qid). */
+/* Firmware TX queues: one for management and one for station data. */
 #define TXQ_SLOTS 256
-static volatile uint8_t *s_tx_ring;
-static uint64_t          s_tx_ring_phys;
-static int               s_tx_qid = -1;
-static uint16_t          s_tx_wr;
-static volatile uint8_t *s_tx_bc_va;              /* byte-count table (iwlagn_scd_bc_tbl) */
-static const uint8_t     s_our_mac[6] = {0x02,0x00,0x00,0xae,0x61,0x5a};
+struct ax_txq { volatile uint8_t *ring,*bc; int qid; uint16_t wr,slots; };
+static struct ax_txq s_mgmt_q={.qid=-1},s_data_q={.qid=-1};
+static uint8_t           s_our_mac[6];
+static uint8_t          *s_mac_ctx;
+static uint8_t           s_prepared_bssid[6];
+static uint8_t           s_prepared_channel;
+static int               s_connect_prepared;
 
 /* Transmit an 802.11 frame: a TX_CMD (0x11c) on the data queue, wrapping
  * iwl_tx_cmd_gen2 (len, offload_assist, flags, dram_info, rate_n_flags) + frame. */
-static void
-send_frame(const uint8_t *frame, uint16_t flen, uint32_t rate, const char *tag)
+static int
+send_frame(struct ax_txq *q,const uint8_t *frame,uint16_t flen,
+           uint16_t mac_hdr_len,uint32_t flags,const char *tag)
 {
-    if (s_tx_qid < 0) return;
+    if(q->qid<0)return -1;
     /* TX frames use the SHORT 4-byte cmd header (not the 8-byte wide header that
      * host commands use): [hdr 4][iwl_tx_cmd_gen2 20][802.11 frame]. */
     uint64_t cmd_phys = 0, ftb_phys = 0;
     uint8_t *cmd = dma_alloc((uint64_t)4 + 20 + flen + 64, &cmd_phys);
     uint8_t *ftb = dma_alloc(64, &ftb_phys);
-    if (!cmd || !ftb) { printk("[AX200] TX dma fail\n"); return; }
+    if(!cmd||!ftb){printk("[AX200] TX dma fail\n");return -1;}
 
-    uint16_t seq = (uint16_t)(QUEUE_TO_SEQ(s_tx_qid) | INDEX_TO_SEQ(s_tx_wr));
+    uint16_t seq=(uint16_t)(QUEUE_TO_SEQ(q->qid)|INDEX_TO_SEQ(q->wr));
     cmd[0] = 0x1c; cmd[1] = 0x00;                    /* TX_CMD, group 0 (legacy) —
                                                         iwlwifi leaves group_id=0 for
                                                         the gen2 TX cmd; group 1 makes
@@ -853,24 +887,22 @@ send_frame(const uint8_t *frame, uint16_t flen, uint32_t rate, const char *tag)
     uint8_t *tc = cmd + 4;                           /* iwl_tx_cmd_gen2 */
     tc[0] = (uint8_t)(flen & 0xff); tc[1] = (uint8_t)(flen >> 8);   /* len */
     /* offload_assist: MH_SIZE (mac hdr in 2-byte words) << 8. 24B mgmt hdr = 12. */
-    tc[2] = 0x00; tc[3] = 0x0c;                       /* 12 << 8 = 0x0C00 */
-    wr_le32b(tc + 4, 0x6);                           /* flags ENCRYPT_DIS|HIGH_PRI —
-                                                        matches iwlwifi's live auth TX
-                                                        (0x06, NOT CMD_RATE); rate=0 so
-                                                        the FW uses the TLC rate table */
+    uint16_t mh_words=(uint16_t)(mac_hdr_len/2);
+    tc[2]=0;tc[3]=(uint8_t)mh_words;
+    wr_le32b(tc+4,flags);
     /* dram_info @8 = 0 (8 bytes) */
-    wr_le32b(tc + 16, rate);                          /* rate_n_flags */
+    wr_le32b(tc+16,0);
     mcopy(tc + 20, frame, flen);
 
     uint16_t copy_size = (uint16_t)(4 + 20 + flen);
     uint16_t tb0 = copy_size < IWL_FIRST_TB_SIZE ? copy_size : IWL_FIRST_TB_SIZE;
     mcopy(ftb, cmd, tb0);
-    volatile uint8_t *tfd = s_tx_ring + (uint32_t)s_tx_wr * 256;
+    volatile uint8_t *tfd=q->ring+(uint32_t)q->wr*256;
     tfd[0] = 0; tfd[1] = 0;
     set_tfd_tb(tfd, ftb_phys, tb0);                        /* TB0: first 20 bytes */
     /* Match iwlwifi's TB layout: TB1 ends exactly at the end of the 802.11 header
      * (4 hdr + 20 tx_cmd + 24 mac hdr = 48), payload goes in its own TB. */
-    uint16_t hdr_end = 4 + 20 + 24;
+    uint16_t hdr_end=(uint16_t)(4+20+mac_hdr_len);
     if (hdr_end > tb0)
         set_tfd_tb(tfd, cmd_phys + tb0, (uint16_t)(hdr_end - tb0));   /* TB1 */
     if (copy_size > hdr_end)
@@ -878,10 +910,9 @@ send_frame(const uint8_t *frame, uint16_t flen, uint32_t rate, const char *tag)
 
     /* Byte-count table entry for this TFD (gen2: dword count, 2 TBs -> 0 chunks).
      * byte_cnt = tx_cmd_gen2.len = the 802.11 frame length. */
-    uint16_t idx = s_tx_wr;
+    uint16_t idx=q->wr;
     uint16_t bc = (uint16_t)((flen + 3) / 4);
-    s_tx_bc_va[idx * 2]     = (uint8_t)(bc & 0xff);
-    s_tx_bc_va[idx * 2 + 1] = (uint8_t)((bc >> 8) & 0xff);
+    q->bc[idx*2]=(uint8_t)bc;q->bc[idx*2+1]=(uint8_t)(bc>>8);
 
     /* Dump the built TFD + command so we can byte-compare against iwlwifi. */
     volatile uint8_t *td = tfd;
@@ -890,37 +921,43 @@ send_frame(const uint8_t *frame, uint16_t flen, uint32_t rate, const char *tag)
            cmd[0], cmd[1], cmd[2], cmd[3], tc[0] | (tc[1] << 8),
            tc[3], tc[2], tc[19], tc[18], tc[17], tc[16]);
 
-    s_tx_wr = (uint16_t)((s_tx_wr + 1) & (TXQ_SLOTS - 1));
-    csr_wr(HBUS_TARG_WRPTR, (uint32_t)(s_tx_wr | (s_tx_qid << 16)));   /* v6.6: qid<<16 */
-    printk("[AX200] TX %s (%u B) on qid %d wr->%u bc[%u]=%u\n", tag, flen, s_tx_qid,
-           s_tx_wr, idx, s_tx_bc_va[idx*2] | (s_tx_bc_va[idx*2+1] << 8));
+    q->wr=(uint16_t)((q->wr+1)&(q->slots-1));
+    csr_wr(HBUS_TARG_WRPTR,(uint32_t)(q->wr|(q->qid<<16)));
+    printk("[AX200] TX %s (%u B) qid=%d\n",tag,flen,q->qid);return 0;
 }
 
 /* Allocate a dynamic TX queue for sta_id 0: driver owns the TFD ring + byte-count
- * table, tells the FW their addresses (SCD_QUEUE_CFG 0x11d v2), reads back the qid. */
+ * table, tells the FW their addresses (SCD_QUEUE_CFG 0x1d via LONG_GROUP),
+ * and reads back the qid. */
 static int
-alloc_tx_queue(void)
+alloc_tx_queue(struct ax_txq *q,uint8_t tid)
 {
+    q->slots=(uint16_t)(tid==15?128:TXQ_SLOTS);
     uint64_t rp = 0, bp = 0;
-    s_tx_ring = dma_alloc(TXQ_SLOTS * 256, &rp);
+    q->ring=dma_alloc(TXQ_SLOTS*256,&rp);
     uint8_t *bc = dma_alloc(4096, &bp);
-    if (!s_tx_ring || !bc) { printk("[AX200] txq DMA fail\n"); return -1; }
-    s_tx_ring_phys = rp;
-    s_tx_bc_va = bc;
+    if(!q->ring||!bc){printk("[AX200] txq DMA fail\n");return -1;}q->bc=bc;
+
+    /* Unused gen2 TFDs must point at INVALID_WR_PTR_CMD.  Firmware may inspect
+     * the initial queue window while allocating it; zero TFDs make AX200 FW
+     * assert instead of returning the queue allocation response. */
+    uint64_t invalid_phys = 0;
+    uint8_t *invalid = dma_alloc(8, &invalid_phys);
+    if(!invalid){printk("[AX200] txq invalid DMA fail\n");return -1;}
+    invalid[0]=0x06; invalid[1]=0x0f; invalid[2]=0xff; invalid[3]=0xff;
+    for(uint16_t i=0;i<q->slots;i++)set_tfd_tb(q->ring+(uint32_t)i*256,invalid_phys,8);
 
     uint8_t cmd[24];
     for (int i = 0; i < 24; i++) cmd[i] = 0;
     cmd[0] = 0;                  /* sta_id */
-    cmd[1] = 15;                 /* tid = IWL_MGMT_TID (mgmt frames) */
+    cmd[1]=tid;
     cmd[2] = 1;                  /* flags = TX_QUEUE_CFG_ENABLE_QUEUE (le16) */
-    wr_le32b(cmd + 4, 1);        /* cb_size = ilog2(16)-3 = 1 — iwlwifi's mgmt queue is
-                                    size 16 (IWL_MGMT_QUEUE_SIZE); live trace showed cb_size=1 */
+    wr_le32b(cmd + 4, q->slots==128?4:5); /* FW 59 AX200 min TXQ=128; data TXQ=256 */
     wr_le32b(cmd + 8,  (uint32_t)bp);          /* byte_cnt_addr (le64) */
     wr_le32b(cmd + 12, (uint32_t)(bp >> 32));
     wr_le32b(cmd + 16, (uint32_t)rp);          /* tfdq_addr (le64) */
     wr_le32b(cmd + 20, (uint32_t)(rp >> 32));
 
-    uint16_t before = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
     send_cmd(0x11d, cmd, 24);
     for (int t = 0; t < 30000; t++) {
         uint32_t ie = csr_rd(CSR_INT);
@@ -929,24 +966,199 @@ alloc_tx_queue(void)
             dump_fw_error();
             return -1;
         }
-        uint16_t closed = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
-        for (uint16_t i = before; i != closed; i = (uint16_t)((i + 1) & 511)) {
-            const uint8_t *r = s_rx_buf_va[i & 511];
+        uint16_t closed = *(volatile uint16_t *)s_rb_stts & 511;
+        while(s_rx_read!=closed) {
+            const uint8_t *r=rx_take();
+            if (!r) continue;
             if (r[4] == 0x1d) {                 /* SCD_QUEUE_CFG response */
-                s_tx_qid = (int)(r[8] | (r[9] << 8));   /* iwl_tx_queue_cfg_rsp.queue_number */
-                s_tx_wr = 0;
+                q->qid=(int)(r[8]|(r[9]<<8));
+                q->wr=(uint16_t)((r[12]|(r[13]<<8))&(q->slots-1));
                 printk("[AX200] *** TX queue: qid=%u resp=%x %x %x %x %x %x %x %x ***\n",
-                       s_tx_qid, r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15]);
+                       q->qid,r[8],r[9],r[10],r[11],r[12],r[13],r[14],r[15]);
                 /* No alloc-time doorbell — iwlwifi only rings HBUS_TARG_WRPTR when
                  * it actually queues a TFD. A spurious wr=0 ring can disturb the SCD. */
                 return 0;
             }
         }
-        before = closed;
         busy_wait_us(10);
     }
     printk("[AX200] TX_QUEUE_CFG: no response\n");
     return -1;
+}
+
+#define RX_STATUS_MIC_OK (1u<<6)
+#define RX_STATUS_SEC_MASK (7u<<8)
+#define RX_STATUS_SEC_CCM (2u<<8)
+static const uint8_t s_llc[6]={0xaa,0xaa,0x03,0,0,0};
+
+/* Extract LLC payload from an AX200 RX_MPDU notification. */
+static int rx_data(const uint8_t *r,const uint8_t **payload,uint16_t *len,
+                   const uint8_t **dst,const uint8_t **src,uint16_t *etype)
+{
+    if(!r||r[4]!=0xc1)return -1;
+    const uint8_t *d=r+8,*f=d+RX_DESC_SIZE;
+    uint16_t n=rd_le16(d);if(n<32||n>4000)return -1;
+    uint16_t fc=rd_le16(f);if((fc&0x000c)!=0x0008)return -1;
+    uint16_t h=(fc&0x0080)?26:24,crypt=(fc&0x4000)?8:0;
+    uint32_t status=rd_le32(d+12);
+    if(crypt&&((status&RX_STATUS_SEC_MASK)!=RX_STATUS_SEC_CCM||!(status&RX_STATUS_MIC_OK)))return -1;
+    uint16_t trailer=(uint16_t)((d[2]&0xf0)>>3);if(n>trailer)n-=trailer;
+    uint16_t pad=(d[3]&0x20)?2:0;if(n<h+crypt+pad+8)return -1;
+    const uint8_t *llc=f+h+crypt+pad;
+    for(int i=0;i<6;i++)if(llc[i]!=s_llc[i])return -1;
+    *payload=llc+8;*len=(uint16_t)(n-h-crypt-pad-8);
+    *etype=rd_be16(llc+6);
+    *dst=f+4;*src=f+16;return 0;
+}
+
+static int tx_data(const uint8_t dst[6],uint16_t etype,const uint8_t *p,
+                   uint16_t len,int encrypt,const char *tag)
+{
+    if(len>1500||s_data_q.qid<0)return -1;
+    uint8_t f[1550];uint16_t n=0;
+    f[n++]=0x08;f[n++]=(uint8_t)(0x01|(encrypt?0x40:0));
+    f[n++]=0;f[n++]=0;
+    for(int i=0;i<6;i++)f[n++]=s_ap_bssid[i];
+    for(int i=0;i<6;i++)f[n++]=s_our_mac[i];
+    for(int i=0;i<6;i++)f[n++]=dst[i];
+    f[n++]=0;f[n++]=0;
+    for(int i=0;i<6;i++)f[n++]=s_llc[i];
+    f[n++]=(uint8_t)(etype>>8);f[n++]=(uint8_t)etype;
+    for(uint16_t i=0;i<len;i++)f[n++]=p[i];
+    return send_frame(&s_data_q,f,n,24,encrypt?0:0x6,tag);
+}
+
+static int install_ccmp(const uint8_t key[16],uint8_t keyid,int multicast)
+{
+    uint8_t c[80];for(int i=0;i<80;i++)c[i]=0;c[0]=0;c[1]=keyid;
+    uint16_t flags=(uint16_t)(2|8|((uint16_t)keyid<<8)|(multicast?(1u<<14):0));
+    c[2]=(uint8_t)flags;c[3]=(uint8_t)(flags>>8);for(int i=0;i<16;i++)c[4+i]=key[i];
+    send_cmd(0x117,c,76); /* FW 59 advertises TKIP_MIC_KEYS: v2 key ABI */
+    uint32_t status=0;
+    if(wait_notif(0x17,1,1000,&status)<0){printk("[AX200] WPA2: key install timeout\n");return -1;}
+    if(status!=1){printk("[AX200] WPA2: key install rejected (%x)\n",status);return -1;}
+    return 0;
+}
+
+static int mic_equal(const uint8_t *a,const uint8_t *b)
+{ uint8_t d=0;for(int i=0;i<16;i++)d|=a[i]^b[i];return d==0; }
+
+static void secure_wipe(void *p,size_t n)
+{ volatile uint8_t *v=p;while(n--)*v++=0; }
+
+static int replay_greater(const uint8_t a[8],const uint8_t b[8])
+{ for(int i=0;i<8;i++)if(a[i]!=b[i])return a[i]>b[i];return 0; }
+
+static int send_eapol_key(const uint8_t *in,uint16_t info,const uint8_t nonce[32],
+                          const uint8_t *keydata,uint16_t kdlen)
+{
+    uint8_t e[160];uint16_t n=(uint16_t)(99+kdlen);if(n>sizeof(e))return -1;
+    for(uint16_t i=0;i<n;i++)e[i]=0;
+    e[0]=2;e[1]=3;wr_be16(e+2,(uint16_t)(n-4));e[4]=2;
+    wr_be16(e+5,info);e[7]=in[7];e[8]=in[8];for(int i=0;i<8;i++)e[9+i]=in[9+i];
+    if(nonce)for(int i=0;i<32;i++)e[17+i]=nonce[i];
+    wr_be16(e+97,kdlen);
+    for(uint16_t i=0;i<kdlen;i++)e[99+i]=keydata[i];
+    wpa2_mic(s_ptk,e,n,e+81);
+    return tx_data(s_ap_bssid,0x888e,e,n,0,"EAPOL");
+}
+
+static int find_gtk(const uint8_t *p,uint16_t len,uint8_t gtk[16],uint8_t *keyid)
+{
+    for(uint16_t i=0;i+2<=len;){uint8_t l=p[i+1];if(i+2+l>len)break;
+        if(p[i]==0xdd&&l>=22&&p[i+2]==0&&p[i+3]==0x0f&&p[i+4]==0xac&&p[i+5]==1){
+            *keyid=p[i+6]&3;for(int k=0;k<16;k++)gtk[k]=p[i+8+k];return 0;}
+        i=(uint16_t)(i+2+l);
+    }return -1;
+}
+
+static int wpa2_handshake(void)
+{
+    uint8_t pmk[32],anonce[32],snonce[32],e[512],gtk[16],plain[256],replay[8],keyid=0;
+    int rc=-1;
+    wpa2_pmk(s_passphrase,s_passphrase_len,(const uint8_t *)s_target_ssid,
+             (size_t)__builtin_strlen(s_target_ssid),pmk);
+    if(random_get_bytes(snonce,32)!=0){printk("[AX200] WPA2: entropy unavailable\n");goto out;}
+    int state=0;
+    for(int t=0;t<1000000;t++){
+        uint16_t closed=*(volatile uint16_t *)s_rb_stts&511;
+        while(s_rx_read!=closed){const uint8_t *r=rx_take(),*p,*da,*sa;uint16_t l,et;
+            if(rx_data(r,&p,&l,&da,&sa,&et)||et!=0x888e||l<99||l>sizeof(e))continue;
+            for(uint16_t i=0;i<l;i++)e[i]=p[i];
+            uint16_t info=rd_be16(e+5);
+            if(state==0&&(info&0x0088)==0x0088&&!(info&0x0100)){
+                for(int i=0;i<32;i++)anonce[i]=e[17+i];
+                for(int i=0;i<8;i++)replay[i]=e[9+i];
+                wpa2_ptk(pmk,s_ap_bssid,s_our_mac,anonce,snonce,s_ptk);
+                static const uint8_t rsn[]={48,20,1,0,0,15,172,4,1,0,0,15,172,4,1,0,0,15,172,2,0,0};
+                if(send_eapol_key(e,0x010a,snonce,rsn,sizeof(rsn))<0)goto out;
+                state=1;
+                printk("[AX200] WPA2: message 2/4 sent\n");
+            }else if(state==1&&(info&0x01c8)==0x01c8){
+                if(!replay_greater(e+9,replay)){printk("[AX200] WPA2: replayed message 3\n");goto out;}
+                uint8_t want[16],got[16];for(int i=0;i<16;i++){got[i]=e[81+i];e[81+i]=0;}
+                wpa2_mic(s_ptk,e,l,want);if(!mic_equal(got,want)){printk("[AX200] WPA2: bad message 3 MIC\n");goto out;}
+                for(int i=0;i<32;i++)if(e[17+i]!=anonce[i])goto out;
+                uint16_t kl=rd_be16(e+97);if(99u+kl>l||kl>sizeof(plain))goto out;
+                int pl=(info&0x1000)?wpa2_aes_unwrap(s_ptk+16,e+99,kl,plain):kl;
+                if(!(info&0x1000))for(uint16_t i=0;i<kl;i++)plain[i]=e[99+i];
+                if(pl<0||find_gtk(plain,(uint16_t)pl,gtk,&keyid)<0){printk("[AX200] WPA2: GTK missing\n");goto out;}
+                if(install_ccmp(s_ptk+32,0,0)||install_ccmp(gtk,keyid,1))goto out;
+                if(send_eapol_key(e,0x030a,0,0,0)<0)goto out;
+                printk("[AX200] WPA2: 4-way handshake complete (CCMP)\n");rc=0;goto out;
+            }
+        }busy_wait_us(10);
+    }printk("[AX200] WPA2: handshake timeout\n");
+out:
+    secure_wipe(pmk,sizeof(pmk));secure_wipe(snonce,sizeof(snonce));
+    secure_wipe(gtk,sizeof(gtk));secure_wipe(plain,sizeof(plain));secure_wipe(e,sizeof(e));
+    if(rc)secure_wipe(s_ptk,sizeof(s_ptk));
+    return rc;
+}
+
+static int wifi_send(netdev_t *dev,const void *pkt,uint16_t len)
+{
+    (void)dev;if(!s_associated||len<14)return -1;const uint8_t *e=pkt;
+    return tx_data(e,rd_be16(e+12),e+14,(uint16_t)(len-14),s_ap_sec,"data");
+}
+
+static uint16_t s_rx_seq[16];
+static uint8_t s_rx_seq_valid[16];
+
+static int wifi_rx_duplicate(const uint8_t *r)
+{
+    const uint8_t *f=r+8+RX_DESC_SIZE;
+    uint16_t fc=rd_le16(f),seq=rd_le16(f+22);
+    uint8_t tid=(fc&0x0080)?(f[24]&15):0;
+    int dup=(fc&0x0800)&&s_rx_seq_valid[tid]&&s_rx_seq[tid]==seq;
+    s_rx_seq[tid]=seq;s_rx_seq_valid[tid]=1;
+    return dup;
+}
+
+static void wifi_poll(netdev_t *dev)
+{
+    if(!s_associated)return;
+    uint16_t closed=*(volatile uint16_t *)s_rb_stts&511;
+    while(s_rx_read!=closed){const uint8_t *r=rx_take(),*p,*da,*sa;uint16_t l,et;
+        if(rx_data(r,&p,&l,&da,&sa,&et)||wifi_rx_duplicate(r))continue;
+        if(et==0x888e||l>1500)continue;
+        uint8_t frame[1514];for(int i=0;i<6;i++){frame[i]=da[i];frame[6+i]=sa[i];}
+        frame[12]=(uint8_t)(et>>8);frame[13]=(uint8_t)et;for(uint16_t i=0;i<l;i++)frame[14+i]=p[i];
+        netdev_rx_deliver(dev,frame,(uint16_t)(14+l));
+    }
+}
+
+static int register_wifi_netdev(void)
+{
+    if(s_netdev_registered)return 0;
+    if(netdev_get("eth0"))return -1;
+    __builtin_memset(&s_wifi_dev,0,sizeof(s_wifi_dev));
+    s_wifi_dev.name[0]='e';s_wifi_dev.name[1]='t';s_wifi_dev.name[2]='h';s_wifi_dev.name[3]='0';
+    for(int i=0;i<6;i++)s_wifi_dev.mac[i]=s_our_mac[i];
+    s_wifi_dev.mtu=1500;
+    s_wifi_dev.send=wifi_send;s_wifi_dev.poll=wifi_poll;
+    if(netdev_register(&s_wifi_dev)<0)return -1;
+    s_netdev_registered=1;return 0;
 }
 
 /* Phase 4: associate to the (open) target AP. Built up command-by-command; each
@@ -958,6 +1170,11 @@ do_connect(void)
     printk("[AX200] --- connect: target ch=%u ---\n", s_ap_channel);
     uint64_t phys;
     uint8_t c[64];
+    uint8_t *m=s_mac_ctx;
+    int reuse=s_connect_prepared&&s_prepared_channel==s_ap_channel;
+    for(int i=0;i<6&&reuse;i++)if(s_prepared_bssid[i]!=s_ap_bssid[i])reuse=0;
+    if(s_connect_prepared&&!reuse){printk("[AX200] connect: target change requires reboot\n");return;}
+    if(reuse)goto session_protect;
     for (int i = 0; i < 64; i++) c[i] = 0;
 
     /* Step 1: PHY_CONTEXT_CMD (0x08, group 0) — configure the PHY for the AP's
@@ -987,7 +1204,9 @@ do_connect(void)
 
     /* Step 2: MAC_CONTEXT_CMD (0x128 v5, 144B) — add our BSS_STA MAC, not yet
      * associated. iwl_mac_ctx_cmd: common hdr + ac[5] EDCA + iwl_mac_data_sta. */
-    uint8_t *m = dma_alloc(256, &phys); (void)phys;
+    m = dma_alloc(256, &phys); (void)phys;
+    if(!m)return;
+    s_mac_ctx=m;
     for (int i = 0; i < 256; i++) m[i] = 0;
     wr_le32b(m + 0, 0);                    /* id_and_color: id=0 color=1 */
     wr_le32b(m + 4, FW_CTXT_ACTION_ADD);
@@ -1073,6 +1292,7 @@ do_connect(void)
         printk("[AX200] TLC_CONFIG ok — station rate table set\n");
     }
 
+session_protect:
     /* Step 5: session protection — reserve on-channel airtime for the auth/assoc
      * exchange (a non-associated station isn't otherwise kept on-channel).
      * SESSION_PROTECTION_CMD (0x305, MAC_CONF_GROUP): action=ADD, conf=ASSOC. */
@@ -1093,11 +1313,11 @@ do_connect(void)
         if (send_check(0x305, sp, 24, "SESSION_PROT") != 0) return;
         s_rx_read = pre_sp;
         for (int t = 0; t < 150000; t++) {    /* wait for the START notif (0xFB, start=1) */
-            uint16_t closed = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
+            uint16_t closed = *(volatile uint16_t *)s_rb_stts & 511;
             int got = 0;
             while (s_rx_read != closed) {
-                const uint8_t *r = s_rx_buf_va[s_rx_read & 511];
-                s_rx_read++;
+                const uint8_t *r = rx_take();
+                if (!r) continue;
                 /* iwl_mvm_session_prot_notif: status[12], start[16], conf[20]. */
                 if (r[4] == 0xfb && r[16] == 1) {
                     printk("[AX200] session-prot STARTED (status=%u conf=%u) — on-channel\n",
@@ -1112,8 +1332,12 @@ do_connect(void)
 
     /* Step 5b: allocate the data TX queue AFTER session protection (iwlwifi order:
      * the queue is allocated lazily right before the first frame, on-channel). */
-    if (alloc_tx_queue() != 0) return;
-    printk("[AX200] TX queue ready\n");
+    if(s_mgmt_q.qid<0){
+        if(alloc_tx_queue(&s_mgmt_q,15)!=0)return;
+        printk("[AX200] TX queue ready\n");
+    }
+    s_connect_prepared=1;s_prepared_channel=s_ap_channel;
+    for(int i=0;i<6;i++)s_prepared_bssid[i]=s_ap_bssid[i];
 
     /* Step 6: open-system AUTH, then (on success) an ASSOCIATION request. */
     uint8_t f[64];
@@ -1133,7 +1357,7 @@ do_connect(void)
     for (int i = 0; i < 6; i++) { a[4+i] = s_ap_bssid[i]; a[10+i] = s_our_mac[i]; a[16+i] = s_ap_bssid[i]; }
     a[22] = 0x10; a[23] = 0;                   /* seq ctrl */
     an = 24;
-    a[an++] = 0x11; a[an++] = 0x00;            /* capability: ESS + Privacy (WPA2 AP) */
+    a[an++]=(uint8_t)(s_ap_sec?0x11:0x01);a[an++]=0;
     a[an++] = 0x0a; a[an++] = 0x00;            /* listen interval */
     a[an++] = 0;   a[an++] = (uint8_t)ssid_len;               /* SSID IE */
     for (int i = 0; i < ssid_len; i++) a[an++] = (uint8_t)s_target_ssid[i];
@@ -1142,22 +1366,28 @@ do_connect(void)
     a[an++]=0x0c; a[an++]=0x12; a[an++]=0x18; a[an++]=0x24;
     a[an++] = 50;  a[an++] = 4;                /* extended supported rates */
     a[an++]=0x30; a[an++]=0x48; a[an++]=0x60; a[an++]=0x6c;
+    if(s_ap_sec){
+        static const uint8_t rsn[]={48,20,1,0,0,15,172,4,1,0,0,15,172,4,
+                                    1,0,0,15,172,2,0,0};
+        for(unsigned i=0;i<sizeof(rsn);i++)a[an++]=rsn[i];
+    }
 
-    s_rx_read = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
-    send_frame(f, 30, 0, "auth");
+    rx_skip_pending();
+    send_frame(&s_mgmt_q,f,30,24,0x6,"auth");
     printk("[AX200] watch start rb_stts=%u qid=%d\n",
-           *(volatile uint16_t *)s_rb_stts & 0x0FFFu, s_tx_qid);
+           *(volatile uint16_t *)s_rb_stts&0x0fffu,s_mgmt_q.qid);
 
     int authed = 0;
     for (int t = 0; t < 400000; t++) {         /* ~4s */
+        if(!authed&&t&&t%50000==0)send_frame(&s_mgmt_q,f,30,24,0x6,"auth-retry");
         uint32_t ie = csr_rd(CSR_INT);
         if (ie & (CSR_INT_BIT_SW_ERR | CSR_INT_BIT_HW_ERR)) {
             printk("[AX200] TX ASSERTED CSR_INT=0x%x\n", ie); dump_fw_error(); return;
         }
-        uint16_t closed = *(volatile uint16_t *)s_rb_stts & 0x0FFFu;
+        uint16_t closed = *(volatile uint16_t *)s_rb_stts & 511;
         while (s_rx_read != closed) {
-            const uint8_t *r = s_rx_buf_va[s_rx_read & 511];
-            s_rx_read++;
+            const uint8_t *r = rx_take();
+            if (!r) continue;
             if (r[4] == 0x1c)                  /* TX response: status in the payload */
                 printk("[AX200]   TX-RESP status=0x%x\n", r[8]);
             for (int o = 8; o < 300; o++) {    /* find a mgmt frame addressed to us */
@@ -1169,7 +1399,7 @@ do_connect(void)
                         printk("[AX200] AUTH reply: seq=%u status=%u\n", r[o+22], st);
                         if (st == 0) {
                             authed = 1;
-                            send_frame(a, (uint16_t)an, 0, "assoc-req");
+                            send_frame(&s_mgmt_q,a,(uint16_t)an,24,0x6,"assoc-req");
                             printk("[AX200] authenticated — assoc request sent\n");
                         }
                     } else if (fc == 0x10) {               /* ASSOC response */
@@ -1177,6 +1407,11 @@ do_connect(void)
                         uint16_t aid = (uint16_t)((r[o+24] | (r[o+25] << 8)) & 0x3fff);
                         printk("[AX200] *** ASSOC RESP status=%u AID=%u ***\n", status, aid);
                         if (status == 0) {
+                            wr_le32b(m+100,1);wr_le32b(m+136,aid);
+                            if(send_check(0x128,m,148,"MAC_CTXT_ASSOC")!=0){s_associated=0;return;}
+                            if(s_data_q.qid<0&&alloc_tx_queue(&s_data_q,0)!=0){s_associated=0;return;}
+                            if(s_ap_sec&&wpa2_handshake()!=0){s_associated=0;return;}
+                            if(register_wifi_netdev()!=0){s_associated=0;return;}
                             s_associated = 1;
                             printk("[AX200] *** ASSOCIATED to '%s' (AID=%u) — link up ***\n",
                                    s_target_ssid, aid);
@@ -1225,21 +1460,28 @@ int iwl_wifi_rescan(void)
     return s_net_count;
 }
 
-int iwl_wifi_connect(const char *ssid)
+int iwl_wifi_connect(const char *ssid,const char *pass,uint8_t pass_len)
 {
     if (!s_present) return -1;
+    if(s_associated){int i=0;while(ssid[i]&&ssid[i]==s_target_ssid[i])i++;
+        return ssid[i]==s_target_ssid[i]?0:-5;}
     for (int i = 0; i < s_net_count; i++) {
         int k = 0;
         while (ssid[k] && s_nets[i].ssid[k] == ssid[k]) k++;
         if (s_nets[i].ssid[k] == 0 && ssid[k] == 0) {   /* match */
+            if((s_nets[i].sec&&(pass_len<8||pass_len>63))||(!s_nets[i].sec&&pass_len))return -4;
             for (int b = 0; b < 6; b++) s_ap_bssid[b] = s_nets[i].bssid[b];
             s_ap_channel = s_nets[i].channel;
+            s_ap_sec=s_nets[i].sec;s_passphrase_len=pass_len;
+            for(uint8_t x=0;x<pass_len;x++)s_passphrase[x]=(uint8_t)pass[x];
             int j = 0;
             for (; s_nets[i].ssid[j]; j++) s_target_ssid[j] = s_nets[i].ssid[j];
             s_target_ssid[j] = 0;
             s_ap_found = 1;
             s_associated = 0;
             do_connect();
+            for(unsigned x=0;x<sizeof(s_passphrase);x++)s_passphrase[x]=0;
+            s_passphrase_len=0;
             return s_associated ? 0 : -3;   /* -3 = attempted but not associated */
         }
     }
@@ -1261,6 +1503,7 @@ load_firmware_and_kick(uint32_t hw_rev)
     }
     s_rb_stts = rb_stts;
     s_used_bd = used_bd;
+    s_free_rbd = free_rbd;
     s_cmd_ring = cmd_ring;
     s_cmd_wr = 0;
 
@@ -1275,6 +1518,7 @@ load_firmware_and_kick(uint32_t hw_rev)
             return -1;
         }
         s_rx_buf_va[i] = bva;
+        s_rx_buf_phys[i] = bp;
         free_rbd[i] = bp | (uint64_t)(i + 1);
     }
 
@@ -1342,6 +1586,7 @@ load_firmware_and_kick(uint32_t hw_rev)
             if (init_after_alive() == 0) {
                 s_present = 1;
                 do_scan();
+                if(!netdev_get("eth0"))register_wifi_netdev();
                 printk("[AX200] ready — %d network(s) scanned\n", s_net_count);
             }
             return 0;
@@ -1385,6 +1630,12 @@ iwl_ax200_init(void)
     printk("[AX200] OK: found Intel Wi-Fi 6 AX200 at %x:%x.%x\n",
            (unsigned)found->bus, (unsigned)found->dev, (unsigned)found->fn);
 
+    if(random_get_bytes(s_our_mac,sizeof(s_our_mac))!=0){
+        printk("[AX200] FAIL: entropy unavailable for station address\n");
+        return;
+    }
+    s_our_mac[0]=(uint8_t)((s_our_mac[0]|2)&0xfe);
+
     /* 2. Enable Memory space + Bus Master (BusMaster needed for the DMA rings
      * we set up in later phases; Memory space to reach BAR0). */
     {
@@ -1411,7 +1662,12 @@ iwl_ax200_init(void)
     }
     {
         uint64_t pa = found->bar[0] & ~0xFFFULL;   /* strip BAR type bits; 4K-aligned */
-        s_mmio = (volatile uint8_t *)(map_bar(pa, 4) + (found->bar[0] & 0xFFFULL));
+        uintptr_t va = map_bar(pa, 4);
+        if (!va) {
+            printk("[AX200] FAIL: out of memory mapping BAR0\n");
+            return;
+        }
+        s_mmio = (volatile uint8_t *)(va + (found->bar[0] & 0xFFFULL));
     }
 
     /* 4b. SW-reset the device core. A bare PCI FLR (e.g. VFIO on VM restart)

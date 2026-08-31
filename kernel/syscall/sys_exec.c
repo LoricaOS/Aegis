@@ -104,6 +104,8 @@ sys_execve(syscall_frame_t *frame,
            uint64_t path_uptr, uint64_t argv_uptr, uint64_t envp_uptr)
 {
     aegis_process_t *proc = current_proc();
+    if (!random_is_ready())
+        return SYS_ERR(EAGAIN);
     /* Allocate argv working area from kva — too large for kernel stack. */
     execve_argbuf_t *abuf = kva_alloc_pages(EXECVE_ARGBUF_PAGES);
     if (!abuf)
@@ -305,10 +307,13 @@ reload_binary:
     if (proc->vfork_parent) {
         uint64_t new_pml4 = vmm_create_user_pml4();
         if (!new_pml4) { ret = SYS_ERR(ENOMEM); goto done; }
+        if (vma_init(proc) != 0) {
+            vmm_free_user_pml4(new_pml4);
+            ret = SYS_ERR(ENOMEM);
+            goto done;
+        }
         proc->pml4_phys = new_pml4;
         vmm_switch_to(new_pml4);
-        vma_free(proc);   /* drop our ref to the parent's shared vma_table */
-        vma_init(proc);   /* fresh, independent table for the new image */
         aegis_task_t *vp = proc->vfork_parent;
         proc->vfork_parent = (void *)0;
         /* vfork window over: thaw the parent's thread group BEFORE waking it (a
@@ -764,6 +769,8 @@ sys_spawn(uint64_t path_uptr, uint64_t argv_uptr,
 
     if (proc_fork_count() >= MAX_PROCESSES)
         return SYS_ERR(EAGAIN);
+    if (!random_is_ready())
+        return SYS_ERR(EAGAIN);
 
     /* Allocate argv working area from kva — too large for kernel stack. */
     execve_argbuf_t *abuf = kva_alloc_pages(EXECVE_ARGBUF_PAGES);
@@ -870,7 +877,12 @@ sys_spawn(uint64_t path_uptr, uint64_t argv_uptr,
      * spawner's table — an unbounded per-spawn VmSize leak that eventually
      * exhausted the spawner's vma_table.  vma_free runs on every fail path
      * below (fail_child, and the main-ELF inline cleanup). */
-    vma_init((struct aegis_process *)child);
+    if (vma_init((struct aegis_process *)child) != 0) {
+        vmm_free_user_pml4(child->pml4_phys);
+        kva_free_pages(child, 2);
+        result = SYS_ERR(ENOMEM);
+        goto fail_early;
+    }
 
     /* 6. Load ELF into child's PML4 */
     elf_load_result_t er;
@@ -1155,11 +1167,6 @@ sys_spawn(uint64_t path_uptr, uint64_t argv_uptr,
 
     /* cwd: inherit from parent */
     __builtin_memcpy(child->cwd, parent->cwd, sizeof(parent->cwd));
-
-    /* VFS confinement: inherit the parent's scope, or spawn would be a
-     * confinement-escape (a confined process could spawn an unconfined child). */
-    __builtin_memcpy(child->vfs_scope, parent->vfs_scope, sizeof(parent->vfs_scope));
-    child->vfs_scope_len = parent->vfs_scope_len;
 
     /* VMA tracking for the stack.  The table was already allocated in step 5a
      * (vma_init, before elf_load) and now also holds the child's ELF segments.

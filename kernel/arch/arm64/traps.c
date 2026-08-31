@@ -72,13 +72,13 @@ idt_init(void)
  * the EL1 data-abort handler must redirect to the fixup, returning "8 bytes
  * not copied". If the table/handler were broken this would panic the boot.
  * Runs once after vmm_init (device idmap active in TTBR0). */
-uint64_t arm64_uaccess_copy(void *dst, const void *src, uint64_t len);
+uint64_t arm64_copy_from_user(void *dst, const void *src, uint64_t len);
 
 void
 uaccess_selftest(void)
 {
     uint8_t buf[8];
-    uint64_t not_copied = arm64_uaccess_copy(buf, (const void *)0x50000000UL, 8);
+    uint64_t not_copied = arm64_copy_from_user(buf, (const void *)0x50000000UL, 8);
     if (not_copied == 8)
         printk("[UACCESS] OK: EL1 fault fixup (%lu/8 uncopied)\n", not_copied);
     else

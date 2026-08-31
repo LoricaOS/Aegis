@@ -43,9 +43,7 @@
 
 /* Staged fd for SCM_RIGHTS passing */
 typedef struct {
-    const vfs_ops_t *ops;
-    void            *priv;
-    uint32_t         flags;
+    vfs_file_t file;
 } unix_passed_fd_t;
 
 /* Max fds per SCM_RIGHTS send. Canonical value + sizing rationale live in

@@ -2,6 +2,7 @@
 #include "udp.h"
 #include "../lib/string.h"
 #include "ip.h"
+#include "ipv6.h"
 #include "socket.h"
 #include "epoll.h"
 #include "spinlock.h"
@@ -57,6 +58,22 @@ int udp_send(netdev_t *dev, uint16_t src_port, ip4_addr_t dst_ip,
     return ip_send(dev, dst_ip, IP_PROTO_UDP, pkt, udp_len);
 }
 
+int udp6_send(netdev_t *dev, uint16_t src_port, const ip6_addr_t *dst_ip,
+              uint16_t dst_port, const void *payload, uint16_t len)
+{
+    if (!dev || len > UDP_TX_MAX - sizeof(udp_hdr_t)) return -1;
+    uint16_t udp_len = (uint16_t)(sizeof(udp_hdr_t) + len);
+    uint8_t pkt[UDP_TX_MAX];
+    udp_hdr_t *h = (udp_hdr_t *)pkt;
+    h->src_port = htons(src_port); h->dst_port = htons(dst_port);
+    h->length = htons(udp_len); h->checksum = 0;
+    if (len) kmemcpy(pkt + sizeof(*h), payload, len);
+    ip6_addr_t src; ipv6_get_linklocal(&src);
+    uint16_t c = ipv6_l4_checksum(&src, dst_ip, IP6_PROTO_UDP, pkt, udp_len);
+    h->checksum = htons(c ? c : 0xffff);
+    return ipv6_send(dev, dst_ip, IP6_PROTO_UDP, pkt, udp_len);
+}
+
 /* S4: UDP pseudo-header checksum validation.
  * Computes one's-complement sum over pseudo-header + UDP header + payload.
  * Returns 0 if valid, non-zero if corrupted. */
@@ -85,43 +102,26 @@ udp_checksum_verify(uint32_t src_ip, uint32_t dst_ip,
     return (uint16_t)~sum;
 }
 
-void udp_rx(netdev_t *dev, ip4_addr_t src_ip, ip4_addr_t dst_ip,
-            const void *udp_data, uint16_t len)
+static void
+udp_deliver(uint8_t family, ip4_addr_t src_ip, ip4_addr_t dst_ip,
+            const ip6_addr_t *src_ip6, const ip6_addr_t *dst_ip6,
+            const udp_hdr_t *hdr, uint16_t udp_claimed)
 {
-    (void)dev;
-    if (len < (uint16_t)sizeof(udp_hdr_t)) return;
     irqflags_t fl = spin_lock_irqsave(&udp_lock);
-
-    /* Deferred socket wake/notify — avoids udp_lock → sock_lock inversion. */
     uint32_t wake_sid = SOCK_NONE;
-
-    const udp_hdr_t *hdr      = (const udp_hdr_t *)udp_data;
-    uint16_t udp_claimed = ntohs(hdr->length);
-    if (udp_claimed < (uint16_t)sizeof(udp_hdr_t)) goto udp_out;  /* malformed */
-    if (udp_claimed > len) goto udp_out;                           /* truncated */
-
-    /* S4: Validate UDP checksum (skip if checksum field is 0 per RFC 768). */
-    if (hdr->checksum != 0) {
-        if (udp_checksum_verify(src_ip, dst_ip,
-                                (const uint8_t *)hdr, udp_claimed) != 0)
-            goto udp_out;  /* drop corrupted packet */
-    }
-
-    {
     uint16_t dst_port  = ntohs(hdr->dst_port);
     uint16_t src_port  = ntohs(hdr->src_port);
     uint16_t payload_len = (uint16_t)(udp_claimed - (uint16_t)sizeof(udp_hdr_t));
-    const uint8_t *payload = (const uint8_t *)udp_data + sizeof(udp_hdr_t);
-    int i;
+    const uint8_t *payload = (const uint8_t *)hdr + sizeof(udp_hdr_t);
 
-    for (i = 0; i < UDP_BINDINGS_MAX; i++) {
+    for (int i = 0; i < UDP_BINDINGS_MAX; i++) {
         if (s_udp[i].port != dst_port || s_udp[i].port == 0)
             continue;
         uint32_t sid = s_udp[i].sock_id;
         if (sid == SOCK_NONE)
             continue;                 /* stale entry — keep scanning */
         sock_t *s = sock_get_nolock(sid);
-        if (!s)
+        if (!s || s->domain != family)
             continue;                 /* slot freed under us — keep scanning */
 
         /* Local-IP demux: a socket bound to a specific local address
@@ -130,8 +130,13 @@ void udp_rx(netdev_t *dev, ip4_addr_t src_ip, ip4_addr_t dst_ip,
          * order; INADDR_ANY (0) is the wildcard and matches everything.
          * Matches Linux: a bind to 10.0.0.5 won't see traffic to a
          * different local address (or limited broadcast). */
-        if (s->local_ip != INADDR_ANY && s->local_ip != dst_ip)
-            continue;
+        if (family == AF_INET) {
+            if (s->local_ip != INADDR_ANY && s->local_ip != dst_ip) continue;
+        } else {
+            static const ip6_addr_t any;
+            if (!ipv6_addr_equal(&s->local_ip6, &any) &&
+                !ipv6_addr_equal(&s->local_ip6, dst_ip6)) continue;
+        }
 
         /* Connected-UDP peer filter: a UDP socket that has called
          * connect() only receives datagrams from its connected peer
@@ -141,8 +146,9 @@ void udp_rx(netdev_t *dev, ip4_addr_t src_ip, ip4_addr_t dst_ip,
          * source.  This both fixes the conformance gap and closes an
          * off-path injection vector against connected sockets. */
         if (s->state == SOCK_CONNECTED) {
-            if (s->remote_ip != src_ip || s->remote_port != src_port)
-                continue;
+            if (s->remote_port != src_port) continue;
+            if (family == AF_INET && s->remote_ip != src_ip) continue;
+            if (family == AF_INET6 && !ipv6_addr_equal(&s->remote_ip6, src_ip6)) continue;
         }
 
         /* Ring is lazily allocated for DGRAM sockets; a matched bound socket
@@ -158,7 +164,9 @@ void udp_rx(netdev_t *dev, ip4_addr_t src_ip, ip4_addr_t dst_ip,
         for (j = 0; j < payload_len; j++)
             slot->data[j] = payload[j];
         slot->len      = payload_len;
+        slot->family   = family;
         slot->src_ip   = src_ip;
+        if (src_ip6) slot->src_ip6 = *src_ip6;
         slot->src_port = src_port;
         slot->in_use   = 1;
         /* Publish the filled slot last.  On x86 stores are ordered, so a
@@ -169,7 +177,6 @@ void udp_rx(netdev_t *dev, ip4_addr_t src_ip, ip4_addr_t dst_ip,
         __atomic_store_n(&s->udp_rx_tail, next, __ATOMIC_RELEASE);
         wake_sid = sid;
         goto udp_out;
-    }
     }
     /* No binding: drop silently. */
 udp_out:
@@ -185,6 +192,31 @@ udp_out:
             if (s_wake) waitq_wake_all(&s_wake->poll_waiters);
         }
     }
+}
+
+void udp_rx(netdev_t *dev, ip4_addr_t src_ip, ip4_addr_t dst_ip,
+            const void *udp_data, uint16_t len)
+{
+    (void)dev;
+    if (len < sizeof(udp_hdr_t)) return;
+    const udp_hdr_t *h = (const udp_hdr_t *)udp_data;
+    uint16_t claimed = ntohs(h->length);
+    if (claimed < sizeof(*h) || claimed > len) return;
+    if (h->checksum && udp_checksum_verify(src_ip, dst_ip,
+                                            (const uint8_t *)h, claimed) != 0) return;
+    udp_deliver(AF_INET, src_ip, dst_ip, 0, 0, h, claimed);
+}
+
+void udp6_rx(netdev_t *dev, const ip6_addr_t *src_ip, const ip6_addr_t *dst_ip,
+             const void *udp_data, uint16_t len)
+{
+    (void)dev;
+    if (len < sizeof(udp_hdr_t)) return;
+    const udp_hdr_t *h = (const udp_hdr_t *)udp_data;
+    uint16_t claimed = ntohs(h->length);
+    if (claimed < sizeof(*h) || claimed > len || h->checksum == 0) return;
+    if (ipv6_l4_checksum(src_ip, dst_ip, IP6_PROTO_UDP, h, claimed) != 0) return;
+    udp_deliver(AF_INET6, 0, 0, src_ip, dst_ip, h, claimed);
 }
 
 /* udp_bind: register a sock_id for the given port. Returns 0 or -1.

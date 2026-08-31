@@ -236,7 +236,8 @@ proc_spawn(const uint8_t *elf_data, size_t elf_len)
         sp_va -= 16;
         {
             uint8_t rand_bytes[16];
-            random_get_bytes(rand_bytes, 16);
+            if (random_get_bytes(rand_bytes, 16) != 0)
+                panic_halt("[RNG] FAIL: init requires a seeded random pool");
             vmm_write_user_bytes(proc->pml4_phys, sp_va, rand_bytes, 16);
         }
         uint64_t at_random_va = sp_va;
@@ -405,7 +406,8 @@ proc_spawn(const uint8_t *elf_data, size_t elf_len)
     proc->mmap_free_count  = 0;
 
     /* Initialize VMA tracking */
-    vma_init((struct aegis_process *)proc);
+    if (vma_init((struct aegis_process *)proc) != 0)
+        panic_halt("[PROC] FAIL: out of memory for init VMA table");
     /* Record user stack VMA. The table is freshly allocated and empty here,
      * so this cannot legitimately fail — but check anyway and treat a failure
      * as fatal, matching every other error in proc_spawn (init must come up

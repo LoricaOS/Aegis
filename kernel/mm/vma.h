@@ -39,10 +39,10 @@ void vma_set_file_backing(struct aegis_process *proc, uint64_t base,
                           uint32_t ino, uint64_t file_off, uint64_t file_size,
                           uint32_t file_gen);
 
-/* vma_init — allocate a kva page for the VMA table.
- * Sets proc->vma_table, vma_count=0, vma_capacity=170, and initialises the
- * page-embedded share count to 1 (see vma.c vma_rc()). */
-void vma_init(struct aegis_process *proc);
+/* vma_init — allocate KVA pages for the VMA table.
+ * Sets proc->vma_table, vma_count=0, the configured capacity, and initialises the
+ * page-embedded share count to 1 (see vma.c vma_rc()). Returns -1 on OOM. */
+int vma_init(struct aegis_process *proc);
 
 /* vma_find — VMA entry containing va, or NULL. Used by demand-paging fault. */
 /* Existence test only — the returned pointer is into the shared table and is
@@ -93,8 +93,8 @@ int vma_update_prot(struct aegis_process *proc,
 void vma_clear(struct aegis_process *proc);
 
 /* vma_clone — deep copy VMA table from src to dst (for fork).
- * Allocates a new kva page for dst, copies entries. */
-void vma_clone(struct aegis_process *dst, struct aegis_process *src);
+ * Allocates a new KVA table for dst and returns -1 on OOM. */
+int vma_clone(struct aegis_process *dst, struct aegis_process *src);
 
 /* vma_share — share VMA table from parent to child (for CLONE_VM threads).
  * Increments refcount, copies pointer. */

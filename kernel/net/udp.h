@@ -22,11 +22,15 @@ void udp_init(void);
  * Ports in host byte order. Returns 0 on success, -1 on error. */
 int udp_send(netdev_t *dev, uint16_t src_port, ip4_addr_t dst_ip,
              uint16_t dst_port, const void *payload, uint16_t len);
+int udp6_send(netdev_t *dev, uint16_t src_port, const ip6_addr_t *dst_ip,
+              uint16_t dst_port, const void *payload, uint16_t len);
 
 /* udp_rx: called by ip_rx for IP_PROTO_UDP (17).
  * src_ip/dst_ip in network byte order (for socket layer delivery). */
 void udp_rx(netdev_t *dev, ip4_addr_t src_ip, ip4_addr_t dst_ip,
             const void *udp_data, uint16_t len);
+void udp6_rx(netdev_t *dev, const ip6_addr_t *src_ip, const ip6_addr_t *dst_ip,
+             const void *udp_data, uint16_t len);
 
 /* udp_bind: register sock_id for dst_port. Returns 0 on success, -1 if already bound. */
 int udp_bind(uint16_t port, uint32_t sock_id);

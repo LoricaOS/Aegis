@@ -31,7 +31,8 @@ if [ "$guards" != 2 ]; then
     exit 1
 fi
 
-if grep -q "\[KTEST\] DONE all-pass" "$LOG" && [ "$fails" = 0 ]; then
+if grep -q "\[KTEST\] DONE all-pass" "$LOG" &&
+   grep -q "\[NET6\] OK" "$LOG" && [ "$fails" = 0 ]; then
     echo "[captest] PASS: kernel booted test-init; capability model enforced"
     grep "\[KTEST\]" "$LOG" | sed 's/^/  /'
     rm -f "$LOG"

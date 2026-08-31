@@ -1,8 +1,8 @@
 /*
  * uaccess.S — fault-tolerant user<->kernel copy for ARM64.
  *
- * uint64_t arm64_uaccess_copy(void *dst [x0], const void *src [x1],
- *                             uint64_t len [x2]);
+ * uint64_t arm64_copy_{from,to}_user(void *dst [x0], const void *src [x1],
+ *                                    uint64_t len [x2]);
  * 8-byte-wide copy with a byte tail (unaligned ldr/str on Normal memory is
  * architecturally fine; this backs every syscall's user<->kernel transfer, so
  * a byte loop was ~8x the work). Returns the number of bytes NOT copied
@@ -18,23 +18,30 @@
  * fixup below instead of panicking. A ring-0 fault on a user buffer can no
  * longer take the kernel down.
  *
- * Both the load and the store are registered: one side is the user pointer
- * (the expected fault) and the other is kernel (a fault there is a caller
- * bug, redirected to the same partial-copy fixup rather than panicking —
- * matches the "either side" coverage of x86's rep movsb).
+ * PAN is cleared only for this leaf copy and restored on both normal and fault
+ * returns. Both accesses remain in __ex_table so a bad kernel pointer is
+ * contained too, matching x86's rep-movsb coverage.
  */
 
 .section .text
-.global arm64_uaccess_copy
-.type arm64_uaccess_copy, %function
-arm64_uaccess_copy:
+.arch_extension pan
+.global arm64_copy_from_user
+.type arm64_copy_from_user, %function
+arm64_copy_from_user:
+    adrp    x4, arch_smap_enabled
+    add     x4, x4, :lo12:arch_smap_enabled
+    ldr     w5, [x4]
     cbz     x2, 2f              // len == 0 → nothing to copy
+    cbz     w5, 4f
+    msr     pan, #0
+    isb
+4:
     cmp     x2, #8
     b.lo    1f                  // short copy → byte loop only
 3:                              // 8-byte main loop
-.Lu_load8:
+.Luf_load8:
     ldr     x3, [x1]
-.Lu_store8:
+.Luf_store8:
     str     x3, [x0]
     add     x0, x0, #8
     add     x1, x1, #8
@@ -43,9 +50,9 @@ arm64_uaccess_copy:
     b.hs    3b
     cbz     x2, 2f
 1:                              // byte tail (< 8 bytes)
-.Lu_load:
+.Luf_load:
     ldrb    w3, [x1]
-.Lu_store:
+.Luf_store:
     strb    w3, [x0]
     add     x0, x0, #1
     add     x1, x1, #1
@@ -53,18 +60,79 @@ arm64_uaccess_copy:
     b.ne    1b
 2:
     mov     x0, #0              // all bytes copied
+    cbz     w5, 5f
+    msr     pan, #1
+    isb
+5:
     ret
-.Lu_fixup:
+.Luf_fixup:
     mov     x0, x2              // x2 = bytes remaining = bytes NOT copied
+    cbz     w5, 6f
+    msr     pan, #1
+    isb
+6:
     ret
-.size arm64_uaccess_copy, . - arm64_uaccess_copy
+.size arm64_copy_from_user, . - arm64_copy_from_user
+
+.global arm64_copy_to_user
+.type arm64_copy_to_user, %function
+arm64_copy_to_user:
+    adrp    x4, arch_smap_enabled
+    add     x4, x4, :lo12:arch_smap_enabled
+    ldr     w5, [x4]
+    cbz     x2, 2f
+    cbz     w5, 4f
+    msr     pan, #0
+    isb
+4:
+    cmp     x2, #8
+    b.lo    1f
+3:
+.Lut_load8:
+    ldr     x3, [x1]
+.Lut_store8:
+    str     x3, [x0]
+    add     x0, x0, #8
+    add     x1, x1, #8
+    sub     x2, x2, #8
+    cmp     x2, #8
+    b.hs    3b
+    cbz     x2, 2f
+1:
+.Lut_load:
+    ldrb    w3, [x1]
+.Lut_store:
+    strb    w3, [x0]
+    add     x0, x0, #1
+    add     x1, x1, #1
+    subs    x2, x2, #1
+    b.ne    1b
+2:
+    mov     x0, #0
+    cbz     w5, 5f
+    msr     pan, #1
+    isb
+5:
+    ret
+.Lut_fixup:
+    mov     x0, x2
+    cbz     w5, 6f
+    msr     pan, #1
+    isb
+6:
+    ret
+.size arm64_copy_to_user, . - arm64_copy_to_user
 
     /* {fault_pc, fixup_pc} entries. 8-byte aligned; the linker gathers
      * __ex_table between __start_ex_table / __stop_ex_table (linker-arm64.ld). */
     .pushsection __ex_table, "a"
     .align 3
-    .quad .Lu_load8,  .Lu_fixup
-    .quad .Lu_store8, .Lu_fixup
-    .quad .Lu_load,   .Lu_fixup
-    .quad .Lu_store,  .Lu_fixup
+    .quad .Luf_load8,  .Luf_fixup
+    .quad .Luf_store8, .Luf_fixup
+    .quad .Luf_load,   .Luf_fixup
+    .quad .Luf_store,  .Luf_fixup
+    .quad .Lut_load8,  .Lut_fixup
+    .quad .Lut_store8, .Lut_fixup
+    .quad .Lut_load,   .Lut_fixup
+    .quad .Lut_store,  .Lut_fixup
     .popsection

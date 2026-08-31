@@ -105,15 +105,11 @@ lapic_init(void)
     /* Allocate a kernel VA page, then remap it to the LAPIC MMIO address.
      * Pattern: kva gives us a PMM-backed page; we unmap that backing and
      * remap to the device physical address with uncacheable flags. */
-    void *va = kva_alloc_pages(1);
+    void *va = kva_map_mmio(phys, 1);
     if (!va) {
         printk("[LAPIC] FAIL: kva_alloc_pages returned NULL\n");
         return;
     }
-    vmm_unmap_page((uintptr_t)va);
-    vmm_map_page((uintptr_t)va, phys,
-                 VMM_FLAG_WRITABLE | VMM_FLAG_WC | VMM_FLAG_UCMINUS);
-
     s_lapic_base = (volatile uint32_t *)va;
 
     lapic_configure();
