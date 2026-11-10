@@ -69,8 +69,9 @@ rfs_may(const ramfs_inode_t *n, uint32_t want)
     uint32_t uid = rfs_caller_uid();
     if (uid == RFS_KERNEL_UID)
         return 1;
-    uint32_t bits = (uid == n->uid) ? (uint32_t)((n->mode >> 6) & 7)
-                                    : (uint32_t)(n->mode & 7);
+    uint32_t bits = uid == n->uid ? (n->mode >> 6) & 7
+                  : current_proc()->gid == n->gid ? (n->mode >> 3) & 7
+                  : n->mode & 7;
     return (bits & want) == want;
 }
 
@@ -84,6 +85,53 @@ dent_find(ramfs_t *inst, const char *name)
         if (inst->dents[i].in_use && rfs_streq(inst->dents[i].name, name))
             return &inst->dents[i];
     return (ramfs_dent_t *)0;
+}
+
+/* Flat names still obey the permissions of every real ancestor. The
+ * mount root is shared/sticky; nested directories require search and a
+ * mutation also needs W+X on the immediate parent. Caller holds inst->lock. */
+static int rfs_path_may(ramfs_t *inst, const char *name, int mutate)
+{
+    if (!rfs_name_ok(name)) return -ENAMETOOLONG;
+    if (!*name) return -EINVAL;
+    char prefix[RAMFS_MAX_NAMELEN];
+    for (uint32_t i = 0; name[i]; i++) {
+        prefix[i] = name[i];
+        if (name[i] != '/') continue;
+        if (i == 0 || name[i-1] == '/') return -EINVAL;
+        prefix[i] = '\0';
+        ramfs_dent_t *d = dent_find(inst, prefix);
+        if (!d) return -ENOENT;
+        ramfs_inode_t *parent = &inst->inodes[d->inode];
+        if (!parent->is_dir) return -ENOTDIR;
+        int final_parent = 1;
+        for (uint32_t k = i + 1; name[k]; k++)
+            if (name[k] == '/') final_parent = 0;
+        if (!rfs_may(parent, mutate && final_parent ? 3 : 1))
+            return -EACCES;
+        prefix[i] = '/';
+    }
+    return 0;
+}
+
+/* Retire data under the instance lock; free KVA only after dropping it.
+ * Otherwise a CPU waiting for this lock cannot ACK the free's TLB shootdown. */
+static uint32_t inode_detach_pages(ramfs_inode_t *n, uint8_t **pages)
+{
+    uint32_t count = n->npages;
+    for (uint32_t i = 0; i < count; i++) {
+        pages[i] = n->pages[i];
+        n->pages[i] = 0;
+    }
+    n->npages = 0;
+    n->size = 0;
+    return count;
+}
+
+static void rfs_free_pages(uint8_t **pages, uint32_t count)
+{
+    for (uint32_t i = 0; i < count; i++)
+        if (pages[i]) kva_free_pages(pages[i], 1);
 }
 
 /* Allocate a fresh inode; returns index or -1. */
@@ -111,26 +159,18 @@ inode_alloc(ramfs_t *inst)
 }
 
 /* Free an inode's data + slot once it has no dentry and no open fd. */
-static void
-inode_release(ramfs_inode_t *n)
+static uint32_t
+inode_release(ramfs_inode_t *n, uint8_t **pages)
 {
-    if (n->nlink != 0 || n->open_count != 0)
-        return;
-    uint32_t k;
-    for (k = 0; k < n->npages; k++) {
-        if (n->pages[k]) {
-            kva_free_pages(n->pages[k], 1);
-            n->pages[k] = (uint8_t *)0;
-        }
-    }
-    n->npages = 0;
-    n->size   = 0;
+    if (n->nlink || n->open_count) return 0;
+    uint32_t count = inode_detach_pages(n, pages);
     n->in_use = 0;
+    return count;
 }
 
 /* Create a name → new-inode link. Returns the inode, or NULL (pools full). */
 static ramfs_inode_t *
-create_named(ramfs_t *inst, const char *name)
+create_named(ramfs_t *inst, const char *name, uint16_t mode)
 {
     uint32_t di;
     for (di = 0; di < RAMFS_MAX_DENTS; di++)
@@ -150,8 +190,8 @@ create_named(ramfs_t *inst, const char *name)
     {
         uint32_t uid = rfs_caller_uid();
         inst->inodes[ii].uid  = (uid == RFS_KERNEL_UID) ? 0u : uid;
-        inst->inodes[ii].gid  = inst->inodes[ii].uid;
-        inst->inodes[ii].mode = inst->inodes[ii].is_dir ? 0755 : 0644;
+        inst->inodes[ii].gid  = uid == RFS_KERNEL_UID ? 0u : current_proc()->gid;
+        inst->inodes[ii].mode = mode & 0777u;
     }
     return &inst->inodes[ii];
 }
@@ -179,7 +219,8 @@ static int
 ramfs_read_fn(void *priv, void *buf, uint64_t off, uint64_t len)
 {
     ramfs_inode_t *n = (ramfs_inode_t *)priv;
-    if (off >= n->size) return 0;
+    irqflags_t fl = spin_lock_irqsave(&n->owner->lock);
+    if (off >= n->size) { spin_unlock_irqrestore(&n->owner->lock, fl); return 0; }
     uint64_t avail = n->size - off;
     if (len > avail) len = avail;
     uint8_t *dst = (uint8_t *)buf;
@@ -197,6 +238,7 @@ ramfs_read_fn(void *priv, void *buf, uint64_t off, uint64_t len)
             __builtin_memset(dst + done, 0, chunk);  /* sparse hole reads zero */
         done += chunk;
     }
+    spin_unlock_irqrestore(&n->owner->lock, fl);
     return (int)len;
 }
 
@@ -204,38 +246,44 @@ static int
 ramfs_write_fn(void *priv, const void *buf, uint64_t len)
 {
     ramfs_inode_t *n = (ramfs_inode_t *)priv;
-    /* Append at end-of-file (stdio issues several small writes; O_TRUNC reset
-     * size to 0 in ramfs_open). buf may be a user or kernel pointer — both are
-     * fine for copy_from_user. */
-    if (len == 0) return 0;
-    uint64_t base = (uint64_t)n->size;
-    /* File at its size cap → return an ERROR, never 0: sys_write/sys_writev pass
-     * a 0 straight back to userspace, and musl's stdio write loop treats 0 as
-     * "retry" (len -= 0), spinning forever. A self-hosting cc1 writing a >cap
-     * temp to /tmp (ramfs) hung the kernel this way (25M repeated writev). */
-    if (base >= RAMFS_MAX_SIZE) return -ENOSPC;
-    if (len > (uint64_t)RAMFS_MAX_SIZE - base)
-        len = (uint64_t)RAMFS_MAX_SIZE - base;
     uint64_t done = 0;
     while (done < len) {
-        uint64_t pos   = base + done;
-        uint32_t pidx  = (uint32_t)(pos / 4096);
-        uint32_t poff  = (uint32_t)(pos % 4096);
-        uint8_t *pg = inode_page(n, pidx, 1);
-        if (!pg) break;                          /* OOM: short write */
-        uint64_t chunk = 4096 - poff;            /* dest page room    */
-        if (chunk > len - done) chunk = len - done;
-        /* Don't cross a source user page in one copy_from_user. */
-        uint64_t src_off = (uint64_t)(uintptr_t)((const uint8_t *)buf + done) & 0xFFFULL;
-        uint64_t to_src_end = 0x1000ULL - src_off;
-        if (chunk > to_src_end) chunk = to_src_end;
-        copy_from_user(pg + poff, (const uint8_t *)buf + done, chunk);
-        done += chunk;
+        uint8_t staged[256];
+        uint64_t chunk = len - done;
+        if (chunk > sizeof(staged)) chunk = sizeof(staged);
+        if (copy_from_user(staged, (const uint8_t *)buf + done, chunk) != 0)
+            return done ? (int)done : -EFAULT;
+        uint8_t *candidate = 0;
+        for (;;) {
+            irqflags_t fl = spin_lock_irqsave(&n->owner->lock);
+            uint32_t pos = n->size;
+            if (pos >= RAMFS_MAX_SIZE || n->is_dir) {
+                spin_unlock_irqrestore(&n->owner->lock, fl);
+                if (candidate) kva_free_pages(candidate, 1);
+                return done ? (int)done : n->is_dir ? -EISDIR : -ENOSPC;
+            }
+            uint32_t idx = pos / 4096, off = pos % 4096;
+            if (!n->pages[idx] && !candidate) {
+                spin_unlock_irqrestore(&n->owner->lock, fl);
+                candidate = kva_alloc_pages(1);
+                if (!candidate) return done ? (int)done : -ENOMEM;
+                __builtin_memset(candidate, 0, 4096);
+                continue;
+            }
+            if (!n->pages[idx]) {
+                n->pages[idx] = candidate;
+                candidate = 0;
+                if (idx + 1 > n->npages) n->npages = (uint16_t)(idx + 1);
+            }
+            if (chunk > 4096u - off) chunk = 4096u - off;
+            __builtin_memcpy(n->pages[idx] + off, staged, chunk);
+            n->size += (uint32_t)chunk;
+            spin_unlock_irqrestore(&n->owner->lock, fl);
+            if (candidate) kva_free_pages(candidate, 1);
+            done += chunk;
+            break;
+        }
     }
-    if (base + done > n->size)
-        n->size = (uint32_t)(base + done);
-    if (done == 0)
-        return -ENOSPC;   /* OOM before a single byte landed — error, never 0 */
     return (int)done;
 }
 
@@ -246,8 +294,10 @@ ramfs_close_fn(void *priv)
     if (!n || !n->owner) return;
     irqflags_t fl = spin_lock_irqsave(&n->owner->lock);
     if (n->open_count) n->open_count--;
-    inode_release(n);
+    uint8_t *pages[RAMFS_PAGES_PER_FILE];
+    uint32_t count = inode_release(n, pages);
     spin_unlock_irqrestore(&n->owner->lock, fl);
+    rfs_free_pages(pages, count);
 }
 
 static void
@@ -294,18 +344,22 @@ static int
 ramfs_dir_readdir_fn(void *priv, uint64_t index, char *name_out, uint8_t *type_out)
 {
     ramfs_t *inst = (ramfs_t *)priv;
+    irqflags_t fl = spin_lock_irqsave(&inst->lock);
     uint64_t found = 0;
     uint32_t i;
     for (i = 0; i < RAMFS_MAX_DENTS; i++) {
-        if (!inst->dents[i].in_use) continue;
+        if (!inst->dents[i].in_use ||
+            rfs_path_may(inst, inst->dents[i].name, 0) != 0) continue;
         if (found == index) {
             rfs_strcpy(name_out, inst->dents[i].name, RAMFS_MAX_NAMELEN);
             ramfs_inode_t *n = &inst->inodes[inst->dents[i].inode];
             *type_out = n->is_dir ? 4 /* DT_DIR */ : 8 /* DT_REG */;
+            spin_unlock_irqrestore(&inst->lock, fl);
             return 0;
         }
         found++;
     }
+    spin_unlock_irqrestore(&inst->lock, fl);
     return -1;
 }
 
@@ -378,62 +432,45 @@ ramfs_init(ramfs_t *inst)
 }
 
 int
-ramfs_open(ramfs_t *inst, const char *name, int flags, vfs_file_t *out)
+ramfs_open(ramfs_t *inst, const char *name, int flags, uint16_t mode, vfs_file_t *out)
 {
+    int access = flags & VFS_O_ACCMODE;
+    if (access == VFS_O_ACCMODE || ((flags & VFS_O_TRUNC) && access == VFS_O_RDONLY))
+        return -EINVAL;
+    uint8_t *pages[RAMFS_PAGES_PER_FILE];
+    uint32_t count = 0;
     irqflags_t fl = spin_lock_irqsave(&inst->lock);
-    if (!rfs_name_ok(name)) {
-        spin_unlock_irqrestore(&inst->lock, fl);
-        return -ENAMETOOLONG;   /* would truncate onto another file's dentry */
-    }
-    ramfs_dent_t  *d = dent_find(inst, name);
+    int rc = rfs_path_may(inst, name, 0);
+    if (rc) { spin_unlock_irqrestore(&inst->lock, fl); return rc; }
+    ramfs_dent_t *d = dent_find(inst, name);
     ramfs_inode_t *n;
     if (!d) {
-        if (!(flags & (int)VFS_O_CREAT)) {
-            spin_unlock_irqrestore(&inst->lock, fl);
-            return -ENOENT;
-        }
-        n = create_named(inst, name);
-        if (!n) {
-            spin_unlock_irqrestore(&inst->lock, fl);
-            return -ENOMEM;
-        }
+        if (!(flags & VFS_O_CREAT)) { spin_unlock_irqrestore(&inst->lock, fl); return -ENOENT; }
+        rc = rfs_path_may(inst, name, 1);
+        if (rc) { spin_unlock_irqrestore(&inst->lock, fl); return rc; }
+        n = create_named(inst, name, mode);
+        if (!n) { spin_unlock_irqrestore(&inst->lock, fl); return -ENOMEM; }
     } else {
-        /* O_CREAT|O_EXCL on an existing entry: fail EEXIST (atomic create —
-         * mkstemp's collision detection; two same-name creators must not both
-         * "succeed" into one file). */
-        if ((flags & (int)VFS_O_CREAT) && (flags & (int)VFS_O_EXCL)) {
-            spin_unlock_irqrestore(&inst->lock, fl);
-            return -EEXIST;
+        if ((flags & VFS_O_CREAT) && (flags & VFS_O_EXCL)) {
+            spin_unlock_irqrestore(&inst->lock, fl); return -EEXIST;
         }
         n = &inst->inodes[d->inode];
-        /* DAC on an EXISTING file (a fresh create is owned by us by
-         * construction). VFS_O_* has no separate read/write bit here, so gate
-         * on what the open can do: any write intent needs write permission. */
-        {
-            uint32_t want = (flags & (int)(VFS_O_WRONLY | VFS_O_RDWR |
-                                           VFS_O_TRUNC | VFS_O_APPEND)) ? 2u : 4u;
-            if (!rfs_may(n, want)) {
-                spin_unlock_irqrestore(&inst->lock, fl);
-                return -EACCES;
-            }
-        }
+        uint32_t want = access == VFS_O_RDWR ? 6u : access == VFS_O_WRONLY ? 2u : 4u;
+        if (!rfs_may(n, want)) { spin_unlock_irqrestore(&inst->lock, fl); return -EACCES; }
     }
-    if (flags & (int)VFS_O_TRUNC) {
-        uint32_t k;
-        for (k = 0; k < n->npages; k++) {
-            if (n->pages[k]) { kva_free_pages(n->pages[k], 1); n->pages[k] = (uint8_t *)0; }
-        }
-        n->npages = 0;
-        n->size   = 0;
+    if (n->is_dir && access != VFS_O_RDONLY) {
+        spin_unlock_irqrestore(&inst->lock, fl); return -EISDIR;
     }
-    n->open_count++;                              /* fd holds a ref            */
-    out->ops    = &s_ramfs_ops;
-    out->priv   = (void *)n;
+    if (flags & VFS_O_TRUNC) count = inode_detach_pages(n, pages);
+    n->open_count++;
+    out->ops = &s_ramfs_ops;
+    out->priv = n;
     out->offset = 0;
-    out->size   = (uint64_t)n->size;
-    out->flags  = 0;
+    out->size = n->size;
+    out->flags = flags;
     out->kflags = 0;
     spin_unlock_irqrestore(&inst->lock, fl);
+    rfs_free_pages(pages, count);
     return 0;
 }
 
@@ -441,17 +478,12 @@ int
 ramfs_stat(ramfs_t *inst, const char *name, k_stat_t *st)
 {
     irqflags_t fl = spin_lock_irqsave(&inst->lock);
-    ramfs_dent_t *d = dent_find(inst, name);
-    if (!d) { spin_unlock_irqrestore(&inst->lock, fl); return -ENOENT; }
-    ramfs_inode_t *n = &inst->inodes[d->inode];
-    __builtin_memset(st, 0, sizeof(*st));
-    st->st_dev   = 3;
-    st->st_ino   = 1;
-    st->st_nlink = 1;
-    st->st_mode  = n->is_dir ? (S_IFDIR | 0755) : (S_IFREG | 0644);
-    st->st_size  = (int64_t)n->size;
+    int rc = rfs_path_may(inst, name, 0);
+    ramfs_dent_t *d = rc ? 0 : dent_find(inst, name);
+    if (!d) { spin_unlock_irqrestore(&inst->lock, fl); return rc ? rc : -ENOENT; }
+    rc = ramfs_stat_fn(&inst->inodes[d->inode], st);
     spin_unlock_irqrestore(&inst->lock, fl);
-    return 0;
+    return rc;
 }
 
 int
@@ -470,14 +502,16 @@ ramfs_opendir(ramfs_t *inst, vfs_file_t *out)
 }
 
 int
-ramfs_mkdir(ramfs_t *inst, const char *name)
+ramfs_mkdir(ramfs_t *inst, const char *name, uint16_t mode)
 {
     irqflags_t fl = spin_lock_irqsave(&inst->lock);
     if (dent_find(inst, name)) {
         spin_unlock_irqrestore(&inst->lock, fl);
         return -EEXIST;
     }
-    ramfs_inode_t *n = create_named(inst, name);
+    int rc = rfs_path_may(inst, name, 1);
+    if (rc) { spin_unlock_irqrestore(&inst->lock, fl); return rc; }
+    ramfs_inode_t *n = create_named(inst, name, mode);
     if (!n) {
         spin_unlock_irqrestore(&inst->lock, fl);
         return -ENOMEM;
@@ -498,9 +532,15 @@ ramfs_rmdir(ramfs_t *inst, const char *name)
     while (name[nlen]) nlen++;
 
     irqflags_t fl = spin_lock_irqsave(&inst->lock);
+    int rc = rfs_path_may(inst, name, 1);
+    if (rc) { spin_unlock_irqrestore(&inst->lock, fl); return rc; }
     ramfs_dent_t *d = dent_find(inst, name);
     if (!d) { spin_unlock_irqrestore(&inst->lock, fl); return -ENOENT; }
     ramfs_inode_t *n = &inst->inodes[d->inode];
+    uint32_t uid = rfs_caller_uid();
+    if (uid != RFS_KERNEL_UID && uid != n->uid) {
+        spin_unlock_irqrestore(&inst->lock, fl); return -EACCES;
+    }
     if (!n->is_dir) { spin_unlock_irqrestore(&inst->lock, fl); return -ENOTDIR; }
 
     for (int i = 0; i < RAMFS_MAX_DENTS; i++) {
@@ -516,8 +556,10 @@ ramfs_rmdir(ramfs_t *inst, const char *name)
 
     d->in_use = 0;
     if (n->nlink) n->nlink--;
-    inode_release(n);
+    uint8_t *pages[RAMFS_PAGES_PER_FILE];
+    uint32_t count = inode_release(n, pages);
     spin_unlock_irqrestore(&inst->lock, fl);
+    rfs_free_pages(pages, count);
     return 0;
 }
 
@@ -525,9 +567,12 @@ int
 ramfs_unlink(ramfs_t *inst, const char *name)
 {
     irqflags_t fl = spin_lock_irqsave(&inst->lock);
+    int rc = rfs_path_may(inst, name, 1);
+    if (rc) { spin_unlock_irqrestore(&inst->lock, fl); return rc; }
     ramfs_dent_t *d = dent_find(inst, name);
     if (!d) { spin_unlock_irqrestore(&inst->lock, fl); return -ENOENT; }
     ramfs_inode_t *n = &inst->inodes[d->inode];
+    if (n->is_dir) { spin_unlock_irqrestore(&inst->lock, fl); return -EISDIR; }
     /* Sticky semantics, as /tmp has had since forever elsewhere: only the
      * owner may remove a name. Without this any process could unlink another's
      * lockfile or runtime state. */
@@ -540,8 +585,10 @@ ramfs_unlink(ramfs_t *inst, const char *name)
     }
     d->in_use = 0;                                /* drop the name             */
     if (n->nlink) n->nlink--;
-    inode_release(n);                             /* frees only if no open fd  */
+    uint8_t *pages[RAMFS_PAGES_PER_FILE];
+    uint32_t count = inode_release(n, pages);
     spin_unlock_irqrestore(&inst->lock, fl);
+    rfs_free_pages(pages, count);
     return 0;
 }
 
@@ -553,12 +600,49 @@ ramfs_rename(ramfs_t *inst, const char *oldname, const char *newname)
         spin_unlock_irqrestore(&inst->lock, fl);
         return -ENAMETOOLONG;
     }
+    int rc = rfs_path_may(inst, oldname, 1);
+    if (!rc) rc = rfs_path_may(inst, newname, 1);
+    if (rc) { spin_unlock_irqrestore(&inst->lock, fl); return rc; }
+    uint8_t *pages[RAMFS_PAGES_PER_FILE];
+    uint32_t count = 0;
     ramfs_dent_t *src = dent_find(inst, oldname);
     if (!src) { spin_unlock_irqrestore(&inst->lock, fl); return -ENOENT; }
     uint32_t ruid = rfs_caller_uid();
     if (ruid != RFS_KERNEL_UID && ruid != inst->inodes[src->inode].uid) {
         spin_unlock_irqrestore(&inst->lock, fl);
         return -EACCES;                 /* not yours to move */
+    }
+    if (src == dent_find(inst, newname)) {
+        spin_unlock_irqrestore(&inst->lock, fl); return 0;
+    }
+    uint32_t oldlen = 0, newlen = 0;
+    while (oldname[oldlen]) oldlen++;
+    while (newname[newlen]) newlen++;
+    int is_dir = inst->inodes[src->inode].is_dir;
+    if (is_dir && newlen > oldlen &&
+        __builtin_memcmp(oldname, newname, oldlen) == 0 && newname[oldlen] == '/') {
+        spin_unlock_irqrestore(&inst->lock, fl); return -EINVAL;
+    }
+    /* Check every renamed child before changing any name. Flat paths must
+     * move together or their old ancestor permissions cease to protect them. */
+    if (is_dir) {
+        for (uint32_t i = 0; i < RAMFS_MAX_DENTS; i++) {
+            ramfs_dent_t *d = &inst->dents[i];
+            if (!d->in_use) continue;
+            uint32_t len = 0;
+            while (d->name[len]) len++;
+            if (len <= oldlen || __builtin_memcmp(d->name, oldname, oldlen) ||
+                d->name[oldlen] != '/') continue;
+            if (newlen + len - oldlen >= RAMFS_MAX_NAMELEN) {
+                spin_unlock_irqrestore(&inst->lock, fl); return -ENAMETOOLONG;
+            }
+            char target[RAMFS_MAX_NAMELEN];
+            __builtin_memcpy(target, newname, newlen);
+            __builtin_memcpy(target + newlen, d->name + oldlen, len - oldlen + 1);
+            if (dent_find(inst, target)) {
+                spin_unlock_irqrestore(&inst->lock, fl); return -EEXIST;
+            }
+        }
     }
     /* POSIX replace: if the destination name exists, drop its inode ref. */
     ramfs_dent_t *dst = dent_find(inst, newname);
@@ -568,13 +652,38 @@ ramfs_rename(ramfs_t *inst, const char *oldname, const char *newname)
             spin_unlock_irqrestore(&inst->lock, fl);
             return -EACCES;             /* would clobber someone else's file */
         }
+        if (dn->is_dir != is_dir) {
+            spin_unlock_irqrestore(&inst->lock, fl); return dn->is_dir ? -EISDIR : -ENOTDIR;
+        }
+        if (is_dir) {
+            for (uint32_t i = 0; i < RAMFS_MAX_DENTS; i++) {
+                ramfs_dent_t *d = &inst->dents[i];
+                uint32_t k = 0;
+                while (k < newlen && d->name[k] == newname[k]) k++;
+                if (d->in_use && k == newlen && d->name[newlen] == '/') {
+                    spin_unlock_irqrestore(&inst->lock, fl); return -ENOTEMPTY;
+                }
+            }
+        }
         dst->in_use = 0;
         if (dn->nlink) dn->nlink--;
-        inode_release(dn);
+        count = inode_release(dn, pages);
     }
-    /* Re-point the source name to its (unchanged) inode — data never moves. */
+    if (is_dir) {
+        for (uint32_t i = 0; i < RAMFS_MAX_DENTS; i++) {
+            ramfs_dent_t *d = &inst->dents[i];
+            if (!d->in_use) continue;
+            uint32_t len = 0;
+            while (d->name[len]) len++;
+            if (len <= oldlen || __builtin_memcmp(d->name, oldname, oldlen) ||
+                d->name[oldlen] != '/') continue;
+            __builtin_memmove(d->name + newlen, d->name + oldlen, len - oldlen + 1);
+            __builtin_memcpy(d->name, newname, newlen);
+        }
+    }
     rfs_strcpy(src->name, newname, RAMFS_MAX_NAMELEN);
     spin_unlock_irqrestore(&inst->lock, fl);
+    rfs_free_pages(pages, count);
     return 0;
 }
 
@@ -586,7 +695,7 @@ ramfs_populate(ramfs_t *inst, const char *name,
     ramfs_dent_t  *d = dent_find(inst, name);
     ramfs_inode_t *n;
     if (!d) {
-        n = create_named(inst, name);
+        n = create_named(inst, name, 0644);
         if (!n) { spin_unlock_irqrestore(&inst->lock, fl); return -ENOMEM; }
     } else {
         n = &inst->inodes[d->inode];

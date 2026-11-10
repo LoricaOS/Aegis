@@ -31,10 +31,15 @@
 void fb_init(void);
 
 /* fb_putchar — render one ASCII character to the framebuffer terminal.
- * Only callable after fb_init().  Ignores the call if fb_available == 0. */
+ * IRQ/SMP-safe, serializes the complete cursor/parser/scroll transition.
+ * No-op without a complete text cell, before init, or after compositor takeover.
+ * The framebuffer lock is a leaf: it never calls printk, allocates or accesses
+ * user memory. Panic rendering intentionally bypasses it. */
 void fb_putchar(char c);
 
-/* fb_write_string — render a NUL-terminated string. */
+/* fb_write_string — render a resident kernel NUL-terminated string.
+ * Serialized per character, not per string/escape sequence. Callers must copy
+ * faultable user input before passing it here; no user copy under the FB lock. */
 void fb_write_string(const char *s);
 
 /* fb_check_amd — log a diagnostic if an AMD iGPU is present but
@@ -54,7 +59,8 @@ int fb_get_phys_info(uint64_t *phys_out, uint32_t *width_out,
                      uint32_t *height_out, uint32_t *pitch_out);
 
 /* fb_lock_compositor — suppress kernel text output to the framebuffer.
- * Called by sys_fb_map when a user compositor maps the FB. */
+ * Called by sys_fb_map when a user compositor maps the FB. Waits for active
+ * text drawing and suppresses the diagnostic heartbeat too. */
 void fb_lock_compositor(void);
 
 /* fb_heartbeat — toggle a small pixel block in the top-left corner.
@@ -62,12 +68,13 @@ void fb_lock_compositor(void);
 void fb_heartbeat(void);
 
 /* fb_boot_splash — display the Aegis logo centered on a dark background.
- * Called once during early boot, after fb_init(). Locks FB output so
- * printk goes to serial only while the splash is visible. */
+ * Called once during early boot, after fb_init(). Serializes drawing with
+ * normal console operations but does not claim compositor ownership.
+ * Graphical boot uses printk_quiet to keep the splash visible. */
 void fb_boot_splash(void);
 
-/* fb_boot_splash_end — clear the splash and unlock FB for normal output.
- * Called when boot is complete, right before starting user processes. */
+/* fb_boot_splash_end — compatibility no-op; the compositor paints the splash
+ * over and owns the framebuffer after fb_lock_compositor(). */
 void fb_boot_splash_end(void);
 
 /* panic_halt — take over framebuffer, display a text message on blue screen,

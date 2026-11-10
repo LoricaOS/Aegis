@@ -76,6 +76,8 @@ typedef struct {
     /* Pending connections waiting for accept */
     aegis_task_t  *connect_waiter; /* task blocked in connect() */
 
+    uint32_t       listen_pid, listen_uid, listen_gid;
+
     /* Peer credentials (captured at connect time) */
     uint32_t       peer_pid;
     uint32_t       peer_uid;
@@ -136,6 +138,11 @@ int unix_sock_accept(uint32_t id);
  * MSG_DONTWAIT) — return -EAGAIN instead of blocking when no data. */
 int unix_sock_read(uint32_t id, void *buf, uint32_t len, int force_nb);
 
+/* Wait without consuming until bytes, staged rights, EOF or an error.
+ * Returns 1 for readiness, 0 for EOF, or -errno. Caller must retry its
+ * nonblocking receive if another receiver steals readiness before dequeue. */
+int unix_sock_wait_recv(uint32_t id, int force_nb);
+
 /* Write to unix socket (to own tx_ring). Returns bytes written or -errno. */
 int unix_sock_write(uint32_t id, const void *buf, uint32_t len);
 
@@ -145,8 +152,14 @@ int unix_sock_peercred(uint32_t id, uint32_t *pid, uint32_t *uid, uint32_t *gid)
 /* Stage fds for SCM_RIGHTS passing to peer. Returns 0 or -errno. */
 int unix_sock_stage_fds(uint32_t peer_id, unix_passed_fd_t *fds, uint8_t count);
 
-/* Receive staged fds. Returns count installed or -errno. */
-int unix_sock_recv_fds(uint32_t id, int *fd_out, int max_fds);
+/* Deliver proposed fd numbers with no locks held, then atomically install.
+ * deliver receives (fds, count, truncated, arg), returning 0 or -errno.
+ * max_fds=0 discards staged rights and reports truncation through deliver.
+ * On failure no fd is installed and all
+ * detached rights are closed. A concurrent allocator taking a proposed slot
+ * yields -EAGAIN, never overwrites that allocator's fd. */
+int unix_sock_recv_fds(uint32_t id, int max_fds,
+                      int (*deliver)(const int *, int, int, void *), void *arg);
 
 /* Open an fd backed by a unix socket. Returns fd or -1. */
 int unix_sock_open_fd(uint32_t sock_id, void *proc, uint32_t flags);

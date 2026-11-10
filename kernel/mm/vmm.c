@@ -609,6 +609,7 @@ vmm_create_user_pml4(void)
 }
 
 /* vmm_map_user_page_nolock — internal helper, caller must hold vmm_window_lock.
+ * Honor absent PRESENT for forked PROT_NONE pages; public map adds PRESENT.
  * Returns 0 on success, -1 on OOM (page table allocation failure). */
 static int
 vmm_map_user_page_nolock(uint64_t pml4_phys, uint64_t virt,
@@ -632,7 +633,7 @@ vmm_map_user_page_nolock(uint64_t pml4_phys, uint64_t virt,
         printk("[VMM] FAIL: vmm_map_user_page double-map\n");
         panic_halt("[VMM] FAIL: vmm_map_user_page double-map");
     }
-    pt[pt_idx] = phys | arch_pte_from_flags(flags | VMM_FLAG_PRESENT);
+    pt[pt_idx] = phys | arch_pte_from_flags(flags);
     vmm_window_unmap();
     return 0;
 }
@@ -651,7 +652,7 @@ vmm_map_user_page(uint64_t pml4_phys, uint64_t virt,
     }
 
     irqflags_t fl = spin_lock_irqsave(&vmm_window_lock);
-    if (vmm_map_user_page_nolock(pml4_phys, virt, phys, flags) < 0) {
+    if (vmm_map_user_page_nolock(pml4_phys, virt, phys, flags | VMM_FLAG_PRESENT) < 0) {
         spin_unlock_irqrestore(&vmm_window_lock, fl);
         printk("[VMM] FAIL: out of memory in vmm_map_user_page\n");
         panic_halt("[VMM] FAIL: out of memory in vmm_map_user_page");
@@ -1083,73 +1084,25 @@ vmm_set_user_prot(uint64_t pml4_phys, uint64_t virt, uint64_t flags)
     uint64_t *pt  = vmm_window_map(ARCH_PTE_ADDR(pde));
     uint64_t  old = pt[pt_idx];
 
-    /* If page was never mapped (no physical address), skip. */
-    if (!(old & VMM_FLAG_PRESENT) && flags == 0) {
+    uint64_t phys = ARCH_PTE_ADDR(old);
+    if (!phys) {
         vmm_window_unmap();
         spin_unlock_irqrestore(&vmm_window_lock, fl);
-        return 0;  /* PROT_NONE on unmapped page is a no-op */
-    }
-    if (!(old & VMM_FLAG_PRESENT)) {
-        /* PROT_NONE-stored page: a prior mprotect(PROT_NONE) cleared PRESENT
-         * but kept the physical frame recorded in the PTE (pt[pt_idx] = phys
-         * with no PRESENT bit). A non-zero PTE here means the frame is still
-         * present and can be re-enabled with the new accessible flags. */
-        uint64_t saved_phys = old ? ARCH_PTE_ADDR(old) : 0;
-        if (saved_phys) {
-            /* Rebuild the PTE from the stored phys with the new flags and
-             * re-enable PRESENT (flags already carry VMM_FLAG_PRESENT here,
-             * since flags == 0 was handled above).
-             *
-             * Preserve the software bits (VMM_FLAG_COW / VMM_FLAG_SHARED)
-             * recorded in the stored PROT_NONE PTE — they identify a still-
-             * shared COW frame or driver-owned shared RAM and must survive an
-             * mprotect (see the matching comment in the normal rebuild below).
-             * If the frame is COW and the caller now requests write access, the
-             * page must stay read-only so the first write still faults into
-             * vmm_cow_fault_handle (a writable+COW PTE would never fault → the
-             * copy would never happen → cross-process aliasing). SHARED frames
-             * are genuinely shared and stay writable (they are never COW). */
-            uint64_t old_sw = old & (VMM_FLAG_COW | VMM_FLAG_SHARED | VMM_FLAG_SHARED_OWNED);
-            uint64_t newpte = saved_phys | arch_pte_from_flags(flags) | old_sw;
-            if ((old_sw & VMM_FLAG_COW) && (flags & VMM_FLAG_WRITABLE))
-                newpte &= ~(uint64_t)VMM_FLAG_WRITABLE;
-            pt[pt_idx] = newpte;
-            vmm_window_unmap();
-            arch_vmm_invlpg(virt);
-            spin_unlock_irqrestore(&vmm_window_lock, fl);
-            tlb_shootdown(pml4_phys, virt, virt + VMM_PAGE_SIZE);
-            return 0;
-        }
-        vmm_window_unmap();
-        spin_unlock_irqrestore(&vmm_window_lock, fl);
-        return -1;  /* genuinely no frame — can't set real prot */
+        return flags == 0 ? 0 : -1;
     }
 
-    /* Preserve physical address AND the software flags. arch_pte_from_flags
-     * only builds the hardware PROT_* bits from the new prot, so without this
-     * the rebuild would silently drop VMM_FLAG_COW (still-shared post-fork
-     * frame) and VMM_FLAG_SHARED (driver-owned fb/memfd RAM). Dropping COW lets
-     * mprotect(PROT_WRITE) make a still-shared frame writable without faulting
-     * → two address spaces alias one live frame. Dropping SHARED makes the
-     * teardown guards free driver RAM (fb double-free). Keep both. */
-    uint64_t phys   = ARCH_PTE_ADDR(old);
-    uint64_t old_sw = old & (VMM_FLAG_COW | VMM_FLAG_SHARED | VMM_FLAG_SHARED_OWNED);
-    if (flags == 0) {
-        /* PROT_NONE: store phys with no PRESENT bit (CPU ignores the PTE) but
-         * keep the address for munmap and the software bits so a later
-         * mprotect that re-enables the page recovers its COW/SHARED status. */
-        pt[pt_idx] = phys | old_sw;
-    } else {
-        uint64_t newpte = phys | arch_pte_from_flags(flags) | old_sw;
-        /* A writable+COW PTE would never fault, so the copy-on-write break
-         * would never run. Keep a still-shared COW page read-only; the first
-         * write faults into vmm_cow_fault_handle, which copies and then makes
-         * the new private frame writable. SHARED (genuinely shared driver RAM,
-         * never COW) stays writable. */
-        if ((old_sw & VMM_FLAG_COW) && (flags & VMM_FLAG_WRITABLE))
-            newpte &= ~(uint64_t)VMM_FLAG_WRITABLE;
-        pt[pt_idx] = newpte;
+    /* COW records permission to write, not merely shared ownership. Revoke
+     * it with WRITE; derive it again for private frames on a write upgrade,
+     * including read-only fork mappings and saved PROT_NONE PTEs. */
+    uint64_t shared = old & (VMM_FLAG_SHARED | VMM_FLAG_SHARED_OWNED);
+    uint64_t newpte = phys | shared;
+    if (flags) {
+        newpte |= arch_pte_from_flags(flags) & ~(uint64_t)VMM_FLAG_COW;
+        if ((flags & VMM_FLAG_WRITABLE) && !shared &&
+            pmm_page_refcount(phys) > 1)
+            newpte = (newpte & ~(uint64_t)VMM_FLAG_WRITABLE) | VMM_FLAG_COW;
     }
+    pt[pt_idx] = newpte;
     vmm_window_unmap();
     arch_vmm_invlpg(virt);
     spin_unlock_irqrestore(&vmm_window_lock, fl);
@@ -1200,8 +1153,9 @@ vmm_copy_user_pages(uint64_t src_pml4, uint64_t dst_pml4)
                     uint64_t *pgtbl = vmm_window_map(pt_phys);
                     uint64_t pte = pgtbl[pti];
                     vmm_window_unmap();
-                    if (!(pte & VMM_FLAG_PRESENT)) continue;
-                    if (!(pte & VMM_FLAG_USER)) continue;
+                    /* A saved PROT_NONE PTE still owns its physical frame. */
+                    if (!ARCH_PTE_ADDR(pte)) continue;
+                    if ((pte & VMM_FLAG_PRESENT) && !(pte & VMM_FLAG_USER)) continue;
                     /* Skip MMIO pages (WC/UC) — framebuffer, device MMIO.
                      * Copying MMIO via memcpy is extremely slow or can
                      * stall the CPU.  Child doesn't need these. */
@@ -1218,14 +1172,15 @@ vmm_copy_user_pages(uint64_t src_pml4, uint64_t dst_pml4)
                      * memfd window). Same-frame, same-flags into the child;
                      * ref the refcounted (memfd) kind, leave driver-owned fb. */
                     if (flags & (VMM_FLAG_SHARED | VMM_FLAG_SHARED_OWNED)) {
-                        if (vmm_map_user_page_nolock(dst_pml4, va, src_phys, flags) < 0) {
-                            spin_unlock_irqrestore(&vmm_window_lock, fl);
-                            return -1;
-                        }
                         if ((flags & VMM_FLAG_SHARED_OWNED) &&
                             pmm_ref_page(src_phys) < 0) {
                             spin_unlock_irqrestore(&vmm_window_lock, fl);
-                            return -1;          /* refcount saturated */
+                            return -1;
+                        }
+                        if (vmm_map_user_page_nolock(dst_pml4, va, src_phys, flags) < 0) {
+                            if (flags & VMM_FLAG_SHARED_OWNED) pmm_free_page(src_phys);
+                            spin_unlock_irqrestore(&vmm_window_lock, fl);
+                            return -1;
                         }
                         if (++batch >= FORK_BATCH_SIZE) {
                             batch = 0;
@@ -1330,8 +1285,9 @@ vmm_cow_user_pages(uint64_t src_pml4, uint64_t dst_pml4)
                     uint64_t *pgtbl = vmm_window_map(pt_phys);
                     uint64_t pte = pgtbl[pti];
                     vmm_window_unmap();
-                    if (!(pte & VMM_FLAG_PRESENT)) continue;
-                    if (!(pte & VMM_FLAG_USER)) continue;
+                    /* A saved PROT_NONE PTE still owns its physical frame. */
+                    if (!ARCH_PTE_ADDR(pte)) continue;
+                    if ((pte & VMM_FLAG_PRESENT) && !(pte & VMM_FLAG_USER)) continue;
                     /* Skip MMIO (framebuffer, device memory). */
                     if (pte & (VMM_FLAG_WC | VMM_FLAG_UCMINUS)) continue;
 
@@ -1342,67 +1298,25 @@ vmm_cow_user_pages(uint64_t src_pml4, uint64_t dst_pml4)
                     uint64_t va = (pml4i << 39) | (pdpti << 30) |
                                   (pdi   << 21) | (pti   << 12);
 
-                    if (flags & (VMM_FLAG_SHARED | VMM_FLAG_SHARED_OWNED)) {
-                        /* Shared RAM inherited into the child as-is: same frame,
-                         * same flags (still writable, NO write-protect, NO COW).
-                         * COW-breaking it would fork a sharer off the live shared
-                         * buffer (the compositor's scanout, or a GUI client's
-                         * window memfd).  Two kinds, distinguished by the flag:
-                         *   - VMM_FLAG_SHARED (driver-owned, e.g. sys_fb_map fb):
-                         *     NO pmm_ref_page — the PMM doesn't track it.
-                         *   - VMM_FLAG_SHARED_OWNED (memfd MAP_SHARED): DO
-                         *     pmm_ref_page — the child now maps the refcounted
-                         *     frame, and teardown will pmm_free_page it. */
-                        if (vmm_map_user_page_nolock(dst_pml4, va, phys, flags) < 0) {
-                            spin_unlock_irqrestore(&vmm_window_lock, fl);
-                            return -1;
-                        }
-                        if ((flags & VMM_FLAG_SHARED_OWNED) &&
-                            pmm_ref_page(phys) < 0) {
-                            spin_unlock_irqrestore(&vmm_window_lock, fl);
-                            return -1;          /* refcount saturated */
-                        }
-                    } else if (flags & VMM_FLAG_WRITABLE) {
-                        /* Writable → RO + COW for both parent and child.
-                         * Write-protect the parent first so any concurrent
-                         * write from the parent will fault and either
-                         * complete the COW via the fault handler or block
-                         * on vmm_window_lock until we finish here. */
-                        uint64_t cow_flags =
-                            (flags & ~(uint64_t)VMM_FLAG_WRITABLE) | VMM_FLAG_COW;
-
-                        /* Update parent PTE: clear W, set COW. No per-page
-                         * invlpg here: the parent is suspended in this syscall
-                         * (IF=0, not running) for the whole walk, so it cannot
-                         * observe a stale writable TLB entry before the single
-                         * full TLB flush at the end of this function. Batching
-                         * 16384 invlpgs into one CR3 reload is a large saving on
-                         * a big address space. (Sibling CPUs are handled by the
-                         * thread_count>1 tlb_flush_all_cpus in sys_fork.) */
+                    int owns_ref = !(flags & VMM_FLAG_SHARED) ||
+                                   (flags & VMM_FLAG_SHARED_OWNED);
+                    if (owns_ref && pmm_ref_page(phys) < 0) {
+                        spin_unlock_irqrestore(&vmm_window_lock, fl);
+                        tlb_flush_all_cpus();
+                        return -1;
+                    }
+                    if (!(flags & (VMM_FLAG_SHARED | VMM_FLAG_SHARED_OWNED)) &&
+                        (flags & VMM_FLAG_WRITABLE)) {
+                        flags = (flags & ~(uint64_t)VMM_FLAG_WRITABLE) | VMM_FLAG_COW;
                         uint64_t *src_pgtbl = vmm_window_map(pt_phys);
-                        src_pgtbl[pti] = phys | cow_flags;
+                        src_pgtbl[pti] = phys | flags;
                         vmm_window_unmap();
-
-                        /* Install into child with same RO+COW flags. */
-                        if (vmm_map_user_page_nolock(dst_pml4, va, phys, cow_flags) < 0) {
-                            spin_unlock_irqrestore(&vmm_window_lock, fl);
-                            return -1;
-                        }
-                        /* Now the frame has two sharers. */
-                        if (pmm_ref_page(phys) < 0) {
-                            spin_unlock_irqrestore(&vmm_window_lock, fl);
-                            return -1;          /* refcount saturated */
-                        }
-                    } else {
-                        /* Read-only → share as-is. */
-                        if (vmm_map_user_page_nolock(dst_pml4, va, phys, flags) < 0) {
-                            spin_unlock_irqrestore(&vmm_window_lock, fl);
-                            return -1;
-                        }
-                        if (pmm_ref_page(phys) < 0) {
-                            spin_unlock_irqrestore(&vmm_window_lock, fl);
-                            return -1;          /* refcount saturated */
-                        }
+                    }
+                    if (vmm_map_user_page_nolock(dst_pml4, va, phys, flags) < 0) {
+                        if (owns_ref) pmm_free_page(phys);
+                        spin_unlock_irqrestore(&vmm_window_lock, fl);
+                        tlb_flush_all_cpus();
+                        return -1;
                     }
 
                     /* Drop and re-take the window lock periodically so
@@ -1560,6 +1474,11 @@ vmm_cow_fault_handle(uint64_t pml4_phys, uint64_t fault_va)
     arch_vmm_invlpg(fault_va);
 
     spin_unlock_irqrestore(&vmm_window_lock, fl);
+
+    /* Remote siblings must stop reading the old frame before its mapping
+     * reference is released. Never wait for IPIs under vmm_window_lock. */
+    uint64_t page = fault_va & ~(uint64_t)(VMM_PAGE_SIZE - 1);
+    tlb_shootdown(pml4_phys, page, page + VMM_PAGE_SIZE);
 
     /* Drop the old frame's refcount. If we were the last sharer this
      * frees it; otherwise (refcount was >= 2) the other sharers keep

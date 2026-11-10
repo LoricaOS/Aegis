@@ -795,6 +795,15 @@ sched_add(aegis_task_t *task)
                          ? sched_current()->sched_vruntime : 0;
     task->is_idle = 0;
     aegis_task_t *cur = sched_current();
+    if (cur && cur->is_user && task->is_user) {
+        aegis_process_t *child = (aegis_process_t *)task;
+        aegis_process_t *creator = (aegis_process_t *)cur;
+        /* Reparenting may have changed the creator's parent while clone
+         * allocated the unpublished thread. Refresh under the same lock as
+         * adoption, so a new sibling cannot retain an already-dead parent. */
+        if (child->pid != child->tgid && child->tgid == creator->tgid)
+            child->ppid = creator->ppid;
+    }
     if (!cur) {
         task->next = task;
         percpu_set_current(task);
@@ -811,62 +820,108 @@ sched_add(aegis_task_t *task)
     spin_unlock_irqrestore(&sched_lock, fl);
 }
 
-/* wake_group_parent_locked — wake the parent of a dying THREAD's process.
- *
- * A task's exit notification goes to dying->ppid, and sys_clone sets ppid to
- * the caller's pid for CLONE_THREAD too — so a thread's SIGCHLD lands on
- * whichever sibling happened to clone it, never on the process's own parent.
- * That is fine for signal delivery (a process reports one child death, not one
- * per thread), but it loses the only event a waitpid'ing parent is waiting for.
- *
- * sys_waitpid refuses to reap a group leader while any sibling is still live,
- * because reaping frees the PML4 the siblings share. So a parent that waits on
- * a multi-threaded child must be re-woken when the LAST sibling zombifies. The
- * leader's own SIGCHLD cannot serve: the leader is killed by
- * thread_group_teardown like any other sibling and typically zombifies first,
- * while its siblings are still running — the parent wakes, finds the leader
- * unreapable, and blocks again. Every later sibling exit then notifies another
- * thread of the same (already dying) group, so nothing ever wakes the parent
- * and it sleeps forever holding the console.
- *
- * Wake it here instead. No signal is raised — only the block is broken;
- * sys_waitpid re-scans and blocks again if the group is still incomplete, so a
- * wake that turns out to be early costs one loop iteration. Caller holds
- * sched_lock, which is also what makes this race-free against the parent:
- * waitpid's no-zombie scan and its transition to TASK_BLOCKED are one critical
- * section, so we either run before the scan (which then sees the whole group
- * zombified and reaps it) or after it blocked (and we wake it). */
+/* Children belong to a parent process, not to one of its threads. Wake every
+ * blocked member so cross-thread waits, including competing waiters whose
+ * last child was just reaped, recheck under sched_lock. Spurious wakes are
+ * harmless: blocking primitives recheck their own conditions. */
+void
+sched_wake_child_waiters_locked(uint32_t parent_tgid)
+{
+    if (!parent_tgid)
+        return;
+    aegis_task_t *cur = sched_current();
+    aegis_task_t *t = cur;
+    do {
+        if (t->is_user && ((aegis_process_t *)t)->tgid == parent_tgid &&
+            t->state == TASK_BLOCKED)
+            sched_wake_locked(t);
+        t = t->next;
+    } while (t != cur);
+}
+
+/* SIGCHLD targets a parent process, not necessarily its leader task. Prefer
+ * an unmasked, non-stopped member; a zombie can never consume a pending signal.
+ * If every live member masks SIGCHLD (or is stopped), retain it on one member
+ * without changing its mask or continuing a stopped job. Caller holds
+ * sched_lock through selection and the existing per-task signal enqueue. */
 static void
-wake_group_parent_locked(aegis_process_t *dying)
+notify_parent_locked(uint32_t parent_tgid)
+{
+    if (!parent_tgid)
+        return;
+    aegis_task_t *cur = sched_current();
+    aegis_task_t *t = cur;
+    aegis_process_t *recipient = (void *)0;
+    int best_rank = 3;
+    do {
+        if (t->is_user && t->state != TASK_ZOMBIE) {
+            aegis_process_t *p = (aegis_process_t *)t;
+            if (p->tgid == parent_tgid) {
+                int rank = t->state == TASK_STOPPED ? 2 :
+                    (p->signal_mask & (1ULL << SIGCHLD)) ? 1 : 0;
+                /* Keep the leader preference only among equally suitable
+                 * recipients; its mask/state must not strand a worker's signal. */
+                if (rank < best_rank ||
+                    (rank == best_rank && p->pid == parent_tgid)) {
+                    recipient = p;
+                    best_rank = rank;
+                }
+            }
+        }
+        t = t->next;
+    } while (t != cur);
+
+    if (recipient)
+        signal_send_pid_locked(recipient->pid, SIGCHLD);
+    sched_wake_child_waiters_locked(parent_tgid);
+}
+
+/* Common exit path, after publishing TASK_ZOMBIE. A leader's pthread_exit
+ * does not orphan the process's children while any other thread survives.
+ * This must live here rather than in sys_exit: fatal signals call sched_exit
+ * directly too. Caller holds sched_lock across the last-member test,
+ * adoption and parent notification. */
+static int
+reparent_children_locked(aegis_process_t *dying)
 {
     aegis_task_t *cur = sched_current();
-    aegis_task_t *t   = cur;
-    uint32_t      ppid = 0;
+    aegis_task_t *t = cur->next;
+    while (t != cur) {
+        if (t->is_user && ((aegis_process_t *)t)->tgid == dying->tgid &&
+            t->state != TASK_ZOMBIE)
+            return 0;
+        t = t->next;
+    }
 
-    /* The leader carries the process's real parent. If it is already gone from
-     * the task list it has been reaped, so nobody is waiting on this group. */
-    do {
-        if (t->is_user && ((aegis_process_t *)t)->pid == dying->tgid) {
-            ppid = ((aegis_process_t *)t)->ppid;
-            break;
+    int adopted_zombie = 0;
+    t = cur->next;
+    while (t != cur) {
+        if (t->is_user) {
+            aegis_process_t *child = (aegis_process_t *)t;
+            if (child->ppid == dying->tgid) {
+                child->ppid = 1;
+                if (child->pid == child->tgid && t->state == TASK_ZOMBIE)
+                    adopted_zombie = 1;
+            }
         }
         t = t->next;
-    } while (t != cur);
+    }
+    /* An already-zombie adoptee will never generate another exit event. */
+    if (adopted_zombie)
+        notify_parent_locked(1);
+    return 1;
+}
 
-    /* ppid == dying->ppid means the sibling was cloned by the leader's parent
-     * itself, which sched_exit already notified. */
-    if (ppid == 0 || ppid == dying->ppid)
-        return;
-
-    t = cur;
-    do {
-        if (t->is_user && ((aegis_process_t *)t)->pid == ppid) {
-            if (t->state == TASK_BLOCKED)
-                sched_wake_locked(t);
-            return;
-        }
-        t = t->next;
-    } while (t != cur);
+/* Stop notification is emitted only AFTER TASK_STOPPED is visible, under
+ * the same lock as waitpid's scan/block transition. */
+static void
+notify_stopped_parent_locked(aegis_task_t *task)
+{
+    if (task->is_user) {
+        aegis_process_t *p = (aegis_process_t *)task;
+        if (p->pid == p->tgid && p->ppid)
+            notify_parent_locked(p->ppid);
+    }
 }
 
 /* Deferred cleanup: dying task's resources cannot be freed before ctx_switch
@@ -967,6 +1022,7 @@ sched_exit(void)
          * immediately so sched_tick does not schedule a dying task. */
         s_cur->state = TASK_ZOMBIE;
         run_list_remove_locked(s_cur);
+        int group_exited = reparent_children_locked(dying);
         /* vfork child dying BEFORE exec: thaw the parent's frozen threads so the
          * parent (woken by SIGCHLD below) can run.  Without this the parent stays
          * frozen and the whole tgid deadlocks. */
@@ -984,13 +1040,12 @@ sched_exit(void)
          * recursive acquisition.
          * Must run before the woken_parent scan so the scan finds the
          * parent in TASK_RUNNING state. */
-        if (dying->ppid != 0)
-            signal_send_pid_locked(dying->ppid, SIGCHLD);
-
-        /* A thread exiting is also the event that can finally make its group
-         * leader reapable — and that news reaches nobody via SIGCHLD above. */
-        if (dying->tgid != dying->pid)
-            wake_group_parent_locked(dying);
+        if (group_exited && dying->ppid != 0) {
+            /* Includes the final sibling exit that makes a zombie leader
+             * reapable, even when the parent leader has already exited.
+             * A normal pthread_exit is not a process-child death event. */
+            notify_parent_locked(dying->ppid);
+        }
 
         /* Find parent for direct ctx_switch (avoids PIT dependency).
          * signal_send_pid may have transitioned the parent BLOCKED→RUNNING;
@@ -1012,8 +1067,8 @@ sched_exit(void)
         while (t != s_cur) {
             if (t->is_user && t->state == TASK_RUNNING && t->on_cpu < 0) {
                 aegis_process_t *p = (aegis_process_t *)t;
-                if (p->pid == dying->ppid &&
-                    (t->waiting_for == 0 || t->waiting_for == dying->pid)) {
+                if (group_exited && p->tgid == dying->ppid &&
+                    (t->waiting_for == 0 || t->waiting_for == dying->tgid)) {
                     woken_parent = t;
                     break;
                 }
@@ -1255,6 +1310,8 @@ sched_block(void)
 void
 sched_wake_locked(aegis_task_t *task)
 {
+    if (!task || task->state == TASK_ZOMBIE)
+        return;
     /* Caller holds sched_lock.  Flip state to TASK_RUNNING and insert the
      * task into the RUNNING-only run queue if it is not already there.
      *
@@ -1317,6 +1374,7 @@ sched_stop(aegis_task_t *task)
         /* Stopping a different task: flip state and remove from run list. */
         task->state = TASK_STOPPED;
         run_list_remove_locked(task);
+        notify_stopped_parent_locked(task);
         spin_unlock_irqrestore(&sched_lock, fl);
         return;
     }
@@ -1325,6 +1383,7 @@ sched_stop(aegis_task_t *task)
     aegis_task_t *old = cur;
 
     old->state = TASK_STOPPED;
+    notify_stopped_parent_locked(old);
 
     /* Pick next runnable, skipping tasks running on other CPUs (see
      * sched_block).  Must run before removing old so the walk starts from

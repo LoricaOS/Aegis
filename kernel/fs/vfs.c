@@ -124,7 +124,7 @@ vfs_ramfs_unlink(const char *path, int *out_rc)
 /* vfs_ramfs_mkdir — if path is on a ramfs mount, create a directory marker
  * there and set *out_rc; returns 1 if handled, 0 if not a ramfs path. */
 int
-vfs_ramfs_mkdir(const char *path, int *out_rc)
+vfs_ramfs_mkdir(const char *path, uint16_t mode, int *out_rc)
 {
     const char *rel;
     /* The ramfs mount roots /tmp and /run always exist. A create-parents
@@ -141,7 +141,7 @@ vfs_ramfs_mkdir(const char *path, int *out_rc)
     int dynamic;
     ramfs_t *r = ramfs_for_path(path, &rel, &dynamic);
     if (!r) return 0;
-    *out_rc = ramfs_mkdir(r, rel);
+    *out_rc = ramfs_mkdir(r, rel, mode);
     if (dynamic) mount_release(r);
     return 1;
 }
@@ -191,43 +191,54 @@ vfs_ramfs_rename(const char *oldp, const char *newp, int *out_rc)
  * cannot diverge at the syscall trust boundary. */
 static int
 vfs_open_ext2_inode(uint32_t ino, int is_protected, int flags,
-                    vfs_file_t *out, int has_install)
+                    vfs_file_t *out, int has_install, int created)
 {
-    int is_auth_gated = 0;
+    int is_auth_gated = 0, is_account_db = 0;
+    int access = flags & VFS_O_ACCMODE;
+    if (access == VFS_O_ACCMODE ||
+        ((flags & VFS_O_TRUNC) && access == VFS_O_RDONLY))
+        return -EINVAL;
+    if ((flags & VFS_O_TRUNC) && sched_current()->is_user &&
+        cap_check(current_proc()->caps, CAP_TABLE_SIZE,
+                  CAP_KIND_VFS_WRITE, CAP_RIGHTS_WRITE) != 0)
+        return -ENOCAP;
+    if (g_rootfs->is_dir(ino) && access != VFS_O_RDONLY)
+        return -EISDIR;
     if ((flags & (int)VFS_O_CREAT) && (flags & (int)VFS_O_EXCL))
         return -EEXIST;
     if (sched_current()->is_user) {
         aegis_process_t *pr = current_proc();
-        int want = 4;
-        if (flags & 1) want = 2;
-        if (flags & 2) want = 4 | 2;
-        if (g_rootfs->check_perm(ino, (uint16_t)pr->uid,
-                                 (uint16_t)pr->gid, want) != 0)
-            return -EACCES;
-    }
-    {
         uint32_t shadow_ino = g_rootfs->get_shadow_ino();
         uint32_t admin_ino  = g_rootfs->get_admin_ino();
-        if (sched_current()->is_user &&
-            ((shadow_ino != 0 && ino == shadow_ino) ||
-             (admin_ino  != 0 && ino == admin_ino))) {
-            aegis_process_t *pr = current_proc();
-            int wr = (flags & 1) || (flags & 2) ||
-                     (flags & (int)VFS_O_TRUNC) ||
-                     (flags & (int)VFS_O_APPEND);
+        int wr = access != VFS_O_RDONLY ||
+                 (flags & (int)(VFS_O_TRUNC | VFS_O_APPEND));
+        if ((shadow_ino != 0 && ino == shadow_ino) ||
+            (admin_ino  != 0 && ino == admin_ino)) {
             if (cap_check(pr->caps, CAP_TABLE_SIZE, CAP_KIND_AUTH,
                           wr ? CAP_RIGHTS_WRITE : CAP_RIGHTS_READ) != 0)
                 return -EACCES;
             is_auth_gated = 1;
-            if (admin_ino != 0 && ino == admin_ino && pr->admin_session == 0) {
-                uint64_t now  = arch_get_ticks();
-                uint64_t last = __atomic_load_n(&s_admin_cred_last_read,
-                                                __ATOMIC_RELAXED);
-                if (last != 0 && (now - last) < ADMIN_CRED_MIN_TICKS)
-                    return -EAGAIN;
-                __atomic_store_n(&s_admin_cred_last_read, now,
-                                 __ATOMIC_RELAXED);
-            }
+        }
+        /* AUTH READ authorizes only a read-only open of the exact cached
+         * credential inode, after resolution and directory-search DAC.
+         * It grants no DAC exemption for other files or mutating opens. */
+        int auth_read = is_auth_gated && !wr && !(flags & (int)VFS_O_CREAT);
+        if (!created && !auth_read) {
+            int want = access == VFS_O_WRONLY ? 2 :
+                       access == VFS_O_RDWR ? 4 | 2 : 4;
+            if (g_rootfs->check_perm(ino, (uint16_t)pr->uid,
+                                     (uint16_t)pr->gid, want) != 0)
+                return -EACCES;
+        }
+        if (is_auth_gated && admin_ino != 0 && ino == admin_ino &&
+            pr->admin_session == 0) {
+            uint64_t now  = arch_get_ticks();
+            uint64_t last = __atomic_load_n(&s_admin_cred_last_read,
+                                            __ATOMIC_RELAXED);
+            if (last != 0 && (now - last) < ADMIN_CRED_MIN_TICKS)
+                return -EAGAIN;
+            __atomic_store_n(&s_admin_cred_last_read, now,
+                             __ATOMIC_RELAXED);
         }
     }
     {
@@ -241,6 +252,7 @@ vfs_open_ext2_inode(uint32_t ino, int is_protected, int flags,
                      (flags & (int)VFS_O_APPEND);
             if (wr && current_proc()->admin_session == 0)
                 return -EACCES;
+            is_account_db = 1;
         }
     }
     {
@@ -250,8 +262,10 @@ vfs_open_ext2_inode(uint32_t ino, int is_protected, int flags,
         if (sched_current()->is_user && is_protected && wr && !has_install)
             return -EACCES;
     }
-    if (flags & (int)VFS_O_TRUNC)
-        g_rootfs->truncate(ino);
+    if (flags & (int)VFS_O_TRUNC) {
+        int rc = g_rootfs->truncate(ino);
+        if (rc < 0) return rc;
+    }
     ext2_fd_priv_t *p = g_rootfs->pool_alloc(ino);
     if (!p) return -ENOMEM;
     int sz = g_rootfs->file_size(ino);
@@ -264,10 +278,11 @@ vfs_open_ext2_inode(uint32_t ino, int is_protected, int flags,
     out->size = (uint64_t)sz;
     out->flags = 0;
     out->kflags = (is_protected ? VFS_KF_PROTECTED : 0) |
-                  (is_auth_gated ? VFS_KF_AUTH_GATED : 0);
+                  (is_auth_gated ? VFS_KF_AUTH_GATED : 0) |
+                  (is_account_db ? VFS_KF_ACCOUNT_DB : 0);
     out->cap_root_inode = 0;
     out->cap_rights = 0;
-    out->_cap_pad = 0;
+    out->cap_root_gen = 0;
     return 0;
 }
 
@@ -299,11 +314,13 @@ vfs_openat_ext2(uint32_t start_ino, uint32_t root_ino, const char *path,
         return -EOPNOTSUPP;
     uint32_t ino = 0;
     int is_protected = starts_protected;
+    irqflags_t fl = g_rootfs->lock();
     int rc = ext2_openat_protected(start_ino, root_ino, path, &ino,
                                    &is_protected);
-    if (rc < 0)
-        return rc == -1 ? -ENOENT : rc;
-    return vfs_open_ext2_inode(ino, is_protected, flags, out, has_install);
+    if (rc >= 0)
+        rc = vfs_open_ext2_inode(ino, is_protected, flags, out, has_install, 0);
+    g_rootfs->unlock(fl);
+    return rc;
 #endif
 }
 
@@ -311,12 +328,19 @@ int
 vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
             int has_install)
 {
+    if ((flags & VFS_O_ACCMODE) == VFS_O_ACCMODE ||
+        ((flags & VFS_O_TRUNC) && (flags & VFS_O_ACCMODE) == VFS_O_RDONLY))
+        return -EINVAL;
+    if ((flags & (VFS_O_CREAT | VFS_O_TRUNC)) && sched_current()->is_user &&
+        cap_check(current_proc()->caps, CAP_TABLE_SIZE,
+                  CAP_KIND_VFS_WRITE, CAP_RIGHTS_WRITE) != 0)
+        return -ENOCAP;
     /* Default: not protected. Non-ext2 backends below don't touch kflags, so
      * this prevents a stale VFS_KF_PROTECTED bit leaking from a reused slot. */
     out->kflags = 0;
     out->cap_root_inode = 0;
     out->cap_rights = 0;
-    out->_cap_pad = 0;
+    out->cap_root_gen = 0;
 
     /* /dev/ptmx → allocate PTY master */
     if (path[0]=='/' && path[1]=='d' && path[2]=='e' && path[3]=='v' && path[4]=='/' &&
@@ -349,7 +373,7 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
         if (path[4] == '\0')
             return ramfs_opendir(&s_tmp_ramfs, out);
         if (path[4] == '/')
-            return ramfs_open(&s_tmp_ramfs, path + 5, flags, out);
+            return ramfs_open(&s_tmp_ramfs, path + 5, flags, create_mode, out);
     }
 
     /* /run or /run/ -> run ramfs */
@@ -357,7 +381,7 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
         if (path[4] == '\0')
             return ramfs_opendir(&s_run_ramfs, out);
         if (path[4] == '/')
-            return ramfs_open(&s_run_ramfs, path + 5, flags, out);
+            return ramfs_open(&s_run_ramfs, path + 5, flags, create_mode, out);
     }
 
     /* Dynamic mounts (sys_mount): a tmpfs subtree, e.g. under /mnt. Checked
@@ -368,7 +392,7 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
         if (mount_acquire(path, &ctx, &rel) == MOUNT_FS_TMPFS) {
             int r = (*rel == '\0')
                   ? ramfs_opendir((ramfs_t *)ctx, out)
-                  : ramfs_open((ramfs_t *)ctx, rel, flags, out);
+                  : ramfs_open((ramfs_t *)ctx, rel, flags, create_mode, out);
             mount_release(ctx);
             return r;
         }
@@ -382,9 +406,16 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
          * symlink-swap can't substitute a different target between the two — see
          * ext2_open_protected. This is the authoritative, atomic replacement for
          * sys_open's racy cap_path_is_protected() pre-check. */
-        if (g_rootfs->open_protected(path, &ino, &is_protected) >= 0)
-            return vfs_open_ext2_inode(ino, is_protected, flags, out,
-                                       has_install);
+        irqflags_t open_fl = g_rootfs->lock();
+        int opened = g_rootfs->open_protected(path, &ino, &is_protected);
+        if (opened >= 0) {
+            int rc = vfs_open_ext2_inode(ino, is_protected, flags, out, has_install, 0);
+            g_rootfs->unlock(open_fl);
+            return rc;
+        }
+        g_rootfs->unlock(open_fl);
+        if (opened != -ENOENT)
+            return opened;
         /* ext2 ENOENT + O_CREAT → check W+X on parent, then create */
         if (flags & (int)VFS_O_CREAT) {
             /* Keep the backend's namespace lock from parent authorization
@@ -407,26 +438,15 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
                 }
             }
             int cr = g_rootfs->create(path,
-                                      create_mode ? create_mode : 0644,
+                                      create_mode,
                                       has_install);
             if (cr == 0) {
-                if (g_rootfs->open_protected(path, &ino, &is_protected) >= 0) {
-                    ext2_fd_priv_t *p = g_rootfs->pool_alloc(ino);
-                    if (!p) {
-                        g_rootfs->unlock(fl);
-                        return -ENOMEM;
-                    }
-                    out->ops    = ((const vfs_ops_t *)g_rootfs->file_ops);
-                    out->priv   = (void *)p;
-                    out->offset = 0;
-                    out->size   = 0;
-                    out->flags  = 0;
-                    out->kflags = is_protected ? VFS_KF_PROTECTED : 0;
-                    out->cap_root_inode = 0;
-                    out->cap_rights = 0;
-                    out->_cap_pad = 0;
+                cr = g_rootfs->open_protected(path, &ino, &is_protected);
+                if (cr >= 0) {
+                    int rc = vfs_open_ext2_inode(ino, is_protected,
+                        flags & ~(int)(VFS_O_CREAT | VFS_O_EXCL), out, has_install, 1);
                     g_rootfs->unlock(fl);
-                    return 0;
+                    return rc;
                 }
             }
             g_rootfs->unlock(fl);

@@ -281,6 +281,13 @@ elf_load(struct aegis_process *proc, uint64_t pml4_phys, const uint8_t *data,
         uint64_t page_count = (va_offset + ph->p_memsz + 4095UL) / 4096UL;
         uint64_t j;
 
+        /* Every caller installs this stack after loading the ELF. */
+        if (page_count && va_base < AEGIS_USER_STACK_TOP &&
+            va_base + page_count * 4096UL > AEGIS_USER_STACK_BASE) {
+            printk("[ELF] FAIL: PT_LOAD overlaps the user stack\n");
+            return -1;
+        }
+
         /* Reject a PT_LOAD whose target pages are ALREADY mapped in this PML4.
          * vmm_map_user_page panic_halt()s on a present PTE ("double-map"), so a
          * crafted ELF could panic the kernel (unprivileged-execve DoS) two ways:

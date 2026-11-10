@@ -395,8 +395,7 @@ virtio_net_irq(void)
 {
     if (!s_dev.priv)
         return;
-    int prev = g_in_isr_poll;
-    g_in_isr_poll = 1;
+    __atomic_fetch_add(&g_in_isr_poll, 1, __ATOMIC_SEQ_CST);
     virtio_net_service(&s_dev);
-    g_in_isr_poll = prev;
+    __atomic_fetch_sub(&g_in_isr_poll, 1, __ATOMIC_SEQ_CST);
 }

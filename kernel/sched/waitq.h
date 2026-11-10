@@ -26,7 +26,8 @@
  * has already been removed by another path. This keeps the cleanup loop
  * simple regardless of which queue actually fired the wake.
  *
- * All ops take spin_lock_irqsave on the queue's lock. ISR-safe.
+ * ISR-safe. Wakes take sched_lock before the queue lock; callers must not
+ * hold sched_lock. Entries and tasks stay protected until waking completes.
  */
 
 #include <stddef.h>

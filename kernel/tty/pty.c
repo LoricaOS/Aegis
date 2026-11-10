@@ -261,8 +261,7 @@ try_acquire_ctty_locked(pty_pair_t *pair)
 		    s_pty_pool[j].tty.session_id == proc->sid)
 			return;   /* session already has a PTY ctty */
 	}
-	pair->tty.session_id = proc->sid;
-	pair->tty.fg_pgrp = proc->pgid;
+	(void)tty_claim(&pair->tty, proc->sid, proc->pgid);
 }
 
 /* ── Master VFS ops ───────────────────────────────────────────────── */
@@ -648,59 +647,76 @@ ptmx_open(int flags, vfs_file_t *out)
 	return 0;
 }
 
-int
-pts_open(uint32_t index, int flags, vfs_file_t *out)
+/* Caller holds a live reference (or the pool lock for a controlling open). */
+static void pts_open_pair(pty_pair_t *pair, int flags, vfs_file_t *out)
 {
-	(void)flags;
+    irqflags_t fl = spin_lock_irqsave(&pair->lock);
+    if (pair->slave_open)
+        refcount_inc(&pair->slave_refs);
+    else {
+        pair->slave_open = 1;
+        refcount_init(&pair->slave_refs, 1);
+    }
+    spin_unlock_irqrestore(&pair->lock, fl);
+    if (!(flags & 0400)) try_acquire_ctty_locked(pair);
+    *out = (vfs_file_t){ .ops = &s_slave_ops, .priv = pair,
+                        .flags = VFS_O_RDWR };
+}
 
-	if (index >= PTY_MAX_PAIRS)
-		return -2; /* ENOENT */
+int pts_open(uint32_t index, int flags, vfs_file_t *out)
+{
+    if (index >= PTY_MAX_PAIRS) return -2;
+    aegis_task_t *task = sched_current();
+    if (!task || !task->is_user) return -13;
+    aegis_process_t *proc = (aegis_process_t *)task;
+    pty_pair_t *pair = &s_pty_pool[index];
+    int rc = -13;
+    /* The name is not authority: possession of either endpoint is. Hold the
+     * fd table lock until the new reference exists, excluding close/reuse. */
+    irqflags_t ffl = spin_lock_irqsave(&proc->fd_table->lock);
+    for (int i = 0; i < PROC_MAX_FDS; i++) {
+        vfs_file_t *f = &proc->fd_table->fds[i];
+        if ((f->ops != &s_master_ops && f->ops != &s_slave_ops) || f->priv != pair)
+            continue;
+        irqflags_t pfl = spin_lock_irqsave(&pty_pool_lock);
+        if (!pair->in_use || !pair->master_open) rc = -2;
+        else if (!pair->locked) {
+            pts_open_pair(pair, flags, out);
+            rc = 0;
+        }
+        spin_unlock_irqrestore(&pty_pool_lock, pfl);
+        break;
+    }
+    spin_unlock_irqrestore(&proc->fd_table->lock, ffl);
+    return rc;
+}
 
-	irqflags_t fl = spin_lock_irqsave(&pty_pool_lock);
-	pty_pair_t *pair = &s_pty_pool[index];
-	if (!pair->in_use || !pair->master_open) {
-		spin_unlock_irqrestore(&pty_pool_lock, fl);
-		return -2; /* ENOENT */
-	}
-	if (pair->locked) {
-		spin_unlock_irqrestore(&pty_pool_lock, fl);
-		return -13; /* EACCES */
-	}
-
-	/* A fresh first open inits the refcount to 1; a SECOND open of an
-	 * already-open slave (open("/dev/pts/N") twice — each path open re-enters
-	 * pts_open, unlike dup which goes through slave_dup_fn) must BUMP the
-	 * existing count, not reset it to 1. Resetting dropped the first opener's
-	 * reference: closing one fd then tore the pair down under the surviving fd
-	 * (refcount underflow → use-after-free + premature free). */
-	if (pair->slave_open) {
-		refcount_inc(&pair->slave_refs);
-	} else {
-		pair->slave_open = 1;
-		refcount_init(&pair->slave_refs, 1);
-	}
-	/* O_NOCTTY (0400): caller does not want this slave to become its
-	 * controlling terminal.  A terminal emulator opens the slave only to
-	 * hand it to the child shell as stdio; the *shell*, not the emulator,
-	 * should own the ctty and the foreground pgrp.  Without this, a
-	 * session-leader emulator (e.g. /bin/terminal) grabs fg_pgrp and the
-	 * shell's reads stop on SIGTTIN. */
-	if (!(flags & 0400))
-		try_acquire_ctty_locked(pair);
-	spin_unlock_irqrestore(&pty_pool_lock, fl);
-
-	out->ops    = &s_slave_ops;
-	out->priv   = pair;
-	out->offset = 0;
-	out->size   = 0;
-	out->flags  = 2; /* O_RDWR */
-	out->kflags = 0;
-	return 0;
+int pty_open_controlling(uint32_t sid, vfs_file_t *out)
+{
+    if (sid == 0) return -6;
+    irqflags_t fl = spin_lock_irqsave(&pty_pool_lock);
+    int rc = -6;  /* ENXIO: no controlling terminal */
+    for (unsigned i = 0; i < PTY_MAX_PAIRS; i++) {
+        pty_pair_t *pair = &s_pty_pool[i];
+        if (!pair->in_use) continue;
+        irqflags_t pfl = spin_lock_irqsave(&pair->lock);
+        if (pair->slave_open && pair->tty.session_id == sid &&
+            refcount_inc_not_zero(&pair->slave_refs)) {
+            *out = (vfs_file_t){ .ops = &s_slave_ops, .priv = pair,
+                                .flags = VFS_O_RDWR };
+            rc = 0;
+        }
+        spin_unlock_irqrestore(&pair->lock, pfl);
+        if (rc == 0) break;
+    }
+    spin_unlock_irqrestore(&pty_pool_lock, fl);
+    return rc;
 }
 
 tty_t *
 pty_find_by_session(uint32_t session_id)
 {
+	if (session_id == 0) return (tty_t *)0;
 	irqflags_t fl = spin_lock_irqsave(&pty_pool_lock);
 	uint32_t i;
 	for (i = 0; i < PTY_MAX_PAIRS; i++) {

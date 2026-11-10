@@ -354,6 +354,10 @@ void ip_rx(netdev_t *dev, const void *frame,
      * bit (0x4000) is left alone (a normal unfragmented packet may set it). */
     if (ntohs(hdr->flags_frag) & 0x3FFF) return;
 
+    /* Snapshot address config once for source/destination classification. */
+    ip4_addr_t my_ip, netmask;
+    net_get_config(&my_ip, &netmask, (ip4_addr_t *)0);
+
     /* rpfilter (anti-spoof) — applies ONLY to wire-received packets. Loopback
      * is delivered via ip_loopback_poll with frame == NULL (and legitimately
      * carries 127/8 or our-own-IP src/dst), so it is exempt; a non-NULL frame
@@ -365,19 +369,22 @@ void ip_rx(netdev_t *dev, const void *frame,
     if (frame != (const void *)0) {
         if ((ntohl(hdr->src) >> 24) == 127)        return;
         if ((ntohl(hdr->dst) >> 24) == 127)        return;
-        if (s_my_ip != 0 && hdr->src == s_my_ip)   return;
+        if (my_ip != 0 && hdr->src == my_ip)       return;
     }
 
-    /* Destination filtering. */
+    /* Destination filtering. Broadcast delivery is needed for UDP/DHCP, but
+     * TCP must never see it (listeners otherwise reflect SYN-ACKs, or RSTs
+     * for closed ports). /31 and /32 have no directed broadcast address. */
     ip4_addr_t dst = hdr->dst;
+    int broadcast = dst == htonl(0xFFFFFFFFu) ||
+        (my_ip != 0 && netmask != 0 && ntohl(netmask) < 0xFFFFFFFEu &&
+         dst == (my_ip | ~netmask));
     int accept = 0;
-    if (dst == s_my_ip && s_my_ip != 0)                              accept = 1;
+    if (dst == my_ip && my_ip != 0)                                  accept = 1;
     if ((ntohl(dst) >> 24) == 127)                                   accept = 1; /* loopback 127.0.0.0/8 */
-    if (dst == htonl(0xFFFFFFFFu))                                   accept = 1;
-    if (s_my_ip == 0 && dst == htonl(0xFFFFFFFFu))                   accept = 1;
-    if (s_my_ip != 0 && s_netmask != 0 &&
-        dst == (s_my_ip | ~s_netmask))                               accept = 1;
+    if (broadcast)                                                  accept = 1;
     if (!accept) return;
+    if (hdr->proto == IP_PROTO_TCP && broadcast) return;
 
     uint16_t hdr_len    = (uint16_t)sizeof(ip_hdr_t);
     uint16_t ip_tot_len = ntohs(hdr->total_len);

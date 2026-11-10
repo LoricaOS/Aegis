@@ -52,7 +52,10 @@ jobs:
       - name: Boot + capability tests (captest + ktest under QEMU/TCG)
         run: make CC=gcc-14 LD=ld OBJCOPY=objcopy NM=nm test
       - name: Stage release artifact
-        run: cp build/aegis.elf aegis.elf
+        # The release asset is the STRIPPED image: that is what `make dist`
+        # documents, and LoricaOS embeds the fetched file in a 3 MiB ESP slot
+        # (build/aegis.elf is ~5x larger and overflows it once the kernel grows).
+        run: cp build/aegis-stripped.elf aegis.elf
       - uses: actions/upload-artifact@v4
         with:
           name: aegis-x86
@@ -89,7 +92,9 @@ jobs:
       - name: Boot + capability tests (captest + ktest under QEMU/TCG)
         run: make -f Makefile.arm64 test
       - name: Stage release artifact
-        run: cp build/arm64/aegis-arm64.elf aegis-arm64.elf
+        # Stripped, for the same reason as x86: the asset is embedded in a
+        # fixed-size ESP slot by LoricaOS.
+        run: cp build/arm64/aegis-arm64-stripped.elf aegis-arm64.elf
       - uses: actions/upload-artifact@v4
         with:
           name: aegis-arm64

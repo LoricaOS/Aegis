@@ -40,6 +40,8 @@ ext2_fd_priv_t *ext2_pool_alloc(uint32_t ino);
 
 /* Release a pool slot (decrements ref_count; frees when 0). */
 void ext2_pool_free(ext2_fd_priv_t *p);
+int ext2_pool_has_inode(uint32_t ino);
+void ext2_reclaim_unlinked(uint32_t ino);
 
 /* Shared ops table for ext2 fds — used by vfs_open, vfs_fchmod, vfs_fchown
  * to identify ext2 file descriptors. */

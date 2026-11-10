@@ -28,6 +28,9 @@
 #include "blkdev.h"
 #include "printk.h"
 #include "smp.h"
+#include "sched.h"
+#include "proc.h"
+#include "cap.h"
 #include "../lib/string.h"
 #include "../include/aegis_errno.h"
 
@@ -102,6 +105,20 @@ static int fat_streq(const char *a, const char *b) {
     }
 }
 
+/* All entry points use the same FAT name spelling before resolution and
+ * policy checks. FAT has no symlinks, so lexical dot removal is authoritative. */
+static int fat_normalize(const char *path, char out[512])
+{
+    if (!path || path[0] != '/') return -EINVAL;
+    uint32_t n = 0;
+    while (path[n]) {
+        if (n >= 511) return -ENAMETOOLONG;
+        n++;
+    }
+    path_canonicalize(path, out, 512);
+    return 0;
+}
+
 /* ---- low-level sector / FAT access ----------------------------------- */
 
 /* Both accessors bound `lba` to the device. This is the last line of defence
@@ -140,14 +157,21 @@ static int fat_cluster_ok(uint32_t cl) {
  * a step budget and gives up past it. */
 #define FAT_CHAIN_STEPS_OK(steps) ((steps) <= s_total_clusters)
 
-/* next cluster in the chain (FAT32), or >= FAT_EOC at end */
-static uint32_t fat_next(uint32_t cl) {
+/* Preserve failed reads for directory lookup: they are not end-of-chain. */
+static int fat_next_checked(uint32_t cl, uint32_t *next) {
     uint8_t sec[SECTOR];
     uint32_t off = cl * 4;
-    if (fat_read_lba(s_fat_lba + off / SECTOR, sec) != 0) return FAT_EOC;
+    if (fat_read_lba(s_fat_lba + off / SECTOR, sec) != 0) return -EIO;
     uint32_t v;
     kmemcpy(&v, sec + (off % SECTOR), 4);
-    return v & 0x0FFFFFFFu;
+    *next = v & 0x0FFFFFFFu;
+    return 0;
+}
+
+/* next cluster in the chain (FAT32), or >= FAT_EOC at end */
+static uint32_t fat_next(uint32_t cl) {
+    uint32_t next;
+    return fat_next_checked(cl, &next) == 0 ? next : FAT_EOC;
 }
 
 /* ---- directory-entry decode + inode synthesis ------------------------ */
@@ -200,14 +224,14 @@ static int read_dirent(uint32_t ino, fat_dirent_t *d) {
     }
     uint32_t lba = ino >> 5, idx = ino & 31;
     uint8_t sec[SECTOR];
-    if (fat_read_lba(lba, sec) != 0) return -ENOENT;
+    if (fat_read_lba(lba, sec) != 0) return -EIO;
     fill_dirent(sec + idx * DIRENT_SIZE, d);
     return 0;
 }
 
 /* iterate a directory's entries. For each valid 8.3 entry, invoke cb; cb
  * returns non-zero to stop. `want_index`<0 => visit all; else stop at the Nth.
- * On a hit, *hit_ino / *hit_dirent are set. Returns 1 if cb stopped, else 0. */
+ * Returns 1 if cb stopped, 0 at the end, or -EIO on a failed/corrupt walk. */
 typedef int (*dir_cb)(const char *name, uint32_t ino, const fat_dirent_t *d, void *ctx);
 
 /* the 13 UCS-2 char slots within a 32-byte LFN entry */
@@ -222,7 +246,7 @@ static int walk_dir(uint32_t dir_cluster, dir_cb cb, void *ctx) {
     while (fat_cluster_ok(cl) && FAT_CHAIN_STEPS_OK(steps)) {
         for (uint32_t s = 0; s < s_spc; s++) {
             uint32_t lba = cluster_lba(cl) + s;
-            if (fat_read_lba(lba, sec) != 0) return 0;
+            if (fat_read_lba(lba, sec) != 0) return -EIO;
             for (uint32_t i = 0; i < SECTOR / DIRENT_SIZE; i++) {
                 const uint8_t *e = sec + i * DIRENT_SIZE;
                 if (e[0] == 0x00) return 0;              /* end of directory */
@@ -236,7 +260,7 @@ static int walk_dir(uint32_t dir_cluster, dir_cb cb, void *ctx) {
                      * stack locals (sec[512], have_lfn, cl — corrupting cl
                      * redirects the whole directory walk). 20 fragments × 13
                      * chars covers the 255-char max long name. */
-                    if (seq < 1 || seq > 20) { have_lfn = 0; continue; }
+                    if (seq < 1 || seq > 20) return -EIO;
                     int base = (seq - 1) * 13;
                     for (int k = 0; k < 13 && base + k < 259; k++) {
                         uint16_t ch; kmemcpy(&ch, e + LFN_POS[k], 2);
@@ -256,9 +280,11 @@ static int walk_dir(uint32_t dir_cluster, dir_cb cb, void *ctx) {
                 if (cb(use, ino, &d, ctx)) return 1;
             }
         }
-        cl = fat_next(cl); steps++;
+        if (fat_next_checked(cl, &cl) != 0) return -EIO;
+        if (cl >= FAT_EOC) return 0;
+        steps++;
     }
-    return 0;
+    return -EIO;
 }
 
 /* ---- path resolution ------------------------------------------------- */
@@ -274,6 +300,11 @@ static int match_cb(const char *name, uint32_t ino, const fat_dirent_t *d, void 
  * and return the final component's name in *base_out instead. */
 static int resolve(const char *path, uint32_t *ino_out, fat_dirent_t *d_out,
                    uint32_t *parent_cluster_out, const char **base_out) {
+    if (!s_dev) return -ENODEV;
+    char canonical[512];
+    int normalized = fat_normalize(path, canonical);
+    if (normalized != 0) return normalized;
+    path = canonical;
     while (*path == '/') path++;
     uint32_t cur_cluster = s_root_cluster;
     uint32_t cur_ino = FAT_ROOT_INO;
@@ -308,7 +339,8 @@ static int resolve(const char *path, uint32_t *ino_out, fat_dirent_t *d_out,
 
         struct match_ctx m = { comp, 0, {0}, 0 };
         if (!(cur_d.attr & ATTR_DIR)) return -ENOTDIR;
-        walk_dir(cur_cluster, match_cb, &m);
+        int walked = walk_dir(cur_cluster, match_cb, &m);
+        if (walked < 0) return walked;
         if (!m.found) return -ENOENT;
         cur_ino = m.ino; cur_d = m.d; cur_cluster = m.d.first_cluster;
     }
@@ -378,7 +410,8 @@ static void fat_mark_clean(void)                    { }
 static const char *fat_devname(void)                { return s_dev ? s_dev->name : "none"; }
 static irqflags_t fat_lock(void)                    { return fat_lock_acquire(); }
 static void fat_unlock(irqflags_t fl)               { fat_lock_release(fl); }
-static uint32_t fat_ino_of(const void *o, void *p)  { (void)o; return p ? ((ext2_fd_priv_t *)p)->ino : 0; }
+static const vfs_ops_t fat_file_ops;
+static uint32_t fat_ino_of(const void *o, void *p) { return o == &fat_file_ops && p ? ((ext2_fd_priv_t *)p)->ino : 0; }
 
 /* ---- fs_ops: path -> inode ------------------------------------------- */
 
@@ -414,7 +447,13 @@ static int fat_open_ex(const char *path, uint32_t *ino, int follow) { (void)foll
 static int fat_path_under(const char *path, const char *tree)
 {
     uint32_t i = 0;
-    while (tree[i] && path[i] == tree[i]) i++;
+    while (tree[i]) {
+        char a = path[i], b = tree[i];
+        if (a >= 'A' && a <= 'Z') a += 32;
+        if (b >= 'A' && b <= 'Z') b += 32;
+        if (a != b) break;
+        i++;
+    }
     if (tree[i] != '\0')
         return 0;                       /* diverged before the tree ended */
     /* Exact match, or a genuine child: "/bin" and "/bin/sh" but not "/binary". */
@@ -423,10 +462,14 @@ static int fat_path_under(const char *path, const char *tree)
 
 static int fat_under_prot(const char *path)
 {
+    char canonical[512];
+    if (fat_normalize(path, canonical) != 0) return 1;
+    path = canonical;
     if (!path || path[0] != '/')
         return 0;
     return fat_path_under(path, "/bin")  || fat_path_under(path, "/sbin") ||
-           fat_path_under(path, "/apps") || fat_path_under(path, "/etc/aegis");
+           fat_path_under(path, "/apps") || fat_path_under(path, "/lib") ||
+           fat_path_under(path, "/etc/aegis");
 }
 
 /* Namespace changes must also protect ancestors: moving /etc aside is as
@@ -434,7 +477,10 @@ static int fat_under_prot(const char *path)
  * links, so normalized path intersection is its authoritative identity test. */
 static int fat_path_guarded(const char *path)
 {
-    static const char *trees[] = { "/bin", "/sbin", "/apps", "/etc/aegis" };
+    char canonical[512];
+    if (fat_normalize(path, canonical) != 0) return 1;
+    path = canonical;
+    static const char *trees[] = { "/bin", "/sbin", "/apps", "/lib", "/etc/aegis" };
     if (!path || path[0] != '/') return 0;
     for (uint32_t i = 0; i < sizeof(trees) / sizeof(trees[0]); i++)
         if (fat_path_under(path, trees[i]) || fat_path_under(trees[i], path))
@@ -550,7 +596,8 @@ static int fat_readdir(uint32_t dir_ino, uint64_t index, char *name_out, uint8_t
     fat_dirent_t d;
     if (read_dirent(dir_ino, &d) != 0 || !(d.attr & ATTR_DIR)) return -ENOTDIR;
     struct rd_ctx r = { index, 0, name_out, type_out, 0 };
-    walk_dir(d.first_cluster, rd_cb, &r);
+    int walked = walk_dir(d.first_cluster, rd_cb, &r);
+    if (walked < 0) return walked;
     return r.hit ? 0 : -1;
 }
 
@@ -583,7 +630,9 @@ static int fat_set(uint32_t cl, uint32_t val) {
     return 0;
 }
 
-/* allocate one free cluster, mark EOC, return it (0 = ENOSPC) */
+static int fat_zero_cluster(uint32_t cl);
+
+/* Allocate only initialized clusters, including sparse regular-file growth. */
 static uint32_t fat_alloc(void) {
     uint8_t sec[SECTOR];
     uint32_t last = s_total_clusters + 2;
@@ -593,6 +642,7 @@ static uint32_t fat_alloc(void) {
         uint32_t v; kmemcpy(&v, sec + (off % SECTOR), 4);
         if ((v & 0x0FFFFFFFu) == 0) {
             if (fat_set(cl, 0x0FFFFFFFu) != 0) return 0;
+            if (fat_zero_cluster(cl) != 0) { (void)fat_set(cl, 0); return 0; }
             s_next_free = cl + 1;
             return cl;
         }
@@ -600,9 +650,11 @@ static uint32_t fat_alloc(void) {
     return 0;
 }
 
-static void fat_zero_cluster(uint32_t cl) {
+static int fat_zero_cluster(uint32_t cl) {
     uint8_t z[SECTOR]; kmemset(z, 0, SECTOR);
-    for (uint32_t s = 0; s < s_spc; s++) fat_write_lba(cluster_lba(cl) + s, z);
+    for (uint32_t s = 0; s < s_spc; s++)
+        if (fat_write_lba(cluster_lba(cl) + s, z) != 0) return -EIO;
+    return 0;
 }
 
 static void fat_free_chain(uint32_t cl) {
@@ -655,7 +707,6 @@ static int find_free_slot(uint32_t dir_cluster, uint32_t *o_lba, uint32_t *o_idx
     }
     uint32_t nc = fat_alloc();
     if (!nc) return -ENOSPC;
-    fat_zero_cluster(nc);
     fat_set(prev, nc);
     *o_lba = cluster_lba(nc); *o_idx = 0;
     return 0;
@@ -718,7 +769,7 @@ static int dir_slot(uint32_t dir_cluster, uint32_t slot, uint32_t *o_lba, uint32
     uint32_t ci = slot / per, within = slot % per, cl = dir_cluster;
     for (uint32_t k = 0; k < ci; k++) {
         uint32_t nx = fat_next(cl);
-        if (nx >= FAT_EOC) { nx = fat_alloc(); if (!nx) return -ENOSPC; fat_zero_cluster(nx); fat_set(cl, nx); }
+        if (nx >= FAT_EOC) { nx = fat_alloc(); if (!nx) return -ENOSPC; fat_set(cl, nx); }
         cl = nx;
     }
     *o_lba = cluster_lba(cl) + within / (SECTOR / DIRENT_SIZE);
@@ -807,7 +858,6 @@ static int fat_make(const char *path, int dir) {
     if (dir) {
         first = fat_alloc();
         if (!first) return -ENOSPC;
-        fat_zero_cluster(first);
         uint8_t dot[11]; kmemset(dot, ' ', 11); dot[0] = '.';
         write_entry(cluster_lba(first), 0, dot, ATTR_DIR, first, 0);
         uint8_t dd[11]; kmemset(dd, ' ', 11); dd[0] = '.'; dd[1] = '.';
@@ -823,11 +873,29 @@ static int fat_make(const char *path, int dir) {
     return write_lfn_name(pcl, base, attr, first, 0, raw);
 }
 
+/* Also gate creation/replacement when a sensitive name is currently absent. */
+static int fat_sensitive_write(const char *path)
+{
+    char canonical[512];
+    if (fat_normalize(path, canonical) != 0) return -EACCES;
+    path = canonical;
+    aegis_task_t *task = sched_current();
+    if (!task || !task->is_user) return 0;
+    aegis_process_t *proc = current_proc();
+    if ((fat_streq(path, "/etc/passwd") || fat_streq(path, "/etc/group")) &&
+        !proc->admin_session) return -EACCES;
+    if ((fat_streq(path, "/etc/shadow") || fat_streq(path, "/etc/aegis/admin")) &&
+        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_AUTH, CAP_RIGHTS_WRITE) != 0)
+        return -EACCES;
+    return 0;
+}
+
 /* ---- fs_ops: write half ---------------------------------------------- */
 
 static int fat_create(const char *p, uint16_t m, int h) {
     (void)m;
     irqflags_t fl = fat_lock_acquire();
+    if (fat_sensitive_write(p) != 0) { fat_lock_release(fl); return -EACCES; }
     uint32_t existing;
     int r = (!h && fat_path_guarded(p)) ? -EPERM
           : (resolve(p, &existing, 0, 0, 0) == 0) ? -EEXIST
@@ -838,6 +906,7 @@ static int fat_create(const char *p, uint16_t m, int h) {
 static int fat_mkdir(const char *p, uint16_t m, int h) {
     (void)m;
     irqflags_t fl = fat_lock_acquire();
+    if (fat_sensitive_write(p) != 0) { fat_lock_release(fl); return -EACCES; }
     uint32_t existing;
     int r = (!h && fat_path_guarded(p)) ? -EPERM
           : (resolve(p, &existing, 0, 0, 0) == 0) ? -EEXIST
@@ -848,6 +917,7 @@ static int fat_mkdir(const char *p, uint16_t m, int h) {
 
 static int fat_unlink(const char *path, int h) {
     irqflags_t fl = fat_lock_acquire();
+    if (fat_sensitive_write(path) != 0) { fat_lock_release(fl); return -EACCES; }
     if (!h && fat_path_guarded(path)) {
         fat_lock_release(fl);
         return -EPERM;
@@ -866,37 +936,53 @@ static int fat_unlink(const char *path, int h) {
 }
 
 /* inode-level write: extend the chain as needed, RMW partial sectors, grow size */
-static int fat_write(uint32_t ino, const void *buf, uint32_t off, uint32_t len) {
+static int fat_write_impl(uint32_t ino, const void *buf, uint32_t off, uint32_t len) {
     fat_dirent_t d;
     if (read_dirent(ino, &d) != 0) return -ENOENT;
     if (d.attr & ATTR_DIR) return -EISDIR;
+    if (!len) return 0;
+    if ((uint64_t)off + len > UINT32_MAX) return -ENOSPC;
+    uint32_t start = off > d.size ? d.size : off;
+    uint32_t gap = off - start;
+    uint32_t total = gap + len; /* bounded by off + len above */
     uint32_t csize = (uint32_t)s_spc * SECTOR;
     uint32_t first = d.first_cluster;
-    if (first < 2) { first = fat_alloc(); if (!first) return -ENOSPC; }
+    if (first < 2) {
+        first = fat_alloc();
+        if (!first) return -ENOSPC;
+        if (patch_entry(ino, first, d.size) != 0) {
+            fat_free_chain(first);
+            return -EIO;
+        }
+    }
     /* first_cluster came off a directory entry: reject it before it reaches
      * cluster_lba() below. */
     if (!fat_cluster_ok(first)) return -EIO;
 
     uint32_t cl = first;
-    for (uint32_t k = 0; k < off / csize; k++) {
+    for (uint32_t k = 0; k < start / csize; k++) {
         uint32_t nx = fat_next(cl);
-        if (nx >= FAT_EOC) { nx = fat_alloc(); if (!nx) return -ENOSPC; fat_set(cl, nx); }
+        if (nx >= FAT_EOC) { nx = fat_alloc(); if (!nx) return -ENOSPC;
+            if (fat_set(cl, nx) != 0) { fat_free_chain(nx); return -EIO; } }
         cl = nx;
         if (!fat_cluster_ok(cl)) return -EIO;    /* corrupt/cyclic chain */
     }
     uint8_t sec[SECTOR];
-    uint32_t done = 0, pos = off % csize;
-    while (done < len) {
+    uint32_t done = 0, pos = start % csize;
+    while (done < total) {
         uint32_t s = pos / SECTOR, so = pos % SECTOR;
         uint32_t lba = cluster_lba(cl) + s, n = SECTOR - so;
-        if (n > len - done) n = len - done;
-        if (so != 0 || n < SECTOR) { if (fat_read_lba(lba, sec) != 0) kmemset(sec, 0, SECTOR); }
-        kmemcpy(sec + so, (const uint8_t *)buf + done, n);
+        if (n > total - done) n = total - done;
+        if (done < gap && n > gap - done) n = gap - done;
+        if (so != 0 || n < SECTOR) { if (fat_read_lba(lba, sec) != 0) return -EIO; }
+        if (done < gap) kmemset(sec + so, 0, n);
+        else kmemcpy(sec + so, (const uint8_t *)buf + done - gap, n);
         if (fat_write_lba(lba, sec) != 0) break;
         done += n; pos += n;
-        if (pos >= csize && done < len) {
+        if (pos >= csize && done < total) {
             uint32_t nx = fat_next(cl);
-            if (nx >= FAT_EOC) { nx = fat_alloc(); if (!nx) break; fat_set(cl, nx); }
+            if (nx >= FAT_EOC) { nx = fat_alloc(); if (!nx) break;
+                if (fat_set(cl, nx) != 0) { fat_free_chain(nx); break; } }
             cl = nx; pos = 0;
             if (!fat_cluster_ok(cl)) break;      /* corrupt/cyclic chain */
         }
@@ -908,16 +994,25 @@ static int fat_write(uint32_t ino, const void *buf, uint32_t off, uint32_t len) 
      * that is refused rather than silently wrapped (no EFBIG in this errno
      * set; ENOSPC is the closest and is already this function's overflow
      * return). */
-    uint64_t ns64 = off + done;
+    uint32_t written = done > gap ? done - gap : 0;
+    uint64_t ns64 = written ? (uint64_t)off + written : d.size;
     if (ns64 > 0xFFFFFFFFULL) return -ENOSPC;
     uint32_t ns = (uint32_t)ns64;
-    patch_entry(ino, first, ns > d.size ? ns : d.size);
-    return (int)done;
+    if (patch_entry(ino, first, ns > d.size ? ns : d.size) != 0) return -EIO;
+    return written ? (int)written : -EIO;
+}
+
+static int fat_write(uint32_t ino, const void *buf, uint32_t off, uint32_t len) {
+    irqflags_t fl = fat_lock_acquire();
+    int rc = fat_write_impl(ino, buf, off, len);
+    fat_lock_release(fl);
+    return rc;
 }
 
 static int fat_truncate(uint32_t ino) {
     fat_dirent_t d;
     if (read_dirent(ino, &d) != 0) return -ENOENT;
+    if (d.attr & ATTR_DIR) return -EISDIR;
     if (d.first_cluster >= 2) fat_free_chain(d.first_cluster);
     return patch_entry(ino, 0, 0);
 }
@@ -932,6 +1027,7 @@ static int notempty_cb(const char *name, uint32_t ino, const fat_dirent_t *d, vo
 }
 static int fat_rmdir(const char *path, int h) {
     irqflags_t fl = fat_lock_acquire();
+    if (fat_sensitive_write(path) != 0) { fat_lock_release(fl); return -EACCES; }
     if (!h && fat_path_guarded(path)) {
         fat_lock_release(fl);
         return -EPERM;
@@ -941,7 +1037,8 @@ static int fat_rmdir(const char *path, int h) {
     if (r) { fat_lock_release(fl); return r; }
     if (!(d.attr & ATTR_DIR)) { fat_lock_release(fl); return -ENOTDIR; }
     int nonempty = 0;
-    walk_dir(d.first_cluster, notempty_cb, &nonempty);
+    r = walk_dir(d.first_cluster, notempty_cb, &nonempty);
+    if (r < 0) { fat_lock_release(fl); return r; }
     if (nonempty) { fat_lock_release(fl); return -ENOTEMPTY; }
     if (d.first_cluster >= 2) fat_free_chain(d.first_cluster);
     uint32_t lba = ino >> 5, idx = ino & 31; uint8_t sec[SECTOR];
@@ -956,6 +1053,7 @@ static int fat_rmdir(const char *path, int h) {
  * ".." still points at its old parent — a known limitation for now. */
 static int fat_rename(const char *old, const char *neu, int h) {
     irqflags_t fl = fat_lock_acquire();
+    if (fat_sensitive_write(old) != 0 || fat_sensitive_write(neu) != 0) { fat_lock_release(fl); return -EACCES; }
     if (!h && (fat_path_guarded(old) || fat_path_guarded(neu))) {
         fat_lock_release(fl);
         return -EPERM;
@@ -988,7 +1086,16 @@ static int fat_readlink(const char *p, char *b, uint32_t n){ (void)p; (void)b; (
 static int fat_chown(const char *p, uint16_t u, uint16_t g, int f, int h) { (void)p; (void)u; (void)g; (void)f; (void)h; return 0; }  /* no-op */
 static int fat_utimes(const char *p, uint32_t a, uint32_t m, int f, int h){ (void)p; (void)a; (void)m; (void)f; (void)h; return 0; }  /* no-op */
 static int fat_write_inode(uint32_t i, const ext2_inode_t *o) { (void)i; (void)o; return 0; }  /* metadata not persisted */
-static uint32_t fat_zero(void) { return 0; }
+static uint32_t fat_sensitive_ino(const char *path)
+{
+    uint32_t ino = 0;
+    (void)fat_open(path, &ino);
+    return ino;
+}
+static uint32_t fat_admin_ino(void) { return fat_sensitive_ino("/etc/aegis/admin"); }
+static uint32_t fat_passwd_ino(void) { return fat_sensitive_ino("/etc/passwd"); }
+static uint32_t fat_shadow_ino(void) { return fat_sensitive_ino("/etc/shadow"); }
+static uint32_t fat_group_ino(void) { return fat_sensitive_ino("/etc/group"); }
 static void fat_anchors_reload(void) { }
 
 /* ---- fd-private pool + file (vfs_ops_t) layer ------------------------ */
@@ -1113,8 +1220,8 @@ const fs_ops_t fat_ops = {
     .is_dir = fat_is_dir, .check_perm = fat_check_perm, .inode_gen = fat_inode_gen,
     .read_symlink_target = fat_readlink_ino,
     .pool_alloc = fat_pool_alloc, .pool_free = fat_pool_free,
-    .get_admin_ino = fat_zero, .get_passwd_ino = fat_zero,
-    .get_shadow_ino = fat_zero, .get_group_ino = fat_zero,
+    .get_admin_ino = fat_admin_ino, .get_passwd_ino = fat_passwd_ino,
+    .get_shadow_ino = fat_shadow_ino, .get_group_ino = fat_group_ino,
     .anchors_reload = fat_anchors_reload,
 };
 

@@ -256,8 +256,8 @@ signal_deliver(cpu_state_t *s)
         if (signum == SIGTSTP || signum == SIGSTOP ||
             signum == SIGTTIN || signum == SIGTTOU) {
             proc->stop_signum = (uint32_t)signum;
-            /* Notify parent in case it's blocked in waitpid(WUNTRACED) */
-            signal_send_pid(proc->ppid, SIGCHLD);
+            /* sched_stop publishes the state and notifies parent waiters
+             * together under sched_lock (no wake-before-stop window). */
             sched_stop((aegis_task_t *)task);  /* yields; returns on SIGCONT */
             return;
         }
@@ -379,7 +379,8 @@ signal_deliver_sysret(syscall_frame_t *frame, uint64_t *saved_rdi_ptr)
         if (signum == SIGTSTP || signum == SIGSTOP ||
             signum == SIGTTIN || signum == SIGTTOU) {
             proc->stop_signum = (uint32_t)signum;
-            signal_send_pid(proc->ppid, SIGCHLD);
+            /* As on the iret path, publish the stop before notifying the
+             * parent's live signal recipient and waiters in sched_stop. */
             sched_stop((aegis_task_t *)task);  /* yields; returns on SIGCONT */
             return 0;
         }

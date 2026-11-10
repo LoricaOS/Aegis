@@ -25,11 +25,13 @@
 static void
 _panic_draw_char(uint32_t px_x, uint32_t px_y, char c, uint32_t fg)
 {
+    if (px_x >= s_fb_width || px_y >= s_fb_height)
+        return;
     const uint8_t *glyph = &font_terminus[(uint8_t)c * PANIC_FONT_H * 2];
     uint32_t row, col;
-    for (row = 0; row < PANIC_FONT_H; row++) {
+    for (row = 0; row < PANIC_FONT_H && row < s_fb_height - px_y; row++) {
         uint16_t bits = ((uint16_t)glyph[row * 2] << 8) | glyph[row * 2 + 1];
-        for (col = 0; col < PANIC_FONT_W; col++) {
+        for (col = 0; col < PANIC_FONT_W && col < s_fb_width - px_x; col++) {
             uint32_t color = (bits & (0x8000u >> col)) ? fg : PANIC_BG;
             uint32_t idx = (px_y + row) * s_pitch_px + (px_x + col);
             s_fb_va[idx] = color;
@@ -41,7 +43,7 @@ static void
 _panic_draw_string(uint32_t *px_x, uint32_t px_y, const char *s, uint32_t fg)
 {
     while (*s) {
-        if (*px_x + PANIC_FONT_W > s_fb_width)
+        if (*px_x > s_fb_width || PANIC_FONT_W > s_fb_width - *px_x)
             break;
         _panic_draw_char(*px_x, px_y, *s, fg);
         *px_x += PANIC_FONT_W;
@@ -144,12 +146,14 @@ panic_bluescreen(uint64_t vector, uint64_t rip, uint64_t error_code,
                  uint64_t cr2, uint64_t rsp, uint64_t rbp,
                  uint64_t rax, uint64_t rbx)
 {
+    /* Never acquire s_text_lock: this CPU may have faulted while holding it.
+     * Disable local IRQs now, not just at halt, and suppress new text writers.
+     * Another CPU already drawing may finish; emergency output is best-effort. */
+    arch_disable_irq();
+    __atomic_store_n(&s_panic_active, 1, __ATOMIC_RELEASE);
     pvpanic_signal_panic();   /* notify host (no-op if no pvpanic device) */
     if (!fb_available || s_fb_va == (void *)0)
         goto halt;
-
-    /* Take over the framebuffer unconditionally */
-    s_fb_locked = 0;
 
     /* Fill screen with blue */
     {
@@ -252,11 +256,11 @@ halt:
 void
 panic_halt(const char *msg)
 {
+    arch_disable_irq();
+    __atomic_store_n(&s_panic_active, 1, __ATOMIC_RELEASE);
     pvpanic_signal_panic();   /* notify host (no-op if no pvpanic device) */
     if (!fb_available || s_fb_va == (void *)0)
         goto phalt;
-
-    s_fb_locked = 0;
 
     /* Fill screen with blue */
     {
@@ -318,8 +322,11 @@ phalt:
 void
 fb_boot_splash(void)
 {
-    if (!fb_available || s_fb_va == (void *)0)
-        return;
+    irqflags_t flags = spin_lock_irqsave(&s_text_lock);
+    if (!fb_available || !s_fb_va || s_fb_locked ||
+        __atomic_load_n(&s_panic_active, __ATOMIC_ACQUIRE))
+        goto out;
+    _fb_erase_cursor();
 
     /* Fill screen with dark background */
     {
@@ -338,24 +345,29 @@ fb_boot_splash(void)
     uint32_t gap = 18;
     uint32_t group_h = dh + gap + PANIC_FONT_H;
 
-    uint32_t top = s_fb_height / 2 - group_h / 2;
-    uint32_t lx  = s_fb_width / 2 - dw / 2;
+    uint32_t top = (s_fb_height > group_h) ? (s_fb_height - group_h) / 2 : 0;
+    uint32_t lx  = (s_fb_width > dw) ? (s_fb_width - dw) / 2 : 0;
     uint32_t ly  = top;
-    uint32_t tx  = s_fb_width / 2 - tw / 2;
+    uint32_t tx  = (s_fb_width > tw) ? (s_fb_width - tw) / 2 : 0;
     uint32_t ty  = ly + dh + gap;
 
     _blit_logo_cov(logo_boot_cov, LOGO_BOOT_W, LOGO_BOOT_H,
                    lx, ly, SPLASH_BG, SPLASH_LOGO_SCALE);
     _splash_draw_string(tx, ty, tag, 0x00E6EAF0u);  /* soft white */
 
-    /* No lock — printk_quiet already suppresses FB output in graphical
-     * mode. The splash persists until Bastion paints over it. */
+    /* Keep the scroll source coherent if normal text resumes after a splash.
+     * Do not claim compositor ownership: graphical boot uses printk_quiet. */
+    if (s_shadow)
+        __builtin_memcpy(s_shadow, (const void *)s_fb_va,
+                         s_fb_pixels * sizeof(uint32_t));
+out:
+    spin_unlock_irqrestore(&s_text_lock, flags);
 }
 
 void
 fb_boot_splash_end(void)
 {
-    /* No-op — splash draws without locking, printk_quiet handles
+    /* No-op — splash does not claim ownership, printk_quiet handles
      * FB output suppression. Nothing to unlock or clear. */
     (void)0;
 }

@@ -12,11 +12,13 @@ static netdev_t *s_devices[NETDEV_MAX];
 static int        s_count = 0;
 static spinlock_t netdev_lock = SPINLOCK_INIT;
 
-/* Non-zero while executing in PIT-ISR / poll context, where arp_resolve must
- * not block (see core/poll.c poll_sources_run, which sets it for the whole
+/* Atomic nesting depth across all CPUs. Non-zero in ISR/poll context, where
+ * arp_resolve must not block (see core/poll.c poll_sources_run for the whole
  * tick, and net/eth.c which consults it). Formerly g_in_netdev_poll, set only
  * inside netdev_poll_all — a narrower property than its consumers needed, which
  * is how tcp_tick came to block in an ISR while holding tcp_lock. */
+/* ponytail: global depth also defers task-context ARP/NDP on other CPUs;
+ * use per-CPU depth if those conservative retries affect throughput. */
 volatile int g_in_isr_poll = 0;
 
 int
@@ -55,17 +57,14 @@ void
 netdev_poll_all(void)
 {
     irqflags_t fl = spin_lock_irqsave(&netdev_lock);
-    /* Save/restore, never clear: poll_sources_run has already set this for the
-     * whole tick, and clearing it on exit would leave the LATER sources (most
-     * importantly tcp_tick) believing they may block. */
-    int prev = g_in_isr_poll;
-    g_in_isr_poll = 1;
+    /* Nested under the tick and sometimes entered from task context. */
+    __atomic_fetch_add(&g_in_isr_poll, 1, __ATOMIC_SEQ_CST);
     int i;
     for (i = 0; i < s_count; i++) {
         if (s_devices[i]->poll)
             s_devices[i]->poll(s_devices[i]);
     }
-    g_in_isr_poll = prev;
+    __atomic_fetch_sub(&g_in_isr_poll, 1, __ATOMIC_SEQ_CST);
     spin_unlock_irqrestore(&netdev_lock, fl);
 }
 

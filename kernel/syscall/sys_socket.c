@@ -65,6 +65,7 @@ scm_fd_passable(const vfs_file_t *f)
  * reject every other flag rather than silently changing its semantics. */
 #define MSG_OOB        0x0001
 #define MSG_PEEK       0x0002
+#define MSG_CTRUNC     0x0008
 #define MSG_DONTWAIT   0x0040
 #define MSG_WAITALL    0x0100
 #define MSG_NOSIGNAL   0x4000
@@ -163,10 +164,11 @@ static uint16_t s_ephem_next = EPHEM_PORT_BASE;
 static uint16_t
 ephem_port_next(void)
 {
+    irqflags_t fl = sock_lock_acquire();
     uint16_t p = s_ephem_next;
-    uint16_t off = (uint16_t)(p - EPHEM_PORT_BASE);
-    off = (uint16_t)((off + 1u) & (EPHEM_PORT_COUNT - 1u));
-    s_ephem_next = (uint16_t)(EPHEM_PORT_BASE + off);
+    s_ephem_next = (uint16_t)(EPHEM_PORT_BASE +
+        ((p - EPHEM_PORT_BASE + 1u) & (EPHEM_PORT_COUNT - 1u)));
+    sock_lock_release(fl);
     return p;
 }
 
@@ -245,7 +247,7 @@ sys_bind(uint64_t fd, uint64_t addr, uint64_t addrlen)
         k_sockaddr_un_t sun;
         __builtin_memset(&sun, 0, sizeof(sun));
         uint32_t copy_len = addrlen < sizeof(sun) ? (uint32_t)addrlen : (uint32_t)sizeof(sun);
-        copy_from_user(&sun, (const void *)(uintptr_t)addr, copy_len);
+        if (copy_from_user(&sun, (const void *)(uintptr_t)addr, copy_len) != 0) return SYS_ERR(EFAULT);
         if (sun.sun_family != AF_UNIX) return SYS_ERR(EINVAL);
         sun.sun_path[UNIX_PATH_MAX - 1] = '\0';
         int rc = unix_sock_bind(uid, sun.sun_path);
@@ -255,25 +257,25 @@ sys_bind(uint64_t fd, uint64_t addr, uint64_t addrlen)
     sock_t *s; uint32_t sid;
     uint64_t err = get_sock_from_pin(&pin, &s, &sid);
     if (err) return err;
+    if (s->state != SOCK_CREATED || s->local_port != 0) return SYS_ERR(EINVAL);
 
     if (s->domain == AF_INET6) {
         if (addrlen < sizeof(k_sockaddr_in6_t)) return SYS_ERR(EINVAL);
         if (!user_ptr_valid(addr, sizeof(k_sockaddr_in6_t))) return SYS_ERR(EFAULT);
         k_sockaddr_in6_t sa;
-        copy_from_user(&sa, (const void *)(uintptr_t)addr, sizeof(sa));
+        if (copy_from_user(&sa, (const void *)(uintptr_t)addr, sizeof(sa)) != 0) return SYS_ERR(EFAULT);
         if (sa.sin6_family != AF_INET6) return SYS_ERR(EINVAL);
         static const ip6_addr_t any;
         ip6_addr_t local; ipv6_get_linklocal(&local);
         if (!ipv6_addr_equal(&sa.sin6_addr, &any) &&
             !ipv6_addr_equal(&sa.sin6_addr, &local)) return SYS_ERR(EADDRNOTAVAIL);
-        s->local_ip6 = sa.sin6_addr;
         uint16_t port = ntohs(sa.sin6_port);
         if (port == 0) {
             if (udp_ensure_local_port(s, sid) != 0) return SYS_ERR(EADDRINUSE);
         } else {
-            s->local_port = port;
             if (udp_bind(port, sid) != 0) return SYS_ERR(EADDRINUSE);
         }
+        s->local_ip6 = sa.sin6_addr;
         s->state = SOCK_BOUND;
         return 0;
     }
@@ -283,7 +285,7 @@ sys_bind(uint64_t fd, uint64_t addr, uint64_t addrlen)
     if (!user_ptr_valid(addr, sizeof(k_sockaddr_in_t))) return SYS_ERR(EFAULT);
 
     k_sockaddr_in_t sa;
-    copy_from_user(&sa, (const void *)(uintptr_t)addr, sizeof(sa));
+    if (copy_from_user(&sa, (const void *)(uintptr_t)addr, sizeof(sa)) != 0) return SYS_ERR(EFAULT);
     if (sa.sin_family != AF_INET) return SYS_ERR(EINVAL);
 
     uint16_t port = ntohs(sa.sin_port);
@@ -298,7 +300,6 @@ sys_bind(uint64_t fd, uint64_t addr, uint64_t addrlen)
             return SYS_ERR(EACCES);
     }
 
-    s->local_ip = sa.sin_addr;
 
     /* Wildcard bind (port 0): assign an ephemeral port, as Linux does.  musl's
      * DNS resolver binds its UDP socket to 0.0.0.0:0 expecting an auto-assigned
@@ -314,25 +315,16 @@ sys_bind(uint64_t fd, uint64_t addr, uint64_t addrlen)
              * binds get distinct ports (no tick-granularity reuse). */
             s->local_port = ephem_port_next();
         }
+        s->local_ip = sa.sin_addr;
         s->state = SOCK_BOUND;
         return 0;
     }
 
+    if (s->type == SOCK_TYPE_DGRAM && udp_bind(port, sid) != 0)
+        return SYS_ERR(EADDRINUSE);
     s->local_port = port;
-    s->state      = SOCK_BOUND;
-
-    /* Register with TCP or UDP binding layer */
-    if (s->type == SOCK_TYPE_DGRAM) {
-        /* Release any previous binding first. Rebinding used to leak the old
-         * port registration, so after this socket closed and its slot was
-         * recycled the stale entry still pointed at the same sid — and the new
-         * owner of that slot received datagrams addressed to a port it never
-         * bound. */
-        if (s->local_port != 0 && s->local_port != port)
-            udp_unbind(s->local_port);
-        return udp_bind(port, sid) == 0 ? 0 : SYS_ERR(EADDRINUSE);
-    }
-    /* TCP: binding is stored in sock_t; actual listen registration happens in sys_listen */
+    s->local_ip = sa.sin_addr;
+    s->state = SOCK_BOUND;
     return 0;
 }
 
@@ -355,9 +347,9 @@ sys_listen(uint64_t fd, uint64_t backlog)
     if (s->type != SOCK_TYPE_STREAM) return SYS_ERR(EOPNOTSUPP);
     if (s->state < SOCK_BOUND) return SYS_ERR(EINVAL);  /* EINVAL: must bind first */
 
+    if (tcp_listen(s->local_port, sid) != 0) return SYS_ERR(EADDRINUSE);
     s->state = SOCK_LISTENING;
-
-    return tcp_listen(s->local_port, sid) == 0 ? 0 : SYS_ERR(EADDRINUSE);
+    return 0;
 }
 
 /* ── sys_accept ────────────────────────────────────────────────────────── */
@@ -396,63 +388,54 @@ do_accept(uint64_t fd, uint64_t addr, uint64_t addrlen, uint64_t flags)
     aegis_process_t *proc = current_proc();
 
     for (;;) {
-        /* Check accept queue */
-        /* Pop the queue ATOMICALLY. head/tail were read and advanced with no
-         * lock, so two threads accept()ing the same listener could both read
-         * the same accept_head and receive the SAME connection on two
-         * different fds — two processes then reading and writing one TCP
-         * stream. sock_lock is the listener's own lock and this is a couple of
-         * loads and a store. */
-        uint32_t conn_id;
-        int have_conn = 0;
-        {
-            irqflags_t afl = sock_lock_acquire();
-            if (ls->accept_head != ls->accept_tail) {
-                conn_id = ls->accept_queue[ls->accept_head];
-                ls->accept_head = (ls->accept_head + 1) & 7;
-                have_conn = 1;
-            }
-            sock_lock_release(afl);
-        }
-        if (have_conn) {
-
-            /* Allocate a new sock_t for this connected peer */
+        if (tcp_accept_ready(lsid)) {
             int new_sid = sock_alloc(SOCK_TYPE_STREAM);
             if (new_sid < 0) return (sock_unref(lsid), SYS_ERR(ENOMEM));
-            sock_t *ns = sock_get((uint32_t)new_sid);
-            ns->state       = SOCK_CONNECTED;
-            ns->domain      = AF_INET;
-            ns->tcp_conn_id = conn_id;
-            ns->nonblocking = (flags & SOCK_FLAG_NONBLOCK) ? 1 : 0;
-
-            /* Copy peer address from tcp_conn_t */
-            tcp_conn_get_addr(conn_id, &ns->remote_ip, &ns->remote_port,
-                              &ns->local_ip, &ns->local_port);
-
-            /* Point tcp_conn back to this new socket */
-            tcp_conn_set_sock(conn_id, (uint32_t)new_sid);
-
-            /* Fill caller's addr struct */
-            if (addr && addrlen) {
-                if (!user_ptr_valid(addr, sizeof(k_sockaddr_in_t)))
-                    return (sock_unref(lsid), SYS_ERR(EFAULT));
-                if (!user_ptr_valid(addrlen, sizeof(uint32_t)))
-                    return (sock_unref(lsid), SYS_ERR(EFAULT));
-                k_sockaddr_in_t sa;
-                sa.sin_family = AF_INET;
-                sa.sin_port   = htons(ns->remote_port);
-                sa.sin_addr   = ns->remote_ip;
-                __builtin_memset(sa.sin_zero, 0, 8);
-                uint32_t outlen = sizeof(sa);
-                copy_to_user((void *)(uintptr_t)addrlen, &outlen, sizeof(uint32_t));
-                copy_to_user((void *)(uintptr_t)addr, &sa, sizeof(sa));
+            tcp_conn_t accepted;
+            int conn_id = tcp_accept(lsid, (uint32_t)new_sid, &accepted);
+            if (conn_id < 0) {
+                sock_unref((uint32_t)new_sid);
+                continue;  /* stale queue entries were discarded */
             }
+            sock_t *ns = sock_get((uint32_t)new_sid);
+            ns->state = SOCK_CONNECTED;
+            ns->tcp_conn_id = (uint32_t)conn_id;
+            ns->nonblocking = (flags & SOCK_FLAG_NONBLOCK) ? 1 : 0;
+            ns->remote_ip = accepted.remote_ip;
+            ns->remote_port = accepted.remote_port;
+            ns->local_ip = accepted.local_ip;
+            ns->local_port = accepted.local_port;
 
+            if (addr && addrlen) {
+                uint32_t capacity;
+                if (!user_ptr_valid(addrlen, sizeof(capacity)) ||
+                    copy_from_user(&capacity, (const void *)(uintptr_t)addrlen,
+                                   sizeof(capacity)) != 0) {
+                    tcp_conn_abort((uint32_t)new_sid, (uint32_t)conn_id);
+                    sock_unref((uint32_t)new_sid);
+                    return (sock_unref(lsid), SYS_ERR(EFAULT));
+                }
+                k_sockaddr_in_t sa = {0};
+                sa.sin_family = AF_INET;
+                sa.sin_port = htons(ns->remote_port);
+                sa.sin_addr = ns->remote_ip;
+                uint32_t outlen = sizeof(sa);
+                uint32_t n = capacity < outlen ? capacity : outlen;
+                if ((n && (!user_ptr_valid(addr, n) ||
+                     copy_to_user((void *)(uintptr_t)addr, &sa, n) != 0)) ||
+                    copy_to_user((void *)(uintptr_t)addrlen, &outlen,
+                                 sizeof(outlen)) != 0) {
+                    tcp_conn_abort((uint32_t)new_sid, (uint32_t)conn_id);
+                    sock_unref((uint32_t)new_sid);
+                    return (sock_unref(lsid), SYS_ERR(EFAULT));
+                }
+            }
             uint32_t fd_flags = (flags & SOCK_FLAG_CLOEXEC) ? VFS_FD_CLOEXEC : 0;
             int new_fd = sock_open_fd((uint32_t)new_sid, proc, fd_flags);
             if (new_fd < 0) {
-                sock_free((uint32_t)new_sid);
-                return (sock_unref(lsid), SYS_ERR(ENOMEM));
+                tcp_conn_abort((uint32_t)new_sid, (uint32_t)conn_id);
+                sock_unref((uint32_t)new_sid);
+                return (sock_unref(lsid), SYS_ERR(EMFILE));
             }
             return (sock_unref(lsid), (uint64_t)new_fd);
         }
@@ -466,7 +449,7 @@ do_accept(uint64_t fd, uint64_t addr, uint64_t addrlen, uint64_t flags)
          * re-runs the authoritative dequeue above. */
         int rc;
         wait_event_interruptible(&ls->poll_waiters,
-            ls->accept_head != ls->accept_tail, rc);
+            tcp_accept_ready(lsid), rc);
         if (rc == BLOCK_EINTR)
             return (sock_unref(lsid), SYS_ERR(EINTR));
     }
@@ -506,7 +489,9 @@ sys_connect(uint64_t fd, uint64_t addr, uint64_t addrlen)
         k_sockaddr_un_t sun;
         __builtin_memset(&sun, 0, sizeof(sun));
         uint32_t copy_len = addrlen < sizeof(sun) ? (uint32_t)addrlen : (uint32_t)sizeof(sun);
-        copy_from_user(&sun, (const void *)(uintptr_t)addr, copy_len);
+        if (copy_from_user(&sun, (const void *)(uintptr_t)addr, copy_len) != 0)
+            return SYS_ERR(EFAULT);
+        if (sun.sun_family != AF_UNIX) return SYS_ERR(EINVAL);
         sun.sun_path[UNIX_PATH_MAX - 1] = '\0';
         int rc = unix_sock_connect(uid, sun.sun_path);
         return rc < 0 ? (uint64_t)(int64_t)rc : 0;
@@ -520,7 +505,8 @@ sys_connect(uint64_t fd, uint64_t addr, uint64_t addrlen)
         if (addrlen < sizeof(k_sockaddr_in6_t)) return SYS_ERR(EINVAL);
         if (!user_ptr_valid(addr, sizeof(k_sockaddr_in6_t))) return SYS_ERR(EFAULT);
         k_sockaddr_in6_t sa6;
-        copy_from_user(&sa6, (const void *)(uintptr_t)addr, sizeof(sa6));
+        if (copy_from_user(&sa6, (const void *)(uintptr_t)addr, sizeof(sa6)) != 0)
+            return SYS_ERR(EFAULT);
         if (sa6.sin6_family != AF_INET6) return SYS_ERR(EINVAL);
         s->remote_ip6 = sa6.sin6_addr;
         s->remote_port = ntohs(sa6.sin6_port);
@@ -534,7 +520,9 @@ sys_connect(uint64_t fd, uint64_t addr, uint64_t addrlen)
     if (!user_ptr_valid(addr, sizeof(k_sockaddr_in_t))) return SYS_ERR(EFAULT);
 
     k_sockaddr_in_t sa;
-    copy_from_user(&sa, (const void *)(uintptr_t)addr, sizeof(sa));
+    if (copy_from_user(&sa, (const void *)(uintptr_t)addr, sizeof(sa)) != 0)
+        return SYS_ERR(EFAULT);
+    if (sa.sin_family != AF_INET) return SYS_ERR(EINVAL);
 
     s->remote_ip   = sa.sin_addr;
     s->remote_port = ntohs(sa.sin_port);
@@ -614,10 +602,8 @@ udp_ensure_local_port(sock_t *s, uint32_t sid)
     for (i = 0; i < EPHEM_PORT_COUNT; i++) {
         uint16_t port = (uint16_t)(EPHEM_PORT_BASE +
                         (((uint32_t)base - EPHEM_PORT_BASE + i) & (EPHEM_PORT_COUNT - 1u)));
-        if (udp_bind(port, sid) == 0) {
-            s->local_port = port;
+        if (udp_bind(port, sid) == 0 || s->local_port != 0)
             return 0;
-        }
     }
     return -1;
 }
@@ -689,7 +675,8 @@ sys_sendto(uint64_t fd, uint64_t buf, uint64_t len,
         if (addr && addrlen >= sizeof(k_sockaddr_in6_t)) {
             if (!user_ptr_valid(addr, sizeof(k_sockaddr_in6_t))) return SYS_ERR(EFAULT);
             k_sockaddr_in6_t sa;
-            copy_from_user(&sa, (const void *)(uintptr_t)addr, sizeof(sa));
+            if (copy_from_user(&sa, (const void *)(uintptr_t)addr, sizeof(sa)) != 0)
+                return SYS_ERR(EFAULT);
             if (sa.sin6_family != AF_INET6) return SYS_ERR(EINVAL);
             dst = sa.sin6_addr; dst_port = ntohs(sa.sin6_port);
         } else if (s->state == SOCK_CONNECTED) {
@@ -711,12 +698,11 @@ sys_sendto(uint64_t fd, uint64_t buf, uint64_t len,
     ip4_addr_t dst_ip;
     uint16_t   dst_port;
     if (addr && addrlen >= sizeof(k_sockaddr_in_t)) {
-        /* Validate the user addr pointer before copy_from_user: uaccess has no
-         * fault fixup, so an unmapped addr would panic the kernel (every other
-         * sockaddr copy-in in this file guards it; this path was missed). */
+        /* Validate the address and reject short copies before using fields. */
         if (!user_ptr_valid(addr, sizeof(k_sockaddr_in_t))) return SYS_ERR(EFAULT);
         k_sockaddr_in_t sa;
-        copy_from_user(&sa, (const void *)(uintptr_t)addr, sizeof(sa));
+        if (copy_from_user(&sa, (const void *)(uintptr_t)addr, sizeof(sa)) != 0)
+            return SYS_ERR(EFAULT);
         dst_ip   = sa.sin_addr;
         dst_port = ntohs(sa.sin_port);
     } else if (s->state == SOCK_CONNECTED) {
@@ -754,13 +740,31 @@ sys_sendto(uint64_t fd, uint64_t buf, uint64_t len,
 
 /* ── sys_recvfrom ──────────────────────────────────────────────────────── */
 
+/* sys_recvfrom is the only UDP consumer (VFS UDP read is unsupported).
+ * Keep the reserved head queued across faultable copies, then commit or abort.
+ * RX cannot reuse that slot until the release-store of head. Never hold
+ * sock_lock during usercopy or wakeup: those can enter MM/scheduler code. */
+static void
+udp_recv_finish(sock_t *s, uint32_t sid, int delivered)
+{
+    irqflags_t fl = sock_lock_acquire();
+    if (delivered) {
+        s->udp_rx[s->udp_rx_head].in_use = 0;
+        __atomic_store_n(&s->udp_rx_head,
+            (s->udp_rx_head + 1) & (UDP_RX_SLOTS - 1), __ATOMIC_RELEASE);
+    }
+    __atomic_store_n(&s->udp_rx_busy, 0, __ATOMIC_RELEASE);
+    sock_lock_release(fl);
+    sock_wake(sid);
+}
+
 uint64_t
 sys_recvfrom(uint64_t fd, uint64_t buf, uint64_t len,
              uint64_t flags, uint64_t addr, uint64_t addrlen)
 {
     if (!recv_flags_supported(flags)) return SYS_ERR(EOPNOTSUPP);
     SCOPED_FD_PIN(pin);
-    if (!user_ptr_valid(buf, len)) return SYS_ERR(EFAULT);
+    if (!user_ptr_writable(buf, len)) return SYS_ERR(EFAULT);
 
     /* AF_UNIX stream recv: recv()/recvfrom() on a connected AF_UNIX socket.
      * Counterpart to the AF_UNIX sys_sendto path — without it recv() fell
@@ -772,10 +776,12 @@ sys_recvfrom(uint64_t fd, uint64_t buf, uint64_t len,
         uint32_t uuid = get_proc_unix_sock(fd, &pin);
         if (uuid != UNIX_NONE) {
             uint8_t kbuf[UNIX_BUF_SIZE]; /* bounce chunk == AF_UNIX ring size */
-            uint32_t want = (uint32_t)len > UNIX_BUF_SIZE ? UNIX_BUF_SIZE : (uint32_t)len;
+            uint32_t want = len > UNIX_BUF_SIZE ? UNIX_BUF_SIZE : (uint32_t)len;
             int n = unix_sock_read(uuid, kbuf, want, (flags & MSG_DONTWAIT) ? 1 : 0);
-            if (n > 0)
-                copy_to_user((void *)(uintptr_t)buf, kbuf, (uint32_t)n);
+            if (n > 0) {
+                uint64_t left = copy_to_user((void *)(uintptr_t)buf, kbuf, (uint32_t)n);
+                if (left) return left < (uint64_t)n ? (uint64_t)n - left : SYS_ERR(EFAULT);
+            }
             return (n < 0) ? (uint64_t)(int64_t)n : (uint64_t)n;
         }
     }
@@ -791,6 +797,7 @@ sys_recvfrom(uint64_t fd, uint64_t buf, uint64_t len,
      * linked waiter — a use-after-free. Every return past this point drops the
      * pin (via the comma operator) so teardown defers to the last putter. See
      * sock_vfs_read. */
+    if (len == 0 && s->type == SOCK_TYPE_STREAM) return 0;
     sock_ref(sid);
 
     /* MSG_DONTWAIT forces this single call to be nonblocking regardless of the
@@ -818,20 +825,24 @@ sys_recvfrom(uint64_t fd, uint64_t buf, uint64_t len,
                  * corruption + loss (a confidentiality bug across processes).
                  * A 2 KB stack buffer is also far safer than an 8 KB static on
                  * the 16 KB kernel stack (interrupts nest on it). Loop-drain the
-                 * ring through the small buffer so one call can still return up
-                 * to `len` bytes; the whole user range was validated up front
-                 * and user pages are eager-mapped, so copy_to_user won't fault. */
+                 * ring through the small buffer. A remap after validation can
+                 * still fault: report only bytes actually copied. Do not copy
+                 * under tcp_lock: lazy/COW faults can take MM locks or do I/O.
+                 * The already-consumed chunk cannot safely be put back after
+                 * another reader runs, so a racing fault may lose its suffix. */
                 uint8_t rbuf[2048];
-                uint32_t total = 0;
-                while (total < (uint32_t)len && n > 0) {
-                    uint32_t remain = (uint32_t)len - total;
-                    uint32_t want   = remain < (uint32_t)n ? remain : (uint32_t)n;
+                uint64_t total = 0;
+                while (total < len && n > 0) {
+                    uint64_t remain = len - total;
+                    uint32_t want = remain < (uint32_t)n ? (uint32_t)remain : (uint32_t)n;
                     if (want > sizeof(rbuf)) want = sizeof(rbuf);
                     int got = tcp_conn_recv(s->sock_id, s->tcp_conn_id, rbuf, (uint16_t)want);
                     if (got <= 0) break;
-                    copy_to_user((void *)(uintptr_t)(buf + total), rbuf,
-                                 (uint32_t)got);
-                    total += (uint32_t)got;
+                    uint64_t left = copy_to_user((void *)(uintptr_t)(buf + total),
+                                                 rbuf, (uint32_t)got);
+                    total += (uint32_t)got - left;
+                    if (left)
+                        return (sock_unref(sid), total ? total : SYS_ERR(EFAULT));
                     n = tcp_conn_recv(s->sock_id, s->tcp_conn_id, (void *)0, 0);  /* re-peek */
                 }
                 if (total > 0)
@@ -863,35 +874,62 @@ sys_recvfrom(uint64_t fd, uint64_t buf, uint64_t len,
 
     /* UDP recv */
     for (;;) {
-        if (s->udp_rx_head != s->udp_rx_tail) {
+        /* Check all outputs before dequeue, including after a blocking wait.
+         * In particular, reject RO/PROT_NONE and invalid address outputs
+         * without discarding a queued datagram. Honour the caller's socklen. */
+        uint32_t capacity = 0;
+        uint32_t outlen = s->domain == AF_INET6 ? sizeof(k_sockaddr_in6_t)
+                                               : sizeof(k_sockaddr_in_t);
+        if (!user_ptr_writable(buf, len))
+            return (sock_unref(sid), SYS_ERR(EFAULT));
+        if (addr) {
+            if (!addrlen || !user_ptr_valid(addrlen, sizeof(capacity)) ||
+                !user_ptr_writable(addrlen, sizeof(capacity)) ||
+                copy_from_user(&capacity, (const void *)(uintptr_t)addrlen,
+                               sizeof(capacity)) != 0 ||
+                !user_ptr_writable(addr, capacity < outlen ? capacity : outlen))
+                return (sock_unref(sid), SYS_ERR(EFAULT));
+        }
+        udp_rx_slot_t packet;
+        int have_packet = 0;
+        irqflags_t fl = sock_lock_acquire();
+        if (!s->udp_rx_busy &&
+            s->udp_rx_head != __atomic_load_n(&s->udp_rx_tail, __ATOMIC_ACQUIRE)) {
             udp_rx_slot_t *slot = &s->udp_rx[s->udp_rx_head];
-            s->udp_rx_head = (s->udp_rx_head + 1) & (UDP_RX_SLOTS - 1);
-            uint32_t copy_len = slot->len < (uint32_t)len ? slot->len : (uint32_t)len;
-            copy_to_user((void *)(uintptr_t)buf, slot->data, copy_len);
-            if (addr && addrlen && s->domain == AF_INET6 &&
-                user_ptr_valid(addr, sizeof(k_sockaddr_in6_t)) &&
-                user_ptr_valid(addrlen, sizeof(uint32_t))) {
+            __atomic_store_n(&s->udp_rx_busy, 1, __ATOMIC_RELEASE);
+            packet = *slot;
+            have_packet = 1;
+        }
+        sock_lock_release(fl);
+        if (have_packet) {
+            /* Neither RX nor another receiver can reuse our reserved slot.
+             * A fault leaves the datagram queued, even on a concurrent remap.
+             * Userspace may see a copied prefix on EFAULT; no delivery is
+             * reported and retry can receive the complete datagram. */
+            uint32_t copy_len = packet.len < len ? packet.len : (uint32_t)len;
+            if (copy_to_user((void *)(uintptr_t)buf, packet.data, copy_len) != 0)
+                return (udp_recv_finish(s, sid, 0), sock_unref(sid), SYS_ERR(EFAULT));
+            uint32_t naddr = capacity < outlen ? capacity : outlen;
+            if (addr && s->domain == AF_INET6) {
                 k_sockaddr_in6_t sa;
                 __builtin_memset(&sa, 0, sizeof(sa));
                 sa.sin6_family = AF_INET6;
-                sa.sin6_port = htons(slot->src_port);
-                sa.sin6_addr = slot->src_ip6;
-                uint32_t outlen = sizeof(sa);
-                copy_to_user((void *)(uintptr_t)addrlen, &outlen, sizeof(outlen));
-                copy_to_user((void *)(uintptr_t)addr, &sa, sizeof(sa));
-            } else if (addr && addrlen &&
-                       user_ptr_valid(addr, sizeof(k_sockaddr_in_t)) &&
-                       user_ptr_valid(addrlen, sizeof(uint32_t))) {
-                k_sockaddr_in_t sa;
+                sa.sin6_port = htons(packet.src_port);
+                sa.sin6_addr = packet.src_ip6;
+                if (copy_to_user((void *)(uintptr_t)addr, &sa, naddr) != 0)
+                    return (udp_recv_finish(s, sid, 0), sock_unref(sid), SYS_ERR(EFAULT));
+            } else if (addr) {
+                k_sockaddr_in_t sa = {0};
                 sa.sin_family = AF_INET;
-                sa.sin_port   = htons(slot->src_port);
-                sa.sin_addr   = slot->src_ip;
-                __builtin_memset(sa.sin_zero, 0, 8);
-                uint32_t outlen = sizeof(sa);
-                copy_to_user((void *)(uintptr_t)addrlen, &outlen, sizeof(uint32_t));
-                copy_to_user((void *)(uintptr_t)addr, &sa, sizeof(sa));
+                sa.sin_port = htons(packet.src_port);
+                sa.sin_addr = packet.src_ip;
+                if (copy_to_user((void *)(uintptr_t)addr, &sa, naddr) != 0)
+                    return (udp_recv_finish(s, sid, 0), sock_unref(sid), SYS_ERR(EFAULT));
             }
-            slot->in_use = 0;
+            if (addr && copy_to_user((void *)(uintptr_t)addrlen, &outlen,
+                                    sizeof(outlen)) != 0)
+                return (udp_recv_finish(s, sid, 0), sock_unref(sid), SYS_ERR(EFAULT));
+            udp_recv_finish(s, sid, 1);
             return (sock_unref(sid), (uint64_t)copy_len);
         }
         if (nonblock) return (sock_unref(sid), SYS_ERR(EAGAIN));
@@ -903,9 +941,11 @@ sys_recvfrom(uint64_t fd, uint64_t buf, uint64_t len,
         int rc;
         if (has_timeout)
             wait_event_timeout(&s->poll_waiters,
+                !__atomic_load_n(&s->udp_rx_busy, __ATOMIC_ACQUIRE) &&
                 s->udp_rx_head != s->udp_rx_tail, deadline, rc);
         else
             wait_event_interruptible(&s->poll_waiters,
+                !__atomic_load_n(&s->udp_rx_busy, __ATOMIC_ACQUIRE) &&
                 s->udp_rx_head != s->udp_rx_tail, rc);
         if (rc == BLOCK_EINTR) return (sock_unref(sid), SYS_ERR(EINTR));
     }
@@ -1112,137 +1152,187 @@ uint64_t sys_sendmsg(uint64_t fd, uint64_t msg_ptr, uint64_t flags)
     return (uint64_t)total_sent;
 }
 
+typedef struct {
+    uint64_t control;
+    uint64_t controllen_ptr;
+    uint64_t flags_ptr;
+    int msg_flags;
+} recv_rights_output_t;
+
+/* Called with owned staged references but with NO object/fd-table lock held.
+ * The helper publishes descriptors only after every output copy succeeds. */
+static int
+recv_rights_output(const int *fds, int nfds, int truncated, void *arg)
+{
+    recv_rights_output_t *out = arg;
+    uint64_t total_cm = 0;
+    if (nfds > 0) {
+        k_cmsghdr_t cm = {
+            .cmsg_len = sizeof(cm) + (uint64_t)nfds * sizeof(int),
+            .cmsg_level = SOL_SOCKET,
+            .cmsg_type = SCM_RIGHTS,
+        };
+        total_cm = cm.cmsg_len;
+        if (copy_to_user((void *)(uintptr_t)out->control, &cm, sizeof(cm)) != 0 ||
+            copy_to_user((void *)(uintptr_t)(out->control + sizeof(cm)),
+                         fds, (uint64_t)nfds * sizeof(int)) != 0)
+            return -EFAULT;
+    }
+    if (copy_to_user((void *)(uintptr_t)out->controllen_ptr,
+                     &total_cm, sizeof(total_cm)) != 0)
+        return -EFAULT;
+    out->msg_flags = truncated ? MSG_CTRUNC : 0;
+    if (copy_to_user((void *)(uintptr_t)out->flags_ptr,
+                     &out->msg_flags, sizeof(out->msg_flags)) != 0)
+        return -EFAULT;
+    return 0;
+}
+
+/* Difference form is overflow-safe even before the range checks. */
+static int
+recv_ranges_overlap(uint64_t a, uint64_t an, uint64_t b, uint64_t bn)
+{
+    if (!an || !bn) return 0;
+    return a <= b ? b - a < an : a - b < bn;
+}
+
 uint64_t sys_recvmsg(uint64_t fd, uint64_t msg_ptr, uint64_t flags)
 {
     if (!recv_flags_supported(flags)) return SYS_ERR(EOPNOTSUPP);
     SCOPED_FD_PIN(pin);
     uint32_t uid = get_proc_unix_sock(fd, &pin);
 
-    /* AF_INET recvmsg: receive into the first non-empty iovec via sys_recvfrom,
-     * which fills the source address into msg_name (a separate addrlen scratch
-     * is required because sys_recvfrom writes a 4-byte length there). One recv
-     * per call preserves datagram boundaries for UDP and is always a legal
-     * (possibly short) read for TCP. No ancillary data for AF_INET — we zero
-     * msg_controllen. Old behavior (ENOSYS) broke recvmsg() on net sockets. */
-    if (uid == UNIX_NONE) {
-        if (!user_ptr_valid(msg_ptr, sizeof(k_msghdr_t)))
-            return SYS_ERR(EFAULT);
-        k_msghdr_t imh;
-        if (copy_from_user(&imh, (const void *)(uintptr_t)msg_ptr, sizeof(imh)))
-            return SYS_ERR(EFAULT);  /* short copy → stale iov/name fields */
-
-        uint64_t r = 0;
-        for (uint64_t i = 0; i < imh.msg_iovlen && i < 8; i++) {
-            k_iovec_t iov;
-            if (!user_ptr_valid((uint64_t)(uintptr_t)imh.msg_iov + i * sizeof(k_iovec_t),
-                                sizeof(k_iovec_t)))
-                return SYS_ERR(EFAULT);
-            if (copy_from_user(&iov,
-                (const void *)((uintptr_t)imh.msg_iov + i * sizeof(k_iovec_t)),
-                sizeof(iov)))
-                return SYS_ERR(EFAULT);  /* short copy → stale iov_base/iov_len */
-            if (iov.iov_len == 0) continue;
-
-            /* sys_recvfrom needs a writable u32 at *addrlen; reuse the user
-             * msg_namelen slot only if a name buffer was supplied. */
-            uint64_t name = (uint64_t)(uintptr_t)imh.msg_name;
-            uint64_t alen = name
-                ? (uint64_t)(uintptr_t)msg_ptr + __builtin_offsetof(k_msghdr_t, msg_namelen)
-                : 0;
-            r = sys_recvfrom(fd, (uint64_t)(uintptr_t)iov.iov_base,
-                             iov.iov_len, flags, name, alen);
-            break;  /* one iovec per recvmsg call */
-        }
-        /* Clear msg_controllen — no ancillary data delivered for AF_INET. */
-        if (imh.msg_control) {
-            uint64_t zero = 0;
-            copy_to_user((void *)((uintptr_t)msg_ptr +
-                         __builtin_offsetof(k_msghdr_t, msg_controllen)),
-                         &zero, sizeof(uint64_t));
-        }
-        return r;
-    }
-
     if (!user_ptr_valid(msg_ptr, sizeof(k_msghdr_t))) return SYS_ERR(EFAULT);
     k_msghdr_t mh;
     if (copy_from_user(&mh, (const void *)(uintptr_t)msg_ptr, sizeof(mh)))
         return SYS_ERR(EFAULT);  /* short copy → stale iov/control fields */
 
-    /* Recv iov data */
-    int64_t total_recv = 0;
-    for (uint64_t i = 0; i < mh.msg_iovlen && i < 8; i++) {
-        k_iovec_t iov;
+    recv_rights_output_t output = {
+        .control = (uint64_t)(uintptr_t)mh.msg_control,
+        .controllen_ptr = msg_ptr + __builtin_offsetof(k_msghdr_t, msg_controllen),
+        .flags_ptr = msg_ptr + __builtin_offsetof(k_msghdr_t, msg_flags),
+    };
+    if (!user_ptr_writable(output.controllen_ptr, sizeof(uint64_t)) ||
+        !user_ptr_writable(output.flags_ptr, sizeof(int)))
+        return SYS_ERR(EFAULT);
+    uint64_t max_fds = 0, control_len = 0;
+    if (uid != UNIX_NONE && mh.msg_control &&
+        mh.msg_controllen >= sizeof(k_cmsghdr_t) + sizeof(int)) {
+        max_fds = (mh.msg_controllen - sizeof(k_cmsghdr_t)) / sizeof(int);
+        if (max_fds > UNIX_PASSED_FD_MAX) max_fds = UNIX_PASSED_FD_MAX;
+        control_len = sizeof(k_cmsghdr_t) + max_fds * sizeof(int);
+        if (!user_ptr_writable(output.control, control_len))
+            return SYS_ERR(EFAULT);
+    }
+
+    /* Phase 1: snapshot inputs and validate every output before waiting,
+     * copying metadata, detaching rights or consuming data. Payload/control/
+     * name writes must not overwrite the header or each other's output.
+     * Payload iovecs may overlap each other (sequential writes are supported).
+     * The iovec array may be an output alias because it is snapshotted first. */
+    k_iovec_t iovs[8];
+    uint64_t niov = mh.msg_iovlen < 8 ? mh.msg_iovlen : 8;
+    int has_payload = 0;
+    if (niov && !user_ptr_valid((uint64_t)(uintptr_t)mh.msg_iov,
+                               niov * sizeof(k_iovec_t)))
+        return SYS_ERR(EFAULT);
+    for (uint64_t i = 0; i < niov; i++) {
         if (!user_ptr_valid((uint64_t)(uintptr_t)mh.msg_iov + i * sizeof(k_iovec_t), sizeof(k_iovec_t)))
             return SYS_ERR(EFAULT);
-        if (copy_from_user(&iov, (const void *)((uintptr_t)mh.msg_iov + i * sizeof(k_iovec_t)), sizeof(iov)))
+        if (copy_from_user(&iovs[i], (const void *)((uintptr_t)mh.msg_iov + i * sizeof(k_iovec_t)), sizeof(iovs[i])))
             return SYS_ERR(EFAULT);  /* short copy → stale iov_base/iov_len */
-        if (iov.iov_len == 0) continue;
-        if (!user_ptr_valid((uint64_t)(uintptr_t)iov.iov_base, iov.iov_len))
+        if (iovs[i].iov_len &&
+            !user_ptr_writable((uint64_t)(uintptr_t)iovs[i].iov_base, iovs[i].iov_len))
             return SYS_ERR(EFAULT);
+        if (iovs[i].iov_len) has_payload = 1;
+    }
+    uint64_t name = 0, name_len = 0;
+    if (uid == UNIX_NONE && mh.msg_name) {
+        sock_t *s; uint32_t sid;
+        uint64_t err = get_sock_from_pin(&pin, &s, &sid);
+        if (err) return err;
+        uint64_t size = s->domain == AF_INET6 ? sizeof(k_sockaddr_in6_t)
+                                             : sizeof(k_sockaddr_in_t);
+        name = (uint64_t)(uintptr_t)mh.msg_name;
+        name_len = mh.msg_namelen < size ? mh.msg_namelen : size;
+        if (!user_ptr_writable(name, name_len) ||
+            !user_ptr_writable(msg_ptr + __builtin_offsetof(k_msghdr_t, msg_namelen),
+                               sizeof(mh.msg_namelen)))
+            return SYS_ERR(EFAULT);
+    }
+    if (recv_ranges_overlap(output.control, control_len, msg_ptr, sizeof(mh)) ||
+        recv_ranges_overlap(name, name_len, msg_ptr, sizeof(mh)))
+        return SYS_ERR(EINVAL);
+    for (uint64_t i = 0; i < niov; i++) {
+        uint64_t base = (uint64_t)(uintptr_t)iovs[i].iov_base;
+        if (recv_ranges_overlap(base, iovs[i].iov_len, msg_ptr, sizeof(mh)) ||
+            recv_ranges_overlap(base, iovs[i].iov_len, output.control, control_len) ||
+            recv_ranges_overlap(base, iovs[i].iov_len, name, name_len))
+            return SYS_ERR(EINVAL);
+    }
+
+    if (uid == UNIX_NONE) {
+        /* Exactly one recvfrom, including zero-capacity/zero-iov UDP receives.
+         * Retain the existing first-nonempty-iovec (short receive) behaviour. */
+        uint64_t buf = 0, len = 0;
+        for (uint64_t i = 0; i < niov; i++) {
+            if (!iovs[i].iov_len) continue;
+            buf = (uint64_t)(uintptr_t)iovs[i].iov_base;
+            len = iovs[i].iov_len;
+            break;
+        }
+        int rc = recv_rights_output(NULL, 0, 0, &output);
+        if (rc < 0) return (uint64_t)(int64_t)rc;
+        uint64_t alen = name ? msg_ptr + __builtin_offsetof(k_msghdr_t, msg_namelen) : 0;
+        return sys_recvfrom(fd, buf, len, flags, name, alen);
+    }
+
+retry_receive:
+    /* Phase 2: wait WITHOUT consuming. Recheck staged rights after the wait,
+     * then resolve all output-copy/fd-slot failures before irreversible data.
+     * Stolen readiness retries here, never in a blocking payload read.
+     *
+     * Existing sendmsg publishes bytes and rights separately; staging has no
+     * stream offsets. This preserves its socket-wide/rights-only semantics,
+     * not a byte-to-rights association guarantee under concurrent receivers. */
+    if (has_payload) {
+        int rc = unix_sock_wait_recv(uid, (flags & MSG_DONTWAIT) ? 1 : 0);
+        if (rc < 0) return (uint64_t)(int64_t)rc;
+    }
+    int rights_recv = unix_sock_recv_fds(uid, (int)max_fds, recv_rights_output, &output);
+    if (rights_recv < 0) return (uint64_t)(int64_t)rights_recv;
+    int ancillary_progress = rights_recv > 0 || (output.msg_flags & MSG_CTRUNC);
+
+    /* Phase 3: only nonblocking reads/copies, so rights arriving during a wait
+     * can never be missed by a one-shot check before a blocking data read. */
+    int64_t total_recv = 0;
+    for (uint64_t i = 0; i < niov; i++) {
+        k_iovec_t iov = iovs[i];
         uint8_t kbuf[UNIX_BUF_SIZE]; /* bounce chunk == AF_UNIX ring size */
         uint64_t remain = iov.iov_len;
         uint64_t off = 0;
         while (remain > 0) {
             uint32_t chunk = remain > UNIX_BUF_SIZE ? UNIX_BUF_SIZE : (uint32_t)remain;
-            int n = unix_sock_read(uid, kbuf, chunk, (flags & MSG_DONTWAIT) ? 1 : 0);
+            /* Installed rights are already successful receive progress. Do not
+             * block after it or hide their valid cmsg behind a later error.
+             * A zero-byte result with rights is also used by zero-iov recvmsg. */
+            int n = unix_sock_read(uid, kbuf, chunk, 1);
             if (n <= 0) {
-                if (total_recv > 0) goto done;
+                if (total_recv > 0 || ancillary_progress) return (uint64_t)total_recv;
+                if (n == -EAGAIN && !(flags & MSG_DONTWAIT)) goto retry_receive;
                 return n == 0 ? 0 : (uint64_t)(int64_t)n;
             }
-            copy_to_user((void *)((uintptr_t)iov.iov_base + off), kbuf, (uint32_t)n);
-            total_recv += n;
+            uint64_t left = copy_to_user((void *)((uintptr_t)iov.iov_base + off),
+                                         kbuf, (uint32_t)n);
+            total_recv += n - left;
+            if (left)
+                return total_recv > 0 || ancillary_progress
+                    ? (uint64_t)total_recv : SYS_ERR(EFAULT);
             off += (uint64_t)n;
             remain -= (uint64_t)n;
-            if ((uint32_t)n < chunk) goto done;  /* partial read: don't block for more */
+            if ((uint32_t)n < chunk) return (uint64_t)total_recv;
         }
     }
-done:
-
-    /* Receive staged fds if msg_control provided */
-    if (mh.msg_control && mh.msg_controllen >= sizeof(k_cmsghdr_t) + sizeof(int)) {
-        /* SECURITY: validate the user-controlled msg_control pointer before any
-         * copy_to_user into it.  Without this a caller can point msg_control at a
-         * kernel VA and have the kernel write the cmsg header + fd ints there
-         * (arbitrary kernel write -> privesc).  Mirrors the sendmsg path. */
-        if (!user_ptr_valid((uint64_t)(uintptr_t)mh.msg_control, mh.msg_controllen))
-            return SYS_ERR(EFAULT);
-        /* Install only as many fds as the caller's control buffer can actually
-         * report. unix_sock_recv_fds installs into the receiver's fd table
-         * immediately; if we asked for UNIX_PASSED_FD_MAX but the buffer only
-         * fits a few, the extra fds were installed yet never announced in a
-         * cmsg (the copy block below was skipped on total_cm > controllen) —
-         * a silent fd-table leak/exhaustion. Cap max_fds to what fits; any
-         * staged fds beyond it are closed by unix_sock_recv_fds (Linux
-         * discards truncated SCM_RIGHTS fds). The >= floor at the enclosing
-         * check guarantees max_fds >= 1. */
-        int max_fds = (int)((mh.msg_controllen - sizeof(k_cmsghdr_t)) / sizeof(int));
-        if (max_fds > UNIX_PASSED_FD_MAX) max_fds = UNIX_PASSED_FD_MAX;
-        int received_fds[UNIX_PASSED_FD_MAX];
-        int nfds = unix_sock_recv_fds(uid, received_fds, max_fds);
-        if (nfds > 0) {
-            /* Build cmsghdr + fd array */
-            k_cmsghdr_t cm;
-            cm.cmsg_len   = sizeof(k_cmsghdr_t) + (uint64_t)(nfds * sizeof(int));
-            cm.cmsg_level = SOL_SOCKET;
-            cm.cmsg_type  = SCM_RIGHTS;
-
-            uint64_t total_cm = sizeof(k_cmsghdr_t) + (uint64_t)(nfds * sizeof(int));
-            if (total_cm <= mh.msg_controllen) {
-                copy_to_user((void *)(uintptr_t)mh.msg_control, &cm, sizeof(cm));
-                copy_to_user((void *)((uintptr_t)mh.msg_control + sizeof(k_cmsghdr_t)),
-                    received_fds, (uint32_t)(nfds * sizeof(int)));
-                /* Update msg_controllen in user struct */
-                copy_to_user((void *)((uintptr_t)msg_ptr + __builtin_offsetof(k_msghdr_t, msg_controllen)),
-                    &total_cm, sizeof(uint64_t));
-            }
-        } else {
-            /* No fds — zero out controllen */
-            uint64_t zero = 0;
-            copy_to_user((void *)((uintptr_t)msg_ptr + __builtin_offsetof(k_msghdr_t, msg_controllen)),
-                &zero, sizeof(uint64_t));
-        }
-    }
-
     return (uint64_t)total_recv;
 }
 
@@ -1281,8 +1371,8 @@ sys_getsockname(uint64_t fd, uint64_t addr, uint64_t addrlen)
         sa.sin6_family = AF_INET6; sa.sin6_port = htons(s->local_port);
         sa.sin6_addr = s->local_ip6;
         uint32_t outlen = sizeof(sa);
-        copy_to_user((void *)(uintptr_t)addrlen, &outlen, sizeof(outlen));
-        copy_to_user((void *)(uintptr_t)addr, &sa, sizeof(sa));
+        COPY_TO_USER(addrlen, &outlen);
+        COPY_TO_USER(addr, &sa);
         return 0;
     }
     if (!user_ptr_valid(addr, sizeof(k_sockaddr_in_t))) return SYS_ERR(EFAULT);
@@ -1292,8 +1382,8 @@ sys_getsockname(uint64_t fd, uint64_t addr, uint64_t addrlen)
     sa.sin_addr   = s->local_ip;
     __builtin_memset(sa.sin_zero, 0, 8);
     uint32_t outlen = sizeof(sa);
-    copy_to_user((void *)(uintptr_t)addrlen, &outlen, sizeof(uint32_t));
-    copy_to_user((void *)(uintptr_t)addr, &sa, sizeof(sa));
+    COPY_TO_USER(addrlen, &outlen);
+    COPY_TO_USER(addr, &sa);
     return 0;
 }
 
@@ -1313,8 +1403,8 @@ sys_getpeername(uint64_t fd, uint64_t addr, uint64_t addrlen)
         sa.sin6_family = AF_INET6; sa.sin6_port = htons(s->remote_port);
         sa.sin6_addr = s->remote_ip6;
         uint32_t outlen = sizeof(sa);
-        copy_to_user((void *)(uintptr_t)addrlen, &outlen, sizeof(outlen));
-        copy_to_user((void *)(uintptr_t)addr, &sa, sizeof(sa));
+        COPY_TO_USER(addrlen, &outlen);
+        COPY_TO_USER(addr, &sa);
         return 0;
     }
     if (!user_ptr_valid(addr, sizeof(k_sockaddr_in_t))) return SYS_ERR(EFAULT);
@@ -1324,8 +1414,8 @@ sys_getpeername(uint64_t fd, uint64_t addr, uint64_t addrlen)
     sa.sin_addr   = s->remote_ip;
     __builtin_memset(sa.sin_zero, 0, 8);
     uint32_t outlen = sizeof(sa);
-    copy_to_user((void *)(uintptr_t)addrlen, &outlen, sizeof(uint32_t));
-    copy_to_user((void *)(uintptr_t)addr, &sa, sizeof(sa));
+    COPY_TO_USER(addrlen, &outlen);
+    COPY_TO_USER(addr, &sa);
     return 0;
 }
 
@@ -1338,7 +1428,7 @@ sys_socketpair(uint64_t domain, uint64_t type, uint64_t proto, uint64_t sv_ptr)
     if (domain != AF_UNIX) return SYS_ERR(EAFNOSUPPORT);
     if (type != SOCK_STREAM && type != SOCK_DGRAM)
         return SYS_ERR(EPROTONOSUPPORT);
-    if (!user_ptr_valid(sv_ptr, 2 * sizeof(int)))
+    if (!user_ptr_writable(sv_ptr, 2 * sizeof(int)))
         return SYS_ERR(EFAULT);
 
     aegis_process_t *proc = current_proc();
@@ -1385,7 +1475,7 @@ sys_setsockopt(uint64_t fd, uint64_t level, uint64_t optname,
     if (err) return err;
 
     int val;
-    copy_from_user(&val, (const void *)(uintptr_t)optval, sizeof(int));
+    COPY_FROM_USER(&val, optval);
 
     if (level == SOL_SOCKET) {
         switch (optname) {
@@ -1398,8 +1488,8 @@ sys_setsockopt(uint64_t fd, uint64_t level, uint64_t optname,
                     return SYS_ERR(EFAULT);
                 int64_t tv_sec;
                 int64_t tv_usec;
-                copy_from_user(&tv_sec,  (const void *)(uintptr_t)optval,     8);
-                copy_from_user(&tv_usec, (const void *)(uintptr_t)(optval+8), 8);
+                COPY_FROM_USER(&tv_sec, optval);
+                COPY_FROM_USER(&tv_usec, optval + 8);
                 /* Clamp the user-supplied timeval before scaling: a negative
                  * value cast to uint32_t becomes a huge (near-infinite) timeout,
                  * and a large tv_sec overflows tv_sec*100 / the uint32_t cast to
@@ -1420,8 +1510,8 @@ sys_setsockopt(uint64_t fd, uint64_t level, uint64_t optname,
                     return SYS_ERR(EFAULT);
                 int64_t tv_sec;
                 int64_t tv_usec;
-                copy_from_user(&tv_sec,  (const void *)(uintptr_t)optval,     8);
-                copy_from_user(&tv_usec, (const void *)(uintptr_t)(optval+8), 8);
+                COPY_FROM_USER(&tv_sec, optval);
+                COPY_FROM_USER(&tv_usec, optval + 8);
                 /* Clamp before scaling — see SO_RCVTIMEO (April audit 1d0528f). */
                 if (tv_sec  < 0)        tv_sec  = 0;
                 if (tv_sec  > 42949672) tv_sec  = 42949672;
@@ -1468,11 +1558,11 @@ sys_getsockopt(uint64_t fd, uint64_t level, uint64_t optname,
         int rc = unix_sock_peercred(uid, &p_pid, &p_uid, &p_gid);
         if (rc < 0) return (uint64_t)(int64_t)rc;
         k_ucred_t uc = { .pid = (int)p_pid, .uid = (int)p_uid, .gid = (int)p_gid };
-        copy_to_user((void *)(uintptr_t)optval, &uc, sizeof(uc));
+        COPY_TO_USER(optval, &uc);
         uint32_t outlen = sizeof(uc);
         if (optlen) {
             if (!user_ptr_valid(optlen, sizeof(uint32_t))) return SYS_ERR(EFAULT);
-            copy_to_user((void *)(uintptr_t)optlen, &outlen, sizeof(uint32_t));
+            COPY_TO_USER(optlen, &outlen);
         }
         return 0;
     }
@@ -1491,12 +1581,12 @@ sys_getsockopt(uint64_t fd, uint64_t level, uint64_t optname,
                                               : s->sndtimeo_ticks;
         int64_t tv_sec  = (int64_t)(t / 100);
         int64_t tv_usec = (int64_t)((t % 100) * 10000);
-        copy_to_user((void *)(uintptr_t)optval,       &tv_sec,  8);
-        copy_to_user((void *)(uintptr_t)(optval + 8), &tv_usec, 8);
+        COPY_TO_USER(optval, &tv_sec);
+        COPY_TO_USER(optval + 8, &tv_usec);
         uint32_t outlen16 = 16;
         if (optlen) {
             if (!user_ptr_valid(optlen, sizeof(uint32_t))) return SYS_ERR(EFAULT);
-            copy_to_user((void *)(uintptr_t)optlen, &outlen16, sizeof(uint32_t));
+            COPY_TO_USER(optlen, &outlen16);
         }
         return 0;
     }
@@ -1541,11 +1631,11 @@ sys_getsockopt(uint64_t fd, uint64_t level, uint64_t optname,
     } else if (level == IPPROTO_TCP && optname == TCP_NODELAY) {
         val = 0;  /* not implemented; report disabled */
     }
-    copy_to_user((void *)(uintptr_t)optval, &val, sizeof(int));
+    COPY_TO_USER(optval, &val);
     uint32_t outlen = sizeof(int);
     if (optlen) {
         if (!user_ptr_valid(optlen, sizeof(uint32_t))) return SYS_ERR(EFAULT);
-        copy_to_user((void *)(uintptr_t)optlen, &outlen, sizeof(uint32_t));
+        COPY_TO_USER(optlen, &outlen);
     }
     return 0;
 }
@@ -1624,7 +1714,7 @@ sys_netcfg(uint64_t op, uint64_t arg1, uint64_t arg2, uint64_t arg3)
         info.ip      = ip;
         info.mask    = mask;
         info.gateway = gw;
-        copy_to_user((void *)(uintptr_t)arg1, &info, sizeof(info));
+        COPY_TO_USER(arg1, &info);
         return 0;
     }
 #ifdef __x86_64__   /* WiFi ops need the AX200 driver (iwl_ax200.c), x86_64-only */
@@ -1644,7 +1734,10 @@ sys_netcfg(uint64_t op, uint64_t arg1, uint64_t arg2, uint64_t arg3)
         __builtin_memset(tmp, 0, sizeof(tmp));
         int n = iwl_wifi_list(tmp, max);
         if (n > 0)
-            copy_to_user((void *)(uintptr_t)arg1, tmp, (uint64_t)n * sizeof(wifi_net_pub_t));
+            if (!user_ptr_writable(arg1, (uint64_t)n * sizeof(wifi_net_pub_t)) ||
+                copy_to_user((void *)(uintptr_t)arg1, tmp,
+                             (uint64_t)n * sizeof(wifi_net_pub_t)) != 0)
+                return SYS_ERR(EFAULT);
         return (uint64_t)n;
     }
     if (op == 4) {

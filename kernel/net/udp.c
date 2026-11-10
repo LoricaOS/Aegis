@@ -154,10 +154,12 @@ udp_deliver(uint8_t family, ip4_addr_t src_ip, ip4_addr_t dst_ip,
         /* Ring is lazily allocated for DGRAM sockets; a matched bound socket
          * always has one, but drop rather than deref if somehow absent. */
         if (!s->udp_rx) goto udp_out;
-        /* Find a free UDP RX slot (SPSC ring: producer owns tail,
-         * consumer owns head). */
+        /* Producers serialize under udp_lock; consumers reserve under sock_lock.
+         * Acquire pairs with the consumer's release of head when its receive
+         * commits, so a producer cannot overwrite a slot still being read. */
         uint8_t next = (uint8_t)((s->udp_rx_tail + 1) & (UDP_RX_SLOTS - 1));
-        if (next == s->udp_rx_head) goto udp_out;  /* ring full, drop */
+        if (next == __atomic_load_n(&s->udp_rx_head, __ATOMIC_ACQUIRE))
+            goto udp_out;  /* ring full, drop */
         udp_rx_slot_t *slot = &s->udp_rx[s->udp_rx_tail & (UDP_RX_SLOTS - 1)];
         if (payload_len > UDP_RX_MAXBUF) payload_len = UDP_RX_MAXBUF;
         uint32_t j;
@@ -169,11 +171,9 @@ udp_deliver(uint8_t family, ip4_addr_t src_ip, ip4_addr_t dst_ip,
         if (src_ip6) slot->src_ip6 = *src_ip6;
         slot->src_port = src_port;
         slot->in_use   = 1;
-        /* Publish the filled slot last.  On x86 stores are ordered, so a
-         * consumer that observes the new tail also observes the slot
-         * contents above; __atomic release makes that explicit and is
-         * correct on ARM64 too (the consumer side in sys_recvfrom reads
-         * head/tail without udp_lock — this is the only synchronisation). */
+        /* Publish the filled slot last. The consumer acquires tail before
+         * reading the slot, then releases head when its receive commits.
+         * These are the cross-lock ordering edges, including on ARM64. */
         __atomic_store_n(&s->udp_rx_tail, next, __ATOMIC_RELEASE);
         wake_sid = sid;
         goto udp_out;
@@ -229,11 +229,13 @@ int
 udp_bind(uint16_t port, uint32_t sock_id)
 {
     if (port == 0) return -1;
-    if (sock_id == SOCK_NONE) return -1;
+    sock_t *sock = sock_get(sock_id);
+    if (!sock || sock->type != SOCK_TYPE_DGRAM) return -1;
     irqflags_t fl = spin_lock_irqsave(&udp_lock);
     uint32_t i;
     for (i = 0; i < UDP_BINDINGS_MAX; i++) {
-        if (s_udp[i].port == port) {
+        if (s_udp[i].port == port ||
+            (s_udp[i].port != 0 && s_udp[i].sock_id == sock_id)) {
             spin_unlock_irqrestore(&udp_lock, fl);
             return -1; /* EADDRINUSE */
         }
@@ -242,6 +244,7 @@ udp_bind(uint16_t port, uint32_t sock_id)
         if (s_udp[i].port == 0) {
             s_udp[i].port    = port;
             s_udp[i].sock_id = sock_id;
+            sock->local_port = port;
             spin_unlock_irqrestore(&udp_lock, fl);
             return 0;
         }
@@ -256,14 +259,14 @@ udp_bind(uint16_t port, uint32_t sock_id)
  * gets closed leaks its port binding (DHCP retry was the symptom that
  * exposed it: second bind to port 68 failed). */
 void
-udp_unbind(uint16_t port)
+udp_unbind(uint16_t port, uint32_t sock_id)
 {
     if (port == 0) return;
     irqflags_t fl = spin_lock_irqsave(&udp_lock);
     uint32_t i;
     /* udp_bind enforces port uniqueness, so at most one entry matches. */
     for (i = 0; i < UDP_BINDINGS_MAX; i++) {
-        if (s_udp[i].port == port) {
+        if (s_udp[i].port == port && s_udp[i].sock_id == sock_id) {
             s_udp[i].port    = 0;
             s_udp[i].sock_id = SOCK_NONE;
             break;

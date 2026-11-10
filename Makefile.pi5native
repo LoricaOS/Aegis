@@ -172,6 +172,10 @@ ALL_OBJS = $(ASM_OBJS) $(C_OBJS)
 
 -include $(C_OBJS:.o=.d)
 
+# VERSION feeds -DAEGIS_VERSION in CFLAGS (also used by the .S rule below), so a
+# version bump must rebuild the objects.
+$(ALL_OBJS): VERSION
+
 $(BUILD)/%.o: kernel/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@

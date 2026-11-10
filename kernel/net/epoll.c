@@ -448,7 +448,16 @@ int epoll_wait_impl(uint32_t epoll_id, uint64_t events_uptr,
             return -EINTR;
         }
 
-        sched_block();
+        /* Producers may have become ready between the first sweep and our
+         * registration. Recheck after every queue is linked; a later producer
+         * then wakes a registered waiter (sched_block consumes the wake latch). */
+        int ready_now = has_deadline && arch_get_ticks() >= deadline;
+        for (int i = 0; i < nsnap && !ready_now; i++) {
+            uint32_t interest = (snap[i].events & ~EPOLL_BEHAVIOUR_FLAGS)
+                              | EPOLL_ALWAYS_REPORT;
+            ready_now = (epoll_compute_readiness(snap[i].fd, proc) & interest) != 0;
+        }
+        if (!ready_now) sched_block();
 
         for (int i = 0; i < n; i++) {
             if (fd_queues[i]) waitq_remove(fd_queues[i], &fd_entries[i]);

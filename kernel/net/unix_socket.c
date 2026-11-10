@@ -353,85 +353,71 @@ static void unix_close_staged(const unix_passed_fd_t *staged, uint8_t n)
             staged[i].file.ops->close(staged[i].file.priv);
 }
 
+/* Queue only final puts: every pending slot stays in_use until processed, so
+ * at most UNIX_SOCK_MAX entries can exist, regardless of descriptor depth. */
+static void unix_put_locked(uint32_t id, uint32_t *pending, unsigned *count)
+{
+    unix_sock_t *us = unix_sock_get(id);
+    if (us && refcount_dec_and_test(&us->refcount))
+        pending[(*count)++] = id;
+}
+
 void unix_sock_free(uint32_t id)
 {
-    /* Detached under the lock, closed after every unlock path. */
-    unix_passed_fd_t staged[UNIX_PASSED_FD_MAX];
-    uint8_t nstaged = 0;
-
+    uint32_t pending[UNIX_SOCK_MAX];
+    unsigned count = 0;
     irqflags_t fl = spin_lock_irqsave(&unix_lock);
-    if (id >= UNIX_SOCK_MAX || !s_unix[id].in_use) {
-        spin_unlock_irqrestore(&unix_lock, fl);
-        return;
-    }
-    unix_sock_t *us = &s_unix[id];
-    if (!refcount_dec_and_test(&us->refcount)) {
-        spin_unlock_irqrestore(&unix_lock, fl);
-        return;
-    }
+    unix_put_locked(id, pending, &count);
+    while (count) {
+        unix_sock_t *us = &s_unix[pending[--count]];
+        unix_passed_fd_t staged[UNIX_PASSED_FD_MAX];
+        uint8_t nstaged = 0;
+        for (uint8_t i = 0; i < us->passed_fd_count; i++) {
+            vfs_file_t *f = &us->passed_fds[i].file;
+            if (f->ops == &g_unix_sock_ops)
+                unix_put_locked((uint32_t)(uintptr_t)f->priv, pending, &count);
+            else
+                staged[nstaged++] = us->passed_fds[i];
+        }
+        us->passed_fd_count = 0;
+        while (us->accept_tail != us->accept_head) {
+            uint32_t child = us->accept_queue[us->accept_tail++ & 7];
+            unix_put_locked(child, pending, &count);
+        }
+        if (us->path[0]) {
+            name_unregister(us->path);
+            us->path[0] = '\0';
+        }
 
-    /* Detach any staged fds that were never received — closed after unlock. */
-    nstaged = us->passed_fd_count;
-    for (uint8_t i = 0; i < nstaged; i++)
-        staged[i] = us->passed_fds[i];
-    us->passed_fd_count = 0;
-
-    /* Unregister name if bound */
-    if (us->path[0]) {
-        name_unregister(us->path);
-        us->path[0] = '\0';
-    }
-
-    uint32_t peer = us->peer_id;
-    unix_sock_t *p = (peer != UNIX_NONE && peer < UNIX_SOCK_MAX &&
-                      s_unix[peer].in_use) ? &s_unix[peer] : (void *)0;
-
-    if (p && p->state != UNIX_CLOSED) {
-        /* Peer still alive: LINGER. Keep this slot occupied (in_use=1,
-         * state=UNIX_CLOSED) so the allocators cannot hand it to a new
-         * connection while the peer's peer_id still references it. The
-         * peer drains any remaining data from our ring and reads EOF
-         * once it's empty (state==UNIX_CLOSED); both slots and rings
-         * are fully released when the PEER closes (branch below).
-         *
-         * History: this slot used to be freed (in_use=0) immediately,
-         * with EOF detected via !in_use. unix_sock_alloc could then
-         * reuse the slot for a brand-new connection while the living
-         * peer still pointed at it — the stale peer fd then read
-         * (stole) the new connection's data. Hit deterministically by
-         * the 1.2.0 Applications launcher (invoke-then-exit: Lumen's
-         * not-yet-reaped server fd consumed the next client's
-         * CREATE_WINDOW, hanging every post-launcher app spawn). */
+        unix_sock_t *peer = unix_sock_get(us->peer_id);
+        waitq_t *wake = (void *)0;
+        void *free_a = (void *)0, *free_b = (void *)0;
         us->state = UNIX_CLOSED;
-        /* Capture the peer's waitq, drop the lock, then wake: a blocked peer
-         * (read/write) and the peer's pollers all live on poll_waiters and
-         * re-check their condition (now state==UNIX_CLOSED → EOF/EPIPE/POLLHUP)
-         * after the wait returns.  Wake AFTER unlock — waitq_wake_all takes
-         * sched_lock and the order is sched_lock > waitq > unix_lock. */
-        waitq_t *peer_wq = &p->poll_waiters;
+        if (peer && peer->state != UNIX_CLOSED) {
+            /* Keep our ring and slot until the peer drains EOF and closes. */
+            if (refcount_inc_not_zero(&peer->refcount))
+                wake = &peer->poll_waiters;  /* stabilize the deferred wake */
+        } else {
+            free_a = us->ring;
+            us->ring = (void *)0;
+            us->in_use = 0;
+            if (peer) {
+                free_b = peer->ring;
+                peer->ring = (void *)0;
+                peer->in_use = 0;
+            }
+        }
+        uint32_t peer_id = us->peer_id;
         spin_unlock_irqrestore(&unix_lock, fl);
+        /* Only non-UNIX objects remain: no recursive Unix destruction. */
         unix_close_staged(staged, nstaged);
-        waitq_wake_all(peer_wq);
-        return;
+        if (free_a) kva_free_pages(free_a, UNIX_BUF_PAGES);
+        if (free_b) kva_free_pages(free_b, UNIX_BUF_PAGES);
+        if (wake) waitq_wake_all(wake);
+        fl = spin_lock_irqsave(&unix_lock);
+        if (wake) unix_put_locked(peer_id, pending, &count);
     }
-
-    /* Peer gone (never connected) or lingering in UNIX_CLOSED: fully
-     * release this slot, the peer's lingering slot, and both rings. Detach the
-     * rings under the lock but free them AFTER unlocking — kva_free_pages does
-     * a TLB shootdown, which must never run while holding unix_lock (a CPU
-     * spinning for unix_lock with IRQs off can't ACK the IPI → deadlock). */
-    void *free_a = us->ring, *free_b = (void *)0;
-    us->ring = (void *)0;
-    if (p && p->state == UNIX_CLOSED) {
-        free_b = p->ring;
-        p->ring = (void *)0;
-        p->in_use = 0;
-    }
-    us->in_use = 0;
     spin_unlock_irqrestore(&unix_lock, fl);
-    unix_close_staged(staged, nstaged);
-    if (free_a) kva_free_pages(free_a, UNIX_BUF_PAGES);
-    if (free_b) kva_free_pages(free_b, UNIX_BUF_PAGES);
 }
 
 /* unix_sock_wake: wake everything blocked on this socket — blocking accept/
@@ -478,6 +464,10 @@ int unix_sock_listen(uint32_t id)
         spin_unlock_irqrestore(&unix_lock, fl);
         return -EINVAL;
     }
+    aegis_process_t *proc = current_proc();
+    us->listen_pid = (uint32_t)proc->pid;
+    us->listen_uid = proc->uid;
+    us->listen_gid = proc->gid;
     us->state = UNIX_LISTENING;
     spin_unlock_irqrestore(&unix_lock, fl);
     return 0;
@@ -501,7 +491,8 @@ int unix_sock_connect(uint32_t id, const char *path)
         return -ECONNREFUSED;  /* silent: callers retry on this */
     }
     unix_sock_t *listener = unix_sock_get(listener_id);
-    if (!listener || listener->state != UNIX_LISTENING) {
+    if (!listener || listener->state != UNIX_LISTENING ||
+        refcount_read(&listener->refcount) == 0) {
         spin_unlock_irqrestore(&unix_lock, fl);
         return -ECONNREFUSED;
     }
@@ -541,6 +532,8 @@ int unix_sock_connect(uint32_t id, const char *path)
         spin_unlock_irqrestore(&unix_lock, fl);
         return -EMFILE;
     }
+
+    refcount_inc(&listener->refcount);
 
     /* Allocate ring buffers (one per direction). kva_alloc_pages can fail
      * (OOM) and may sleep/touch other allocators, so drop unix_lock across
@@ -582,6 +575,7 @@ int unix_sock_connect(uint32_t id, const char *path)
          * unix_lock; see unix_sock_alloc). */
         if (ring_a) kva_free_pages(ring_a, UNIX_BUF_PAGES);
         if (ring_b) kva_free_pages(ring_b, UNIX_BUF_PAGES);
+        unix_sock_free(listener_id);
         return fail;
     }
 
@@ -605,12 +599,9 @@ int unix_sock_connect(uint32_t id, const char *path)
     s_unix[server_id].peer_uid = proc->uid;
     s_unix[server_id].peer_gid = proc->gid;
 
-    /* Capture server-side credentials into client socket
-     * (will be the listener's process — available via accept caller).
-     * For now set to 0, accept() will fill from accepting process. */
-    client->peer_pid = 0;
-    client->peer_uid = 0;
-    client->peer_gid = 0;
+    client->peer_pid = listener->listen_pid;
+    client->peer_uid = listener->listen_uid;
+    client->peer_gid = listener->listen_gid;
 
     /* Enqueue server-side sock_id into listener's accept queue */
     listener->accept_queue[listener->accept_head & 7] = (uint32_t)server_id;
@@ -624,6 +615,7 @@ int unix_sock_connect(uint32_t id, const char *path)
     waitq_t *listener_wq = &listener->poll_waiters;
     spin_unlock_irqrestore(&unix_lock, fl);
     waitq_wake_all(listener_wq);
+    unix_sock_free(listener_id);
     return 0;
 }
 
@@ -669,18 +661,6 @@ int unix_sock_accept(uint32_t id)
     uint32_t server_id = listener->accept_queue[listener->accept_tail & 7];
     listener->accept_tail++;
 
-    /* Fill peer credentials from accepting process */
-    aegis_process_t *proc = current_proc();
-    unix_sock_t *server = unix_sock_get(server_id);
-    if (server && server->peer_id != UNIX_NONE) {
-        unix_sock_t *client = unix_sock_get(server->peer_id);
-        if (client) {
-            client->peer_pid = (uint32_t)proc->pid;
-            client->peer_uid = proc->uid;
-            client->peer_gid = proc->gid;
-        }
-    }
-
     spin_unlock_irqrestore(&unix_lock, fl);
     return (int)server_id;
 }
@@ -700,9 +680,10 @@ static int unix_read_ready(uint32_t peer)
            p->state == UNIX_CLOSED || ring_used(p) > 0;
 }
 
-int unix_sock_read(uint32_t id, void *buf, uint32_t len, int force_nb)
+static int unix_sock_read_impl(uint32_t id, void *buf, uint32_t len, int force_nb,
+                               int wait_only)
 {
-    if (len == 0) return 0;
+    if (len == 0 && !wait_only) return 0;
     irqflags_t fl = spin_lock_irqsave(&unix_lock);
     unix_sock_t *us = unix_sock_get(id);
     if (!us || us->state != UNIX_CONNECTED) {
@@ -722,6 +703,14 @@ int unix_sock_read(uint32_t id, void *buf, uint32_t len, int force_nb)
     uint32_t peer = us->peer_id;
 
     for (;;) {
+        /* recvmsg waits without dequeue, then resolves ancillary publication
+         * before its nonblocking data read. Recheck rights AFTER every wait,
+         * not just once before entering a possibly blocking stream read. */
+        if (wait_only && us->passed_fd_count > 0) {
+            spin_unlock_irqrestore(&unix_lock, fl);
+            unix_sock_free(id);
+            return 1;
+        }
         /* Read from PEER's tx_ring. A closed peer lingers in_use=1 with
          * state==UNIX_CLOSED (slot + ring kept alive, unallocatable)
          * until we close too — so the ring stays valid for draining and
@@ -737,6 +726,11 @@ int unix_sock_read(uint32_t id, void *buf, uint32_t len, int force_nb)
 
         uint16_t avail = ring_used(p);
         if (avail > 0) {
+            if (wait_only) {
+                spin_unlock_irqrestore(&unix_lock, fl);
+                unix_sock_free(id);
+                return 1;
+            }
             if (len > avail) len = avail;
             uint8_t *dst = (uint8_t *)buf;
             trace_emit(TRACE_UNIX_RECV, len, p->ring_head, p->ring_tail);
@@ -788,7 +782,7 @@ int unix_sock_read(uint32_t id, void *buf, uint32_t len, int force_nb)
         spin_unlock_irqrestore(&unix_lock, fl);
         int rc;
         wait_event_interruptible(&s_unix[id].poll_waiters,
-            unix_read_ready(peer), rc);
+            unix_read_ready(peer) || (wait_only && s_unix[id].passed_fd_count > 0), rc);
         if (rc == BLOCK_EINTR) {
             unix_sock_free(id);   /* drop the read pin (lock already released) */
             return -EINTR;
@@ -802,6 +796,16 @@ int unix_sock_read(uint32_t id, void *buf, uint32_t len, int force_nb)
         }
         peer = us->peer_id;
     }
+}
+
+int unix_sock_read(uint32_t id, void *buf, uint32_t len, int force_nb)
+{
+    return unix_sock_read_impl(id, buf, len, force_nb, 0);
+}
+
+int unix_sock_wait_recv(uint32_t id, int force_nb)
+{
+    return unix_sock_read_impl(id, NULL, 0, force_nb, 1);
 }
 
 /* ── Write (to own tx_ring, peer reads from it) ────────────────────────── */
@@ -938,11 +942,46 @@ int unix_sock_peercred(uint32_t id, uint32_t *pid, uint32_t *uid, uint32_t *gid)
 
 /* ── fd passing (SCM_RIGHTS) ───────────────────────────────────────────── */
 
+/* Does an existing strong-reference path lead from start to target? Include
+ * unaccepted endpoints: their initial reference belongs to the listener. */
+static int unix_reaches_locked(uint32_t start, uint32_t target)
+{
+    uint8_t seen[UNIX_SOCK_MAX] = {0};
+    uint32_t pending[UNIX_SOCK_MAX];
+    unsigned count = 0;
+    if (start >= UNIX_SOCK_MAX) return 0;
+    pending[count++] = start;
+    seen[start] = 1;
+    while (count) {
+        uint32_t id = pending[--count];
+        if (id == target) return 1;
+        unix_sock_t *us = unix_sock_get(id);
+        if (!us) continue;
+        for (unsigned i = 0; i < us->passed_fd_count +
+                                    (uint8_t)(us->accept_head - us->accept_tail); i++) {
+            uint32_t next;
+            if (i < us->passed_fd_count) {
+                vfs_file_t *f = &us->passed_fds[i].file;
+                if (f->ops != &g_unix_sock_ops) continue;
+                next = (uint32_t)(uintptr_t)f->priv;
+            } else {
+                next = us->accept_queue[(us->accept_tail + i -
+                                         us->passed_fd_count) & 7];
+            }
+            if (next < UNIX_SOCK_MAX && !seen[next]) {
+                seen[next] = 1;
+                pending[count++] = next;
+            }
+        }
+    }
+    return 0;
+}
+
 int unix_sock_stage_fds(uint32_t peer_id, unix_passed_fd_t *fds, uint8_t count)
 {
     irqflags_t fl = spin_lock_irqsave(&unix_lock);
     unix_sock_t *p = unix_sock_get(peer_id);
-    if (!p || p->state == UNIX_CLOSED) {
+    if (!p || p->state == UNIX_CLOSED || refcount_read(&p->refcount) == 0) {
         spin_unlock_irqrestore(&unix_lock, fl);
         return p ? -32 : -9;  /* EPIPE (lingering peer) or EBADF */
     }
@@ -950,25 +989,30 @@ int unix_sock_stage_fds(uint32_t peer_id, unix_passed_fd_t *fds, uint8_t count)
         spin_unlock_irqrestore(&unix_lock, fl);
         return -105;  /* ENOBUFS */
     }
+    for (uint8_t i = 0; i < count; i++) {
+        vfs_file_t *f = &fds[i].file;
+        if (f->ops == &g_unix_sock_ops &&
+            unix_reaches_locked((uint32_t)(uintptr_t)f->priv, peer_id)) {
+            spin_unlock_irqrestore(&unix_lock, fl);
+            return -ELOOP;
+        }
+    }
     for (uint8_t i = 0; i < count; i++)
         p->passed_fds[p->passed_fd_count++] = fds[i];
+    refcount_inc(&p->refcount); /* keep the waitq alive until after wake */
     spin_unlock_irqrestore(&unix_lock, fl);
+    waitq_wake_all(&p->poll_waiters);
+    unix_sock_free(peer_id);
     return 0;
 }
 
-int unix_sock_recv_fds(uint32_t id, int *fd_out, int max_fds)
+int unix_sock_recv_fds(uint32_t id, int max_fds,
+                       int (*deliver)(const int *, int, int, void *), void *arg)
 {
-    /* Take the staged fds under unix_lock, then INSTALL them under the
-     * receiver's fd_table.lock.
-     *
-     * Two locks, strictly in sequence, because they cannot be nested: the
-     * documented order is fd_table.lock > any object lock (fd_table.h), and
-     * this runs with unix_lock already the inner one. Installing with no fd
-     * lock at all — the old code — raced a CLONE_FILES sibling: two threads
-     * (or a concurrent open) could pick the SAME free slot, and the loser's
-     * object was overwritten in place, leaking its reference and handing the
-     * receiver two fds onto one object. Detaching first also means an
-     * fd-table-full receiver drops the tail exactly once. */
+    if (!deliver || max_fds < 0 || max_fds > UNIX_PASSED_FD_MAX) return -EINVAL;
+    /* Detach the owned references once. Never copy to user under unix_lock or
+     * fd_table.lock: a lazy/COW fault can allocate, acquire MM locks or do I/O.
+     * The detached references remain ours until successful publication. */
     unix_passed_fd_t take[UNIX_PASSED_FD_MAX];
     uint8_t ntake = 0;
 
@@ -976,7 +1020,7 @@ int unix_sock_recv_fds(uint32_t id, int *fd_out, int max_fds)
     unix_sock_t *us = unix_sock_get(id);
     if (!us || us->passed_fd_count == 0) {
         spin_unlock_irqrestore(&unix_lock, fl);
-        return 0;
+        return deliver(NULL, 0, 0, arg);
     }
     for (uint8_t i = 0; i < us->passed_fd_count; i++)
         take[ntake++] = us->passed_fds[i];
@@ -985,40 +1029,42 @@ int unix_sock_recv_fds(uint32_t id, int *fd_out, int max_fds)
 
     aegis_process_t *proc = current_proc();
     int installed = 0;
+    int fd_out[UNIX_PASSED_FD_MAX];
 
     irqflags_t ffl = spin_lock_irqsave(&proc->fd_table->lock);
-    for (uint8_t i = 0; i < ntake && installed < max_fds; i++) {
-        /* Find free fd slot */
-        int free_fd = -1;
-        for (int f = 0; f < PROC_MAX_FDS; f++) {
-            if (!proc->fd_table->fds[f].ops) { free_fd = f; break; }
-        }
-        if (free_fd < 0) break;  /* fd table full */
-
-        vfs_file_t incoming = take[i].file;
-        const vfs_ops_t *ops = incoming.ops;
-        incoming.ops = (const vfs_ops_t *)0;
-        incoming.offset = 0;
-        /* Inherit the sender's file *status* flags (O_NONBLOCK etc., which
-         * belong to the shared open file description) but NOT FD_CLOEXEC,
-         * which is a per-fd-table property the receiver owns. Linux clears
-         * close-on-exec on received SCM_RIGHTS fds unless the receiver asked
-         * for MSG_CMSG_CLOEXEC; carrying the sender's bit through could close
-         * a passed fd across the receiver's next execve. */
-        incoming.flags &= ~VFS_FD_CLOEXEC;
-        proc->fd_table->fds[free_fd] = incoming;
-        /* ops LAST: it is the slot's in-use marker, so the slot is fully
-         * populated before any other holder of this table can see it taken. */
-        proc->fd_table->fds[free_fd].ops    = ops;
-        fd_out[installed++] = free_fd;
+    for (int f = 0; f < PROC_MAX_FDS && installed < max_fds && installed < ntake; f++) {
+        if (!proc->fd_table->fds[f].ops)
+            fd_out[installed++] = f;
     }
     spin_unlock_irqrestore(&proc->fd_table->lock, ffl);
 
-    /* Drop any fds that couldn't be installed (receiver's fd table full).
-     * Closed with NO lock held — see unix_close_staged: an undelivered
-     * AF_UNIX fd's ->close re-enters unix_lock and would deadlock this CPU. */
+    int rc = deliver(fd_out, installed, installed < ntake, arg);
+    if (rc == 0) {
+        ffl = spin_lock_irqsave(&proc->fd_table->lock);
+        /* Validate ALL slots before publishing ANY. A failed optimistic
+         * reservation must neither partially publish nor close a sibling's fd. */
+        for (int i = 0; i < installed; i++) {
+            if (proc->fd_table->fds[fd_out[i]].ops) {
+                rc = -EAGAIN;
+                break;
+            }
+        }
+        if (rc == 0) {
+            for (int i = 0; i < installed; i++) {
+                vfs_file_t incoming = take[i].file;
+                incoming.offset = 0;
+                /* Preserve status flags, not the sender's FD_CLOEXEC. */
+                incoming.flags &= ~VFS_FD_CLOEXEC;
+                proc->fd_table->fds[fd_out[i]] = incoming;
+            }
+        }
+        spin_unlock_irqrestore(&proc->fd_table->lock, ffl);
+    }
+    if (rc != 0) installed = 0;
+    /* Includes truncation and every failed delivery/slot race. Close outside
+     * both locks: an AF_UNIX close can re-enter unix_lock. */
     unix_close_staged(take + installed, (uint8_t)(ntake - installed));
-    return installed;
+    return rc != 0 ? rc : installed;
 }
 
 /* ── fd helpers ────────────────────────────────────────────────────────── */

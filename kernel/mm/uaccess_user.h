@@ -88,7 +88,7 @@
  */
 #define COPY_FROM_USER(dst, uptr)                                              \
     do {                                                                      \
-        if (!user_ptr_valid((uint64_t)(uintptr_t)(uptr), sizeof(*(dst))))     \
+        if (!user_ptr_readable((uint64_t)(uintptr_t)(uptr), sizeof(*(dst))))  \
             return SYS_ERR(EFAULT);                                           \
         if (copy_from_user((dst), (const void *)(uintptr_t)(uptr),            \
                            sizeof(*(dst))) != 0)                              \
@@ -102,7 +102,7 @@
  */
 #define COPY_TO_USER(uptr, src)                                               \
     do {                                                                      \
-        if (!user_ptr_valid((uint64_t)(uintptr_t)(uptr), sizeof(*(src))))     \
+        if (!user_ptr_writable((uint64_t)(uintptr_t)(uptr), sizeof(*(src))))  \
             return SYS_ERR(EFAULT);                                           \
         if (copy_to_user((void *)(uintptr_t)(uptr), (src),                    \
                          sizeof(*(src))) != 0)                                \
@@ -120,7 +120,7 @@
 static inline bool
 copy_from_user_checked_(void *dst, uint64_t uptr, uint64_t n)
 {
-    if (!user_ptr_valid(uptr, n))
+    if (!user_ptr_readable(uptr, n))
         return false;
     return copy_from_user(dst, (const void *)(uintptr_t)uptr, n) == 0;
 }
@@ -128,7 +128,7 @@ copy_from_user_checked_(void *dst, uint64_t uptr, uint64_t n)
 static inline bool
 copy_to_user_checked_(uint64_t uptr, const void *src, uint64_t n)
 {
-    if (!user_ptr_valid(uptr, n))
+    if (!user_ptr_writable(uptr, n))
         return false;
     return copy_to_user((void *)(uintptr_t)uptr, src, n) == 0;
 }

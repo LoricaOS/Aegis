@@ -294,7 +294,7 @@ int arp_resolve(netdev_t *dev, ip4_addr_t ip, mac_addr_t *mac_out)
          * but keep using the cached MAC so traffic never stalls on it. Updating
          * last_used here also rate-limits the refresh to once per window. Skip
          * from the ISR RX path, which must not send. */
-        if (!g_in_isr_poll &&
+        if (!__atomic_load_n(&g_in_isr_poll, __ATOMIC_SEQ_CST) &&
             (uint32_t)(now - e->last_used) > ARP_REFRESH_TICKS)
             arp_send_request(dev, ip);
         e->last_used = now;
@@ -322,7 +322,7 @@ int arp_resolve(netdev_t *dev, ip4_addr_t ip, mac_addr_t *mac_out)
      * like tcp_connect also run with IRQs disabled — those callers CAN safely
      * block here, because they have released tcp_lock first and are not in the
      * ISR chain. */
-    if (g_in_isr_poll) {
+    if (__atomic_load_n(&g_in_isr_poll, __ATOMIC_SEQ_CST)) {
         return -1;  /* caller should retry later */
     }
 

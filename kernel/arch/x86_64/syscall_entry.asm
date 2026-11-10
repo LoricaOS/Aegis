@@ -178,6 +178,15 @@ syscall_entry:
     pop  r14
     pop  r15
 
+    ; SYSRET faults in ring 0 for a noncanonical RIP. Validate while the
+    ; kernel stack and GS are still active; RCX is restored below.
+    mov  rcx, [rsp + 8]
+    shr  rcx, 47
+    jnz  .bad_user_return
+    mov  rcx, [rsp + 16]
+    shr  rcx, 47
+    jnz  .bad_user_return
+
     ; ── Step 4: restore RFLAGS, RIP, RSP; return to ring 3 ──────────────────
     pop  r11          ; RFLAGS
     pop  rcx          ; return RIP
@@ -185,6 +194,12 @@ syscall_entry:
 
     swapgs            ; restore user GS.base before returning to ring 3
     o64 sysret       ; sysretq: restore RIP from RCX, RFLAGS from R11, RSP, enter ring 3
+
+.bad_user_return:
+    and  rsp, -16
+    extern sched_exit
+    call sched_exit
+    ud2
 
 ; proc_enter_user — switch to user PML4 and iretq into ring 3.
 ;

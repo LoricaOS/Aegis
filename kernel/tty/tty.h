@@ -109,6 +109,8 @@ tty_t *tty_console(void);
 int tty_receive_isig(tty_t *tty, char c);
 
 /* Find the controlling tty for the current process's session. */
+int tty_claim(tty_t *tty, uint32_t sid, uint32_t pgid);
+int tty_console_allowed(void);
 tty_t *tty_find_controlling(uint32_t session_id);
 
 #endif /* AEGIS_TTY_H */

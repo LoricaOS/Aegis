@@ -96,7 +96,7 @@ int ramfs_busy(ramfs_t *inst);
  * name: flat relative path without the mount prefix (e.g. "vigil.pid", "lb/o.png").
  * Returns 0 on success and fills *out; -2 (ENOENT) if not found and !O_CREAT;
  * -12 (ENOMEM) if the inode/dentry pools are full. */
-int ramfs_open(ramfs_t *inst, const char *name, int flags, vfs_file_t *out);
+int ramfs_open(ramfs_t *inst, const char *name, int flags, uint16_t mode, vfs_file_t *out);
 
 /* ramfs_stat — fill *st for a ramfs file. Returns 0, or -2 (ENOENT). */
 int ramfs_stat(ramfs_t *inst, const char *name, k_stat_t *st);
@@ -110,7 +110,7 @@ int ramfs_populate(ramfs_t *inst, const char *name,
                    const uint8_t *kbuf, uint32_t len);
 
 /* ramfs_mkdir — create a directory entry. Returns 0, -17 (EEXIST), -12 (ENOMEM). */
-int ramfs_mkdir(ramfs_t *inst, const char *name);
+int ramfs_mkdir(ramfs_t *inst, const char *name, uint16_t mode);
 
 /* ramfs_unlink — remove a name. Returns 0, or -2 (ENOENT). The inode (and its
  * data) is freed only when its last dentry AND last open fd are gone. */

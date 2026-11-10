@@ -1,4 +1,5 @@
 #include "proc.h"
+#include "tty.h"
 #include "elf.h"
 #include "vmm.h"
 #include "pmm.h"
@@ -453,6 +454,7 @@ proc_spawn(const uint8_t *elf_data, size_t elf_len)
 
     /* Pre-open fd 0 (stdin) to keyboard device. */
     proc->fd_table->fds[0] = *kbd_vfs_open();
+    (void)tty_claim(tty_console(), proc->sid, proc->pgid);
 
     /* Pre-open fd 2 (stderr) to console device. */
     proc->fd_table->fds[2] = *console_open();

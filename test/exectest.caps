@@ -1,1 +1,3 @@
 service DISK_ADMIN ADMIN_AUTH
+service NET_SOCKET
+service CAP_DELEGATE

@@ -125,7 +125,7 @@ typedef struct {
     uint32_t         kflags; /* kernel-internal fd flags (VFS_KF_*); was _pad */
     uint64_t         cap_root_inode; /* confined directory capability root */
     uint32_t         cap_rights;     /* CAP_RIGHTS_* ceiling for openat */
-    uint32_t         _cap_pad;
+    uint32_t         cap_root_gen;   /* generation of confined root */
 } vfs_file_t;
 
 _Static_assert(sizeof(vfs_file_t) == 56, "vfs_file_t must be 56 bytes");
@@ -147,6 +147,9 @@ _Static_assert(sizeof(vfs_file_t) == 56, "vfs_file_t must be 56 bytes");
 /* A confined directory fd is authority for relative openat resolution. Its
  * root and rights are copied by dup/fork/SCM_RIGHTS and can only be narrowed. */
 #define VFS_KF_CAP_CONFINED 0x4U
+
+/* Account database mutation requires a current admin session after transfer. */
+#define VFS_KF_ACCOUNT_DB 0x8U
 
 /* O_NONBLOCK flag value (Linux x86-64).  Stored in vfs_file_t.flags by
  * fcntl(F_SETFL).  sys_read sets vfs_read_nonblock before calling a VFS
@@ -219,7 +222,7 @@ int vfs_openat_ext2(uint32_t start_ino, uint32_t root_ino, const char *path,
  * ramfs mount; return 0 if the caller should fall through to ext2. */
 int vfs_ramfs_unlink(const char *path, int *out_rc);
 int vfs_ramfs_rename(const char *oldp, const char *newp, int *out_rc);
-int vfs_ramfs_mkdir(const char *path, int *out_rc);
+int vfs_ramfs_mkdir(const char *path, uint16_t mode, int *out_rc);
 int vfs_ramfs_rmdir(const char *path, int *out_rc);
 
 /* vfs_stat_path — stat a file by path.

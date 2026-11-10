@@ -75,6 +75,8 @@ int vfs_read_nonblock = 0;
 static int
 fd_content_write_allowed(const aegis_process_t *proc, const vfs_file_t *f)
 {
+    if ((f->kflags & VFS_KF_ACCOUNT_DB) && !proc->admin_session)
+        return 0;
     if ((f->kflags & VFS_KF_AUTH_GATED) &&
         cap_check(proc->caps, CAP_TABLE_SIZE,
                   CAP_KIND_AUTH, CAP_RIGHTS_WRITE) != 0)

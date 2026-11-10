@@ -131,11 +131,10 @@ gen_maps(char *buf, uint32_t bufsz, aegis_process_t *proc)
     char *end = buf + bufsz - 1;
     uint32_t i;
 
-    if (!proc->vma_table)
-        return 0;
-
-    for (i = 0; i < vma_count_get(proc) && (end - p) >= MAPS_MAX_RECORD; i++) {
-        vma_entry_t *v = &proc->vma_table[i];
+    vma_entry_t maps[128];
+    uint32_t count = vma_snapshot(proc, maps, 128);
+    for (i = 0; i < count && (end - p) >= MAPS_MAX_RECORD; i++) {
+        vma_entry_t *v = &maps[i];
         uint64_t vstart = v->base;
         uint64_t vend = v->base + v->len;
 
@@ -331,12 +330,7 @@ gen_status(char *buf, uint32_t bufsz, aegis_process_t *proc)
     /* VmSize: sum of VMA lengths in kB */
     p = pfs_bstr(p, end, "VmSize:\t");
     {
-        uint64_t total = 0;
-        uint32_t i;
-        if (proc->vma_table) {
-            for (i = 0; i < vma_count_get(proc); i++)
-                total += proc->vma_table[i].len;
-        }
+        uint64_t total = vma_size_bytes(proc);
         p = pfs_bdec(p, end, total / 1024);
     }
     p = pfs_bstr(p, end, " kB\n");
@@ -1167,7 +1161,7 @@ static const procfs_root_node_t s_proc_root[] = {
     { "cpuinfo", 8, S_IFREG | 0444, gen_cpuinfo,   CAP_KIND_NULL },
     { "smart",   8, S_IFREG | 0444, gen_smart,     CAP_KIND_NULL },
     { "hda",     8, S_IFREG | 0444, gen_hda,       CAP_KIND_NULL },
-    { "tasks",   8, S_IFREG | 0444, gen_tasks,     CAP_KIND_NULL },
+    { "tasks",   8, S_IFREG | 0440, gen_tasks,     CAP_KIND_PROC_READ },
     /* stackshot/trace/dmesg: whole-system state and kernel addresses, and
      * stackshot's dump holds sched_lock across kilobytes of serial output.
      * Ungated these were an unprivileged system-wide freeze plus a kernel
@@ -1253,7 +1247,7 @@ procfs_dir_readdir(void *priv, uint64_t index, char *name_out, uint8_t *type_out
     aegis_task_t *t = cur;
     uint64_t found = 0;
     do {
-        if (t->is_user) {
+        if (t->is_user && procfs_check_access(((aegis_process_t *)t)->pid) == 0) {
             if (found == pidx) {
                 aegis_process_t *proc = (aegis_process_t *)t;
                 char *p = pfs_u64_dec(name_out, proc->pid);

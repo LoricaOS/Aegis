@@ -16,6 +16,7 @@
 #define VMA_GUARD        7   /* guard page (PROT_NONE) */
 #define VMA_SHARED       8   /* MAP_SHARED mapping — phys pages owned by memfd */
 #define VMA_FILE         9   /* demand-paged MAP_PRIVATE file mapping (ext2) */
+#define VMA_SHARED_RO   10   /* MAP_SHARED from a read-only fd: no write upgrade */
 
 typedef struct {
     uint64_t base;
@@ -38,6 +39,14 @@ struct aegis_process;
 void vma_set_file_backing(struct aegis_process *proc, uint64_t base,
                           uint32_t ino, uint64_t file_off, uint64_t file_size,
                           uint32_t file_gen);
+
+/* Total bytes under the same snapshot locks. */
+uint64_t vma_size_bytes(struct aegis_process *proc);
+
+/* Copy at most capacity entries under the leaf lock. Safe under sched_lock;
+ * the caller must keep proc alive. out == NULL returns the live entry count. */
+uint32_t vma_snapshot(struct aegis_process *proc, vma_entry_t *out,
+                      uint32_t capacity);
 
 /* vma_init — allocate KVA pages for the VMA table.
  * Sets proc->vma_table, vma_count=0, the configured capacity, and initialises the

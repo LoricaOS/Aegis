@@ -18,10 +18,39 @@
 #include "vma.h"
 #include "printk.h"
 
+extern spinlock_t sched_lock;
+
 /* The kva allocation must cover the struct — EXECVE_ARGBUF_PAGES is a
  * hand-computed ceiling and the struct has grown before. */
 _Static_assert(sizeof(execve_argbuf_t) <= EXECVE_ARGBUF_PAGES * 4096,
                "EXECVE_ARGBUF_PAGES too small for execve_argbuf_t");
+
+/* Tell the dynamic loader when policy grants authority the caller lacked. */
+static int
+exec_gains_caps(const cap_slot_t *before, const cap_slot_t *after)
+{
+    for (uint32_t i = 0; i < CAP_TABLE_SIZE; i++)
+        if (after[i].kind != CAP_KIND_NULL &&
+            cap_check(before, CAP_TABLE_SIZE, after[i].kind, after[i].rights) != 0)
+            return 1;
+    return 0;
+}
+
+/* An unattenuated image may receive in-place admin_session authority from a
+ * login child AFTER its auxv is frozen, even if exec itself adds no caps.
+ * Start it secure from the outset; holding authority_busy until SYSRET would
+ * not cover userspace loader startup. A persistent ceiling prevents that
+ * elevation (including session-only authority), but does not excuse gains at
+ * this exec/spawn boundary. Keep both creation paths on the same rule.
+ *
+ * This supplies AT_SECURE, not kernel-side environment filtering: the OS's
+ * interpreter/libc must honor it. See docs/audits/capability-secure-start.md. */
+static int
+exec_requires_secure_start(const cap_slot_t *before, const cap_slot_t *after,
+                           int ceiling_active, int admin_gain)
+{
+    return !ceiling_active || admin_gain || exec_gains_caps(before, after);
+}
 
 /* Copy a NULL-terminated user array of C-strings into a FLAT kernel buffer:
  * up to `max` entries, appended NUL-separated into strbuf[strbuf_sz], with a
@@ -40,7 +69,8 @@ copy_user_argv(uint64_t arr_uptr, char *strbuf, int strbuf_sz, char *ptrs[], int
         if (!user_ptr_valid(ptr_addr, 8))
             return -1;
         uint64_t str_ptr;
-        copy_from_user(&str_ptr, (const void *)(uintptr_t)ptr_addr, 8);
+        if (copy_from_user(&str_ptr, (const void *)(uintptr_t)ptr_addr, 8))
+            return -1;
         if (!str_ptr)
             break;  /* NULL terminator */
         ptrs[n] = &strbuf[off];
@@ -50,7 +80,8 @@ copy_user_argv(uint64_t arr_uptr, char *strbuf, int strbuf_sz, char *ptrs[], int
             if (!user_ptr_valid(str_ptr, 1))
                 return -1;
             char c;
-            copy_from_user(&c, (const void *)(uintptr_t)str_ptr, 1);
+            if (copy_from_user(&c, (const void *)(uintptr_t)str_ptr, 1))
+                return -1;
             strbuf[off++] = c;
             str_ptr++;
             if (c == '\0')
@@ -104,6 +135,10 @@ sys_execve(syscall_frame_t *frame,
            uint64_t path_uptr, uint64_t argv_uptr, uint64_t envp_uptr)
 {
     aegis_process_t *proc = current_proc();
+    cap_slot_t prior_caps[CAP_TABLE_SIZE];
+    int prior_admin;
+    uint64_t authority_epoch = 0;
+    int authority_pending = 0;
     if (!random_is_ready())
         return SYS_ERR(EAGAIN);
     /* Allocate argv working area from kva — too large for kernel stack. */
@@ -125,7 +160,8 @@ sys_execve(syscall_frame_t *frame,
             if (!user_ptr_valid(path_uptr + i, 1))
                 { ret = SYS_ERR(EFAULT); goto done; }
             char c;
-            copy_from_user(&c, (const void *)(uintptr_t)(path_uptr + i), 1);
+            if (copy_from_user(&c, (const void *)(uintptr_t)(path_uptr + i), 1))
+                { ret = SYS_ERR(EFAULT); goto done; }
             path[i] = c;
             if (c == '\0') break;
         }
@@ -192,14 +228,22 @@ reload_binary:
                 if (xperm != 0)
                     { ret = SYS_ERR(EACCES); goto done; }
             } else {
-                /* No else-branch here meant: any path ext2_open cannot resolve
-                 * but vfs_open CAN (a ramfs /tmp or /run file, a mounted tmpfs)
-                 * was exec'd with NO X_OK check whatsoever — the permission
-                 * test was simply skipped rather than failed. Those backends
-                 * have no executable bit to consult, so refuse to exec from
-                 * them outright: a writable-by-anyone filesystem is not a place
-                 * to run code from, and nothing in the system does. */
-                ret = SYS_ERR(EACCES); goto done;
+                /* ext2 cannot resolve this path. It may still exist on a
+                 * non-ext2 mount (ramfs /tmp, tmpfs /run), which has no
+                 * executable bit to consult — refuse to exec from there.
+                 * But a path that exists NOWHERE must report ENOENT: callers
+                 * distinguish "missing" from "not executable", and
+                 * posix_spawn surfaces the exec errno to its caller (a missing
+                 * target reported as EACCES also made `command -v`-style
+                 * checks and spawn error handling diagnose the wrong fault).
+                 * sys_spawn already propagates vfs_open's error here; this
+                 * path used to collapse both cases to EACCES. */
+                vfs_file_t probe;
+                if (vfs_open(path, 0, 0, &probe) == 0) {
+                    if (probe.ops->close) probe.ops->close(probe.priv);
+                    ret = SYS_ERR(EACCES); goto done;
+                }
+                ret = SYS_ERR(ENOENT); goto done;
             }
         }
         vfs_file_t vf;
@@ -266,6 +310,24 @@ reload_binary:
         for (uint64_t i = 0; i < sizeof(shebang_interp) && i < sizeof(path); i++)
             path[i] = shebang_interp[i];
         goto reload_binary;
+    }
+
+    /* Exclude remote elevation before tearing down the old image. Policy
+     * derivation below must not race a login child publishing authority for
+     * that image, even when this exec keeps the same executable pathname. */
+    {
+        irqflags_t fl = spin_lock_irqsave(&sched_lock);
+        if (proc->authority_busy) {
+            spin_unlock_irqrestore(&sched_lock, fl);
+            ret = SYS_ERR(EPERM);
+            goto done;
+        }
+        proc->authority_busy = 1;
+        authority_epoch = ++proc->authority_epoch;
+        authority_pending = 1;
+        __builtin_memcpy(prior_caps, proc->caps, sizeof(prior_caps));
+        prior_admin = (int)proc->admin_session;
+        spin_unlock_irqrestore(&sched_lock, fl);
     }
 
     /* 3b. POSIX: execve reduces the thread group to the calling thread BEFORE
@@ -337,13 +399,6 @@ reload_binary:
      * RequestServer/WebContent. */
     proc->task.clear_child_tid = 0;
     vma_clear(proc);
-    {
-        uint64_t pi;
-        for (pi = 0; pi < sizeof(proc->exe_path) - 1 && path[pi]; pi++)
-            proc->exe_path[pi] = path[pi];
-        proc->exe_path[pi] = '\0';
-    }
-    proc_trace_log("exec", proc->pid, proc->ppid, proc->exe_path);
     proc->task.fs_base = 0;
 
     /* Reset capability table to baseline + policy on exec — exec is a
@@ -353,11 +408,10 @@ reload_binary:
     /* FIRST-BOOT elevation does not survive exec; credential-backed elevation
      * does. The distinction matters both ways:
      *
-     *  - Keeping it for the credential case is the sudo model working as
-     *    designed. `admin` in stsh elevates the shell, and the commands that
-     *    shell then fork+execs (herald install, the installer) must inherit it,
-     *    or elevation would be useless. Clearing unconditionally here breaks
-     *    every admin workflow.
+     *  - A verified process retains its own session when replacing its image.
+     *    This is not child inheritance: fork/vfork/spawn clear latent session
+     *    authority, so launchers that relied on elevated children must migrate
+     *    to explicit bounded grants or separately authenticated execution.
      *  - Dropping it for the first-boot case closes the leak: `configure` runs
      *    elevated before any credential exists, g_first_boot is latched for the
      *    whole boot, and the setup flow ends by LAUNCHING THE DESKTOP rather
@@ -367,13 +421,12 @@ reload_binary:
      *
      * The firstboot re-grant below re-establishes both flags if this exec is
      * itself the anchored setup program. */
-    if (proc->admin_session_firstboot) {
-        proc->admin_session = 0;
-        proc->admin_session_firstboot = 0;
-    }
-    cap_apply_policy(proc->caps, path, proc->authenticated, proc->admin_session);
+    int new_admin = proc->admin_session_firstboot ? 0 : prior_admin;
+    int new_firstboot = 0;
+    cap_slot_t newcaps[CAP_TABLE_SIZE];
+    cap_apply_policy(newcaps, path, proc->authenticated, new_admin);
     if (proc->cap_ceiling_active)
-        cap_apply_ceiling(proc->caps, proc->cap_ceiling);
+        cap_apply_ceiling(newcaps, proc->cap_ceiling);
 
     /* First-boot exception: the anchored setup program (caps.d/configure) runs
      * before any login on an unconfigured system, so it has no admin_session to
@@ -382,9 +435,33 @@ reload_binary:
      * to the firstboot-tier policy (only configure declares it). This is the
      * session half of the same exception that hands it the AUTH/INSTALL caps. */
     if (!proc->cap_ceiling_active && cap_policy_is_firstboot(path)) {
-        proc->admin_session = 1;
-        proc->admin_session_firstboot = 1;   /* not credential-backed */
+        new_admin = 1;
+        new_firstboot = 1;   /* not credential-backed */
     }
+    {
+        irqflags_t fl = spin_lock_irqsave(&sched_lock);
+        if (!proc->authority_busy || proc->authority_epoch != authority_epoch) {
+            spin_unlock_irqrestore(&sched_lock, fl);
+            /* Past flush_old_exec: never return to an image whose authority
+             * transaction was invalidated. Do not clear another owner's busy. */
+            sched_exit();
+            __builtin_unreachable();
+        }
+        uint64_t pi;
+        for (pi = 0; pi < sizeof(proc->exe_path) - 1 && path[pi]; pi++)
+            proc->exe_path[pi] = path[pi];
+        proc->exe_path[pi] = '\0';
+        proc->admin_session = (uint32_t)new_admin;
+        proc->admin_session_firstboot = (uint32_t)new_firstboot;
+        __builtin_memcpy(proc->caps, newcaps, sizeof(newcaps));
+        proc->authority_busy = 0;
+        proc->authority_epoch++;
+        authority_pending = 0;
+        spin_unlock_irqrestore(&sched_lock, fl);
+    }
+    proc_trace_log("exec", proc->pid, proc->ppid, proc->exe_path);
+    int secure_exec = exec_requires_secure_start(prior_caps, newcaps,
+                          (int)proc->cap_ceiling_active, new_admin && !prior_admin);
 
     /* C2: Reset signal state across exec — pending signals, mask, and all
      * signal dispositions must be cleared.  Matches POSIX exec semantics:
@@ -432,7 +509,7 @@ reload_binary:
              * process's already-granted caps. */
             if (!elf_interp_trusted(er.interp, (uint16_t)proc->uid,
                                     (uint16_t)proc->gid,
-                                    cap_policy_lookup(path) != 0)) {
+                                    cap_policy_lookup(path, 0))) {
                 printk("[EXEC] refused untrusted PT_INTERP: %s\n", er.interp);
                 sched_exit(); __builtin_unreachable();
             }
@@ -554,11 +631,11 @@ reload_binary:
      * + envc (envp pointers)
      * + 1 (envp NULL)
      * + auxv pairs × 2 qwords each:
-     *     7 base: PHDR, PHNUM, PAGESZ, ENTRY, RANDOM, PHENT, NULL
+     *     8 base: PHDR, PHNUM, PAGESZ, ENTRY, RANDOM, PHENT, SECURE, NULL
      *   + 1 if interp: AT_BASE
      */
     {
-    uint64_t auxv_qwords = has_interp ? 16 : 14;
+    uint64_t auxv_qwords = has_interp ? 18 : 16;
     uint64_t table_qwords = (uint64_t)(argc2) + (uint64_t)envc + 3 + auxv_qwords;
     uint64_t table_bytes  = table_qwords * 8ULL;
 
@@ -661,6 +738,12 @@ reload_binary:
             vmm_write_user_u64(proc->pml4_phys, wp, INTERP_BASE); wp += 8;
         }
 
+        /* Request secure startup from the OS interpreter/libc. */
+        if (vmm_write_user_u64(proc->pml4_phys, wp, 23ULL) != 0 ||
+            vmm_write_user_u64(proc->pml4_phys, wp + 8, secure_exec) != 0)
+            { sched_exit(); __builtin_unreachable(); }
+        wp += 16;
+
         /* auxv: AT_NULL (end sentinel) */
         if (vmm_write_user_u64(proc->pml4_phys, wp, 0ULL) != 0)
             { sched_exit(); __builtin_unreachable(); }
@@ -732,6 +815,14 @@ reload_binary:
     } /* argc scope */
 
 done:
+    if (authority_pending) {
+        irqflags_t fl = spin_lock_irqsave(&sched_lock);
+        if (proc->authority_busy && proc->authority_epoch == authority_epoch) {
+            proc->authority_busy = 0;
+            proc->authority_epoch++;
+        }
+        spin_unlock_irqrestore(&sched_lock, fl);
+    }
     if (ext2_buf) kva_free_pages(ext2_buf, ext2_pages);
     kva_free_pages(abuf, EXECVE_ARGBUF_PAGES);
     return ret;
@@ -922,7 +1013,7 @@ sys_spawn(uint64_t path_uptr, uint64_t argv_uptr,
              * was X_OK-checked against above. */
             if (!elf_interp_trusted(er.interp, (uint16_t)parent->uid,
                                     (uint16_t)parent->gid,
-                                    cap_policy_lookup(path) != 0)) {
+                                    cap_policy_lookup(path, 0))) {
                 printk("[EXEC] refused untrusted PT_INTERP: %s\n", er.interp);
                 goto fail_child;
             }
@@ -969,6 +1060,7 @@ sys_spawn(uint64_t path_uptr, uint64_t argv_uptr,
 
     /* 8. Build ABI initial stack (same layout as execve) */
     uint64_t sp_va = USER_STACK_TOP_EXEC;
+    uint64_t secure_auxv_va = 0;
 
     /* Stack-underflow guards (mirrors execve): argc<=64 + envc<=32 strings of up
      * to 256 bytes each can total 24 KB, exceeding the 16 KB stack. execve kills
@@ -1024,7 +1116,7 @@ sys_spawn(uint64_t path_uptr, uint64_t argv_uptr,
 
     /* Pointer table: argc + argv + NULL + envp + NULL + auxv */
     {
-        uint64_t auxv_qwords = has_interp ? 16 : 12;
+        uint64_t auxv_qwords = has_interp ? 18 : 14;
         uint64_t table_qwords = (uint64_t)argc + 2 + (uint64_t)envc + 1 + auxv_qwords;
         uint64_t table_bytes  = table_qwords * 8ULL;
 
@@ -1074,6 +1166,10 @@ sys_spawn(uint64_t path_uptr, uint64_t argv_uptr,
             vmm_write_user_u64(child->pml4_phys, wp, 4ULL); wp += 8;  /* AT_PHENT */
             vmm_write_user_u64(child->pml4_phys, wp, 56ULL); wp += 8;
         }
+
+        vmm_write_user_u64(child->pml4_phys, wp, 23ULL); wp += 8; /* AT_SECURE */
+        secure_auxv_va = wp;
+        vmm_write_user_u64(child->pml4_phys, wp, 0ULL); wp += 8;
 
         vmm_write_user_u64(child->pml4_phys, wp, 0ULL); wp += 8;  /* AT_NULL */
         vmm_write_user_u64(child->pml4_phys, wp, 0ULL); wp += 8;
@@ -1140,7 +1236,7 @@ sys_spawn(uint64_t path_uptr, uint64_t argv_uptr,
     child->pid             = proc_alloc_pid();
     child->tgid            = child->pid;
     child->thread_count    = 1;
-    child->ppid            = parent->pid;
+    child->ppid            = parent->tgid;
     child->uid             = parent->uid;
     child->gid             = parent->gid;
     child->pgid            = child->pid;   /* new process group */
@@ -1185,22 +1281,44 @@ sys_spawn(uint64_t path_uptr, uint64_t argv_uptr,
     child->signal_mask     = 0;
     __builtin_memset(child->sigactions, 0, sizeof(child->sigactions));
 
-    /* 12. Capabilities: baseline + policy, OR cap_mask if provided.
-     * Policy-based caps from /etc/aegis/caps.d/ replace the old exec_caps mechanism. */
+    /* 12. Fresh policy issuance, optionally narrowed by explicit delegation.
+     * Snapshot parent authority under its publication lock, never across I/O. */
     {
         uint32_t ci;
-        /* Baseline + policy (the authenticated flag is inherited from the
-         * parent for spawned children). Shared with execve / proc_spawn via
-         * cap_apply_policy. The cap_mask path below further restricts this
-         * computed set. */
-        cap_apply_policy(child->caps, path, parent->authenticated, parent->admin_session);
+        cap_slot_t parent_caps[CAP_TABLE_SIZE];
+        uint32_t parent_authenticated, parent_admin, parent_auth_uid, parent_auth_gid;
+        irqflags_t auth_fl = spin_lock_irqsave(&sched_lock);
+        __builtin_memcpy(parent_caps, parent->caps, sizeof(parent_caps));
+        parent_authenticated = parent->authenticated;
+        parent_admin = parent->admin_session;
+        parent_auth_uid = parent->auth_uid;
+        parent_auth_gid = parent->auth_gid;
+        __builtin_memcpy(child->cap_ceiling, parent->cap_ceiling,
+                         sizeof(child->cap_ceiling));
+        child->cap_ceiling_active = parent->cap_ceiling_active;
+        spin_unlock_irqrestore(&sched_lock, auth_fl);
+
+        /* Session authority never passes to a new process. In masked mode
+         * only, the parent's session qualifies the policy intersection used
+         * to issue explicitly requested, parent-held caps; it is not itself
+         * delegated. Unmasked spawn gets unauthenticated destination policy. */
+        child->authenticated = 0;
+        child->admin_session = 0;
+        child->admin_session_firstboot = 0;
+        child->auth_uid = AUTH_ID_NONE;
+        child->auth_gid = AUTH_ID_NONE;
+        cap_apply_policy(child->caps, path,
+                         cap_mask_uptr ? (int)parent_authenticated : 0,
+                         cap_mask_uptr ? (int)parent_admin : 0);
+        if (child->cap_ceiling_active)
+            cap_apply_ceiling(child->caps, child->cap_ceiling);
 
         /* cap_mask restricts the computed cap set (baseline + policy).
          * If provided, only caps that appear in BOTH the computed set AND
          * the mask survive. */
         if (cap_mask_uptr != 0) {
             /* cap_mask mode: caller must hold CAP_DELEGATE */
-            if (cap_check(parent->caps, CAP_TABLE_SIZE,
+            if (cap_check(parent_caps, CAP_TABLE_SIZE,
                           CAP_KIND_CAP_DELEGATE, CAP_RIGHTS_READ) != 0) {
                 kva_free_pages(kstack, 4);
                 result = SYS_ERR(ENOCAP);
@@ -1270,7 +1388,7 @@ sys_spawn(uint64_t path_uptr, uint64_t argv_uptr,
                         goto fail_child;
                     }
                 }
-                if (cap_check(parent->caps, CAP_TABLE_SIZE,
+                if (cap_check(parent_caps, CAP_TABLE_SIZE,
                               mask[ci].kind, mask[ci].rights) != 0) {
                     kva_free_pages(kstack, 4);
                     result = SYS_ERR(ENOCAP);
@@ -1284,36 +1402,29 @@ sys_spawn(uint64_t path_uptr, uint64_t argv_uptr,
                 }
             }
 
-            /* Persist the attenuation across future execs. Session flags are
-             * intentionally inherited, but can no longer regenerate a kind
-             * or right excluded by this mask. A descendant can only inherit
-             * or further narrow this ceiling. */
+            /* Persist the already-ceiling-filtered intersection across future
+             * execs. Descendants inherit constraints, never session authority. */
             cap_ceiling_from_table(child->cap_ceiling, child->caps);
             child->cap_ceiling_active = 1;
-        } else if (parent->cap_ceiling_active) {
-            __builtin_memcpy(child->cap_ceiling, parent->cap_ceiling,
-                             sizeof(child->cap_ceiling));
-            child->cap_ceiling_active = 1;
-            cap_apply_ceiling(child->caps, child->cap_ceiling);
-        }
 
-        /* Inherit authenticated flag + bound identity from parent */
-        child->authenticated = parent->authenticated;
-        child->admin_session = parent->admin_session;
-        child->admin_session_firstboot = parent->admin_session_firstboot;
-        child->auth_uid      = parent->auth_uid;
-        child->auth_gid      = parent->auth_gid;
-        if (cap_mask_uptr != 0) {
-            /* These flags are latent policy authority, and admin_session is
-             * also consulted directly by account-DB gates. A masked spawn has
-             * already received every explicitly selected cap it may use; do
-             * not carry session state that can restore excluded authority on
-             * exec (or bypass a cap table entirely). The bound identity stays:
-             * exercising it still requires an explicitly retained SETUID cap. */
-            child->authenticated = 0;
-            child->admin_session = 0;
-            child->admin_session_firstboot = 0;
+            /* Bound identity is usable authority too: retain it only when the
+             * caller explicitly selected SETUID and it survived all filters. */
+            if (cap_check(child->caps, CAP_TABLE_SIZE,
+                          CAP_KIND_SETUID, CAP_RIGHTS_WRITE) == 0) {
+                child->auth_uid = parent_auth_uid;
+                child->auth_gid = parent_auth_gid;
+            }
         }
+    }
+
+    /* Publish the final policy/attenuation result before the child can run. */
+    if (vmm_write_user_u64(child->pml4_phys, secure_auxv_va,
+            exec_requires_secure_start(parent->caps, child->caps,
+                (int)child->cap_ceiling_active,
+                child->admin_session && !parent->admin_session)) != 0) {
+        kva_free_pages(kstack, 4);
+        result = SYS_ERR(EFAULT);
+        goto fail_child;
     }
 
     /* 13. File descriptor table. */
@@ -1353,13 +1464,14 @@ sys_spawn(uint64_t path_uptr, uint64_t argv_uptr,
         }
     }
 
-    /* 14. Add child to scheduler */
-    sched_add(&child->task);
+    /* 14. A sibling can wait/reap as soon as the child is published. */
+    uint32_t child_pid = child->pid;
     proc_inc_fork_count();
+    sched_add(&child->task);
 
     /* Success — free argv buffer and return child PID */
     kva_free_pages(abuf, EXECVE_ARGBUF_PAGES);
-    return (uint64_t)child->pid;
+    return (uint64_t)child_pid;
 
 fail_child:
     /* Tear the child's fd table down through fd_table_unref so each fd's

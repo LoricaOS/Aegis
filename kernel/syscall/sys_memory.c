@@ -187,36 +187,21 @@ sys_brk_impl(uint64_t arg1)
          * search and the teardown path. VMA_HEAP is only ever created here,
          * always with prot 0x03, so the reservation always merges. */
     } else if (arg1 < proc->brk) {
-        /* Shrink: unmap and free pages [arg1, proc->brk) */
+        /* Update the VMA under its leaf lock before releasing any frames. */
+        if (vma_remove(proc, arg1, proc->brk - arg1) != 0)
+            return proc->brk;
         uint64_t va;
         for (va = arg1; va < proc->brk; va += 4096UL) {
-            uint64_t phys = vmm_phys_of_user(proc->pml4_phys, va);
+            uint64_t phys = vmm_phys_of_user_raw(proc->pml4_phys, va);
             if (phys) {
+                uint64_t pte = vmm_pte_of_user_raw(proc->pml4_phys, va);
                 vmm_unmap_user_page(proc->pml4_phys, va);
-                pmm_free_page(phys);
+                if (!(pte & VMM_FLAG_SHARED)) pmm_free_page(phys);
             }
         }
         proc->brk = arg1;
 
-        /* Update heap VMA */
-        if (proc->vma_table) {
-            uint32_t vi;
-            for (vi = 0; vi < vma_count_get(proc); vi++) {
-                if (proc->vma_table[vi].type == VMA_HEAP) {
-                    if (proc->brk <= proc->vma_table[vi].base) {
-                        /* Removing the whole heap entry by its exact
-                         * [base,len) — a full removal, never a split, so this
-                         * cannot return -1. Cast to void deliberately. */
-                        (void)vma_remove(proc, proc->vma_table[vi].base,
-                                         proc->vma_table[vi].len);
-                    } else {
-                        proc->vma_table[vi].len = proc->brk -
-                                                  proc->vma_table[vi].base;
-                    }
-                    break;
-                }
-            }
-        }
+
     }
 
     return proc->brk;
@@ -324,15 +309,28 @@ sys_mmap_impl(uint64_t arg1, uint64_t arg2, uint64_t arg3,
     if (file_backed && (off & 0xFFFUL))
         return SYS_ERR(EINVAL);   /* EINVAL — offset not page-aligned */
 
-    /* Re-validate AUTH on USE, exactly as sys_read/sys_pread64 do: mmap is a
-     * sibling read path onto the same fd. An fd opened past the AUTH gate
-     * (/etc/shadow, /etc/aegis/admin) carries VFS_KF_AUTH_GATED; if it reached a
-     * process lacking CAP_KIND_AUTH (inherited across exec, or dup'd), that
-     * process must not read the secret by mmap'ing it either. Without this,
-     * mmap was an AUTH-bypass hole the read-path defense didn't cover. */
-    if (file_backed && (backing->kflags & VFS_KF_AUTH_GATED) &&
-        cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_AUTH, CAP_RIGHTS_READ) != 0)
-        return SYS_ERR(EACCES);
+    /* Mapping file bytes is a read, including private writable copies and
+     * lazy mappings whose first read happens after the fd is closed. */
+    if (file_backed) {
+        if (cap_check(proc->caps, CAP_TABLE_SIZE,
+                      CAP_KIND_VFS_READ, CAP_RIGHTS_READ) != 0)
+            return SYS_ERR(ENOCAP);
+        if ((backing->flags & VFS_O_ACCMODE) != VFS_O_RDONLY &&
+            (backing->flags & VFS_O_ACCMODE) != VFS_O_RDWR)
+            return SYS_ERR(EACCES);
+        if ((backing->kflags & VFS_KF_AUTH_GATED) && !proc->admin_session &&
+            cap_check(proc->caps, CAP_TABLE_SIZE,
+                      CAP_KIND_AUTH, CAP_RIGHTS_READ) != 0)
+            return SYS_ERR(EACCES);
+        if (is_shared && (prot & PROT_WRITE)) {
+            if (cap_check(proc->caps, CAP_TABLE_SIZE,
+                          CAP_KIND_VFS_WRITE, CAP_RIGHTS_WRITE) != 0)
+                return SYS_ERR(ENOCAP);
+            if ((backing->flags & VFS_O_ACCMODE) != VFS_O_RDWR ||
+                ((backing->kflags & VFS_KF_ACCOUNT_DB) && !proc->admin_session))
+                return SYS_ERR(EACCES);
+        }
+    }
 
     /* Read-only MAP_SHARED of a regular (non-memfd) file: Aegis keeps no page
      * cache for ext2, so a *true* shared file mapping is memfd-only. But a
@@ -375,7 +373,10 @@ sys_mmap_impl(uint64_t arg1, uint64_t arg2, uint64_t arg3,
         }
     }
     uint8_t vma_type = lazy_file ? VMA_FILE
-                     : (is_shared && file_backed) ? VMA_SHARED : VMA_MMAP;
+                     : (is_shared && file_backed)
+                       ? ((backing->flags & VFS_O_ACCMODE) == VFS_O_RDWR
+                          ? VMA_SHARED : VMA_SHARED_RO)
+                       : VMA_MMAP;
 
     int is_fixed = (flags & MAP_FIXED) && addr != 0;
     uint64_t base;
@@ -606,7 +607,7 @@ sys_mmap_impl(uint64_t arg1, uint64_t arg2, uint64_t arg3,
          * under it. */
         if (!reserved &&
             vma_insert(proc, base, len, (uint32_t)(prot & 0x07),
-                       VMA_SHARED) != 0) {
+                       vma_type) != 0) {
             uint64_t v2;
             for (v2 = base; v2 < base + len; v2 += 4096UL) {
                 uint64_t p = vmm_phys_of_user_raw(proc->pml4_phys, v2);
@@ -1138,6 +1139,22 @@ sys_mprotect_impl(uint64_t addr, uint64_t len, uint64_t prot)
     }
 
     aegis_process_t *proc = current_proc();
+
+    /* A shared mapping retains its original fd's write ceiling, even after
+     * close. Recheck the caller's capability before any write upgrade. */
+    if (prot & PROT_WRITE) {
+        for (uint64_t va = addr; va < addr + rlen;) {
+            vma_entry_t v;
+            if (!vma_find_copy(proc, va, &v)) { va += 4096UL; continue; }
+            if (v.type == VMA_SHARED_RO)
+                return SYS_ERR(EACCES);
+            if (v.type == VMA_SHARED &&
+                cap_check(proc->caps, CAP_TABLE_SIZE,
+                          CAP_KIND_VFS_WRITE, CAP_RIGHTS_WRITE) != 0)
+                return SYS_ERR(ENOCAP);
+            va = v.base + v.len;
+        }
+    }
 
     /* Update the VMA table FIRST so the page-protection change and its
      * bookkeeping are all-or-nothing. vma_update_prot only touches the table;

@@ -131,7 +131,7 @@ sys_mkdir(uint64_t arg1, uint64_t arg2)
                   CAP_KIND_VFS_WRITE, CAP_RIGHTS_WRITE) != 0)
         return SYS_ERR(EPERM);
     char kpath[256];
-    (void)arg2; /* mode ignored for now */
+    uint16_t mode = (uint16_t)(arg2 & 0777u & ~proc->umask);
     if (copy_path_resolved(kpath, arg1, sizeof(kpath)) != 0)
         return SYS_ERR(EFAULT);
     /* Install-tree mutation gate is enforced ATOMICALLY inside ext2_mkdir now
@@ -145,7 +145,7 @@ sys_mkdir(uint64_t arg1, uint64_t arg2)
      * dirs under /tmp, e.g. Ladybird's XDG_RUNTIME_DIR). */
     {
         int rc;
-        if (vfs_ramfs_mkdir(kpath, &rc))
+        if (vfs_ramfs_mkdir(kpath, mode, &rc))
             return (rc < 0) ? (uint64_t)(int64_t)rc : 0;
     }
     /* POSIX/Linux ordering: an EXISTING target is EEXIST regardless of parent
@@ -171,7 +171,7 @@ sys_mkdir(uint64_t arg1, uint64_t arg2)
                 return SYS_ERR(EACCES);
         }
     }
-    int r = g_rootfs->mkdir(kpath, 0755, has_install);
+    int r = g_rootfs->mkdir(kpath, mode, has_install);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }
 

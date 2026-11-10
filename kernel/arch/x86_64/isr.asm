@@ -163,6 +163,7 @@ ISR_NOERR 0xFE
 ; Calling convention: SystemV AMD64 ABI — rdi = first argument (cpu_state_t *).
 ; The cpu_state_t pointer is rsp+8 after the saved-CR3 slot is pushed.
 isr_common_stub:
+    cld                         ; C ABI; interrupted RFLAGS are already saved
     ; SWAPGS if interrupt came from ring 3 (user mode).
     ; At this point: [RSP+0]=vector, [RSP+8]=error_code, [RSP+16]=RIP, [RSP+24]=CS.
     ; CS == 0x23 means user code segment (RPL=3).  Must swap GS.base before
@@ -230,6 +231,17 @@ isr_common_stub:
 ; (fork returns 0 in child) and all registers from the parent's syscall frame.
 global isr_post_dispatch
 isr_post_dispatch:
+    ; Validate every user IRET frame before restoring CR3/GPRs or user GS.
+    ; This also covers interrupts taken with an invalid user stack pointer.
+    cmp  qword [rsp + 152], 0x23
+    jne  .valid_user_return
+    mov  rax, [rsp + 144]
+    shr  rax, 47
+    jnz  .bad_user_return
+    mov  rax, [rsp + 168]
+    shr  rax, 47
+    jnz  .bad_user_return
+.valid_user_return:
 
     ; Restore the original CR3 (from the stack slot at [RSP]).
     pop  rax                        ; rax = saved CR3
@@ -273,6 +285,12 @@ isr_post_dispatch:
     or  qword [rsp + 32], 3        ; force SS.RPL = 3
 .iretq_go:
     iretq
+
+.bad_user_return:
+    and rsp, -16
+    extern sched_exit
+    call sched_exit
+    ud2
 
 ; sigreturn_iretq — return to user space from a signal handler via IRETQ with
 ; the FULL interrupted register set restored (rdi/rsi/rdx/rcx/r11 included).

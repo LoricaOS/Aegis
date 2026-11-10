@@ -250,6 +250,7 @@ virtio_gpu_init(void)
     s_fb = (uint8_t *)kva_alloc_pages_low(pages);
     if (!s_fb)
         return;
+    _memset(s_fb, 0, (uint64_t)pages * 4096u);
     s_fb_w = w; s_fb_h = hgt; s_fb_pitch = w * 4u; s_fb_pages = pages;
 
     /* Build the mem-entry array (one per backing page) in its own DMA buffer. */

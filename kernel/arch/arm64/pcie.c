@@ -93,8 +93,10 @@ enumerate_function(uint8_t bus, uint8_t dev, uint8_t fn)
     d->subclass   = (uint8_t)((cls >> 16) & 0xFF);
     d->progif     = (uint8_t)((cls >>  8) & 0xFF);
     d->bus = bus; d->dev = dev; d->fn = fn;
-    for (int i = 0; i < 6; )
-        d->bar[i] = decode_bar(bus, dev, fn, &i);
+    for (int i = 0; i < 6; ) {
+        int slot = i;
+        d->bar[slot] = decode_bar(bus, dev, fn, &i);
+    }
     printk("[PCIE] found %x:%x class=%x at %x:%x.%x\n",
            (unsigned)d->vendor_id, (unsigned)d->device_id,
            (unsigned)d->class_code, (unsigned)bus, (unsigned)dev, (unsigned)fn);

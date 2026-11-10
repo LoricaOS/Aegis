@@ -8,6 +8,7 @@
 #include "syscall_util.h"
 #include "spinlock.h"
 #include "cap.h"
+#include "kbd_vfs.h"
 #include <stdint.h>
 
 static spinlock_t tty_global_lock = SPINLOCK_INIT;
@@ -23,9 +24,9 @@ extern spinlock_t sched_lock;
 /*
  * tty_pgrp_in_session — POSIX tcsetpgrp() validity check.
  *
- * Returns 1 if some live user process has process-group id `pgid` AND
- * belongs to session `sid`; 0 otherwise.  POSIX requires the target
- * process group of TIOCSPGRP to be a non-empty group in the same session
+ * Returns 1 if some non-zombie user process has process-group id `pgid`
+ * AND belongs to session `sid`; stopped jobs still count.  POSIX requires
+ * the target process group of TIOCSPGRP to be non-empty in the same session
  * as the controlling terminal.  This both rejects bogus pgids and stops a
  * process from steering a tty toward a group outside its own session.
  *
@@ -49,7 +50,7 @@ tty_pgrp_in_session(uint32_t pgid, uint32_t sid)
     int found = 0;
     aegis_task_t *t = cur;
     do {
-        if (t->is_user) {
+        if (t->is_user && t->state != TASK_ZOMBIE) {
             aegis_process_t *p = (aegis_process_t *)t;
             if (p->pgid == pgid && p->sid == sid) {
                 found = 1;
@@ -164,6 +165,7 @@ tty_receive_isig(tty_t *tty, char c)
 
 tty_t *tty_find_controlling(uint32_t session_id)
 {
+    if (session_id == 0) return (tty_t *)0;
     tty_t *t;
 
     /* Check the console tty first. */
@@ -174,6 +176,45 @@ tty_t *tty_find_controlling(uint32_t session_id)
     if (t)
         return t;
     return (tty_t *)0;
+}
+
+/* All controlling-terminal claim paths share this target ownership lock. */
+int tty_claim(tty_t *tty, uint32_t sid, uint32_t pgid)
+{
+    if (!tty || sid == 0) return -1;
+    /* spawn creates a fresh session while explicitly transferring stdio.
+     * A delegated console holder may attach after the foreground controller
+     * selects its pgrp; merely holding a background fd cannot steal a tty. */
+    int delegated = 0;
+    aegis_task_t *task = sched_current();
+    if (tty == s_console_tty && task && task->is_user) {
+        aegis_process_t *proc = (aegis_process_t *)task;
+        delegated = proc->sid == sid && proc->pgid == pgid &&
+                    kbd_vfs_has_input_fd();
+    }
+    irqflags_t fl = spin_lock_irqsave(&tty_global_lock);
+    int rc = -1;
+    if (tty->session_id == 0 || tty->session_id == sid ||
+        (delegated && tty->fg_pgrp == pgid)) {
+        tty->session_id = sid;
+        tty->fg_pgrp = pgid;
+        rc = 0;
+    }
+    spin_unlock_irqrestore(&tty_global_lock, fl);
+    return rc;
+}
+
+/* FB/WRITE already grants direct display/input access (see /dev/mouse).
+ * A console login uses its controlling session or a delegated input fd. */
+int tty_console_allowed(void)
+{
+    aegis_task_t *task = sched_current();
+    if (!task || !task->is_user) return 1;
+    aegis_process_t *proc = (aegis_process_t *)task;
+    return (s_console_tty && s_console_tty->session_id != 0 &&
+            s_console_tty->session_id == proc->sid) ||
+           cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_FB,
+                     CAP_RIGHTS_WRITE) == 0 || kbd_vfs_has_input_fd();
 }
 
 /* ── Defaults ────────────────────────────────────────────────────── */
@@ -199,18 +240,18 @@ void tty_init_defaults(tty_t *tty)
 
 int tty_is_fg(tty_t *tty)
 {
-    aegis_task_t *t;
-    aegis_process_t *proc;
-
-    if (tty->fg_pgrp == 0)
-        return 1;
-
-    t = sched_current();
-    if (!t || !t->is_user)
-        return 1;
-
-    proc = (aegis_process_t *)t;
-    return proc->pgid == tty->fg_pgrp;
+    aegis_task_t *task = sched_current();
+    if (!task || !task->is_user) return 1;
+    aegis_process_t *proc = (aegis_process_t *)task;
+    if (tty == s_console_tty) {
+        if (cap_check(proc->caps, CAP_TABLE_SIZE, CAP_KIND_FB,
+                      CAP_RIGHTS_WRITE) == 0)
+            return 1;
+        /* The foreground controller can select a spawned child's new session
+         * when it has explicitly delegated the console input description.
+         * Read/poll check that authority separately, outside tty locks. */
+    } else if (tty->session_id != 0 && tty->session_id != proc->sid) return 0;
+    return tty->fg_pgrp == 0 || proc->pgid == tty->fg_pgrp;
 }
 
 /* ── Echo helper ─────────────────────────────────────────────────── */
@@ -233,19 +274,15 @@ int tty_read(tty_t *tty, char *buf, uint32_t len)
     if (len == 0)
         return 0;
 
-    /* SIGTTIN: background process trying to read.
-     * If the process ignores SIGTTIN (e.g. a compositor that always
-     * needs keyboard input), allow the read to proceed. */
+    if (tty == s_console_tty && !tty_console_allowed())
+        return -ENOCAP;
     if (!tty_is_fg(tty)) {
-        aegis_task_t *t = sched_current();
-        if (t && t->is_user) {
-            aegis_process_t *proc = (aegis_process_t *)t;
-            if (proc->sigactions[SIGTTIN].sa_handler != SIG_IGN) {
-                signal_send_pgrp(proc->pgid, SIGTTIN);
-                return -4; /* EINTR */
-            }
-            /* SIGTTIN ignored — allow background read */
-        }
+        aegis_process_t *proc = (aegis_process_t *)sched_current();
+        if (proc->sigactions[SIGTTIN].sa_handler == SIG_IGN ||
+            (proc->signal_mask & (1ULL << SIGTTIN)))
+            return -5;  /* EIO: ignoring/blocking a signal grants no input */
+        signal_send_pgrp(proc->pgid, SIGTTIN);
+        return -4;
     }
 
     /* Snapshot termios flags under lock */
@@ -481,38 +518,37 @@ int tty_write(tty_t *tty, const char *buf, uint32_t len)
 
 int tty_ioctl(tty_t *tty, uint32_t cmd, uint64_t arg)
 {
+    if (tty == s_console_tty && !tty_console_allowed())
+        return -ENOCAP;
+
     /* TIOCSPGRP — set the foreground process group.
      *
-     * This must be authority-gated: without a check, any process can steal
-     * the foreground pgrp of a tty, hijacking which group receives ^C /
-     * job-control signals (DoS / signal redirection).  POSIX tcsetpgrp()
-     * requires (a) the fd be the caller's controlling terminal and (b) the
-     * target pgrp be a group in the caller's session.  We additionally
-     * gate on the same capability the in-kernel job-control path
-     * (sys_setfg, syscall 360) uses — CAP_KIND_PROC_READ/WRITE returning
-     * EPERM on denial — so the two foreground-setting paths share one
-     * authority model.
+     * The open tty fd scopes this operation; explicit baseline IPC/READ
+     * authority permits job control only within the caller's tty session.
+     * It grants neither process inspection nor control of unrelated ttys
+     * or groups.  The legacy sys_setfg path retains its PROC_READ/WRITE
+     * requirement.  Here the existing controlling-tty representation is
+     * a nonzero tty->session_id matching the caller's sid, and the target
+     * must be a non-empty group in that session.
      *
      * Handled here, BEFORE taking tty_global_lock, because the
      * session-membership walk needs sched_lock and the canonical lock
-     * order is sched_lock > tty_global_lock.  Aegis shells (stsh, shell)
-     * drive job control via sys_setfg, not this ioctl, so a strict check
-     * here cannot break the live job-control path; it only serves
-     * POSIX-conformant callers and rejects illegitimate ones. */
+     * order is sched_lock > tty_global_lock.  User copies can fault and
+     * must also complete before taking either spinlock. */
     if (cmd == TIOCSPGRP) {
         uint32_t val;
-        if (!user_ptr_valid(arg, sizeof(uint32_t)))
+        if (!user_ptr_readable(arg, sizeof(val)) ||
+            copy_from_user(&val, (const void *)arg, sizeof(val)) != 0)
             return -14; /* EFAULT */
-        copy_from_user(&val, (const void *)arg, sizeof(uint32_t));
 
         aegis_task_t *t = sched_current();
         if (!t || !t->is_user)
             return -1; /* EPERM — no user context */
         aegis_process_t *proc = (aegis_process_t *)t;
 
-        /* Capability gate (mirrors sys_setfg). */
+        /* Required even for uid 0 or a caller holding the tty fd. */
         if (cap_check(proc->caps, CAP_TABLE_SIZE,
-                      CAP_KIND_PROC_READ, CAP_RIGHTS_WRITE) < 0)
+                      CAP_KIND_IPC, CAP_RIGHTS_READ) < 0)
             return -1; /* EPERM */
 
         /* (a) tty must be the caller's controlling terminal. */
@@ -524,42 +560,25 @@ int tty_ioctl(tty_t *tty, uint32_t cmd, uint64_t arg)
             return -1; /* EPERM — no such group in session */
 
         irqflags_t pf = spin_lock_irqsave(&tty_global_lock);
+        /* A concurrent claim must not redirect this update to another
+         * session while the scheduler membership walk was in progress. */
+        if (tty->session_id == 0 || tty->session_id != proc->sid) {
+            spin_unlock_irqrestore(&tty_global_lock, pf);
+            return -1;
+        }
         tty->fg_pgrp = val;
         spin_unlock_irqrestore(&tty_global_lock, pf);
         return 0;
     }
 
-    /* TIOCSCTTY — make this tty the calling session leader's controlling
-     * terminal and set its foreground pgrp.  A fresh session leader (after
-     * setsid) uses this to claim the slave it will exec a shell on; without
-     * it the shell inherits a stale fg_pgrp and gets job-control signals.
-     * (tinysshd's login_tty does exactly setsid()+ioctl(slave,TIOCSCTTY).) */
     if (cmd == TIOCSCTTY) {
         aegis_task_t *t = sched_current();
-        if (!t || !t->is_user) return -1; /* EPERM */
+        if (!t || !t->is_user) return -1;
         aegis_process_t *proc = (aegis_process_t *)t;
-        if (proc->sid != proc->pid) return -1; /* only a session leader */
-        irqflags_t pf = spin_lock_irqsave(&tty_global_lock);
-        /* Only claim a tty that is UNCLAIMED, or already ours (idempotent).
-         * This used to overwrite session_id/fg_pgrp unconditionally, so any
-         * unprivileged process holding the console or a PTY on fd 0 could
-         * setsid() (which has no capability gate) and then steal the
-         * controlling terminal out from under its login shell: the shell's
-         * tty_find_controlling(sid) then returns NULL, it takes SIGTTIN on the
-         * next stdin read, and Ctrl-C/SIGTSTP go to the attacker's pgrp
-         * instead. Matches Linux, which requires CAP_SYS_ADMIN to steal an
-         * already-claimed tty. The legitimate caller (login_tty: setsid then
-         * TIOCSCTTY on a fresh slave) is claiming an unclaimed tty and is
-         * unaffected. Checked under the lock so it cannot race another
-         * claimant. */
-        if (tty->session_id != 0 && tty->session_id != proc->sid) {
-            spin_unlock_irqrestore(&tty_global_lock, pf);
-            return -1; /* EPERM — already another session's controlling tty */
-        }
-        tty->session_id = proc->sid;
-        tty->fg_pgrp    = proc->pgid;
-        spin_unlock_irqrestore(&tty_global_lock, pf);
-        return 0;
+        if (proc->sid != proc->pid) return -1;
+        tty_t *existing = tty_find_controlling(proc->sid);
+        if (existing && existing != tty) return -1;
+        return tty_claim(tty, proc->sid, proc->pgid);
     }
 
     /* Pre-validate (and therefore pre-fault) the termios buffer BEFORE taking

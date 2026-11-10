@@ -44,6 +44,12 @@ typedef struct aegis_process {
      * by CAP_KIND_*; inactive processes retain the normal policy behavior. */
     uint32_t      cap_ceiling[CAP_KIND_MAX + 1u];
     uint32_t      cap_ceiling_active;
+    /* sched_lock serializes published authority (caps, session/auth state,
+     * exe_path) and these transaction markers. Every published change bumps
+     * epoch; busy excludes remote elevation during exec/drop policy I/O.
+     * Fresh PCBs start at zero; these markers are never inherited. */
+    uint64_t      authority_epoch;
+    uint32_t      authority_busy;
     uint32_t      authenticated;          /* 1 if session passed login auth; survives exec */
     uint32_t      admin_session;          /* sudo-style admin session: even root must authenticate
                                            * THIS shell session (a SEPARATE credential, distinct from
@@ -51,11 +57,12 @@ typedef struct aegis_process {
                                            * (INSTALL → herald). Granted by sys_admin_session, which
                                            * only /bin/login -elevate may request (CAP_KIND_ADMIN_AUTH)
                                            * after verifying the credential — it targets its parent
-                                           * shell. Inherited by fork/clone, survives exec. */
+                                           * shell. Copied for CLONE_THREAD only; survives this
+                                           * process's exec, never inherited by a new process. */
     /* 1 iff admin_session was granted by the FIRST-BOOT exception rather than
      * by a verified credential. Credential-backed elevation deliberately
-     * survives exec (that is the sudo model: an elevated shell runs elevated
-     * commands). First-boot elevation must NOT — `configure` runs before any
+     * survives an in-place exec, not independent child creation.
+     * First-boot elevation must NOT survive exec — `configure` runs before any
      * credential exists, and g_first_boot is latched for the whole boot, so
      * without this a setup flow that ends by launching the desktop instead of
      * rebooting left the entire session tree admin-elevated. Cleared with
@@ -85,7 +92,7 @@ typedef struct aegis_process {
     uint32_t      pid;          /* unique process ID; 1 = init */
     uint32_t      tgid;         /* thread group ID (= leader's PID) */
     uint32_t      thread_count; /* live threads in this group (leader tracks) */
-    uint32_t      ppid;         /* parent PID; 0 = no parent   */
+    uint32_t      ppid;         /* parent thread-group ID; 0 = no parent */
     uint32_t      uid;          /* user ID; 0 = root */
     uint32_t      gid;          /* group ID; 0 = root */
     uint32_t      pgid;         /* process group ID; init = own pid      */

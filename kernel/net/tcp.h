@@ -50,6 +50,13 @@ _Static_assert(((TCP_RBUF_SIZE - 1) >> TCP_RCV_WSCALE) <= 0xFFFF,
 
 /* TIME_WAIT duration: 4 seconds (shortened 2MSL; non-production acceptable). */
 #define TCP_TIMEWAIT_TICKS  400   /* 4 s at 100 Hz */
+/* FIN_WAIT_2 duration. Our FIN is acked here and there is nothing left to
+ * retransmit, so this state has no RTO of its own. RFC 1122 §4.2.2.13 requires
+ * it to be time-bounded anyway: a peer that never sends its FIN must not pin a
+ * connection slot (and its 320 KiB ring pair) for the rest of the boot. 60 s
+ * matches Linux's tcp_fin_timeout default. Reaching TIME_WAIT (peer FIN) still
+ * happens immediately when it arrives. */
+#define TCP_FINWAIT2_TICKS  6000  /* 60 s at 100 Hz */
 /* Retransmit timeout: 1 s initial, doubles to 8 s (3 retransmits then RST). */
 #define TCP_RTO_INITIAL     100   /* 1 s at 100 Hz */
 #define TCP_RTO_MAX         800   /* 8 s at 100 Hz */
@@ -84,17 +91,22 @@ typedef struct {
                                * we decide to offer scaling on this conn */
     uint16_t    snd_mss;       /* peer's MSS from its SYN (clamped to TCP_ADVMSS);
                                * 0 (zeroed slot) → treat as 536 default */
-    uint8_t    *rbuf;          /* kva ring, attached lazily on first active use
-                               * (tcp_attach_buffers); NULL for an unused/LISTEN
-                               * slot; kept across slot reuse, never freed */
+    uint8_t    *rbuf;          /* kva ring: attached on passive final ACK or local
+                               * outbound connect, never for an incoming SYN.
+                               * NULL until then; pooled across slot reuse */
     uint32_t    rbuf_head, rbuf_tail;
     uint8_t    *sbuf;          /* kva ring, see rbuf */
     uint32_t    sbuf_head, sbuf_tail;
     uint32_t    retransmit_at;
     uint8_t     retransmit_count;
     uint32_t    timewait_at;
+    uint32_t    finwait2_at;    /* FIN_WAIT_2 reclamation deadline (no RTO there) */
     uint32_t    sock_id;
     uint32_t    listener_id;
+    uint64_t    generation;
+    uint32_t    accept_queue[8];
+    uint64_t    accept_generation[8];
+    uint8_t     accept_head, accept_tail;
 } tcp_conn_t;
 
 /* tcp_init: zero the connection table. Called from net_init(). */
@@ -127,9 +139,11 @@ int  tcp_conn_send(uint32_t sock_id, uint32_t conn_id, const void *data, uint16_
  * sendable (EPIPE).  For the socket layer's blocking send. */
 int  tcp_conn_send_ready(uint32_t sock_id, uint32_t conn_id);
 int  tcp_conn_close(uint32_t sock_id, uint32_t conn_id);
-void tcp_conn_get_addr(uint32_t conn_id, ip4_addr_t *rip, uint16_t *rport,
-                       ip4_addr_t *lip, uint16_t *lport);
-void tcp_conn_set_sock(uint32_t conn_id, uint32_t sock_id);
+void tcp_conn_abort(uint32_t sock_id, uint32_t conn_id);
+/* Accept claims a generation-checked queued connection under tcp_lock.
+ * Caller owns an unpublished socket; out is a stable connection snapshot. */
+int tcp_accept(uint32_t listener_id, uint32_t sock_id, tcp_conn_t *out);
+int tcp_accept_ready(uint32_t listener_id);
 /* tcp_conn_get: pointer to tcp_conn_t for conn_id, or NULL if invalid or not
  * owned by sock_id. Lockless — a readiness HINT only; never move data through
  * it (see tcp.c). */

@@ -55,8 +55,8 @@ uint64_t
 sys_set_tid_address(uint64_t arg1)
 {
     aegis_task_t *task = sched_current();
-    if (arg1 && arg1 >= 0xFFFF800000000000ULL)
-        return SYS_ERR(EFAULT);  /* EFAULT — reject kernel addresses */
+    if (arg1 && !user_ptr_valid(arg1, sizeof(uint32_t)))
+        return SYS_ERR(EFAULT);
     task->clear_child_tid = arg1;
     if (!task->is_user) return 1;
     return (uint64_t)((aegis_process_t *)task)->pid;
@@ -132,9 +132,8 @@ uint64_t
 sys_arch_prctl(uint64_t arg1, uint64_t arg2)
 {
     if (arg1 == ARCH_SET_FS) {
-        /* Reject kernel addresses — user process must not set FS base to
-         * kernel space. Corrupts musl TLS → cascading garbage syscalls. */
-        if (arg2 >= 0xFFFF800000000000ULL)
+        /* WRMSR itself faults on noncanonical addresses. */
+        if (arg2 > USER_ADDR_MAX)
             return SYS_ERR(EFAULT);
         sched_current()->fs_base = arg2;
         arch_set_fs_base(arg2);
@@ -172,7 +171,7 @@ sys_setpgid(uint64_t pid_arg, uint64_t pgid_arg)
             return SYS_ERR(ESRCH);
         }
         /* Can only setpgid on self or direct child */
-        if (target->ppid != caller->pid) {
+        if (target->ppid != caller->tgid) {
             spin_unlock_irqrestore(&sched_lock, fl);
             return SYS_ERR(EPERM);
         }
@@ -223,10 +222,15 @@ sys_setsid(void)
 {
     aegis_process_t *proc = current_proc();
     /* POSIX: EPERM if already a process group leader */
-    if (proc->pgid == proc->pid)
+    irqflags_t fl = spin_lock_irqsave(&sched_lock);
+    if (proc->pgid == proc->pid) {
+        spin_unlock_irqrestore(&sched_lock, fl);
         return SYS_ERR(EPERM);
+    }
     proc->sid  = proc->pid;
     proc->pgid = proc->pid;
+    proc->authority_epoch++;
+    spin_unlock_irqrestore(&sched_lock, fl);
     return (uint64_t)proc->pid;
 }
 
@@ -336,7 +340,7 @@ sys_setuid(uint64_t uid_arg)
     if (cap_check(proc->caps, CAP_TABLE_SIZE,
                   CAP_KIND_SETUID, CAP_RIGHTS_WRITE) != 0)
         return SYS_ERR(EACCES);
-    if (target != proc->auth_uid)
+    if (proc->auth_uid == AUTH_ID_NONE || target != proc->auth_uid)
         return SYS_ERR(EPERM);  /* EPERM — not the bound identity */
     proc->uid = target;
     return 0;
@@ -356,7 +360,7 @@ sys_setgid(uint64_t gid_arg)
     if (cap_check(proc->caps, CAP_TABLE_SIZE,
                   CAP_KIND_SETUID, CAP_RIGHTS_WRITE) != 0)
         return SYS_ERR(EACCES);
-    if (target != proc->auth_gid)
+    if (proc->auth_gid == AUTH_ID_NONE || target != proc->auth_gid)
         return SYS_ERR(EPERM);  /* EPERM — not the bound identity */
     proc->gid = target;
     return 0;

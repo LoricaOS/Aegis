@@ -239,7 +239,7 @@ static void sock_vfs_close(void *priv)
      * socket leaks its port forever and the next bind() to the same port
      * returns EADDRINUSE. The DHCP client retry loop caught this. */
     if (type == SOCK_TYPE_DGRAM && lport != 0)
-        udp_unbind(lport);
+        udp_unbind(lport, sock_id);
     /* Tear down the TCP connection slot on close().  Most apps (curl, the
      * herald package client) close() without an explicit shutdown(), so
      * tcp_conn_close was previously only reached via sys_shutdown — every
@@ -539,7 +539,7 @@ sock_vfs_poll(void *priv)
                     r |= SOCK_POLLHUP;
             }
         } else if (s->state == SOCK_LISTENING) {
-            if (s->accept_head != s->accept_tail) r |= SOCK_POLLIN;
+            if (tcp_accept_ready(s->sock_id)) r |= SOCK_POLLIN;
         } else if (s->state == SOCK_CONNECTING) {
             /* Nonblocking connect in flight. On the FAILURE path (RST in
              * SYN_SENT) tcp_rx sets the tcp_conn to TCP_CLOSED but never

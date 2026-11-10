@@ -151,7 +151,8 @@ walk_to_pte(uint64_t root_phys, uint64_t va)
 }
 
 /* map_page_in — install a 4K mapping for va→phys in root_phys.
- * flags are ABSTRACT. Returns 0 ok, -1 OOM, 1 already-present (when
+ * flags are ABSTRACT; fork may omit PRESENT to retain PROT_NONE.
+ * Returns 0 ok, -1 OOM, 1 already-present (when
  * tolerate_present). Caller holds vmm_lock. */
 static int
 map_page_in(uint64_t root_phys, uint64_t va, uint64_t phys,
@@ -172,7 +173,7 @@ map_page_in(uint64_t root_phys, uint64_t va, uint64_t phys,
         printk("[VMM] FAIL: double-map va=0x%lx\n", va);
         panic_halt("[VMM] FAIL: vmm map double-map");
     }
-    l3[i] = phys | arch_pte_from_flags(flags | VMM_FLAG_PRESENT);
+    l3[i] = phys | arch_pte_from_flags(flags);
     /* Full runtime PTE-install discipline (the canonical ARM sequence:
      * STR -> DSB ISHST -> TLBI -> DSB ISH -> ISB). The old code did only
      * the DSB ISHST, on the "fresh invalid->valid transitions need no
@@ -366,7 +367,7 @@ vmm_try_map_page(uint64_t virt, uint64_t phys, uint64_t flags)
         panic_halt("[VMM] FAIL: vmm_map_page misaligned");
 
     irqflags_t fl = spin_lock_irqsave(&vmm_lock);
-    int r = map_page_in(s_ttbr1_phys, virt, phys, flags, 0);
+    int r = map_page_in(s_ttbr1_phys, virt, phys, flags | VMM_FLAG_PRESENT, 0);
     spin_unlock_irqrestore(&vmm_lock, fl);
     return r;
 }
@@ -454,7 +455,7 @@ vmm_map_user_page(uint64_t pml4_phys, uint64_t virt,
         panic_halt("[VMM] FAIL: vmm_map_user_page misaligned");
 
     irqflags_t fl = spin_lock_irqsave(&vmm_lock);
-    int r = map_page_in(pml4_phys, virt, phys, flags, 0);
+    int r = map_page_in(pml4_phys, virt, phys, flags | VMM_FLAG_PRESENT, 0);
     spin_unlock_irqrestore(&vmm_lock, fl);
     if (r < 0)
         panic_halt("[VMM] FAIL: out of memory in vmm_map_user_page");
@@ -468,7 +469,7 @@ vmm_try_map_user_page(uint64_t pml4_phys, uint64_t virt,
         panic_halt("[VMM] FAIL: vmm_try_map_user_page misaligned");
 
     irqflags_t fl = spin_lock_irqsave(&vmm_lock);
-    int r = map_page_in(pml4_phys, virt, phys, flags, 1);
+    int r = map_page_in(pml4_phys, virt, phys, flags | VMM_FLAG_PRESENT, 1);
     spin_unlock_irqrestore(&vmm_lock, fl);
     return r;
 }
@@ -564,41 +565,20 @@ vmm_set_user_prot(uint64_t pml4_phys, uint64_t virt, uint64_t flags)
     }
     uint64_t old = *pte;
 
-    if (!(old & A64_PTE_VALID) && flags == 0) {
+    uint64_t phys = ARCH_PTE_ADDR(old);
+    if (!phys) {
         spin_unlock_irqrestore(&vmm_lock, fl);
-        return 0;   /* PROT_NONE on unmapped page is a no-op */
+        return flags == 0 ? 0 : -1;
     }
-
-    uint64_t phys   = ARCH_PTE_ADDR(old);
-    uint64_t old_sw = old & (A64_PTE_SW_COW | A64_PTE_SW_SHARED |
-                             A64_PTE_SW_OWNED);
-
-    if (!(old & A64_PTE_VALID)) {
-        /* PROT_NONE-stored page: phys retained with VALID clear. */
-        if (!phys) {
-            spin_unlock_irqrestore(&vmm_lock, fl);
-            return -1;
-        }
-        uint64_t newpte = phys | arch_pte_from_flags(flags) | old_sw;
-        /* COW+writable must never coexist: keep COW pages read-only so
-         * the first write still faults into vmm_cow_fault_handle. */
-        if ((old_sw & A64_PTE_SW_COW) && (flags & VMM_FLAG_WRITABLE))
-            newpte |= A64_PTE_RO;
-        *pte = newpte;
-        arch_vmm_invlpg(virt);
-        spin_unlock_irqrestore(&vmm_lock, fl);
-        return 0;
+    uint64_t shared = old & (A64_PTE_SW_SHARED | A64_PTE_SW_OWNED);
+    uint64_t newpte = phys | shared;
+    if (flags) {
+        newpte |= arch_pte_from_flags(flags & ~VMM_FLAG_COW);
+        if ((flags & VMM_FLAG_WRITABLE) && !shared &&
+            pmm_page_refcount(phys) > 1)
+            newpte |= A64_PTE_RO | A64_PTE_SW_COW;
     }
-
-    if (flags == 0) {
-        /* PROT_NONE: keep phys + software bits, clear VALID. */
-        *pte = phys | old_sw;
-    } else {
-        uint64_t newpte = phys | arch_pte_from_flags(flags) | old_sw;
-        if ((old_sw & A64_PTE_SW_COW) && (flags & VMM_FLAG_WRITABLE))
-            newpte |= A64_PTE_RO;
-        *pte = newpte;
-    }
+    *pte = newpte;
     arch_vmm_invlpg(virt);
     spin_unlock_irqrestore(&vmm_lock, fl);
     return 0;
@@ -694,13 +674,31 @@ vmm_copy_user_pages(uint64_t src_pml4, uint64_t dst_pml4)
                 uint64_t *l3 = pv(ARCH_PTE_ADDR(l2[i2]));
                 for (uint64_t i3 = 0; i3 < 512; i3++) {
                     uint64_t pte = l3[i3];
-                    if (!(pte & A64_PTE_VALID)) continue;
-                    if (!(pte & A64_PTE_USER)) continue;
+                    /* Saved PROT_NONE leaf descriptors retain ownership. */
+                    if (!ARCH_PTE_ADDR(pte)) continue;
+                    if ((pte & A64_PTE_VALID) && !(pte & A64_PTE_USER)) continue;
                     /* Skip device/NC (MMIO) mappings. */
                     if ((pte & A64_PTE_ATTR(7)) != A64_PTE_ATTR(A64_ATTR_NORMAL_WB))
                         continue;
 
                     uint64_t src_phys = ARCH_PTE_ADDR(pte);
+                    uint64_t va = (i0 << 39) | (i1 << 30) |
+                                  (i2 << 21) | (i3 << 12);
+                    uint64_t aflags = arch_pte_to_flags(pte) &
+                                      ~0x0000FFFFFFFFF000UL;
+                    if (aflags & (VMM_FLAG_SHARED | VMM_FLAG_SHARED_OWNED)) {
+                        if ((aflags & VMM_FLAG_SHARED_OWNED) &&
+                            pmm_ref_page(src_phys) < 0) {
+                            spin_unlock_irqrestore(&vmm_lock, fl);
+                            return -1;
+                        }
+                        if (map_page_in(dst_pml4, va, src_phys, aflags, 0) < 0) {
+                            if (aflags & VMM_FLAG_SHARED_OWNED) pmm_free_page(src_phys);
+                            spin_unlock_irqrestore(&vmm_lock, fl);
+                            return -1;
+                        }
+                        continue;
+                    }
                     uint64_t dst_phys = pmm_alloc_page();
                     if (!dst_phys) {
                         spin_unlock_irqrestore(&vmm_lock, fl);
@@ -708,10 +706,9 @@ vmm_copy_user_pages(uint64_t src_pml4, uint64_t dst_pml4)
                     }
                     __builtin_memcpy(arch_dmap(dst_phys),
                                      arch_dmap(src_phys), 4096);
-                    uint64_t va = (i0 << 39) | (i1 << 30) |
-                                  (i2 << 21) | (i3 << 12);
-                    uint64_t aflags = arch_pte_to_flags(pte) &
-                                      ~0x0000FFFFFFFFF000UL;
+                    /* A private eager copy owns its frame independently. */
+                    if (aflags & VMM_FLAG_COW)
+                        aflags = (aflags & ~VMM_FLAG_COW) | VMM_FLAG_WRITABLE;
                     if (map_page_in(dst_pml4, va, dst_phys, aflags, 0) < 0) {
                         pmm_free_page(dst_phys);
                         spin_unlock_irqrestore(&vmm_lock, fl);
@@ -741,8 +738,9 @@ vmm_cow_user_pages(uint64_t src_pml4, uint64_t dst_pml4)
                 uint64_t *l3 = pv(ARCH_PTE_ADDR(l2[i2]));
                 for (uint64_t i3 = 0; i3 < 512; i3++) {
                     uint64_t pte = l3[i3];
-                    if (!(pte & A64_PTE_VALID)) continue;
-                    if (!(pte & A64_PTE_USER)) continue;
+                    /* Saved PROT_NONE leaf descriptors retain ownership. */
+                    if (!ARCH_PTE_ADDR(pte)) continue;
+                    if ((pte & A64_PTE_VALID) && !(pte & A64_PTE_USER)) continue;
                     if ((pte & A64_PTE_ATTR(7)) != A64_PTE_ATTR(A64_ATTR_NORMAL_WB))
                         continue;
 
@@ -752,36 +750,18 @@ vmm_cow_user_pages(uint64_t src_pml4, uint64_t dst_pml4)
                     uint64_t aflags = arch_pte_to_flags(pte) &
                                       ~0x0000FFFFFFFFF000UL;
 
-                    if (aflags & (VMM_FLAG_SHARED | VMM_FLAG_SHARED_OWNED)) {
-                        /* Shared RAM: inherit the mapping AS-IS — never
-                         * COW-break it, or the child stops sharing.
-                         * VMM_FLAG_SHARED is driver-owned (fb) and takes no
-                         * reference; VMM_FLAG_SHARED_OWNED is a refcounted
-                         * memfd frame and the child's mapping is a new
-                         * reference. This whole branch used to test SHARED
-                         * only — and arch_pte_to_flags could not even report
-                         * SHARED_OWNED — so memfd MAP_SHARED pages fell into
-                         * the COW branch below and a compositor client that
-                         * forked after mapping its window silently de-shared
-                         * it. Mirrors x86 vmm.c. */
-                        if (map_page_in(dst_pml4, va, phys, aflags, 0) < 0)
-                            goto oom;
-                        if ((aflags & VMM_FLAG_SHARED_OWNED) &&
-                            pmm_ref_page(phys) < 0)
-                            goto oom;          /* refcount saturated */
-                    } else if (aflags & VMM_FLAG_WRITABLE) {
-                        uint64_t cow = (aflags & ~VMM_FLAG_WRITABLE)
-                                       | VMM_FLAG_COW;
-                        l3[i3] = phys | arch_pte_from_flags(cow);
-                        if (map_page_in(dst_pml4, va, phys, cow, 0) < 0)
-                            goto oom;
-                        if (pmm_ref_page(phys) < 0)
-                            goto oom;          /* refcount saturated */
-                    } else {
-                        if (map_page_in(dst_pml4, va, phys, aflags, 0) < 0)
-                            goto oom;
-                        if (pmm_ref_page(phys) < 0)
-                            goto oom;          /* refcount saturated */
+                    int owns_ref = !(aflags & VMM_FLAG_SHARED) ||
+                                   (aflags & VMM_FLAG_SHARED_OWNED);
+                    if (owns_ref && pmm_ref_page(phys) < 0)
+                        goto oom;
+                    if (!(aflags & (VMM_FLAG_SHARED | VMM_FLAG_SHARED_OWNED)) &&
+                        (aflags & VMM_FLAG_WRITABLE)) {
+                        aflags = (aflags & ~VMM_FLAG_WRITABLE) | VMM_FLAG_COW;
+                        l3[i3] = phys | arch_pte_from_flags(aflags);
+                    }
+                    if (map_page_in(dst_pml4, va, phys, aflags, 0) < 0) {
+                        if (owns_ref) pmm_free_page(phys);
+                        goto oom;
                     }
                 }
             }
@@ -793,6 +773,7 @@ vmm_cow_user_pages(uint64_t src_pml4, uint64_t dst_pml4)
     return 0;
 oom:
     spin_unlock_irqrestore(&vmm_lock, fl);
+    __asm__ volatile("dsb ishst\n\ttlbi vmalle1is\n\tdsb ish\n\tisb" ::: "memory");
     return -1;
 }
 

@@ -31,11 +31,10 @@ int g_first_boot = 0;
 void cap_policy_detect_first_boot(void)
 {
     vfs_file_t f;
-    if (vfs_open("/etc/aegis/configured", VFS_O_RDONLY, 0, &f) == 0) {
+    int rc = vfs_open("/etc/aegis/configured", VFS_O_RDONLY, 0, &f);
+    g_first_boot = (rc == -ENOENT);
+    if (rc == 0) {
         if (f.ops && f.ops->close) f.ops->close(f.priv);
-        g_first_boot = 0;                       /* marker present → configured  */
-    } else {
-        g_first_boot = 1;                       /* marker absent → first boot   */
     }
     printk("[CAP] first-boot exception: %s\n",
            g_first_boot ? "ACTIVE (system unconfigured)" : "off (configured)");
@@ -44,6 +43,9 @@ void cap_policy_detect_first_boot(void)
 /* Static policy table */
 static cap_policy_entry_t s_entries[CAP_POLICY_MAX_ENTRIES];
 static uint32_t s_entry_count;
+/* ponytail: serialize infrequent policy reloads; snapshot the table if reload
+ * latency becomes material. Readers never retain pointers into this table. */
+static spinlock_t s_policy_lock = SPINLOCK_INIT;
 
 /* Dynamic trusted-path anchors: extra directory prefixes (beyond the hardcoded
  * /bin /sbin /apps) under which an installed binary may derive policy caps. Read
@@ -205,21 +207,33 @@ parse_policy(const char *data, uint64_t len, cap_policy_entry_t *entry)
         /* Read tier word */
         char tier_buf[16];
         uint32_t ti = 0;
+        int tier_overflow = 0;
         while (pos < len && data[pos] != ' ' && data[pos] != '\t' &&
-               data[pos] != '\n' && data[pos] != '\r' && ti < sizeof(tier_buf) - 1) {
-            tier_buf[ti++] = data[pos++];
+               data[pos] != '\n' && data[pos] != '\r') {
+            if (ti < sizeof(tier_buf) - 1)
+                tier_buf[ti++] = data[pos];
+            else
+                tier_overflow = 1;
+            pos++;
         }
         tier_buf[ti] = '\0';
 
+        /* An invalid tier invalidates the entire physical line. Never retry
+         * its remaining words as tiers ("disabled service POWER"), including
+         * suffixes of overlong tokens. */
         uint32_t tier;
-        if (streq(tier_buf, "service"))
+        if (!tier_overflow && ti == sizeof("service") - 1 && streq(tier_buf, "service"))
             tier = CAP_TIER_SERVICE;
-        else if (streq(tier_buf, "admin"))
+        else if (!tier_overflow && ti == sizeof("admin") - 1 && streq(tier_buf, "admin"))
             tier = CAP_TIER_ADMIN;
-        else if (streq(tier_buf, "firstboot"))
+        else if (!tier_overflow && ti == sizeof("firstboot") - 1 &&
+                 streq(tier_buf, "firstboot"))
             tier = CAP_TIER_FIRSTBOOT;
-        else
-            continue;  /* unknown tier — skip line */
+        else {
+            while (pos < len && data[pos] != '\n' && data[pos] != '\r')
+                pos++;
+            continue;
+        }
 
         /* Read cap names on the rest of this line */
         while (pos < len && data[pos] != '\n' && data[pos] != '\r') {
@@ -232,11 +246,20 @@ parse_policy(const char *data, uint64_t len, cap_policy_entry_t *entry)
             /* Read cap name */
             char cap_buf[32];
             uint32_t ci = 0;
+            int cap_invalid = 0;
             while (pos < len && data[pos] != ' ' && data[pos] != '\t' &&
-                   data[pos] != '\n' && data[pos] != '\r' && ci < sizeof(cap_buf) - 1) {
-                cap_buf[ci++] = data[pos++];
+                   data[pos] != '\n' && data[pos] != '\r') {
+                if (data[pos] == '\0')
+                    cap_invalid = 1;
+                if (ci < sizeof(cap_buf) - 1)
+                    cap_buf[ci++] = data[pos];
+                else
+                    cap_invalid = 1;
+                pos++;
             }
             cap_buf[ci] = '\0';
+            if (cap_invalid)
+                continue;
 
             uint32_t kind = cap_name_to_kind(cap_buf);
             if (kind == CAP_KIND_NULL) {
@@ -256,10 +279,11 @@ parse_policy(const char *data, uint64_t len, cap_policy_entry_t *entry)
     return 0;
 }
 
-void
-cap_policy_load(void)
+static void
+cap_policy_load_locked(void)
 {
     s_entry_count = 0;
+    s_anchor_path_count = 0;
 
     /* Read the directory listing from /etc/aegis/caps.d/ */
     vfs_file_t dir;
@@ -384,6 +408,14 @@ cap_policy_load(void)
            s_entry_count, (unsigned)s_anchor_path_count);
 }
 
+void
+cap_policy_load(void)
+{
+    irqflags_t fl = spin_lock_irqsave(&s_policy_lock);
+    cap_policy_load_locked();
+    spin_unlock_irqrestore(&s_policy_lock, fl);
+}
+
 /* cap_anchor_audit — verify the trusted-for-granting tree ⊆ the write-protected
  * tree (T5). cap_policy_lookup derives authority from a binary's PATH, so every
  * granting anchor MUST be install-protected at the ext2 layer — otherwise an
@@ -402,6 +434,7 @@ cap_policy_load(void)
 void
 cap_anchor_audit(void)
 {
+    irqflags_t fl = spin_lock_irqsave(&s_policy_lock);
     static const char *const static_anchors[] = { "/bin", "/sbin", "/apps" };
     unsigned warned = 0;
     unsigned i;
@@ -428,10 +461,11 @@ cap_anchor_audit(void)
         printk("[CAP_POLICY] OK: anchor/protected-tree invariant holds "
                "(%u anchors)\n",
                3u + (unsigned)s_anchor_path_count);
+    spin_unlock_irqrestore(&s_policy_lock, fl);
 }
 
-const cap_policy_entry_t *
-cap_policy_lookup(const char *exe_path)
+static const cap_policy_entry_t *
+cap_policy_lookup_locked(const char *exe_path)
 {
     if (!exe_path || !exe_path[0])
         return (const cap_policy_entry_t *)0;
@@ -534,6 +568,16 @@ cap_policy_lookup(const char *exe_path)
 }
 
 int
+cap_policy_lookup(const char *exe_path, cap_policy_entry_t *out)
+{
+    irqflags_t fl = spin_lock_irqsave(&s_policy_lock);
+    const cap_policy_entry_t *entry = cap_policy_lookup_locked(exe_path);
+    if (entry && out) *out = *entry;
+    spin_unlock_irqrestore(&s_policy_lock, fl);
+    return entry != 0;
+}
+
+int
 cap_policy_is_firstboot(const char *exe_path)
 {
     if (!g_first_boot)
@@ -548,15 +592,17 @@ cap_policy_is_firstboot(const char *exe_path)
      * only while unconfigured) — not a hot path. */
     {
         vfs_file_t mf;
-        if (vfs_open("/etc/aegis/configured", VFS_O_RDONLY, 0, &mf) == 0) {
-            if (mf.ops && mf.ops->close) mf.ops->close(mf.priv);
+        int rc = vfs_open("/etc/aegis/configured", VFS_O_RDONLY, 0, &mf);
+        if (rc != -ENOENT) {
+            if (rc == 0 && mf.ops && mf.ops->close) mf.ops->close(mf.priv);
             g_first_boot = 0;
-            printk("[CAP] first-boot exception: closed (marker written)\n");
+            printk("[CAP] first-boot exception: closed (marker present or lookup failed)\n");
             return 0;
         }
     }
-    const cap_policy_entry_t *pol = cap_policy_lookup(exe_path);
-    if (!pol)
+    cap_policy_entry_t entry;
+    const cap_policy_entry_t *pol = &entry;
+    if (!cap_policy_lookup(exe_path, &entry))
         return 0;
     for (uint32_t ci = 0; ci < pol->count; ci++)
         if (pol->caps[ci].tier == CAP_TIER_FIRSTBOOT)
@@ -595,8 +641,10 @@ cap_apply_policy(cap_slot_t *caps, const char *path, int authenticated,
 
     /* Policy: SERVICE-tier caps unconditionally; ADMIN-tier only for an
      * authenticated session. Trusted-path-anchored (see cap_policy_lookup). */
-    const cap_policy_entry_t *pol = cap_policy_lookup(path);
-    if (pol) {
+    cap_policy_entry_t policy;
+    const cap_policy_entry_t *pol = &policy;
+    int first_boot = cap_policy_is_firstboot(path);
+    if (cap_policy_lookup(path, &policy)) {
         for (ci = 0; ci < pol->count; ci++) {
             if (pol->caps[ci].tier == CAP_TIER_SERVICE) {
                 /* Defense in depth: INSTALL and DISK_ADMIN are the two kinds the
@@ -751,7 +799,7 @@ cap_apply_policy(cap_slot_t *caps, const char *path, int authenticated,
                  * marker the setup writes leaves g_first_boot 0 on every later
                  * boot, and only the trusted-path-anchored `configure` binary
                  * declares this tier (cap_policy_lookup gates on the anchor). */
-                if (g_first_boot)
+                if (first_boot)
                     cap_grant(caps, CAP_TABLE_SIZE,
                               pol->caps[ci].kind, pol->caps[ci].rights);
             }

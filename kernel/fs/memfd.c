@@ -7,6 +7,7 @@
 #include "pmm.h"
 #include "vmm.h"
 #include "spinlock.h"
+#include "tlb.h"
 #include "fd_resolve.h"
 #include "../include/aegis_errno.h"
 #include <stdint.h>
@@ -192,7 +193,7 @@ memfd_t *memfd_from_fd(int fd, void *proc_ptr)
 
 /* ── Truncate ──────────────────────────────────────────────────────────── */
 
-int memfd_truncate(uint32_t id, uint64_t size)
+static int memfd_truncate_impl(uint32_t id, uint64_t size)
 {
     irqflags_t fl = spin_lock_irqsave(&memfd_lock);
     memfd_t *mf = memfd_get(id);
@@ -291,6 +292,22 @@ int memfd_truncate(uint32_t id, uint64_t size)
     mf->size       = size;
     spin_unlock_irqrestore(&memfd_lock, fl);
     return 0;
+}
+
+/* The fd caller pins lifetime. Only resize owns this lock, and KVA/VMM work
+ * stays outside memfd_lock; waiting CPUs still service shootdown requests. */
+static spinlock_t resize_locks[MEMFD_MAX];
+int memfd_truncate(uint32_t id, uint64_t size)
+{
+    if (id >= MEMFD_MAX) return -EBADF;
+    irqflags_t fl = arch_irq_save();
+    while (!spin_trylock(&resize_locks[id])) {
+        tlb_poll_incoming();
+        arch_pause();
+    }
+    int rc = memfd_truncate_impl(id, size);
+    spin_unlock_irqrestore(&resize_locks[id], fl);
+    return rc;
 }
 
 /* memfd_get_page_ref — for the MAP_SHARED mmap path (sys_memory.c). Under

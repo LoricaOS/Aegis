@@ -24,6 +24,7 @@
 #include "random.h"
 #include "netdev.h"
 #include "wpa2_crypto.h"
+#include "spinlock.h"
 #include <stdint.h>
 
 #define AX200_VENDOR   0x8086
@@ -144,6 +145,29 @@ static uint16_t          s_cmd_wr;           /* command queue write pointer */
 static uint16_t          s_rx_read;          /* next RX buffer index to examine */
 static uint16_t          s_rx_write = NRBDS - 8;
 static uint8_t           s_rx_copy[4096];
+
+/* DMA ownership is per hardware slot. Buffers are retained for the device's
+ * lifetime; a completion, never a wrapping producer, permits reuse. */
+#define AX_DMA_SLOT_SIZE 4096u
+#define AX_FIRST_TB_OFF (AX_DMA_SLOT_SIZE - 64u)
+#define AX_CMD_SLOTS 32u
+#define TXQ_SLOTS 256
+struct ax_txq {
+    volatile uint8_t *ring, *bc;
+    uint8_t *buffers;
+    uint64_t ring_phys, bc_phys, buffer_phys[TXQ_SLOTS];
+    int qid;
+    uint16_t wr, rd, slots;
+    uint8_t configuring, submitted;
+};
+static struct ax_txq s_mgmt_q={.qid=-1},s_data_q={.qid=-1};
+static spinlock_t s_tx_lock = SPINLOCK_INIT;
+static uint8_t *s_cmd_buffers;
+static uint64_t s_cmd_buffer_phys[AX_CMD_SLOTS];
+static uint16_t s_cmd_rd, s_cmd_id[AX_CMD_SLOTS];
+static uint8_t s_cmd_pending[AX_CMD_SLOTS];
+static uint8_t s_tx_resp_ver, s_ba_notif_ver;
+
 
 static inline uint32_t csr_rd(uint32_t off) { return *(volatile uint32_t *)(s_mmio + off); }
 static inline void     csr_wr(uint32_t off, uint32_t v) { *(volatile uint32_t *)(s_mmio + off) = v; }
@@ -363,6 +387,52 @@ static inline uint16_t rd_be16(const uint8_t *p)
 static inline void wr_be16(uint8_t *p, uint16_t v)
 { p[0]=(uint8_t)(v>>8); p[1]=(uint8_t)v; }
 
+/* Firmware ABI: Linux v6.12 iwlwifi fw/api/tx.h, TX_RSP v6/v7 and
+ * COMPRESSED_BA_RES v4/v5. AX200 uses these gen2 layouts when no notification
+ * version is advertised. Unsupported advertised layouts retain ownership. */
+static void tx_reclaim_locked(uint16_t qid, uint16_t ssn)
+{
+    struct ax_txq *q = qid == s_mgmt_q.qid ? &s_mgmt_q :
+                       qid == s_data_q.qid ? &s_data_q : 0;
+    if (!q || !q->slots) return;
+    uint16_t next = ssn & (q->slots - 1);
+    uint16_t done = (next - q->rd) & (q->slots - 1);
+    uint16_t outstanding = (q->wr - q->rd) & (q->slots - 1);
+    if (done <= outstanding) q->rd = next;
+}
+
+static void tx_complete(const uint8_t *r, uint32_t bytes)
+{
+    if (bytes < 8) return;
+    uint16_t seq = rd_le16(r + 6);
+    irqflags_t fl = spin_lock_irqsave(&s_tx_lock);
+    unsigned index = seq & 0xff;
+    /* Bit 15 marks unsolicited RX. Never free a host command on a TX/BA
+     * notification, or on an unrelated command that happens to share its slot. */
+    if ((seq & 0xff00) == QUEUE_TO_SEQ(CMD_Q_ID) &&
+        index < AX_CMD_SLOTS && s_cmd_pending[index] &&
+        s_cmd_id[index] == (uint16_t)(r[4] | (uint16_t)r[5] << 8)) {
+        s_cmd_pending[index] = 0;
+        while (s_cmd_rd != s_cmd_wr && !s_cmd_pending[s_cmd_rd])
+            s_cmd_rd = (s_cmd_rd + 1) & (AX_CMD_SLOTS - 1);
+    }
+    if (r[5] == 0 || r[5] == 1) {
+        if (r[4] == 0x1c && bytes >= 56 && r[8] == 1 &&
+            (s_tx_resp_ver == 0 || s_tx_resp_ver == 6 || s_tx_resp_ver == 7)) {
+            tx_reclaim_locked(rd_le16(r + 44), rd_le32(r + 52) & 0xfff);
+        } else if (r[4] == 0xc5 && bytes >= 40 &&
+                   (s_ba_notif_ver == 0 || s_ba_notif_ver == 4 || s_ba_notif_ver == 5)) {
+            uint32_t count = rd_le16(r + 36);
+            uint32_t ratids = rd_le16(r + 38);
+            if (40u + count * 8u + ratids * 4u <= bytes)
+                for (uint32_t i = 0; i < count; i++)
+                    tx_reclaim_locked(rd_le16(r + 40 + i * 8),
+                                      rd_le16(r + 42 + i * 8));
+        }
+    }
+    spin_unlock_irqrestore(&s_tx_lock, fl);
+}
+
 /* AX200 completion entries are 32-bit VIDs, not the 32-byte AX210 format.
  * Return the actual packet buffer for a completion-ring index. */
 static const uint8_t *rx_at(uint16_t idx)
@@ -386,7 +456,11 @@ static const uint8_t *rx_take(void)
     if(r)for(unsigned i=0;i<sizeof(s_rx_copy);i++)s_rx_copy[i]=r[i];
     rx_restock(s_rx_read);
     s_rx_read=(uint16_t)((s_rx_read+1)&511);
-    return r?s_rx_copy:0;
+    if (!r) return 0;
+    uint32_t len = rd_le32(s_rx_copy) & 0x3fff;
+    if (len < 4 || len > sizeof(s_rx_copy) - 4) return 0;
+    tx_complete(s_rx_copy, len + 4);
+    return s_rx_copy;
 }
 static void rx_skip_pending(void)
 { uint16_t c=*(volatile uint16_t *)s_rb_stts&511;while(s_rx_read!=c)(void)rx_take(); }
@@ -452,6 +526,10 @@ static int parse_firmware(void)
                  * ADD_STA 0x18 v12, TX 0x1c v7, MAC_CTXT 0x28 v5, BINDING 0x2b v2 */
                 if (c == 0x17 && g == 0x05) s_scd_qcfg_ver = v;   /* new txq path */
                 if(c==0x17&&g==0x00)s_sta_key_ver=v;
+                /* IWL_FW_CMD_VER_UNKNOWN is 99 (fw/file.h), not 0xff. */
+                uint8_t nv = tdata[o+3] == 99 ? 0 : tdata[o+3];
+                if(c==0x1c&&(g==0||g==1))s_tx_resp_ver=nv;
+                if(c==0xc5&&(g==0||g==1))s_ba_notif_ver=nv;
                 /* DATA_PATH_GROUP(5): TLC 0x0f, RLC 0x08, STA_HE 0x07 */
                 if (g == 0x05 && (c==0x0f||c==0x08||c==0x07||c==0x0d||c==0x17))
                     printk("[AX200] dpcmdver 0x%x/g%u=v%u\n", c, g, v);
@@ -523,6 +601,18 @@ dma_alloc(uint64_t bytes, uint64_t *phys_out)
         ((volatile uint8_t *)va)[i] = 0;
     *phys_out = phys;
     return (void *)va;
+}
+
+static int dma_slots_init(uint8_t **buffers, uint64_t *phys, unsigned count)
+{
+    if (*buffers) return 0;
+    uint8_t *mem = kva_alloc_pages_low(count);
+    if (!mem) return -1;
+    __builtin_memset(mem, 0, (uint64_t)count * AX_DMA_SLOT_SIZE);
+    for (unsigned i = 0; i < count; i++)
+        phys[i] = kva_page_phys(mem + i * AX_DMA_SLOT_SIZE);
+    *buffers = mem;
+    return 0;
 }
 
 static void
@@ -610,17 +700,23 @@ set_tfd_tb(volatile uint8_t *tfd, uint64_t addr, uint16_t len)
 /* Send a host command (id = (group_id<<8)|opcode) with an optional payload.
  * AX200 uses the 8-byte wide header, including for legacy IDs remapped into
  * LONG_GROUP. Copy its first 20 bytes into a first-TB buffer, then ring it. */
-static void
+static int
 send_cmd(uint16_t cmd_id, const void *payload, uint16_t plen)
 {
     const uint16_t hdr_len=8;
-    uint64_t cmd_phys = 0, ftb_phys = 0;
-    uint8_t *cmd = dma_alloc((uint64_t)hdr_len + plen + 64, &cmd_phys);
-    uint8_t *ftb = dma_alloc(64, &ftb_phys);
-    if (!cmd || !ftb) {
-        printk("[AX200] send_cmd: DMA alloc failed\n");
-        return;
+    if (!s_cmd_buffers || !s_cmd_ring || plen > AX_FIRST_TB_OFF - hdr_len ||
+        (plen && !payload)) return -1;
+    irqflags_t fl = spin_lock_irqsave(&s_tx_lock);
+    unsigned next = (s_cmd_wr + 1) & (AX_CMD_SLOTS - 1);
+    if (next == s_cmd_rd || s_cmd_pending[s_cmd_wr]) {
+        spin_unlock_irqrestore(&s_tx_lock, fl);
+        return -1;
     }
+    uint8_t *cmd = s_cmd_buffers + s_cmd_wr * AX_DMA_SLOT_SIZE;
+    uint8_t *ftb = cmd + AX_FIRST_TB_OFF;
+    uint64_t cmd_phys = s_cmd_buffer_phys[s_cmd_wr];
+    uint64_t ftb_phys = cmd_phys + AX_FIRST_TB_OFF;
+    __builtin_memset(cmd, 0, AX_DMA_SLOT_SIZE);
 
     uint16_t seq = (uint16_t)(QUEUE_TO_SEQ(CMD_Q_ID) | INDEX_TO_SEQ(s_cmd_wr));
     cmd[0] = (uint8_t)(cmd_id & 0xff);          /* opcode */
@@ -643,10 +739,13 @@ send_cmd(uint16_t cmd_id, const void *payload, uint16_t plen)
     if (copy_size > tb0)
         set_tfd_tb(tfd, cmd_phys + tb0, (uint16_t)(copy_size - tb0));
 
-    s_cmd_wr = (uint16_t)((s_cmd_wr + 1) & 31);
+    s_cmd_pending[s_cmd_wr] = 1;
+    s_cmd_id[s_cmd_wr] = cmd_id;
+    s_cmd_wr = (uint16_t)next;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
     csr_wr(HBUS_TARG_WRPTR, (uint32_t)(s_cmd_wr | (CMD_Q_ID << 16)));
-    printk("[AX200] sent cmd 0x%x (seq=0x%x, %u bytes) wr->%u\n",
-           cmd_id, seq, copy_size, s_cmd_wr);
+    spin_unlock_irqrestore(&s_tx_lock, fl);
+    return 0;
 }
 
 /* Send a command and dump the FW's response packet (cmd/group + 24 payload
@@ -692,7 +791,7 @@ wait_notif(uint8_t want_cmd, uint8_t want_grp, int timeout_ms,uint32_t *status)
 static int
 send_check(uint16_t cmd_id, const void *pl, uint16_t plen, const char *tag)
 {
-    send_cmd(cmd_id, pl, plen);
+    if (send_cmd(cmd_id, pl, plen) != 0) return -1;
     for (int t = 0; t < 10000; t++) {
         uint32_t ie = csr_rd(CSR_INT);
         if (ie & (CSR_INT_BIT_SW_ERR | CSR_INT_BIT_HW_ERR)) {
@@ -743,10 +842,7 @@ init_after_alive(void)
 static void
 do_scan(void)
 {
-    uint64_t phys;
-    uint8_t *cmd = dma_alloc(2560, &phys);   /* zeroed */
-    if (!cmd) { printk("[AX200] scan: DMA alloc failed\n"); return; }
-    (void)phys;
+    uint8_t cmd[2560] = {0};  /* send_cmd copies into its owned DMA slot */
 
     /* SCAN_CFG_CMD (v4, group 1, cmd 0x0c => 0x10c): the reduced scan config,
      * required once before any scan request. struct iwl_scan_config (12B):
@@ -803,7 +899,7 @@ do_scan(void)
     seg[16] = 24; seg[17] = 0; seg[18] = 8; seg[19] = 0; /* common_data: off 24, len 8 */
     /* Total struct = 1940 bytes. */
 
-    send_cmd(0x10d, cmd, 1940);              /* SCAN_REQ_UMAC, group 1 */
+    if (send_cmd(0x10d, cmd, 1940) != 0) return;              /* SCAN_REQ_UMAC, group 1 */
     printk("[AX200] SCAN_REQ_UMAC sent (passive, ch 1-13); watching for beacons...\n");
 
     rx_skip_pending();
@@ -855,11 +951,8 @@ do_scan(void)
 }
 
 /* Firmware TX queues: one for management and one for station data. */
-#define TXQ_SLOTS 256
-struct ax_txq { volatile uint8_t *ring,*bc; int qid; uint16_t wr,slots; };
-static struct ax_txq s_mgmt_q={.qid=-1},s_data_q={.qid=-1};
 static uint8_t           s_our_mac[6];
-static uint8_t          *s_mac_ctx;
+static uint8_t           s_mac_ctx[256];
 static uint8_t           s_prepared_bssid[6];
 static uint8_t           s_prepared_channel;
 static int               s_connect_prepared;
@@ -870,13 +963,19 @@ static int
 send_frame(struct ax_txq *q,const uint8_t *frame,uint16_t flen,
            uint16_t mac_hdr_len,uint32_t flags,const char *tag)
 {
-    if(q->qid<0)return -1;
-    /* TX frames use the SHORT 4-byte cmd header (not the 8-byte wide header that
-     * host commands use): [hdr 4][iwl_tx_cmd_gen2 20][802.11 frame]. */
-    uint64_t cmd_phys = 0, ftb_phys = 0;
-    uint8_t *cmd = dma_alloc((uint64_t)4 + 20 + flen + 64, &cmd_phys);
-    uint8_t *ftb = dma_alloc(64, &ftb_phys);
-    if(!cmd||!ftb){printk("[AX200] TX dma fail\n");return -1;}
+    if (!frame || flen > AX_FIRST_TB_OFF - 24 || mac_hdr_len > flen ||
+        (mac_hdr_len & 1) || mac_hdr_len > 62) return -1;
+    irqflags_t fl = spin_lock_irqsave(&s_tx_lock);
+    if (q->qid < 0 || !q->buffers || !q->ring || !q->bc ||
+        ((q->wr + 1) & (q->slots - 1)) == q->rd) {
+        spin_unlock_irqrestore(&s_tx_lock, fl);
+        return -1;
+    }
+    uint8_t *cmd = q->buffers + q->wr * AX_DMA_SLOT_SIZE;
+    uint8_t *ftb = cmd + AX_FIRST_TB_OFF;
+    uint64_t cmd_phys = q->buffer_phys[q->wr];
+    uint64_t ftb_phys = cmd_phys + AX_FIRST_TB_OFF;
+    __builtin_memset(cmd, 0, AX_DMA_SLOT_SIZE);
 
     uint16_t seq=(uint16_t)(QUEUE_TO_SEQ(q->qid)|INDEX_TO_SEQ(q->wr));
     cmd[0] = 0x1c; cmd[1] = 0x00;                    /* TX_CMD, group 0 (legacy) —
@@ -914,16 +1013,12 @@ send_frame(struct ax_txq *q,const uint8_t *frame,uint16_t flen,
     uint16_t bc = (uint16_t)((flen + 3) / 4);
     q->bc[idx*2]=(uint8_t)bc;q->bc[idx*2+1]=(uint8_t)(bc>>8);
 
-    /* Dump the built TFD + command so we can byte-compare against iwlwifi. */
-    volatile uint8_t *td = tfd;
-    printk("[AX200] TFD: ntb=%u tb0[len=%u] tb1[len=%u] | cmd: %x %x %x %x tc.len=%u off=%x%x rate=%x%x%x%x\n",
-           td[0], td[2] | (td[3] << 8), td[12] | (td[13] << 8),
-           cmd[0], cmd[1], cmd[2], cmd[3], tc[0] | (tc[1] << 8),
-           tc[3], tc[2], tc[19], tc[18], tc[17], tc[16]);
-
     q->wr=(uint16_t)((q->wr+1)&(q->slots-1));
+    __atomic_thread_fence(__ATOMIC_RELEASE);
     csr_wr(HBUS_TARG_WRPTR,(uint32_t)(q->wr|(q->qid<<16)));
-    printk("[AX200] TX %s (%u B) qid=%d\n",tag,flen,q->qid);return 0;
+    spin_unlock_irqrestore(&s_tx_lock, fl);
+    (void)tag;
+    return 0;
 }
 
 /* Allocate a dynamic TX queue for sta_id 0: driver owns the TFD ring + byte-count
@@ -932,20 +1027,24 @@ send_frame(struct ax_txq *q,const uint8_t *frame,uint16_t flen,
 static int
 alloc_tx_queue(struct ax_txq *q,uint8_t tid)
 {
+    if (__atomic_test_and_set(&q->configuring, __ATOMIC_ACQUIRE)) return -1;
+    int result = -1;
+    if (q->qid >= 0) { result = 0; goto out; }
+    if (q->submitted) goto out;  /* timed-out configuration may still own DMA */
     q->slots=(uint16_t)(tid==15?128:TXQ_SLOTS);
-    uint64_t rp = 0, bp = 0;
-    q->ring=dma_alloc(TXQ_SLOTS*256,&rp);
-    uint8_t *bc = dma_alloc(4096, &bp);
-    if(!q->ring||!bc){printk("[AX200] txq DMA fail\n");return -1;}q->bc=bc;
-
-    /* Unused gen2 TFDs must point at INVALID_WR_PTR_CMD.  Firmware may inspect
-     * the initial queue window while allocating it; zero TFDs make AX200 FW
-     * assert instead of returning the queue allocation response. */
-    uint64_t invalid_phys = 0;
-    uint8_t *invalid = dma_alloc(8, &invalid_phys);
-    if(!invalid){printk("[AX200] txq invalid DMA fail\n");return -1;}
+    if (!q->ring) q->ring=dma_alloc(TXQ_SLOTS*256,&q->ring_phys);
+    if (!q->bc) q->bc=dma_alloc(4096,&q->bc_phys);
+    if (!q->ring || !q->bc ||
+        dma_slots_init(&q->buffers, q->buffer_phys, q->slots) != 0) goto out;
+    uint64_t rp=q->ring_phys, bp=q->bc_phys;
+    /* Invalid-TFD command fits in unused space at the end of the BC page. */
+    volatile uint8_t *invalid=q->bc + 4088;
     invalid[0]=0x06; invalid[1]=0x0f; invalid[2]=0xff; invalid[3]=0xff;
-    for(uint16_t i=0;i<q->slots;i++)set_tfd_tb(q->ring+(uint32_t)i*256,invalid_phys,8);
+    for(uint16_t i=0;i<q->slots;i++) {
+        volatile uint8_t *tfd=q->ring+(uint32_t)i*256;
+        tfd[0]=tfd[1]=0;
+        set_tfd_tb(tfd,bp+4088,8);
+    }
 
     uint8_t cmd[24];
     for (int i = 0; i < 24; i++) cmd[i] = 0;
@@ -958,32 +1057,39 @@ alloc_tx_queue(struct ax_txq *q,uint8_t tid)
     wr_le32b(cmd + 16, (uint32_t)rp);          /* tfdq_addr (le64) */
     wr_le32b(cmd + 20, (uint32_t)(rp >> 32));
 
-    send_cmd(0x11d, cmd, 24);
+    if (send_cmd(0x11d, cmd, 24) != 0) goto out;
+    q->submitted=1;
     for (int t = 0; t < 30000; t++) {
         uint32_t ie = csr_rd(CSR_INT);
         if (ie & (CSR_INT_BIT_SW_ERR | CSR_INT_BIT_HW_ERR)) {
             printk("[AX200] TX_QUEUE_CFG ASSERTED CSR_INT=0x%x\n", ie);
             dump_fw_error();
-            return -1;
+            goto out;
         }
         uint16_t closed = *(volatile uint16_t *)s_rb_stts & 511;
         while(s_rx_read!=closed) {
             const uint8_t *r=rx_take();
             if (!r) continue;
-            if (r[4] == 0x1d) {                 /* SCD_QUEUE_CFG response */
-                q->qid=(int)(r[8]|(r[9]<<8));
-                q->wr=(uint16_t)((r[12]|(r[13]<<8))&(q->slots-1));
+            if (r[4] == 0x1d && (r[5] == 0 || r[5] == 1) &&
+                (rd_le32(r) & 0x3fff) >= 12 && rd_le16(r+8) > 0 && rd_le16(r+8) < 512) {                 /* SCD_QUEUE_CFG response */
+                irqflags_t fl=spin_lock_irqsave(&s_tx_lock);
+                q->wr=q->rd=(uint16_t)(rd_le16(r+12)&(q->slots-1));
+                q->qid=(int)rd_le16(r+8);
+                spin_unlock_irqrestore(&s_tx_lock,fl);
                 printk("[AX200] *** TX queue: qid=%u resp=%x %x %x %x %x %x %x %x ***\n",
                        q->qid,r[8],r[9],r[10],r[11],r[12],r[13],r[14],r[15]);
                 /* No alloc-time doorbell — iwlwifi only rings HBUS_TARG_WRPTR when
                  * it actually queues a TFD. A spurious wr=0 ring can disturb the SCD. */
-                return 0;
+                result=0;
+                goto out;
             }
         }
         busy_wait_us(10);
     }
     printk("[AX200] TX_QUEUE_CFG: no response\n");
-    return -1;
+out:
+    __atomic_clear(&q->configuring, __ATOMIC_RELEASE);
+    return result;
 }
 
 #define RX_STATUS_MIC_OK (1u<<6)
@@ -1033,7 +1139,7 @@ static int install_ccmp(const uint8_t key[16],uint8_t keyid,int multicast)
     uint8_t c[80];for(int i=0;i<80;i++)c[i]=0;c[0]=0;c[1]=keyid;
     uint16_t flags=(uint16_t)(2|8|((uint16_t)keyid<<8)|(multicast?(1u<<14):0));
     c[2]=(uint8_t)flags;c[3]=(uint8_t)(flags>>8);for(int i=0;i<16;i++)c[4+i]=key[i];
-    send_cmd(0x117,c,76); /* FW 59 advertises TKIP_MIC_KEYS: v2 key ABI */
+    if (send_cmd(0x117,c,76) != 0) return -1; /* FW 59 advertises TKIP_MIC_KEYS: v2 key ABI */
     uint32_t status=0;
     if(wait_notif(0x17,1,1000,&status)<0){printk("[AX200] WPA2: key install timeout\n");return -1;}
     if(status!=1){printk("[AX200] WPA2: key install rejected (%x)\n",status);return -1;}
@@ -1168,7 +1274,6 @@ static void
 do_connect(void)
 {
     printk("[AX200] --- connect: target ch=%u ---\n", s_ap_channel);
-    uint64_t phys;
     uint8_t c[64];
     uint8_t *m=s_mac_ctx;
     int reuse=s_connect_prepared&&s_prepared_channel==s_ap_channel;
@@ -1204,9 +1309,7 @@ do_connect(void)
 
     /* Step 2: MAC_CONTEXT_CMD (0x128 v5, 144B) — add our BSS_STA MAC, not yet
      * associated. iwl_mac_ctx_cmd: common hdr + ac[5] EDCA + iwl_mac_data_sta. */
-    m = dma_alloc(256, &phys); (void)phys;
-    if(!m)return;
-    s_mac_ctx=m;
+
     for (int i = 0; i < 256; i++) m[i] = 0;
     wr_le32b(m + 0, 0);                    /* id_and_color: id=0 color=1 */
     wr_le32b(m + 4, FW_CTXT_ACTION_ADD);
@@ -1351,8 +1454,7 @@ session_protect:
     /* Association request, built once, sent after AUTH succeeds. */
     int ssid_len = 0;
     while (s_target_ssid[ssid_len] && ssid_len < 32) ssid_len++;
-    uint8_t a[96]; int an;
-    for (int i = 0; i < 96; i++) a[i] = 0;
+    uint8_t a[24 + 4 + 2 + 32 + 10 + 6 + 22] = {0}; int an;
     a[0] = 0x00; a[1] = 0x00;                  /* FC: mgmt, subtype assoc-req */
     for (int i = 0; i < 6; i++) { a[4+i] = s_ap_bssid[i]; a[10+i] = s_our_mac[i]; a[16+i] = s_ap_bssid[i]; }
     a[22] = 0x10; a[23] = 0;                   /* seq ctrl */
@@ -1505,7 +1607,9 @@ load_firmware_and_kick(uint32_t hw_rev)
     s_used_bd = used_bd;
     s_free_rbd = free_rbd;
     s_cmd_ring = cmd_ring;
-    s_cmd_wr = 0;
+    s_cmd_wr = s_cmd_rd = 0;
+    if (dma_slots_init(&s_cmd_buffers, s_cmd_buffer_phys, AX_CMD_SLOTS) != 0)
+        return -1;
 
     /* Populate the RX free-buffer ring: entry = buffer_phys | vid (vid in the
      * low bits, buffers are 4K-aligned so they don't collide). Keep each

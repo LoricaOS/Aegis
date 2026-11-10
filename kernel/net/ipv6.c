@@ -150,7 +150,7 @@ static int ndp_resolve(netdev_t *dev, const ip6_addr_t *ip, mac_addr_t *mac)
     ndp_pending(ip);
     spin_unlock_irqrestore(&ip6_lock, fl);
     ndp_solicit(dev, ip);
-    if (g_in_isr_poll) return -1;
+    if (__atomic_load_n(&g_in_isr_poll, __ATOMIC_SEQ_CST)) return -1;
     for (uint32_t i = 0; i < 500; i++) {
         arch_wait_for_irq();
         if (dev->poll) dev->poll(dev);
@@ -261,7 +261,7 @@ ipv6_selftest(netdev_t *dev)
                  slot->data[0] == byte && slot->family == AF_INET6 &&
                  ipv6_addr_equal(&slot->src_ip6, &s_linklocal);
         }
-        udp_unbind(rs->local_port);
+        udp_unbind(rs->local_port, (uint32_t)rx);
     }
     if (tx >= 0) sock_free((uint32_t)tx);
     if (rx >= 0) sock_free((uint32_t)rx);

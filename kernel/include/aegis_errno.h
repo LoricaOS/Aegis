@@ -50,9 +50,11 @@
 #define ESRCH            3   /* No such process                     (~4) */
 #define EINTR            4   /* Interrupted syscall (wait_event rc) (~6) */
 #define EIO              5   /* I/O error                           (~3) */
+#define ENXIO            6   /* No such device or controlling terminal   */
 #define E2BIG            7   /* Argument list too long (exec/spawn stack) */
 #define ENOEXEC          8   /* Exec format error                   (~3) */
 #define EBADF            9   /* Bad file descriptor                (~14) */
+#define ECHILD          10   /* No matching child process                */
 #define EAGAIN          11   /* Try again / would block             (~5) */
 #define ENOMEM          12   /* Out of memory                      (~31) */
 #define EACCES          13   /* Permission denied                  (~11) */

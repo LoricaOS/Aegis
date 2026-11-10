@@ -82,15 +82,10 @@ poll_sources_run(void)
      * "arp_resolve does not block in ISR context" were true only for the RX
      * path they were written against. (audit 2026-08-01 C-2 / A4-C3.)
      *
-     * Setting it here covers every source once, at the real boundary. The
-     * per-driver save/restore hacks in xhci_poll and virtio_net_poll — added
-     * because those are likewise reached outside netdev_poll_all — become
-     * redundant but stay harmless, since they restore rather than clear.
-     * Save/restore rather than clear-to-zero for the same reason: this runs
-     * around calls that may set it themselves. */
-    int prev = g_in_isr_poll;
-    g_in_isr_poll = 1;
+     * Count active scopes, including nested drivers and concurrent CPUs.
+     * Saving/restoring one global boolean could clear another CPU's scope. */
+    __atomic_fetch_add(&g_in_isr_poll, 1, __ATOMIC_SEQ_CST);
     for (int i = 0; i < s_count; i++)
         s_sources[i].fn();
-    g_in_isr_poll = prev;
+    __atomic_fetch_sub(&g_in_isr_poll, 1, __ATOMIC_SEQ_CST);
 }

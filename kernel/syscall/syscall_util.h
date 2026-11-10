@@ -4,27 +4,45 @@
 #include <stdint.h>
 #include "arch.h"
 
-/* uaccess_range_mapped — 1 if every page of [addr, addr+len) is mapped in
- * the current process's user page tables (uaccess_check.c).  Kernel tasks
- * (no user PML4) pass unconditionally. */
+/* Snapshot checks, not a pin: every copy must still check its residual.
+ * Kernel tasks (no user address space) retain range-only semantics. */
 int uaccess_range_mapped(uint64_t addr, uint64_t len);
+/* prot: 0 = any access, 1 = read, 2 = write (PROT_* bit values). */
+int uaccess_range_accessible(uint64_t addr, uint64_t len, uint32_t prot);
 
 /* user_ptr_valid — return 1 if [addr, addr+len) lies entirely within the
- * canonical user address space AND every page in the range is mapped.
+ * canonical user address space AND has some access permission.
  * For len=0, validates that addr itself is a canonical user address (does
  * NOT unconditionally pass — a kernel addr with len=0 still returns 0).
  * Overflow-safe: addr <= USER_ADDR_MAX - len avoids addr+len wraparound.
  *
- * The mapped-check exists because copy_from_user/copy_to_user have no
- * fault fixup table: a kernel-mode #PF on an unmapped-but-in-range user
- * pointer is unrecoverable (panics).  Range check runs first so the walk
- * never sees an overflowing range. */
+ * Lazy VMAs need not have PTEs yet. copy_*_user faults can populate them,
+ * break COW, or return a nonzero residual on failure. Validation is only a
+ * snapshot, including across blocking calls and concurrent munmap/mprotect.
+ * This directionless compatibility check rejects PROT_NONE, not read-only
+ * outputs. New copy sites should use the directional checks below. */
 static inline int
 user_ptr_valid(uint64_t addr, uint64_t len)
 {
     if (!(len <= USER_ADDR_MAX && addr <= USER_ADDR_MAX - len))
         return 0;
     return uaccess_range_mapped(addr, len);
+}
+
+static inline int
+user_ptr_readable(uint64_t addr, uint64_t len)
+{
+    if (!(len <= USER_ADDR_MAX && addr <= USER_ADDR_MAX - len))
+        return 0;
+    return uaccess_range_accessible(addr, len, 1);
+}
+
+static inline int
+user_ptr_writable(uint64_t addr, uint64_t len)
+{
+    if (!(len <= USER_ADDR_MAX && addr <= USER_ADDR_MAX - len))
+        return 0;
+    return uaccess_range_accessible(addr, len, 2);
 }
 
 /* ── Negative-errno return helpers (TRY-style propagation) ────────────────

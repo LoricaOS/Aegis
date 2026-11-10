@@ -20,6 +20,7 @@ init_directory_cap(vfs_file_t *f)
     uint32_t ino = g_rootfs->ino_of(f->ops, f->priv);
     if (ino != 0 && g_rootfs->is_dir(ino)) {
         f->cap_root_inode = ino;
+        f->cap_root_gen = g_rootfs->inode_gen(ino);
         f->cap_rights = CAP_RIGHTS_READ | CAP_RIGHTS_WRITE | CAP_RIGHTS_EXEC;
     }
 }
@@ -210,7 +211,7 @@ sys_open(uint64_t arg1, uint64_t arg2, uint64_t arg3)
      * opener claim it and be overwritten here. */
     vfs_file_t opened;
     __builtin_memset(&opened, 0, sizeof(opened));
-    int r = vfs_open_ex(kpath, (int)arg2, (uint16_t)(arg3 & 0xFFF),
+    int r = vfs_open_ex(kpath, (int)arg2, (uint16_t)(arg3 & 0777u & ~proc->umask),
                         &opened, has_install);
     if (r < 0)
         return (uint64_t)(int64_t)r;
@@ -285,7 +286,12 @@ sys_openat(uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4)
                                 CAP_RIGHTS_WRITE) == 0;
     vfs_file_t opened;
     __builtin_memset(&opened, 0, sizeof(opened));
-    int rc = vfs_openat_ext2(start,
+    irqflags_t nsfl = g_rootfs->lock();
+    int rc;
+    if (confined && g_rootfs->inode_gen((uint32_t)pin.file.cap_root_inode) !=
+                    pin.file.cap_root_gen)
+        rc = -EACCES;
+    else rc = vfs_openat_ext2(start,
         confined ? (uint32_t)pin.file.cap_root_inode : EXT2_ROOT_INODE,
         path, (int)arg3, &opened, has_install,
         (pin.file.kflags & VFS_KF_PROTECTED) != 0);
@@ -294,12 +300,15 @@ sys_openat(uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4)
         if (confined) {
             opened.kflags |= VFS_KF_CAP_CONFINED;
             opened.cap_root_inode = pin.file.cap_root_inode;
+            opened.cap_root_gen = pin.file.cap_root_gen;
             opened.cap_rights = pin.file.cap_rights;
         } else if (ino != 0 && g_rootfs->is_dir(ino)) {
             opened.cap_root_inode = ino;
+            opened.cap_root_gen = g_rootfs->inode_gen(ino);
             opened.cap_rights = pin.file.cap_rights;
         }
     }
+    g_rootfs->unlock(nsfl);
     fd_table_unpin(&pin);
     if (rc < 0)
         return (uint64_t)(int64_t)rc;
@@ -1199,6 +1208,7 @@ sys_cap_rights_limit(uint64_t fd_u, uint64_t rights_u, uint64_t confine_u)
         return SYS_ERR(ENOTDIR);
     }
 
+    uint32_t root_gen = g_rootfs->inode_gen(ino);
     irqflags_t fl = spin_lock_irqsave(&proc->fd_table->lock);
     vfs_file_t *slot = (fd >= 0 && (uint32_t)fd < PROC_MAX_FDS)
                      ? &proc->fd_table->fds[fd] : (vfs_file_t *)0;
@@ -1206,8 +1216,10 @@ sys_cap_rights_limit(uint64_t fd_u, uint64_t rights_u, uint64_t confine_u)
     if (same) {
         slot->cap_rights &= (uint32_t)rights_u;
         if (confine_u) {
-            if (!(slot->kflags & VFS_KF_CAP_CONFINED))
+            if (!(slot->kflags & VFS_KF_CAP_CONFINED)) {
                 slot->cap_root_inode = ino;
+                slot->cap_root_gen = root_gen;
+            }
             slot->kflags |= VFS_KF_CAP_CONFINED;
         }
     }

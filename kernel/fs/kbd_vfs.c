@@ -1,5 +1,7 @@
 #include "kbd_vfs.h"
 #include "tty.h"
+#include "pty.h"
+#include "proc.h"
 #include "vfs.h"
 #include "kbd.h"
 #include "printk.h"
@@ -123,7 +125,7 @@ kbd_vfs_poll_fn(void *priv)
 {
 	(void)priv;
 	uint16_t events = 0x0004; /* POLLOUT always */
-	if (kbd_has_data())
+	if (tty_console_allowed() && tty_is_fg(&s_console_tty) && kbd_has_data())
 		events |= 0x0001; /* POLLIN */
 	return events;
 }
@@ -167,6 +169,28 @@ kbd_vfs_is_tty(const vfs_file_t *f)
 	return f->ops == &s_kbd_ops;
 }
 
+int
+kbd_vfs_has_input_fd(void)
+{
+    aegis_task_t *task = sched_current();
+    if (!task || !task->is_user) return 0;
+    aegis_process_t *proc = (aegis_process_t *)task;
+    if (!proc->fd_table) return 0;
+    int found = 0;
+    irqflags_t fl = spin_lock_irqsave(&proc->fd_table->lock);
+    for (uint32_t i = 0; i < PROC_MAX_FDS; i++) {
+        const vfs_file_t *f = &proc->fd_table->fds[i];
+        uint32_t mode = f->flags & VFS_O_ACCMODE;
+        if (kbd_vfs_is_tty(f) &&
+            (mode == VFS_O_RDONLY || mode == VFS_O_RDWR)) {
+            found = 1;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&proc->fd_table->lock, fl);
+    return found;
+}
+
 vfs_file_t *
 kbd_vfs_open(void)
 {
@@ -176,4 +200,18 @@ kbd_vfs_open(void)
 		s_inited = 1;
 	}
 	return &s_kbd_file;
+}
+
+/* /dev/tty follows the caller's controlling terminal. Console access can also
+ * be explicitly delegated by an input fd or the physical-input FB grant. */
+int tty_open_current(vfs_file_t *out)
+{
+    vfs_file_t *console = kbd_vfs_open();
+    aegis_task_t *task = sched_current();
+    if (task && task->is_user &&
+        pty_open_controlling(((aegis_process_t *)task)->sid, out) == 0)
+        return 0;
+    if (!tty_console_allowed()) return -ENXIO;
+    *out = *console;
+    return 0;
 }

@@ -44,10 +44,6 @@ static const char s_motd[] =
     "\n"
     " Aegis " AEGIS_VERSION " \"Ambient Argus\"\n"
     "\n";
-static const char s_passwd[] = "root:x:0:0:root:/root:/bin/stsh\n";
-static const char s_shadow[] =
-    "root:$6$5a3b9c1d2e4f6789$fvwyIjdmyvB59hifGMRFrcwhBb4cH0.3nRy2j2LpCk."
-    "aNIFNyvYQJ36Bsl94miFbD/JHICz8O1dXoegZ0OmOg.:19000:0:99999:7:::\n";
 static const char s_profile[] =
     "PS1='root@aegis:${PWD:-/}# '\n"
     "export PS1\n"
@@ -101,8 +97,6 @@ static const char s_cap_installer[] = "admin DISK_ADMIN AUTH\n";
 
 /* Compile-time size constants for static string entries. */
 static const unsigned int s_hosts_size         = sizeof(s_hosts)         - 1;
-static const unsigned int s_passwd_size        = sizeof(s_passwd)        - 1;
-static const unsigned int s_shadow_size        = sizeof(s_shadow)        - 1;
 static const unsigned int s_profile_size       = sizeof(s_profile)       - 1;
 static const unsigned int s_vigil_run_size     = sizeof(s_vigil_run)     - 1;
 static const unsigned int s_vigil_policy_size  = sizeof(s_vigil_policy)  - 1;
@@ -169,8 +163,6 @@ static const initrd_entry_t s_files[] = {
     { "/etc/vigil/services/dhcp/policy", (const unsigned char *)s_dhcp_policy, (const unsigned char *)s_dhcp_policy + s_dhcp_policy_size },
     { "/etc/vigil/services/dhcp/caps", (const unsigned char *)s_dhcp_caps, (const unsigned char *)s_dhcp_caps + s_dhcp_caps_size },
     { "/etc/hosts",  (const unsigned char *)s_hosts,  (const unsigned char *)s_hosts + s_hosts_size },
-    { "/etc/passwd", (const unsigned char *)s_passwd, (const unsigned char *)s_passwd + s_passwd_size },
-    { "/etc/shadow", (const unsigned char *)s_shadow, (const unsigned char *)s_shadow + s_shadow_size },
     { "/etc/profile", (const unsigned char *)s_profile, (const unsigned char *)s_profile + s_profile_size },
     { "/etc/vigil/services/getty/run", (const unsigned char *)s_vigil_run, (const unsigned char *)s_vigil_run + s_vigil_run_size },
     { "/etc/vigil/services/getty/policy", (const unsigned char *)s_vigil_policy, (const unsigned char *)s_vigil_policy + s_vigil_policy_size },
@@ -244,15 +236,7 @@ initrd_stat_fn(void *priv, k_stat_t *st)
     st->st_dev     = 1;
     st->st_ino     = ino;
     st->st_nlink   = 1;
-    /* /etc/shadow must be 0640 root:root — not world-readable.
-     * All other initrd files are executables or config (0555). */
-    if (e->name[0]=='/' && e->name[1]=='e' && e->name[2]=='t' &&
-        e->name[3]=='c' && e->name[4]=='/' && e->name[5]=='s' &&
-        e->name[6]=='h' && e->name[7]=='a' && e->name[8]=='d' &&
-        e->name[9]=='o' && e->name[10]=='w' && e->name[11]=='\0')
-        st->st_mode = S_IFREG | 0640;
-    else
-        st->st_mode = S_IFREG | 0555;
+    st->st_mode = S_IFREG | 0555;
     st->st_size    = (int64_t)sz;
     st->st_blksize = 512;
     st->st_blocks  = (int64_t)(((uint64_t)sz + 511) / 512 * 8);
@@ -297,7 +281,7 @@ static const dir_entry_t s_root_entries[] = {
     { (const char *)0, 0 }
 };
 static const dir_entry_t s_etc_entries[] = {
-    { "motd", 8 }, { "banner", 8 }, { "banner.net", 8 }, { "passwd", 8 }, { "shadow", 8 }, { "profile", 8 },
+    { "motd", 8 }, { "banner", 8 }, { "banner.net", 8 }, { "profile", 8 },
     { "vigil", 4 }, { "aegis", 4 }, { (const char *)0, 0 }
 };
 static const dir_entry_t s_vigil_entries[] = {
@@ -790,9 +774,7 @@ initrd_open(const char *path, vfs_file_t *out)
         const char *a = path, *b = "/dev/tty";
         while (*a && *b && *a == *b) { a++; b++; }
         if (*a == *b) {
-            vfs_file_t *tty = kbd_vfs_open();
-            *out = *tty;
-            return 0;
+            return tty_open_current(out);
         }
     }
 

@@ -1,10 +1,34 @@
 #include "gpt.h"
 #include "blkdev.h"
 #include "printk.h"
+#include "spinlock.h"
+#include "smp.h"
 #include <stdint.h>
 #include <stddef.h>
 
 #define GPT_MAX_PARTS 7   /* BLKDEV_MAX=8 minus 1 slot for the parent disk */
+
+static spinlock_t s_gpt_lock = SPINLOCK_INIT;
+static int s_gpt_owner = -1, s_gpt_depth;
+static irqflags_t gpt_lock(void)
+{
+    irqflags_t fl = arch_irq_save();
+    int cpu = (int)percpu_self()->cpu_id;
+    if (__atomic_load_n(&s_gpt_owner, __ATOMIC_RELAXED) != cpu) {
+        spin_lock(&s_gpt_lock);
+        __atomic_store_n(&s_gpt_owner, cpu, __ATOMIC_RELAXED);
+    }
+    s_gpt_depth++;
+    return fl;
+}
+static void gpt_unlock(irqflags_t fl)
+{
+    if (--s_gpt_depth == 0) {
+        __atomic_store_n(&s_gpt_owner, -1, __ATOMIC_RELAXED);
+        spin_unlock(&s_gpt_lock);
+    }
+    arch_irq_restore(fl);
+}
 
 /* ── CRC32 (polynomial 0xEDB88320, reflected) ─────────────────────────────
  * Standard CRC32 used by GPT tools (sgdisk, gdisk, parted).
@@ -77,6 +101,7 @@ typedef struct {
  * Local variables would produce dangling pointers after gpt_scan() returns. */
 static gpt_part_priv_t s_parts[GPT_MAX_PARTS];
 static blkdev_t        s_devs[GPT_MAX_PARTS];
+static uint8_t         s_registered[GPT_MAX_PARTS];
 
 /* Aegis partition type GUID prefix (first 8 bytes).
  * Full GUID: A3618F24-0C76-4B3D-{role}-000000000000
@@ -117,10 +142,10 @@ static const uint8_t k_aegis_guid_prefix[8] = {
  */
 static uint8_t s_part_bounce[4096];  /* sized for one 4K native sector */
 
-static int gpt_part_read(blkdev_t *dev, uint64_t lba, uint32_t count, void *buf)
+static int gpt_part_read_impl(blkdev_t *dev, uint64_t lba, uint32_t count, void *buf)
 {
     gpt_part_priv_t *p = (gpt_part_priv_t *)dev->priv;
-    if (lba + count > dev->block_count)
+    if (lba > dev->block_count || count > dev->block_count - lba)
         return -1;
     uint32_t native_bs = p->parent->block_size;
     if (native_bs == 512)
@@ -147,11 +172,11 @@ static int gpt_part_read(blkdev_t *dev, uint64_t lba, uint32_t count, void *buf)
     return 0;
 }
 
-static int gpt_part_write(blkdev_t *dev, uint64_t lba, uint32_t count,
+static int gpt_part_write_impl(blkdev_t *dev, uint64_t lba, uint32_t count,
                           const void *buf)
 {
     gpt_part_priv_t *p = (gpt_part_priv_t *)dev->priv;
-    if (lba + count > dev->block_count)
+    if (lba > dev->block_count || count > dev->block_count - lba)
         return -1;
     uint32_t native_bs = p->parent->block_size;
     if (native_bs == 512)
@@ -181,6 +206,21 @@ static int gpt_part_write(blkdev_t *dev, uint64_t lba, uint32_t count,
         in += chunk; byte_start += chunk; remaining -= chunk;
     }
     return 0;
+}
+
+static int gpt_part_read(blkdev_t *dev, uint64_t lba, uint32_t count, void *buf)
+{
+    irqflags_t fl = gpt_lock();
+    int rc = gpt_part_read_impl(dev, lba, count, buf);
+    gpt_unlock(fl);
+    return rc;
+}
+static int gpt_part_write(blkdev_t *dev, uint64_t lba, uint32_t count, const void *buf)
+{
+    irqflags_t fl = gpt_lock();
+    int rc = gpt_part_write_impl(dev, lba, count, buf);
+    gpt_unlock(fl);
+    return rc;
 }
 
 /* ── Header validation ────────────────────────────────────────────────────
@@ -218,7 +258,7 @@ static int header_valid(const uint8_t *sector_buf, uint64_t expected_lba)
 /* ── gpt_scan ─────────────────────────────────────────────────────────────
  * Scans devname for a valid GPT, registers partitions as child blkdevs. */
 
-int gpt_scan(const char *devname)
+static int gpt_scan_impl(const char *devname)
 {
     /* All large buffers are static to avoid stack overflow.
      * gpt_scan is called once at boot from a single-threaded context. */
@@ -329,7 +369,9 @@ int gpt_scan(const char *devname)
         }
         if (!aegis) continue;
 
-        int idx = part_num - 1;
+        int idx;
+        for (idx = 0; idx < GPT_MAX_PARTS && s_registered[idx]; idx++) { }
+        if (idx == GPT_MAX_PARTS) break;
 
         /* Private data: parent device + partition start LBA */
         s_parts[idx].parent     = dev;
@@ -360,6 +402,7 @@ int gpt_scan(const char *devname)
                    (unsigned)(part_num - 1));
             break;
         }
+        s_registered[idx] = 1;
         part_num++;
     }
 
@@ -373,8 +416,22 @@ int gpt_scan(const char *devname)
     return count;
 }
 
+int gpt_scan(const char *devname)
+{
+    irqflags_t fl = gpt_lock();
+    int rc = gpt_scan_impl(devname);
+    gpt_unlock(fl);
+    return rc;
+}
+
 int gpt_rescan(const char *devname)
 {
+    irqflags_t fl = gpt_lock();
+    blkdev_t *parent = blkdev_get(devname);
     blkdev_unregister_children(devname);
-    return gpt_scan(devname);
+    for (int i = 0; i < GPT_MAX_PARTS; i++)
+        if (s_parts[i].parent == parent) s_registered[i] = 0;
+    int rc = gpt_scan_impl(devname);
+    gpt_unlock(fl);
+    return rc;
 }

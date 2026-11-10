@@ -4,11 +4,14 @@
  *
  * It proves the kernel boots a user process end-to-end AND that the capability
  * model holds at the syscall boundary: a privileged syscall (sethostname, gated
- * on CAP_KIND_POWER) must be DENIED for init, which holds only baseline caps —
+ * on CAP_KIND_POWER) succeeds with its explicit bootstrap grant, while raw
+ * disk access is denied —
  * the no-ambient-authority guarantee, even for pid 1. Results go to fd 1/2
  * (the kernel pre-opens both to /dev/console → serial). Harness greps the
  * "[KTEST] DONE all-pass" line.
  */
+
+#include "../kernel/cap/cap.h"
 
 #ifdef __aarch64__
 /* aarch64: nr in x8, args x0-x5, svc #0, ret in x0. */
@@ -52,6 +55,10 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
 #define SYS_blkdev_list  510   /* gated on CAP_KIND_DISK_ADMIN — init LACKS this */
 #define SYS_vfs_confine  518   /* reserved; unsafe lexical version retired */
 #define SYS_cap_rights_limit 520
+#define SYS_cap_query    362
+#define SYS_admin_session 517
+#define SYS_admin_session_active 519
+#define SYS_admin_self   AEGIS_SYS_ADMIN_SELF
 
 /* Colliding syscalls: the x86 number would be MIS-translated on aarch64, so
  * use each arch's real Linux number (aarch64's are translated to the x86
@@ -69,6 +76,9 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
 #define SYS_rt_sigreturn 139
 #define SYS_sigaltstack  132
 #define SYS_mmap         222
+#define SYS_mprotect     226
+#define SYS_munmap       215
+#define SYS_set_tid_address 96
 #define SYS_mremap       216
 #define SYS_brk          214
 #define SYS_clock_gettime  113
@@ -106,6 +116,9 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
 #define SYS_rt_sigreturn 15
 #define SYS_sigaltstack  131
 #define SYS_mmap         9
+#define SYS_mprotect     10
+#define SYS_munmap       11
+#define SYS_set_tid_address 218
 #define SYS_mremap       25
 #define SYS_brk          12
 #define SYS_clock_gettime  228
@@ -215,8 +228,65 @@ static long k_stat_blocks(const void *st)
 #define MAP_ANON_PRIV  0x22       /* MAP_PRIVATE | MAP_ANONYMOUS */
 #define MREMAP_MAYMOVE 1
 
+/* Linux clone places TLS before child-TID on arm64, after it on x86. */
+static long k_clone(long flags, long stack, long ptid, long ctid, long tls)
+{
+#ifdef __aarch64__
+    return sys6(SYS_clone, flags, stack, ptid, tls, ctid, 0);
+#else
+    return sys6(SYS_clone, flags, stack, ptid, ctid, tls, 0);
+#endif
+}
+
+static volatile int g_vm_control;
+
 static unsigned slen(const char *s) { unsigned n = 0; while (s[n]) n++; return n; }
 static void out(const char *s) { sys3(SYS_write, 2, (long)s, slen(s)); }
+
+static int empty_child_authority(void)
+{
+    cap_slot_t caps[CAP_TABLE_SIZE];
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (sys3(SYS_cap_query, 0, (long)caps, sizeof(caps)) != CAP_TABLE_SIZE)
+            return 0;
+        for (unsigned i = 0; i < CAP_TABLE_SIZE; i++)
+            if (caps[i].kind || caps[i].rights) return 0;
+        if (sys3(SYS_write, 2, (long)"!", 1) != -1 ||
+            sys6(SYS_openat, AT_FDCWD, (long)"/proc/uptime", 0, 0, 0, 0) != -1 ||
+            sys3(SYS_sethostname, (long)"forbidden", 9, 0) != -1)
+            return 0;
+        /* Repeated no-op drops cannot refresh policy or bootstrap grants. */
+        if (sys3(SYS_admin_session, 0, 0, 0) != 0) return 0;
+    }
+    return 1;
+}
+
+/* Both bootstrap init and its empty fork child lack ADMIN_AUTH. SELF must
+ * reject them, and undefined legacy selectors must fail as EINVAL rather
+ * than being interpreted as parent elevation. Check each call's cap/flag
+ * nonpublication, not just its errno. These Aegis numbers are arch-shared. */
+static int denied_admin_issuance(void)
+{
+    cap_slot_t before[CAP_TABLE_SIZE], after[CAP_TABLE_SIZE];
+    if (sys3(SYS_cap_query, 0, (long)before, sizeof(before)) != CAP_TABLE_SIZE ||
+        sys3(SYS_admin_session_active, 0, 0, 0) != 0)
+        return 0;
+    for (unsigned i = 0; i < CAP_TABLE_SIZE; i++)
+        if (before[i].kind == CAP_KIND_ADMIN_AUTH) return 0;
+    const long invalid[] = { 2, 3, -1L, 1L << 32, (1L << 32) | 1, (1L << 32) | 2 };
+    for (unsigned call = 0; call <= sizeof(invalid) / sizeof(invalid[0]); call++) {
+        long ret = call == 0 ? sys3(SYS_admin_self, 0, 0, 0)
+                            : sys3(SYS_admin_session, invalid[call - 1], 0, 0);
+        if (ret != (call == 0 ? -1 /* EPERM */ : -22 /* EINVAL */) ||
+            sys3(SYS_cap_query, 0, (long)after, sizeof(after)) != CAP_TABLE_SIZE ||
+            sys3(SYS_admin_session_active, 0, 0, 0) != 0)
+            return 0;
+        for (unsigned i = 0; i < CAP_TABLE_SIZE; i++)
+            if (before[i].kind != after[i].kind || before[i].rights != after[i].rights)
+                return 0;
+    }
+    return 1;
+}
 
 /* Signal handling: a handler + a restorer trampoline. On return, the handler
  * branches to the restorer (x30/pretcode), which calls rt_sigreturn to
@@ -228,6 +298,7 @@ static void sig_handler(int signum) { g_sig_got = signum; }
  * fresh stack, so it must not read anything off its creator's frame — every
  * value it needs lives here. */
 static volatile long g_tg_rfd = -1;
+static volatile int g_lifecycle_mode;
 static volatile long g_cow = 0;   /* dedicated COW test page (data, not stack) */
 
 /* sigaltstack test: a SA_ONSTACK handler records the stack region it ran on
@@ -258,8 +329,84 @@ struct ksigaction {
     unsigned long sa_mask;
 };
 
-void _start(void)
+/* The self-exec lifecycle modes below need fresh baseline policy, not inherited
+ * fork authority. Keep the fd in argv: pre-exec formatting needs no caps. */
+static void exec_lifecycle(int mode, int fd)
 {
+    char m[] = { (char)('0' + mode), 0 };
+    char f[12];
+    unsigned v = (unsigned)fd, n = 0;
+    do { f[n++] = (char)('0' + v % 10); v /= 10; } while (v);
+    for (unsigned i = 0; i < n / 2; i++) {
+        char c = f[i]; f[i] = f[n - i - 1]; f[n - i - 1] = c;
+    }
+    f[n] = 0;
+    char *argv[] = { (char *)"/bin/vigil", (char *)"lifecycle", m, f, 0 };
+    char *envp[] = { 0 };
+    sys3(SYS_execve, (long)argv[0], (long)argv, (long)envp);
+    sys3(SYS_exit, 99, 0, 0);
+    for (;;) { }
+}
+
+/* Runs only after exec has independently issued THREAD_CREATE and VFS_READ.
+ * New-stack thread bodies use globals, never the creator's local frame. */
+static void lifecycle_child(int mode, int fd)
+{
+    g_tg_rfd = fd;
+    g_lifecycle_mode = mode;
+    int count = mode == 3 ? 3 : 1;
+    for (int j = 0; j < count; j++) {
+        long stk = sys6(SYS_mmap, 0, 65536, PROT_RW, MAP_ANON_PRIV, -1, 0);
+        if (stk <= 0) { sys3(SYS_exit_group, 98, 0, 0); for (;;) { } }
+        long t = k_clone(0x100 | 0x200 | 0x400 | 0x800 | 0x10000,
+                         (stk + 65536 - 4096) & ~15L, 0, 0, 0);
+        if (t < 0) { sys3(SYS_exit_group, 98, 0, 0); for (;;) { } }
+        if (t == 0) {
+            if (g_lifecycle_mode == 2) sys3(SYS_exit_group, 88, 0, 0);
+            for (;;) {
+                char b;
+                if (g_lifecycle_mode == 1) {
+                    if (sys3(SYS_read, g_tg_rfd, (long)&b, 1) < 0)
+                        sys3(SYS_exit_group, 98, 0, 0);
+                }
+                else sys3(SYS_sched_yield, 0, 0, 0);
+            }
+        }
+    }
+    if (mode == 2) {
+        char b;
+        for (;;) sys3(SYS_read, g_tg_rfd, (long)&b, 1);
+    }
+    if (mode == 1) {
+        long ts[2] = { 0, 150000000L };
+        sys6(SYS_clock_nanosleep, 0, 0, (long)ts, 0, 0, 0);
+    }
+    sys3(SYS_exit_group, mode == 1 ? 77 : 0, 0, 0);
+    for (;;) { }
+}
+
+/* Capture argv before a C prologue changes the initial ABI stack. */
+#ifdef __aarch64__
+__asm__(".global _start\n_start:\nmov x0, sp\nbl test_main\n1: b 1b\n");
+#else
+__asm__(".global _start\n_start:\nmov %rsp, %rdi\nand $-16, %rsp\ncall test_main\n1: jmp 1b\n");
+#endif
+
+__attribute__((used)) static void test_main(const unsigned long *stack)
+{
+    if (stack[0] == 4) {
+        const char *arg = (const char *)stack[2];
+        const char *m = (const char *)stack[3], *f = (const char *)stack[4];
+        if (arg[0] == 'l' && m[0] >= '1' && m[0] <= '3' && !m[1]) {
+            int fd = 0;
+            for (unsigned i = 0; i < 10 && f[i]; i++) {
+                if (f[i] < '0' || f[i] > '9' || fd > 1000000)
+                    sys3(SYS_exit, 98, 0, 0);
+                fd = fd * 10 + f[i] - '0';
+            }
+            lifecycle_child(m[0] - '0', fd);
+        }
+    }
     int pass = 0, total = 0;
 
     out("[KTEST] init running\n");
@@ -331,6 +478,28 @@ void _start(void)
         { pass++; out("[KTEST] PASS unsafe vfs-confine retired\n"); }
     else out("[KTEST] FAIL unsafe vfs-confine still active\n");
 
+    total++;
+    {
+        cap_slot_t before[CAP_TABLE_SIZE], after[CAP_TABLE_SIZE];
+        long before_count = sys3(SYS_cap_query, 0, (long)before, sizeof(before));
+        int ok = before_count == CAP_TABLE_SIZE && denied_admin_issuance();
+        long pid = k_clone(SIGCHLD, 0, 0, 0, 0);
+        if (pid == 0) sys3(SYS_exit, denied_admin_issuance() ? 0 : 98, 0, 0);
+        int status = 0;
+        ok &= pid > 0 && sys6(SYS_wait4, pid, (long)&status, 0, 0, 0, 0) == pid &&
+              status == 0;
+        /* The child's invalid selectors must not elevate its direct parent,
+         * either through cap publication or the separate admin-session flag. */
+        long after_count = sys3(SYS_cap_query, 0, (long)after, sizeof(after));
+        ok &= sys3(SYS_admin_session_active, 0, 0, 0) == 0;
+        if (before_count == CAP_TABLE_SIZE && after_count == CAP_TABLE_SIZE) {
+            for (unsigned i = 0; i < CAP_TABLE_SIZE; i++)
+                ok &= before[i].kind == after[i].kind && before[i].rights == after[i].rights;
+        } else ok = 0;
+        if (ok) { pass++; out("[KTEST] PASS admin SELF denied + invalid legacy selectors preserve caller/parent authority\n"); }
+        else out("[KTEST] FAIL admin issuance denial or authority changed\n");
+    }
+
     /* 5. FP/SIMD state survives a context switch (arm64 only — this
      *    test-init is built -mno-sse on x86, where the FXSAVE path is
      *    already proven by the real LoricaOS userland). Load a sentinel
@@ -377,6 +546,165 @@ void _start(void)
             pass++; out("[KTEST] PASS fork+cow (child isolated)\n");
         } else out("[KTEST] FAIL fork/cow\n");
     }
+
+    total++;
+    {
+        long pid = k_clone(SIGCHLD, 0, 0, 0, 0);
+        if (pid == 0) sys3(SYS_exit, empty_child_authority() ? 0 : 98, 0, 0);
+        int st = 0;
+        if (pid > 0 && sys6(SYS_wait4, pid, (long)&st, 0, 0, 0, 0) == pid && st == 0) {
+            pass++; out("[KTEST] PASS independent child empty and admin-drop cannot regrant\n");
+        } else out("[KTEST] FAIL independent child authority\n");
+    }
+
+    /* mprotect must preserve private fork isolation across a read-only
+     * source mapping, including PROT_NONE save/restore. Revoking WRITE on a
+     * COW mapping must also revoke the fault handler's permission to write. */
+    total++;
+    {
+        int ok = 1;
+        long page = sys6(SYS_mmap, 0, 4096, PROT_RW, MAP_ANON_PRIV, -1, 0);
+        if (page <= 0) ok = 0;
+        for (int mode = 0; mode < 3 && ok; mode++) {
+            sys3(SYS_mprotect, page, 4096, PROT_RW);
+            *(volatile unsigned *)page = 0x1234;
+            if (mode < 2) ok &= sys3(SYS_mprotect, page, 4096, 1) == 0;
+            long pid = k_clone(SIGCHLD, 0, 0, 0, 0);
+            if (pid == 0) {
+                if (mode == 1 && sys3(SYS_mprotect, page, 4096, 0) != 0)
+                    sys3(SYS_exit, 98, 0, 0);
+                if (sys3(SYS_mprotect, page, 4096, mode == 2 ? 1 : PROT_RW) != 0)
+                    sys3(SYS_exit, 98, 0, 0);
+                *(volatile unsigned *)page = 0x5678;
+                sys3(SYS_exit, 7, 0, 0);
+            }
+            int st = 0;
+            if (pid <= 0 || sys6(SYS_wait4, pid, (long)&st, 0, 0, 0, 0) != pid)
+                ok = 0;
+            else if (mode == 2) ok &= (st & 0x7f) == 11; /* SIGSEGV */
+            else ok &= st == (7 << 8);
+            ok &= *(volatile unsigned *)page == 0x1234;
+        }
+        if (page > 0) sys3(SYS_munmap, page, 4096, 0);
+        if (ok) { pass++; out("[KTEST] PASS mprotect COW isolation and write revocation\n"); }
+        else out("[KTEST] FAIL mprotect COW isolation or revocation\n");
+    }
+
+    /* Exit clear_child_tid must neither bypass read-only permission nor
+     * modify another process's still-shared private frame. */
+    total++;
+    {
+        int ok = 1;
+        long page = sys6(SYS_mmap, 0, 4096, PROT_RW, MAP_ANON_PRIV, -1, 0);
+        if (page <= 0) ok = 0;
+        if (ok) {
+            *(volatile unsigned *)page = 0x7654;
+            ok &= sys3(SYS_mprotect, page, 4096, 1) == 0;
+            long pid = k_clone(SIGCHLD, 0, 0, 0, 0);
+            if (pid == 0) {
+                long tid = sys3(SYS_set_tid_address, page, 0, 0);
+                sys3(SYS_exit, tid > 0 ? 0 : 98, 0, 0);
+            }
+            int st = 0;
+            ok &= pid > 0 && sys6(SYS_wait4, pid, (long)&st, 0, 0, 0, 0) == pid && st == 0;
+            ok &= *(volatile unsigned *)page == 0x7654;
+            sys3(SYS_munmap, page, 4096, 0);
+        }
+        if (ok) { pass++; out("[KTEST] PASS clear-tid respects readonly COW\n"); }
+        else out("[KTEST] FAIL clear-tid readonly COW\n");
+    }
+
+    total++;
+    {
+        int ok = 1;
+        const char *path = "/tmp/.kt-mmap-access";
+        long fd = sys6(SYS_openat, AT_FDCWD, (long)path, 0x242, 0600, 0, 0);
+        if (fd < 0) ok = 0;
+        if (fd >= 0) { ok &= sys3(SYS_write, fd, (long)"mmap", 4) == 4; sys3(SYS_close, fd, 0, 0); }
+        fd = sys6(SYS_openat, AT_FDCWD, (long)path, 1, 0, 0, 0);
+        ok &= fd >= 0 && sys6(SYS_mmap, 0, 4096, 1, 2, fd, 0) == -13;
+        if (fd >= 0) sys3(SYS_close, fd, 0, 0);
+        fd = sys6(SYS_openat, AT_FDCWD, (long)path, 0, 0, 0, 0);
+        ok &= fd >= 0 && sys6(SYS_mmap, 0, 4096, PROT_RW, 1, fd, 0) == -13;
+        long page = fd >= 0 ? sys6(SYS_mmap, 0, 4096, 1, 1, fd, 0) : -1;
+        ok &= page > 0;
+        if (page > 0) { ok &= *(volatile char *)page == 'm'; sys3(SYS_munmap, page, 4096, 0); }
+        if (fd >= 0) sys3(SYS_close, fd, 0, 0);
+        k_unlink(path);
+        if (ok) { pass++; out("[KTEST] PASS mmap fd read/write authority\n"); }
+        else out("[KTEST] FAIL mmap fd authority\n");
+    }
+
+    total++;
+    {
+#ifdef __aarch64__
+        const long bad = 0x0001000000000000L;
+#else
+        const long bad = 0x0000800000000000L;
+#endif
+        const long thread = 0x100 | 0x800 | 0x10000;
+        int ok = k_clone(0x100 | SIGCHLD, 0, 0, 0, 0) == -22;
+        ok &= k_clone(thread | 0x80000, 0, 0, 0, bad) == -14;
+        ok &= k_clone(SIGCHLD | 0x80000, 0, 0, 0, bad) == -14;
+        ok &= k_clone(thread | 0x200000, 0, 0, bad - 2, 0) == -14;
+        ok &= k_clone(thread | 0x100000, 0, bad - 2, 0, 0) == -14;
+        ok &= k_clone(thread, bad, 0, 0, 0) == -14;
+        ok &= k_clone(SIGCHLD, bad, 0, 0, 0) == -14;
+        ok &= k_clone((1L << 40) | SIGCHLD, 0, 0, 0, 0) == -22;
+#ifndef __aarch64__
+        ok &= sys3(158 /* arch_prctl */, 0x1002 /* ARCH_SET_FS */, bad, 0) == -14;
+#endif
+        long page = sys6(SYS_mmap, 0, 4096, PROT_RW, MAP_ANON_PRIV, -1, 0);
+        long stk = sys6(SYS_mmap, 0, 65536, PROT_RW, MAP_ANON_PRIV, -1, 0);
+        if (page <= 0 || stk <= 0) ok = 0;
+        if (page > 0 && stk > 0) {
+            *(volatile unsigned *)page = 0x9876;
+            sys3(SYS_mprotect, page, 4096, 1);
+            ok &= k_clone(thread | 0x100000, stk + 32768, page, 0, 0) == -14;
+            ok &= k_clone(thread | 0x1000000, stk + 32768, 0, page, 0) == -14;
+            ok &= *(volatile unsigned *)page == 0x9876;
+        }
+        if (page > 0) sys3(SYS_munmap, page, 4096, 0);
+        if (stk > 0) sys3(SYS_munmap, stk, 65536, 0);
+        if (ok) { pass++; out("[KTEST] PASS clone VM TLS stack and TID boundaries\n"); }
+        else out("[KTEST] FAIL clone VM TLS stack or TID boundaries\n");
+    }
+
+    /* Positive vfork control: the suspended parent observes a shared write
+     * only after the child exits. Existing thread tests below cover THREAD. */
+    total++;
+    {
+        int ok = 1;
+        long stk = sys6(SYS_mmap, 0, 65536, PROT_RW, MAP_ANON_PRIV, -1, 0);
+        if (stk <= 0) ok = 0;
+        if (ok) {
+            g_vm_control = 0;
+            long pid = k_clone(0x100 | 0x4000 | SIGCHLD, stk + 32768, 0, 0, 0);
+            if (pid == 0) {
+                g_vm_control = empty_child_authority() ? 1 : -1;
+                sys3(SYS_exit, g_vm_control == 1 ? 0 : 98, 0, 0);
+            }
+            int st = 0;
+            ok &= pid > 0 && g_vm_control == 1;
+            ok &= pid > 0 && sys6(SYS_wait4, pid, (long)&st, 0, 0, 0, 0) == pid && st == 0;
+            sys3(SYS_munmap, stk, 65536, 0);
+        }
+        if (ok) { pass++; out("[KTEST] PASS vfork shared VM control and empty authority\n"); }
+        else out("[KTEST] FAIL vfork shared VM control\n");
+    }
+
+#ifndef __aarch64__
+    total++;
+    {
+        unsigned long flags;
+        /* Timer interrupts occur while user DF is set. The kernel must clear
+         * its own DF before C, while preserving the interrupted user's flag. */
+        __asm__ volatile("std; mov $50000000, %%ecx; 1: dec %%ecx; jnz 1b; pushfq; pop %0; cld"
+                         : "=r"(flags) : : "rcx", "cc", "memory");
+        if (flags & (1UL << 10)) { pass++; out("[KTEST] PASS interrupt user DF preserved\n"); }
+        else out("[KTEST] FAIL interrupt user DF\n");
+    }
+#endif
 
     /* 7. Signal delivery + sigreturn. Install a SIGUSR1 handler, kill self,
      *    and check the handler ran and returned cleanly. On arm64 this
@@ -442,10 +770,13 @@ void _start(void)
         int status = 0;
         sys6(SYS_wait4, pid, (long)&status, 0, 0, 0, 0);
         int cs = (status >> 8) & 0xff;
-        if (pid > 0 && cs == 42) { pass++; out("[KTEST] PASS exec (+procfs cap gate)\n"); }
+        if (pid > 0 && status == (42 << 8)) { pass++; out("[KTEST] PASS exec (+procfs cap gate)\n"); }
         else if (cs == 43) out("[KTEST] FAIL svc-tier-DISK_ADMIN-granted (privesc!)\n");
         else if (cs == 44) out("[KTEST] FAIL procfs-unreachable (gate untestable)\n");
         else if (cs == 45) out("[KTEST] FAIL proc-stackshot-ungated (freeze+leak!)\n");
+        else if (cs == 47) out("[KTEST] FAIL exec AT_SECURE\n");
+        else if (cs == 48) out("[KTEST] FAIL exec fresh-policy cap table\n");
+        else if (cs >= 49 && cs <= 51) out("[KTEST] FAIL spawn/exec authority regression\n");
         else out("[KTEST] FAIL exec\n");
     }
 
@@ -517,20 +848,26 @@ void _start(void)
             k_rmdir("/ktrl");
         } else ok = 0;
 
-        long q = sys6(SYS_mmap, 0, 4096, PROT_RW, MAP_ANON_PRIV, -1, 0);
-        if (q > 0) {
+        /* Keep a guard before the test page so mmap cannot merge it into a
+         * neighbor's VMA; reserve then free its growth page explicitly. */
+        long reserve = sys6(SYS_mmap, 0, 12288, 0, MAP_ANON_PRIV, -1, 0);
+        long q = reserve > 0 ? reserve + 4096 : -1;
+        if (q > 0 && sys3(SYS_mprotect, q, 4096, PROT_RW) == 0 &&
+            sys3(SYS_munmap, q + 4096, 4096, 0) == 0) {
+            *(volatile unsigned *)q = 0x13579;
             /* Wraps the address space when unchecked. */
             if (sys6(SYS_mremap, q, 4096, -8192L, MREMAP_MAYMOVE, 0, 0) > 0)
                 ok = 0;
-            /* Huge but non-wrapping: the unpreemptible-scan wedge. If this
-             * regresses, the harness times out rather than failing here. */
+            /* Huge but non-wrapping: the unpreemptible-scan wedge. */
             if (sys6(SYS_mremap, q, 4096, 0x7FFFFFFFFFFF0000L,
                      MREMAP_MAYMOVE, 0, 0) > 0)
                 ok = 0;
-            /* The mapping must be untouched and still growable afterwards. */
-            if (sys6(SYS_mremap, q, 4096, 8192, MREMAP_MAYMOVE, 0, 0) != q)
+            if (*(volatile unsigned *)q != 0x13579 ||
+                sys6(SYS_mremap, q, 4096, 8192, MREMAP_MAYMOVE, 0, 0) != q ||
+                *(volatile unsigned *)q != 0x13579)
                 ok = 0;
         } else ok = 0;
+        if (reserve > 0) sys3(SYS_munmap, reserve, 12288, 0);
 
         if (ok) { pass++; out("[KTEST] PASS readlink/mremap underflow guards\n"); }
         else out("[KTEST] FAIL readlink/mremap underflow guards\n");
@@ -1001,7 +1338,8 @@ void _start(void)
      *     ->sp ctx_switch loads. Ring 0, from baseline caps only
      *     (THREAD_CREATE is baseline).
      *
-     *     Shape: child clones a thread that blocks reading an empty pipe, then
+     *     Shape: child execs this image for fresh baseline caps, then clones a
+     *     thread that blocks reading an empty pipe, then
      *     exit_group()s. We reap it and then WRITE to that pipe, which is what
      *     walks read_waiters. Three things are asserted: the reap completes at
      *     all (a leader is not reapable while a sibling is non-zombie, so a
@@ -1019,37 +1357,7 @@ void _start(void)
         if (ok) {
             g_tg_rfd = pfd[0];
             long pid = sys6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);
-            if (pid == 0) {
-                /* ---- child (group leader) ---- */
-                long stk = sys6(SYS_mmap, 0, 65536, PROT_RW, MAP_ANON_PRIV, -1, 0);
-                if (stk > 0) {
-                    /* CLONE_VM|FS|FILES|SIGHAND|THREAD == a real thread: shares
-                     * our address space AND our tgid, which is what makes it a
-                     * sibling exit_group has to tear down. Stack grows down, so
-                     * hand clone the TOP, 16-aligned — but leave a page of slack
-                     * BELOW the exact end. A cloned child resumes in the middle
-                     * of _start, which still has a live frame and addresses its
-                     * locals as POSITIVE offsets from rsp (it opens
-                     * `sub $0x890,%rsp`). Handed the exact end, the first such
-                     * access lands past the mapping, where there is no VMA to
-                     * fault against, and the thread takes a SIGSEGV that has
-                     * nothing to do with what it was written to test. */
-                    long top = (stk + 65536 - 4096) & ~15L;
-                    long t = sys6(SYS_clone, 0x100 | 0x200 | 0x400 | 0x800 | 0x10000,
-                                  top, 0, 0, 0, 0);
-                    if (t == 0) {
-                        /* ---- sibling thread, on the fresh stack ---- */
-                        char b;
-                        for (;;)
-                            sys3(SYS_read, g_tg_rfd, (long)&b, 1);  /* parks */
-                    }
-                }
-                /* Let the sibling reach the blocking read before we exit. */
-                struct { long s, ns; } ts = { 0, 150000000L };  /* 150 ms */
-                sys6(SYS_clock_nanosleep, 0, 0, (long)&ts, 0, 0, 0);
-                sys3(SYS_exit_group, 77, 0, 0);
-                sys3(SYS_exit, 98, 0, 0);   /* unreachable */
-            }
+            if (pid == 0) exec_lifecycle(1, pfd[0]);
             int status = 0;
             long w = sys6(SYS_wait4, pid, (long)&status, 0, 0, 0, 0);
             if (w != pid || ((status >> 8) & 0xff) != 77) ok = 0;
@@ -1100,35 +1408,15 @@ void _start(void)
         if (sys3(SYS_pipe2, (long)pfd, 0, 0) != 0) ok = 0;
         if (ok) {
             long pid = sys6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);
-            if (pid == 0) {
-                /* ---- child: the group LEADER ---- */
-                long stk = sys6(SYS_mmap, 0, 65536, PROT_RW, MAP_ANON_PRIV, -1, 0);
-                if (stk > 0) {
-                    /* Slack below the exact end — see case 14 for the hazard. */
-                    long top = (stk + 65536 - 4096) & ~15L;
-                    long t = sys6(SYS_clone, 0x100 | 0x200 | 0x400 | 0x800 | 0x10000,
-                                  top, 0, 0, 0, 0);
-                    if (t == 0) {
-                        /* ---- sibling thread, on the fresh stack ----
-                         * Straight into exit_group: no locals, no delay. It
-                         * does not matter whether the leader has reached its
-                         * read() yet, because thread_group_teardown does not
-                         * return until every sibling is a zombie — so the
-                         * leader zombifies before this thread does either way,
-                         * which is the whole point of the case. */
-                        sys3(SYS_exit_group, 88, 0, 0);
-                    }
-                }
-                /* Park the leader so the teardown has to kill it where it
-                 * blocks — the shape a shell's child is in when this bites. */
-                { char b; for (;;) sys3(SYS_read, pfd[0], (long)&b, 1); }
-            }
+            if (pid == 0) exec_lifecycle(2, pfd[0]);
             /* THE PROBE: a BLOCKING wait4. WNOHANG would poll its own way out
              * of the bug and prove nothing — the defect is precisely that the
              * blocked parent is never woken again. */
             int status = 0;
             long w = sys6(SYS_wait4, pid, (long)&status, 0, 0, 0, 0);
-            if (w != pid) ok = 0;
+            /* Non-leader exit_group kills the leader with SIGKILL; wait4
+             * reports that leader's signal death, not the caller's code 88. */
+            if (pid <= 0 || w != pid || status != 9) ok = 0;
             { int st2 = 0; while (sys6(SYS_wait4, -1, (long)&st2, 1 /*WNOHANG*/,
                                        0, 0, 0) > 0) { } }
             sys3(SYS_close, pfd[0], 0, 0);
@@ -1154,7 +1442,9 @@ void _start(void)
      *
      *     So assert what the leak actually destroys: the ability to CREATE
      *     threads. Each child reports whether all three of its clones succeeded,
-     *     and one failure fails the case. At three leaked slots per iteration
+     *     and one failure fails the case. Each child execs for fresh policy
+     *     before creating threads; fork itself deliberately grants none.
+     *     At three leaked slots per iteration
      *     that ceiling is reached around iteration 83, so 100 iterations clear
      *     it with margin while staying well inside the harness timeout. */
     total++;
@@ -1163,36 +1453,12 @@ void _start(void)
         for (int i = 0; i < 100 && ok; i++) {
             long pid = sys6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);
             if (pid < 0) { ok = 0; break; }
-            if (pid == 0) {
-                /* ---- child: the group leader ---- */
-                int failed = 0;
-                for (int j = 0; j < 3; j++) {
-                    long stk = sys6(SYS_mmap, 0, 16384, PROT_RW, MAP_ANON_PRIV,
-                                    -1, 0);
-                    if (stk <= 0) { failed = 1; break; }
-                    /* Hand clone a stack pointer with slack ABOVE it. The child
-                     * resumes inside _start, whose locals gcc addresses at
-                     * POSITIVE offsets from rsp (it opens `sub $0x890,%rsp`), so
-                     * an exact-end pointer puts the first spill just past the
-                     * mapping — a SIGSEGV with no VMA to fault against, which is
-                     * the kernel behaving correctly. Cases 14 and 15 get away
-                     * with the exact end only because their thread bodies happen
-                     * to compile to no stack access at all. */
-                    long top = (stk + 16384 - 4096) & ~15L;
-                    long t = sys6(SYS_clone,
-                                  0x100 | 0x200 | 0x400 | 0x800 | 0x10000,
-                                  top, 0, 0, 0, 0);
-                    if (t < 0) { failed = 1; break; }
-                    if (t == 0)
-                        for (;;) sys3(SYS_sched_yield, 0, 0, 0);
-                }
-                sys3(SYS_exit_group, failed, 0, 0);
-            }
+            if (pid == 0) exec_lifecycle(3, 0);
             int st = 0;
             if (sys6(SYS_wait4, pid, (long)&st, 0, 0, 0, 0) != pid) { ok = 0; break; }
             /* Non-zero == the child could not create its threads, i.e. the slots
              * from earlier iterations were never returned. */
-            if (((st >> 8) & 0xff) != 0) { ok = 0; break; }
+            if (st != 0) { ok = 0; break; }
         }
         if (ok) { pass++; out("[KTEST] PASS thread-zombie reap (slots returned)\n"); }
         else out("[KTEST] FAIL thread-zombie reap\n");

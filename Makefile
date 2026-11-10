@@ -9,6 +9,8 @@ LD      = x86_64-elf-ld
 OBJCOPY = x86_64-elf-objcopy
 NM      = x86_64-elf-nm
 HOSTCC ?= cc
+MKE2FS ?= mke2fs
+DEBUGFS ?= debugfs
 
 # Version: single source of truth is the VERSION file (NOT git) so builds are
 # deterministic and reproducible anywhere. Stamped into the kernel (uname,
@@ -375,7 +377,10 @@ all: $(BUILD)/aegis.elf
 # ── Config generation ───────────────────────────────────────────────────────
 # Every object depends on the generated header, so `make` with no .config first
 # seeds configs/full_defconfig (historical everything-on build), then compiles.
-$(ALL_OBJS): | $(AUTOCONF_H)
+# VERSION is expanded into CFLAGS (-DAEGIS_VERSION), so every object must
+# depend on it directly: without this, bumping VERSION left every .o untouched
+# and `make dist` shipped a kernel still stamped with the OLD version.
+$(ALL_OBJS): VERSION | $(AUTOCONF_H)
 
 .config:
 	@echo "  [config] no .config — seeding configs/full_defconfig"
@@ -555,8 +560,8 @@ $(BUILD)/test-exectgt: test/exectgt.c
 
 $(BUILD)/test-rootfs.img: $(BUILD)/test-init $(BUILD)/test-exectgt test/exectest.caps
 	dd if=/dev/zero of=$@ bs=512 count=8192 2>/dev/null      # 4 MiB
-	/sbin/mke2fs -t ext2 -F -b 4096 -L aegis-test $@ >/dev/null 2>&1
-	printf 'mkdir /bin\nwrite $(BUILD)/test-init /bin/vigil\nwrite $(BUILD)/test-exectgt /bin/exectest\nmkdir /etc\nmkdir /etc/aegis\nmkdir /etc/aegis/caps.d\nwrite test/exectest.caps /etc/aegis/caps.d/exectest\n' | /sbin/debugfs -w $@ >/dev/null 2>&1
+	$(MKE2FS) -t ext2 -F -b 4096 -L aegis-test $@ >/dev/null 2>&1
+	printf 'mkdir /bin\nwrite $(BUILD)/test-init /bin/vigil\nwrite $(BUILD)/test-exectgt /bin/exectest\nmkdir /etc\nmkdir /etc/aegis\nmkdir /etc/aegis/caps.d\nwrite test/exectest.caps /etc/aegis/caps.d/exectest\n' | $(DEBUGFS) -w $@ >/dev/null 2>&1
 
 $(BUILD)/aegis-test.iso: $(KERNEL_STRIPPED) $(BUILD)/test-rootfs.img $(LIMINE_BIN)
 	@rm -rf $(BUILD)/test-isodir

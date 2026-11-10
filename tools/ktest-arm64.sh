@@ -5,17 +5,19 @@
 set -u
 ISO="${1:?usage: ktest-arm64.sh <aegis-arm64.iso>}"
 LOG="$(mktemp)"
-FW=""
-for f in /usr/share/AAVMF/AAVMF_CODE.fd /usr/share/qemu-efi-aarch64/QEMU_EFI.fd; do
-    [ -f "$f" ] && FW="$f" && break
-done
-[ -n "$FW" ] || { echo "[ktest-arm64] FAIL: no AAVMF/QEMU_EFI firmware found"; exit 1; }
+FW="${QEMU_EFI:-}"
+if [ -z "$FW" ]; then
+    for f in /usr/share/AAVMF/AAVMF_CODE.fd /usr/share/qemu-efi-aarch64/QEMU_EFI.fd; do
+        [ -f "$f" ] && FW="$f" && break
+    done
+fi
+[ -f "$FW" ] || { echo "[ktest-arm64] FAIL: set QEMU_EFI to an AAVMF/QEMU_EFI firmware image"; exit 1; }
 
-timeout 120 qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a72 -m 2048M \
+timeout "${QEMU_TIMEOUT:-120}" qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a72 -m 2048M \
     -bios "$FW" \
     -cdrom "$ISO" \
     -display none -nodefaults -serial stdio -no-reboot \
-    > "$LOG" 2>&1 || true
+    </dev/null > "$LOG" 2>&1 || true
 
 if grep -q "no init at" "$LOG"; then
     echo "[ktest-arm64] PASS: kernel reached init-spawn with no userland"

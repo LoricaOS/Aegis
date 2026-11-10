@@ -51,6 +51,11 @@ typedef struct {
 _Static_assert(VMA_HDR_OFFSET + sizeof(vma_hdr_t) <= (VMA_TABLE_PAGES * PAGE_SIZE),
                "vma_table header overruns the table page");
 
+/* Protect table pointer publication/removal against foreign procfs readers.
+ * Lock order: sched_lock -> table_ptr_lock -> table leaf lock. No allocator,
+ * operation lock or scheduler call runs under table_ptr_lock. */
+static spinlock_t table_ptr_lock = SPINLOCK_INIT;
+
 static inline vma_hdr_t *vma_hdr(struct aegis_process *proc) {
     return (vma_hdr_t *)((char *)proc->vma_table + VMA_HDR_OFFSET);
 }
@@ -82,9 +87,42 @@ void vma_op_unlock(struct aegis_process *proc, irqflags_t flags) {
     spin_unlock_irqrestore(&vma_hdr(proc)->op_lock, flags);
 }
 
-/* Public read-only accessor for code outside vma.c (procfs, brk). */
+uint32_t vma_snapshot(struct aegis_process *proc, vma_entry_t *out,
+                      uint32_t capacity) {
+    if (!proc) return 0;
+    irqflags_t fl = spin_lock_irqsave(&table_ptr_lock);
+    uint32_t count = 0;
+    if (proc->vma_table) {
+        spinlock_t *lk = vlock(proc);
+        spin_lock(lk);
+        count = *vcnt(proc);
+        if (out) {
+            if (count > capacity) count = capacity;
+            __builtin_memcpy(out, proc->vma_table, count * sizeof(*out));
+        }
+        spin_unlock(lk);
+    }
+    spin_unlock_irqrestore(&table_ptr_lock, fl);
+    return count;
+}
+
+uint64_t vma_size_bytes(struct aegis_process *proc) {
+    if (!proc) return 0;
+    irqflags_t fl = spin_lock_irqsave(&table_ptr_lock);
+    uint64_t size = 0;
+    if (proc->vma_table) {
+        spinlock_t *lk = vlock(proc);
+        spin_lock(lk);
+        for (uint32_t i = 0; i < *vcnt(proc); i++)
+            size += proc->vma_table[i].len;
+        spin_unlock(lk);
+    }
+    spin_unlock_irqrestore(&table_ptr_lock, fl);
+    return size;
+}
+
 uint32_t vma_count_get(struct aegis_process *proc) {
-    return (proc && proc->vma_table) ? *vcnt(proc) : 0;
+    return vma_snapshot(proc, (vma_entry_t *)0, 0);
 }
 
 /* ── helpers ─────────────────────────────────────────────────────────── */
@@ -196,14 +234,16 @@ int vma_init(struct aegis_process *proc) {
     vma_entry_t *table = (vma_entry_t *)kva_alloc_pages(VMA_TABLE_PAGES);
     if (!table)
         return -1;
-    if (proc->vma_table)
-        vma_free(proc);
-    proc->vma_table    = table;
+    vma_hdr_t *hdr = (vma_hdr_t *)((char *)table + VMA_HDR_OFFSET);
+    refcount_init(&hdr->rc, 1);
+    hdr->count = 0;
+    hdr->lock = (spinlock_t)SPINLOCK_INIT;
+    hdr->op_lock = (spinlock_t)SPINLOCK_INIT;
+    vma_free(proc);
+    irqflags_t fl = spin_lock_irqsave(&table_ptr_lock);
+    proc->vma_table = table;
     proc->vma_capacity = (uint32_t)VMA_CAPACITY;
-    refcount_init(vma_rc(proc), 1);
-    *vcnt(proc) = 0;
-    { spinlock_t init = SPINLOCK_INIT; vma_hdr(proc)->lock = init; }
-    { spinlock_t init = SPINLOCK_INIT; vma_hdr(proc)->op_lock = init; }
+    spin_unlock_irqrestore(&table_ptr_lock, fl);
     return 0;
 }
 
@@ -631,11 +671,7 @@ int vma_clone(struct aegis_process *dst, struct aegis_process *src) {
     vma_entry_t *new_table = (vma_entry_t *)kva_alloc_pages(VMA_TABLE_PAGES);
     if (!new_table)
         return -1;
-    uint32_t count = *vcnt(src);
-
-    if (count > 0)
-        __builtin_memcpy(new_table, src->vma_table,
-                         count * sizeof(vma_entry_t));
+    uint32_t count = vma_snapshot(src, new_table, VMA_CAPACITY);
 
     dst->vma_table    = new_table;
     dst->vma_capacity = (uint32_t)VMA_CAPACITY;
@@ -649,21 +685,22 @@ int vma_clone(struct aegis_process *dst, struct aegis_process *src) {
 }
 
 void vma_share(struct aegis_process *child, struct aegis_process *parent) {
-    child->vma_table    = parent->vma_table;
-    child->vma_capacity = parent->vma_capacity;
-    /* child shares parent's table page → shares the embedded refcount AND the
-     * embedded entry count. Do NOT copy a per-process count: a stale copy would
-     * truncate this thread's vma_find range against VMAs another thread added. */
+    irqflags_t fl = spin_lock_irqsave(&table_ptr_lock);
     refcount_inc(vma_rc(parent));
+    child->vma_table = parent->vma_table;
+    child->vma_capacity = parent->vma_capacity;
+    spin_unlock_irqrestore(&table_ptr_lock, fl);
 }
 
 void vma_free(struct aegis_process *proc) {
-    if (!proc->vma_table)
-        return;
-
-    /* Drop one reference; the LAST sharer frees the page. */
-    if (refcount_dec_and_test(vma_rc(proc)))
-        kva_free_pages(proc->vma_table, VMA_TABLE_PAGES);
-
+    irqflags_t fl = spin_lock_irqsave(&table_ptr_lock);
+    vma_entry_t *table = proc->vma_table;
     proc->vma_table = (vma_entry_t *)0;
+    proc->vma_capacity = 0;
+    spin_unlock_irqrestore(&table_ptr_lock, fl);
+    if (table) {
+        vma_hdr_t *hdr = (vma_hdr_t *)((char *)table + VMA_HDR_OFFSET);
+        if (refcount_dec_and_test(&hdr->rc))
+            kva_free_pages(table, VMA_TABLE_PAGES);
+    }
 }

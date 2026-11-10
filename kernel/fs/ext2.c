@@ -10,6 +10,9 @@
 #include "ext2_internal.h"
 #include "spinlock.h"
 #include "smp.h"   /* percpu_self()->cpu_id for the recursive lock owner */
+#include "sched.h"
+#include "proc.h"
+#include "ext2_vfs.h"
 #include "vfs.h"   /* vfs_open/vfs_file_t — ext2_anchors_reload reads /etc/aegis/anchors */
 
 /* ext2_internal.h defines EIO/EINVAL/etc. but not EFBIG.  ext2_write needs
@@ -1142,6 +1145,14 @@ int ext2_check_perm(uint32_t ino, uint16_t proc_uid, uint16_t proc_gid, int want
     return -EACCES;
 }
 
+static int ext2_caller_perm(uint32_t ino, int want)
+{
+    aegis_task_t *task = sched_current();
+    if (!task || !task->is_user) return 0;
+    aegis_process_t *proc = current_proc();
+    return ext2_check_perm(ino, (uint16_t)proc->uid, (uint16_t)proc->gid, want);
+}
+
 /* ------------------------------------------------------------------ */
 /* ext2_read_symlink_target — read symlink target from inode           */
 /* ------------------------------------------------------------------ */
@@ -1214,7 +1225,7 @@ static int ext2_walk_impl(uint32_t start_ino, uint32_t root_ino,
                           int follow_final, int *touched)
 {
     if (!s_mounted)
-        return -1;
+        return -ENODEV;
 
     char resolved[512];
     uint32_t depth = 0;
@@ -1225,6 +1236,8 @@ static int ext2_walk_impl(uint32_t start_ino, uint32_t root_ino,
     plen = 0;
     while (path[plen] != '\0' && plen < 510)
         plen++;
+    if (path[plen] != '\0')
+        return -ENAMETOOLONG;
     for (i = 0; i < plen; i++)
         resolved[i] = path[i];
     resolved[plen] = '\0';
@@ -1253,8 +1266,9 @@ restart_walk:
             char component[256];
             uint32_t clen = 0;
             while (*p != '\0' && *p != '/') {
-                if (clen < 255)
-                    component[clen++] = *p;
+                if (clen == 255)
+                    return -ENAMETOOLONG;
+                component[clen++] = *p;
                 p++;
             }
             component[clen] = '\0';
@@ -1264,6 +1278,10 @@ restart_walk:
                 p++;
 
             int is_final = (*p == '\0');
+
+            int perm = ext2_caller_perm(current_ino, 1);
+            if (perm != 0)
+                return perm;
 
             /* ".." is normally a real ext2 entry. For an inode-rooted walk,
              * however, following it at the capability root would escape the
@@ -1292,11 +1310,13 @@ restart_walk:
             /* Read current directory inode */
             ext2_inode_t dir_inode;
             if (ext2_read_inode(current_ino, &dir_inode) < 0)
-                return -1;
+                return -EIO;
 
             /* Must be a directory */
             if ((dir_inode.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR)
-                return -1;
+                return -ENOTDIR;
+            if (!dir_inode.i_size || dir_inode.i_size % s_block_size)
+                return -EIO;
 
             /* Search directory entries for component */
             int found = 0;
@@ -1307,10 +1327,10 @@ restart_walk:
                 uint32_t file_block = pos / s_block_size;
                 uint32_t blk = ext2_block_num(&dir_inode, file_block);
                 if (blk == 0)
-                    break;
+                    return -EIO;
                 uint8_t *data = cache_get_slot(blk);
                 if (!data)
-                    return -1;
+                    return -EIO;
                 uint32_t block_pos = pos % s_block_size;
                 /* +8 <= : the dirent header (inode/rec_len/name_len/file_type)
                  * is 8 bytes; a tail of <8 bytes must not be dereferenced or
@@ -1320,8 +1340,9 @@ restart_walk:
                 while (block_pos + 8 <= s_block_size) {
                     ext2_dirent_t *de =
                         (ext2_dirent_t *)(data + block_pos);
-                    if (de->rec_len < 8 || block_pos + de->rec_len > s_block_size)
-                        break;
+                    if (de->rec_len < 8 || (de->rec_len & 3) ||
+                        block_pos + de->rec_len > s_block_size)
+                        return -EIO;
                     if (de->inode == 0) {
                         block_pos += de->rec_len;
                         pos += de->rec_len;
@@ -1329,13 +1350,11 @@ restart_walk:
                     }
                     /* name_len must fit inside the record (rec_len already
                      * validated >= 8 above, so rec_len - 8 can't underflow).
-                     * Skip malformed entries to avoid an OOB read past the
-                     * 4096 cache buffer during the name compare. */
-                    if ((uint32_t)de->name_len + 8u > (uint32_t)de->rec_len) {
-                        block_pos += de->rec_len;
-                        pos += de->rec_len;
-                        continue;
-                    }
+                     * Malformed records cannot establish that a name is absent:
+                     * first-boot authority depends on a trustworthy ENOENT. */
+                    if ((uint32_t)de->name_len + 8u > (uint32_t)de->rec_len ||
+                        de->inode > s_sb.s_inodes_count)
+                        return -EIO;
                     if (de->name_len == (uint8_t)clen) {
                         uint32_t k;
                         int match = 1;
@@ -1358,13 +1377,13 @@ restart_walk:
                     break;
                 if (!found) {
                     uint32_t block_end = (file_block + 1) * s_block_size;
-                    if (pos < block_end)
-                        pos = block_end;
+                    if (pos != block_end)
+                        return -EIO;
                 }
             }
 
             if (!found)
-                return -1;
+                return -ENOENT;
 
             /* Flag if this resolved component is a protected-tree root. Covers
              * intermediate dirs (so /apps/<id>/file flags on "apps") and the
@@ -1379,7 +1398,7 @@ restart_walk:
             /* Check if resolved inode is a symlink */
             ext2_inode_t child_node;
             if (ext2_read_inode(child_ino, &child_node) < 0)
-                return -1;
+                return -EIO;
 
             if ((child_node.i_mode & EXT2_S_IFMT) == EXT2_S_IFLNK) {
                 /* Final component and no-follow requested: return the symlink inode */
@@ -1394,9 +1413,13 @@ restart_walk:
                     return -ELOOP;
 
                 char target[256];
+                if (child_node.i_size >= sizeof(target))
+                    return -ENAMETOOLONG;
                 int tlen = ext2_read_symlink_target(child_ino, target, sizeof(target));
                 if (tlen < 0)
                     return tlen;
+                if (tlen == 0)
+                    return -EIO;
 
                 /* Build new path: [link's dir +] target + "/" + remaining.
                  *
@@ -1415,6 +1438,13 @@ restart_walk:
                 char newpath[512];
                 uint32_t np = 0;
                 uint32_t ti;
+                uint32_t remaining = 0;
+                while (p[remaining]) remaining++;
+                uint32_t prefix = target[0] != '/'
+                                ? (uint32_t)(comp_begin - resolved) : 0;
+                if (target[0] != '/' && !prefix) prefix = 1;
+                if (prefix + (uint32_t)tlen + remaining + (remaining != 0) > 510)
+                    return -ENAMETOOLONG;
 
                 if (target[0] != '/') {
                     uint32_t plen_pfx = (uint32_t)(comp_begin - resolved);
@@ -1466,14 +1496,48 @@ int ext2_open_ex(const char *path, uint32_t *inode_out, int follow_final)
     return ext2_walk(path, inode_out, follow_final, (int *)0);
 }
 
+/* Namespace lock held. A retained descendant may have been moved out of its
+ * delegated tree; its current ancestry must still lead to the original root. */
+static int ext2_descends_from(uint32_t ino, uint32_t root)
+{
+    for (uint32_t depth = 0; depth < 512; depth++) {
+        if (ino == root) return 1;
+        ext2_inode_t dir;
+        if (ext2_read_inode(ino, &dir) != 0 ||
+            (dir.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR)
+            return 0;
+        uint32_t parent = 0;
+        for (uint32_t pos = 0; pos < dir.i_size && !parent;) {
+            uint32_t blk = ext2_block_num(&dir, pos / s_block_size);
+            uint8_t *data = blk ? cache_get_slot(blk) : 0;
+            if (!data) return 0;
+            uint32_t bp = pos % s_block_size;
+            if (bp + 8 > s_block_size) return 0;
+            ext2_dirent_t *de = (ext2_dirent_t *)(data + bp);
+            if (de->rec_len < 8 || bp + de->rec_len > s_block_size)
+                return 0;
+            if (de->name_len == 2 && de->rec_len >= 10 &&
+                de->name[0] == '.' && de->name[1] == '.')
+                parent = de->inode;
+            pos += de->rec_len;
+        }
+        if (!parent || parent == ino) return 0;
+        ino = parent;
+    }
+    return 0;
+}
+
 int ext2_openat_protected(uint32_t start_ino, uint32_t root_ino,
                           const char *path, uint32_t *inode_out,
                           int *is_protected)
 {
-    if (!path || path[0] == '/' || !ext2_is_dir(start_ino) ||
-        !ext2_is_dir(root_ino))
-        return -EINVAL;
+    if (!path || path[0] == '/') return -EINVAL;
     irqflags_t fl = ext2_lock_acquire();
+    if (!ext2_is_dir(start_ino) || !ext2_is_dir(root_ino) ||
+        !ext2_descends_from(start_ino, root_ino)) {
+        ext2_lock_release(fl);
+        return -EACCES;
+    }
     int touched = *is_protected;
     int rc = ext2_walk_impl(start_ino, root_ino, path, inode_out, 1, &touched);
     if (rc >= 0)
@@ -1610,6 +1674,10 @@ int ext2_symlink(const char *linkpath, const char *target, int has_install)
         ext2_lock_release(fl);
         return -1;
     }
+    if (ext2_caller_perm(parent_ino, 3) != 0) {
+        ext2_lock_release(fl);
+        return -EACCES;
+    }
 
     /* Reject an existing name with EEXIST (POSIX symlink()).  Without this,
      * ext2_dir_add_entry below would append a SECOND dirent with the same name
@@ -1687,6 +1755,10 @@ int ext2_symlink(const char *linkpath, const char *target, int has_install)
         cache_mark_dirty(blk);
     }
 
+    if (sched_current() && sched_current()->is_user) {
+        inode.i_uid = (uint16_t)current_proc()->uid;
+        inode.i_gid = (uint16_t)current_proc()->gid;
+    }
     inode.i_generation = ext2_next_gen();   /* secfix M2: unique per allocation */
     ext2_write_inode(new_ino, &inode);
     int r = ext2_dir_add_entry(parent_ino, new_ino, basename, EXT2_FT_SYMLINK);
@@ -1734,6 +1806,10 @@ int ext2_link(const char *oldpath, const char *newpath, int has_install)
     if (ext2_lookup_parent(newpath, &parent_ino, &basename) != 0) {
         ext2_lock_release(fl);
         return -ENOENT;
+    }
+    if (ext2_caller_perm(parent_ino, 3) != 0) {
+        ext2_lock_release(fl);
+        return -EACCES;
     }
     {
         uint32_t existing;
@@ -1950,6 +2026,35 @@ static void ext2_free_inode_blocks(ext2_inode_t *inode)
         ext2_free_block(dind);           /* outer pointer block */
         inode->i_block[13] = 0;
     }
+}
+
+/* Reclaim only after the last name AND open description are gone.
+ * Caller holds the recursive namespace lock (including close and allocation). */
+void ext2_reclaim_unlinked(uint32_t ino)
+{
+    if (ext2_pool_has_inode(ino)) return;
+    ext2_inode_t inode;
+    if (ext2_read_inode(ino, &inode) != 0 || inode.i_links_count || inode.i_dtime)
+        return;
+    if ((inode.i_mode & EXT2_S_IFMT) == EXT2_S_IFLNK && inode.i_blocks == 0)
+        __builtin_memset(inode.i_block, 0, sizeof(inode.i_block));
+    else
+        ext2_free_inode_blocks(&inode);
+    uint32_t grp = (ino - 1) / s_sb.s_inodes_per_group;
+    if (grp >= s_num_groups) return;
+    uint8_t *bitmap = cache_get_slot(s_bgd[grp].bg_inode_bitmap);
+    if (!bitmap) return;
+    uint32_t bit = (ino - 1) % s_sb.s_inodes_per_group;
+    bitmap[bit / 8] &= (uint8_t)~(1u << (bit % 8));
+    cache_mark_dirty(s_bgd[grp].bg_inode_bitmap);
+    s_bgd[grp].bg_free_inodes_count++;
+    s_sb.s_free_inodes_count++;
+    if ((inode.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR &&
+        s_bgd[grp].bg_used_dirs_count)
+        s_bgd[grp].bg_used_dirs_count--;
+    inode.i_size = inode.i_blocks = 0;
+    inode.i_dtime = 1;
+    ext2_write_inode(ino, &inode);
 }
 
 /* ext2_alloc_block — scan block bitmaps for a free bit.
@@ -2193,6 +2298,11 @@ int ext2_write(uint32_t inode_num, const void *buf,
         return -1;
     }
 
+    if ((inode.i_mode & EXT2_S_IFMT) != EXT2_S_IFREG) {
+        ext2_lock_release(fl);
+        return -EISDIR;
+    }
+
     const uint8_t *src = (const uint8_t *)buf;
     uint32_t bytes_written = 0;
     uint32_t orig_size = inode.i_size;   /* save before write loop */
@@ -2264,7 +2374,7 @@ int ext2_truncate(uint32_t inode_num)
         ext2_lock_release(fl);
         return -1;
     }
-    if ((inode.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR) {
+    if ((inode.i_mode & EXT2_S_IFMT) != EXT2_S_IFREG) {
         ext2_lock_release(fl);
         return -1;
     }
@@ -2300,6 +2410,10 @@ int ext2_create(const char *path, uint16_t mode, int has_install)
         ext2_lock_release(fl);
         return -1;
     }
+    if (ext2_caller_perm(parent_ino, 3) != 0) {
+        ext2_lock_release(fl);
+        return -EACCES;
+    }
 
     /* Reject an existing name BEFORE allocating. Every other creator in this
      * file checks; ext2_create did not, so two concurrent O_CREATs (or a
@@ -2328,6 +2442,10 @@ int ext2_create(const char *path, uint16_t mode, int has_install)
         ((uint8_t *)&inode)[ci] = 0;
     inode.i_mode = EXT2_S_IFREG | (mode & 0x1FFu);
     inode.i_links_count = 1;
+    if (sched_current() && sched_current()->is_user) {
+        inode.i_uid = (uint16_t)current_proc()->uid;
+        inode.i_gid = (uint16_t)current_proc()->gid;
+    }
     inode.i_generation = ext2_next_gen();   /* secfix M2: unique per allocation */
     inode.i_atime = inode.i_mtime = inode.i_ctime = ext2_now();
     ext2_write_inode(new_ino, &inode);
@@ -2355,6 +2473,10 @@ int ext2_unlink(const char *path, int has_install)
     if (ext2_lookup_parent(path, &parent_ino, &basename) != 0) {
         ext2_lock_release(fl);
         return -1;
+    }
+    if (ext2_caller_perm(parent_ino, 3) != 0) {
+        ext2_lock_release(fl);
+        return -EACCES;
     }
 
     /* NO-FOLLOW: unlink() operates on the final component itself, never on
@@ -2391,30 +2513,11 @@ int ext2_unlink(const char *path, int has_install)
     if (inode.i_links_count > 0)
         inode.i_links_count--;
 
-    if (inode.i_links_count == 0) {
-        /* free ALL data blocks (direct + single/double indirect + pointer
-         * blocks) — previously only i_block[0..11] were freed, leaking the
-         * indirect blocks of any file larger than 12 blocks. */
-        ext2_free_inode_blocks(&inode);
-        /* free inode */
-        uint32_t igrp = 0;
-        if (s_sb.s_inodes_per_group > 0)
-            igrp = (ino - 1) / s_sb.s_inodes_per_group;
-        if (igrp < s_num_groups) {
-            uint8_t *ibitmap = cache_get_slot(s_bgd[igrp].bg_inode_bitmap);
-            if (ibitmap) {
-                uint32_t ibit = (ino - 1) % s_sb.s_inodes_per_group;
-                ibitmap[ibit / 8] &= (uint8_t)~(1u << (ibit % 8));
-                cache_mark_dirty(s_bgd[igrp].bg_inode_bitmap);
-                s_bgd[igrp].bg_free_inodes_count++;
-                s_sb.s_free_inodes_count++;
-            }
-        }
-        inode.i_blocks = 0;
-        inode.i_dtime = 1; /* mark deleted */
-    }
-    ext2_write_inode(ino, &inode);
     int r = ext2_dir_remove_entry(parent_ino, basename);
+    if (r == 0) {
+        ext2_write_inode(ino, &inode);
+        ext2_reclaim_unlinked(ino);
+    }
     ext2_lock_release(fl);
     return r;
 }
@@ -2435,6 +2538,10 @@ int ext2_mkdir(const char *path, uint16_t mode, int has_install)
     if (ext2_lookup_parent(path, &parent_ino, &basename) != 0) {
         ext2_lock_release(fl);
         return -1;
+    }
+    if (ext2_caller_perm(parent_ino, 3) != 0) {
+        ext2_lock_release(fl);
+        return -EACCES;
     }
 
     /* Reject an existing name with EEXIST (POSIX). Without this, mkdir of an
@@ -2471,6 +2578,10 @@ int ext2_mkdir(const char *path, uint16_t mode, int has_install)
     inode.i_size = s_block_size;
     inode.i_blocks = s_block_size / 512;
     inode.i_block[0] = blk;
+    if (sched_current() && sched_current()->is_user) {
+        inode.i_uid = (uint16_t)current_proc()->uid;
+        inode.i_gid = (uint16_t)current_proc()->gid;
+    }
     inode.i_generation = ext2_next_gen();   /* secfix M2: unique per allocation */
     inode.i_atime = inode.i_mtime = inode.i_ctime = ext2_now();
     ext2_write_inode(new_ino, &inode);
@@ -2542,6 +2653,10 @@ int ext2_rmdir(const char *path, int has_install)
     if (ext2_lookup_parent(path, &parent_ino, &basename) != 0) {
         ext2_lock_release(fl);
         return -1;
+    }
+    if (ext2_caller_perm(parent_ino, 3) != 0) {
+        ext2_lock_release(fl);
+        return -EACCES;
     }
 
     /* NO-FOLLOW: rmdir() must not traverse a final-component symlink. With
@@ -2615,31 +2730,11 @@ int ext2_rmdir(const char *path, int has_install)
         }
     }
 
-    /* Free ALL the directory's data blocks (direct + indirect trees). */
-    ext2_free_inode_blocks(&inode);
-
-    /* Free the inode. */
-    {
-        uint32_t igrp = 0;
-        if (s_sb.s_inodes_per_group > 0)
-            igrp = (ino - 1) / s_sb.s_inodes_per_group;
-        if (igrp < s_num_groups) {
-            uint8_t *ibitmap = cache_get_slot(s_bgd[igrp].bg_inode_bitmap);
-            if (ibitmap) {
-                uint32_t ibit = (ino - 1) % s_sb.s_inodes_per_group;
-                ibitmap[ibit / 8] &= (uint8_t)~(1u << (ibit % 8));
-                cache_mark_dirty(s_bgd[igrp].bg_inode_bitmap);
-                s_bgd[igrp].bg_free_inodes_count++;
-                s_sb.s_free_inodes_count++;
-            }
-            if (s_bgd[igrp].bg_used_dirs_count > 0)
-                s_bgd[igrp].bg_used_dirs_count--;
-        }
-    }
+    int removed = ext2_dir_remove_entry(parent_ino, basename);
+    if (removed != 0) { ext2_lock_release(fl); return removed; }
     inode.i_links_count = 0;
-    inode.i_blocks = 0;
-    inode.i_dtime = 1;
     ext2_write_inode(ino, &inode);
+    ext2_reclaim_unlinked(ino);
 
     /* Parent loses the child's ".." back-reference. */
     {
@@ -2651,7 +2746,7 @@ int ext2_rmdir(const char *path, int has_install)
         }
     }
 
-    int r = ext2_dir_remove_entry(parent_ino, basename);
+    int r = 0;
     ext2_lock_release(fl);
     return r;
 }
@@ -2706,6 +2801,11 @@ int ext2_rename(const char *old_path, const char *new_path, int has_install)
     if (ext2_lookup_parent(new_path, &new_parent_ino, &new_basename) != 0) {
         ext2_lock_release(fl);
         return -1;
+    }
+    if (ext2_caller_perm(old_parent_ino, 3) != 0 ||
+        ext2_caller_perm(new_parent_ino, 3) != 0) {
+        ext2_lock_release(fl);
+        return -EACCES;
     }
 
     ext2_inode_t inode;
@@ -2763,27 +2863,11 @@ int ext2_rename(const char *old_path, const char *new_path, int has_install)
         } else {
             /* Replacing a regular file: drop its dir entry, then free its inode
              * + blocks if that was its last link (mirrors ext2_unlink). */
-            ext2_dir_remove_entry(new_parent_ino, new_basename);
-            if (dst.i_links_count > 0)
-                dst.i_links_count--;
-            if (dst.i_links_count == 0) {
-                ext2_free_inode_blocks(&dst);
-                uint32_t igrp = (s_sb.s_inodes_per_group > 0)
-                    ? (dst_ino - 1) / s_sb.s_inodes_per_group : 0;
-                if (igrp < s_num_groups) {
-                    uint8_t *ib = cache_get_slot(s_bgd[igrp].bg_inode_bitmap);
-                    if (ib) {
-                        uint32_t ibit = (dst_ino - 1) % s_sb.s_inodes_per_group;
-                        ib[ibit / 8] &= (uint8_t)~(1u << (ibit % 8));
-                        cache_mark_dirty(s_bgd[igrp].bg_inode_bitmap);
-                        s_bgd[igrp].bg_free_inodes_count++;
-                        s_sb.s_free_inodes_count++;
-                    }
-                }
-                dst.i_blocks = 0;
-                dst.i_dtime = 1;
-            }
+            int rr = ext2_dir_remove_entry(new_parent_ino, new_basename);
+            if (rr != 0) { ext2_lock_release(fl); return rr; }
+            if (dst.i_links_count) dst.i_links_count--;
             ext2_write_inode(dst_ino, &dst);
+            ext2_reclaim_unlinked(dst_ino);
         }
     }
 

@@ -46,6 +46,20 @@ typedef struct {
 #define CAP_KIND_AUDIO_CONTROL 22u /* may mutate global audio volume/playback */
 #define CAP_KIND_TIME         23u  /* may set the global realtime clock */
 
+/* sys_admin_session (517) legacy selectors. Unknown values fail with EINVAL.
+ * Do not extend 517 with a SELF selector: older kernels treat EVERY nonzero
+ * selector as PARENT. A new caller must never elevate a parent by accident. */
+#define AEGIS_ADMIN_SESSION_DROP   0u
+#define AEGIS_ADMIN_SESSION_PARENT 1u
+
+/* sys_admin_self (521), no arguments. Old kernels return ENOSYS, without
+ * changing authority. SELF is credential issuance, not session delegation:
+ * requires live ADMIN_AUTH WRITE, authenticated binding 0/0 AND uid/gid 0/0,
+ * no persistent cap ceiling, no authority transaction and no live sibling
+ * in the thread group. Trusted login checks the credential/operation allowlist
+ * and execs in the SAME process; independent children gain no session state. */
+#define AEGIS_SYS_ADMIN_SELF       521u
+
 /* CAP_KIND_MAX — highest DEFINED capability kind. Used to reject undefined kinds
  * (e.g. the sys_spawn cap_mask delegation path) without hardcoding a specific
  * kind that goes stale when a new one is added. MUST be bumped whenever a
@@ -124,8 +138,8 @@ void cap_policy_detect_first_boot(void);
 
 /* Look up the policy for a binary by full exe_path.
  * Extracts basename (everything after last '/') and compares.
- * Returns pointer to entry, or NULL if no policy found. */
-const cap_policy_entry_t *cap_policy_lookup(const char *exe_path);
+ * Copies a stable entry to out (optional). Returns 1 if found, 0 otherwise. */
+int cap_policy_lookup(const char *exe_path, cap_policy_entry_t *out);
 
 /* True iff the first-boot exception is live (g_first_boot) AND this binary's
  * policy declares a firstboot-tier cap — i.e. this exec is the anchored setup

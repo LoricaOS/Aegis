@@ -37,49 +37,32 @@ waitq_remove(waitq_t *wq, waitq_entry_t *e)
 void
 waitq_wake_one(waitq_t *wq)
 {
-    irqflags_t fl = spin_lock_irqsave(&wq->lock);
-    waitq_entry_t *e = wq->head;
-    aegis_task_t  *t = e ? e->task : NULL;
-    spin_unlock_irqrestore(&wq->lock, fl);
-    if (t) sched_wake(t);
+    irqflags_t fl = spin_lock_irqsave(&sched_lock);
+    spin_lock(&wq->lock);
+    if (wq->head && wq->head->task)
+        sched_wake_locked(wq->head->task);
+    spin_unlock(&wq->lock);
+    spin_unlock_irqrestore(&sched_lock, fl);
 }
 
 void
 waitq_wake_all(waitq_t *wq)
 {
-    /* Snapshot tasks under the lock, sched_wake outside (sched_lock >
-     * waitq_lock). Loop in batches of 64 stack entries so we never
-     * silently drop a waiter when fan-out exceeds the snapshot size.
-     * The woken tasks are responsible for calling waitq_remove on
-     * themselves — sched_wake just flips state to RUNNING. */
-    for (;;) {
-        aegis_task_t *snap[64];
-        int           n = 0;
-
-        irqflags_t fl = spin_lock_irqsave(&wq->lock);
-        for (waitq_entry_t *e = wq->head; e && n < 64; e = e->next)
-            snap[n++] = e->task;
-        spin_unlock_irqrestore(&wq->lock, fl);
-
-        if (n == 0) return;
-
-        for (int i = 0; i < n; i++)
-            if (snap[i]) sched_wake(snap[i]);
-
-        if (n < 64) return;
-        /* List had >= 64 entries — there may be more after the woken
-         * tasks remove themselves. Re-acquire and continue. */
-    }
+    /* Protect both waiter entries and task lifetime through the wake. Walk
+     * once: waiters need not run or unlink before this function returns. */
+    irqflags_t fl = spin_lock_irqsave(&sched_lock);
+    spin_lock(&wq->lock);
+    for (waitq_entry_t *e = wq->head; e; e = e->next)
+        if (e->task) sched_wake_locked(e->task);
+    spin_unlock(&wq->lock);
+    spin_unlock_irqrestore(&sched_lock, fl);
 }
 
 void
 waitq_wait(waitq_t *wq)
 {
-    /* Stack-allocated entry. Safe across the sched_block window because
-     * waitq_wake_one / waitq_wake_all snapshot e->task (a stable pointer
-     * to the TCB), not &e itself — they never dereference the entry
-     * after dropping wq->lock. A future refactor that snapshots entry
-     * pointers would silently introduce a UAF here. */
+    /* Wake holds the queue lock through task access, so the entry remains
+     * live until waitq_remove completes. */
     waitq_entry_t e = { .task = sched_current(), .next = NULL,
                         .prev = NULL,           .on_queue = 0 };
     waitq_add(wq, &e);

@@ -328,6 +328,7 @@ uint64_t sys_fb_map(uint64_t arg1);
 uint64_t sys_fb_flush(void);
 uint64_t sys_install_commit(void);
 uint64_t sys_admin_session(uint64_t on);
+uint64_t sys_admin_self(void);
 uint64_t sys_admin_session_active(void);
 
 /* ── memfd / ftruncate (sys_memory.c) ──────────────────────────────────── */

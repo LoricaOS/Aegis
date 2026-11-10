@@ -90,6 +90,37 @@ void proc_inc_fork_count(void)
      CLONE_THREAD | CLONE_SYSVSEM | CLONE_SETTLS | CLONE_PARENT_SETTID | \
      CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID | CLONE_DETACHED)
 
+/* Only threads remain in the parent's security principal. A new process
+ * inherits restrictions, never usable caps or latent session/identity grants.
+ * Snapshot under the publication lock so threads cannot copy torn authority.
+ * An inactive ceiling stays inactive: exec may issue fresh trusted policy,
+ * but an existing active ceiling must constrain that issuance forever. */
+static void
+init_child_authority(aegis_process_t *child, const aegis_process_t *parent,
+                     int is_thread)
+{
+    irqflags_t fl = spin_lock_irqsave(&sched_lock);
+    __builtin_memcpy(child->cap_ceiling, parent->cap_ceiling,
+                     sizeof(child->cap_ceiling));
+    child->cap_ceiling_active = parent->cap_ceiling_active;
+    if (is_thread) {
+        __builtin_memcpy(child->caps, parent->caps, sizeof(child->caps));
+        child->authenticated = parent->authenticated;
+        child->admin_session = parent->admin_session;
+        child->admin_session_firstboot = parent->admin_session_firstboot;
+        child->auth_uid = parent->auth_uid;
+        child->auth_gid = parent->auth_gid;
+    } else {
+        __builtin_memset(child->caps, 0, sizeof(child->caps));
+        child->authenticated = 0;
+        child->admin_session = 0;
+        child->admin_session_firstboot = 0;
+        child->auth_uid = AUTH_ID_NONE;
+        child->auth_gid = AUTH_ID_NONE;
+    }
+    spin_unlock_irqrestore(&sched_lock, fl);
+}
+
 /*
  * sys_exit — syscall 60
  *
@@ -124,13 +155,10 @@ sys_exit(uint64_t arg1)
         /* clear_child_tid: write 0 and futex wake (for pthread_join) */
         if (sched_current()->clear_child_tid) {
             uint32_t zero = 0;
-            /* Fault in the (possibly lazy-mmap'd) TLS page before writing —
-             * vmm_write_user_bytes silently drops writes to not-present pages. */
-            if (user_ptr_valid(sched_current()->clear_child_tid, sizeof(zero)))
-                vmm_write_user_bytes(proc->pml4_phys,
-                                     sched_current()->clear_child_tid,
-                                     &zero, sizeof(zero));
-            futex_wake_addr(sched_current()->clear_child_tid, 1, proc->pml4_phys);
+            uint64_t addr = sched_current()->clear_child_tid;
+            if (user_ptr_valid(addr, sizeof(zero)) &&
+                copy_to_user((void *)(uintptr_t)addr, &zero, sizeof(zero)) == 0)
+                futex_wake_addr(addr, 1, proc->pml4_phys);
         }
 
         /* Session leader exit: SIGHUP + SIGCONT to foreground group */
@@ -149,22 +177,8 @@ sys_exit(uint64_t arg1)
             arch_request_shutdown();
         }
 
-        /* C2: Reparent orphan children to init (PID 1) so they can be
-         * reaped by waitpid instead of staying as zombies forever.
-         * Walk under sched_lock — the list mutates concurrently on SMP. */
-        {
-            irqflags_t fl = spin_lock_irqsave(&sched_lock);
-            aegis_task_t *t = sched_current()->next;
-            while (t != sched_current()) {
-                if (t->is_user) {
-                    aegis_process_t *child = (aegis_process_t *)t;
-                    if (child->ppid == proc->pid)
-                        child->ppid = 1;
-                }
-                t = t->next;
-            }
-            spin_unlock_irqrestore(&sched_lock, fl);
-        }
+        /* Child ownership belongs to the whole thread group. sched_exit
+         * reparents only when its final live member exits (including signals). */
     }
     sched_exit();
     __builtin_unreachable();
@@ -289,21 +303,7 @@ uint64_t sys_exit_group(uint64_t arg1)
             arch_request_shutdown();
         }
 
-        /* C2: Reparent orphan children to init (PID 1).
-         * Walk under sched_lock — the list mutates concurrently on SMP. */
-        {
-            irqflags_t fl = spin_lock_irqsave(&sched_lock);
-            aegis_task_t *t = sched_current()->next;
-            while (t != sched_current()) {
-                if (t->is_user) {
-                    aegis_process_t *child = (aegis_process_t *)t;
-                    if (child->ppid == proc->pid)
-                        child->ppid = 1;
-                }
-                t = t->next;
-            }
-            spin_unlock_irqrestore(&sched_lock, fl);
-        }
+        /* Common sched_exit handles final-thread reparenting. */
     }
     sched_exit();
     __builtin_unreachable();
@@ -338,23 +338,29 @@ sys_clone(syscall_frame_t *frame, uint64_t flags, uint64_t child_stack,
      * bits don't get silently downgraded to a plain thread/fork clone. The
      * recognised set (incl. the legacy CLONE_DETACHED that musl sets) is in
      * CLONE_IMPLEMENTED_MASK above. */
-    if (cl & ~(uint32_t)CLONE_IMPLEMENTED_MASK)
+    if ((flags >> 32) || (cl & ~(uint32_t)CLONE_IMPLEMENTED_MASK))
         return SYS_ERR(EINVAL);
 
-    /* Without CLONE_VM this is a plain fork. Pass the caller's rdi/rsi/rdx
-     * (= flags/child_stack/ptid for a clone) so the child inherits them. */
-    if (!(cl & CLONE_VM))
+    /* Reject invalid return/TLS addresses before either clone route. */
+    uint64_t user_rsp = child_stack ? child_stack : FRAME_SP(frame);
+    if (user_rsp > USER_ADDR_MAX ||
+        ((cl & CLONE_SETTLS) && tls > USER_ADDR_MAX) ||
+        ((cl & CLONE_PARENT_SETTID) && ptid > USER_ADDR_MAX - sizeof(uint32_t)) ||
+        ((cl & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID)) &&
+         ctid > USER_ADDR_MAX - sizeof(uint32_t)))
+        return SYS_ERR(EFAULT);
+
+    if (!(cl & CLONE_VM)) {
+        /* The fork route does not implement clone's TLS/TID/sharing options. */
+        if (cl & ~CLONE_DETACHED)
+            return SYS_ERR(EINVAL);
         return sys_fork(frame, flags, child_stack, ptid);
-
-    /* ── Thread creation (CLONE_VM set) ─────────────────────────────────── */
-
-    /* H4: Reject kernel addresses for TLS pointer. */
-    if ((cl & CLONE_SETTLS) && tls >= 0xFFFF800000000000ULL)
-        return SYS_ERR(EFAULT);
-
-    /* H3: Reject kernel addresses for CLONE_CHILD_CLEARTID pointer. */
-    if ((cl & CLONE_CHILD_CLEARTID) && ctid >= 0xFFFF800000000000ULL)
-        return SYS_ERR(EFAULT);
+    }
+    /* Independent processes cannot concurrently borrow an unowned PML4.
+     * Thread groups and suspended-parent vfork have explicit teardown rules. */
+    if (!(cl & (CLONE_THREAD | CLONE_VFORK)) ||
+        ((cl & CLONE_THREAD) && (cl & CLONE_VFORK)))
+        return SYS_ERR(EINVAL);
 
     aegis_task_t    *parent_task = sched_current();
     if (!parent_task || !parent_task->is_user)
@@ -364,13 +370,10 @@ sys_clone(syscall_frame_t *frame, uint64_t flags, uint64_t child_stack,
     (void)u_rdi; (void)u_rsi; (void)u_rdx;  /* arm64 copies frame->regs[] below */
 #endif
 
-    /* Capability gate: THREAD_CREATE gates CONCURRENT shared-address-space
-     * threads. vfork (CLONE_VM|CLONE_VFORK without CLONE_THREAD) is exempt: the
-     * parent is suspended for the whole window, sibling threads are frozen, and
-     * the child inherits exactly the parent's caps and must exec or _exit
-     * immediately — no concurrency and no authority beyond a plain fork (which
-     * is itself ungated). So vfork is ungated like fork; a bare CLONE_VM thread
-     * still requires THREAD_CREATE. */
+    /* THREAD_CREATE gates concurrent shared-address-space threads. A vfork
+     * child is a separate process with no inherited authority, just like fork.
+     * Its parent and siblings are frozen until exec/_exit. This shared-memory
+     * window is an ABI mechanism, not a sandbox against the borrowing child. */
     int is_vfork = (cl & CLONE_VFORK) && !(cl & CLONE_THREAD);
     if (!is_vfork &&
         cap_check(parent->caps, CAP_TABLE_SIZE,
@@ -409,18 +412,8 @@ sys_clone(syscall_frame_t *frame, uint64_t flags, uint64_t child_stack,
         }
     }
 
-    /* 4. Copy capability table + authenticated flag + bound identity. */
-    uint32_t ci;
-    for (ci = 0; ci < CAP_TABLE_SIZE; ci++)
-        child->caps[ci] = parent->caps[ci];
-    __builtin_memcpy(child->cap_ceiling, parent->cap_ceiling,
-                     sizeof(child->cap_ceiling));
-    child->cap_ceiling_active = parent->cap_ceiling_active;
-    child->authenticated = parent->authenticated;
-    child->admin_session = parent->admin_session;
-    child->admin_session_firstboot = parent->admin_session_firstboot;
-    child->auth_uid      = parent->auth_uid;
-    child->auth_gid      = parent->auth_gid;
+    /* 4. Threads retain their principal; independent/vfork children do not. */
+    init_child_authority(child, parent, (cl & CLONE_THREAD) != 0);
 
     /* 5. Scalar fields. */
     child->brk       = parent->brk;
@@ -438,7 +431,9 @@ sys_clone(syscall_frame_t *frame, uint64_t flags, uint64_t child_stack,
     __builtin_memcpy(child->exe_path, parent->exe_path, sizeof(parent->exe_path));
     __builtin_memcpy(child->cwd, parent->cwd, sizeof(parent->cwd));
     child->pid       = proc_alloc_pid();
-    child->ppid      = parent->pid;
+    /* Threads have their process's parent; new processes belong to the
+     * creator's group, not to the particular thread that called clone. */
+    child->ppid      = (cl & CLONE_THREAD) ? parent->ppid : parent->tgid;
     child->uid       = parent->uid;
     child->gid       = parent->gid;
     child->pgid      = parent->pgid;
@@ -527,7 +522,6 @@ sys_clone(syscall_frame_t *frame, uint64_t flags, uint64_t child_stack,
      * → iretq to user space.  Only difference: when child_stack != 0, use
      * child_stack instead of frame->user_rsp for the iretq RSP slot. */
     uint64_t *sp = (uint64_t *)(kstack + 4 * 4096);
-    uint64_t user_rsp = child_stack ? child_stack : FRAME_SP(frame);
 
 #ifdef __aarch64__
     extern void fork_child_return(void);
@@ -605,54 +599,36 @@ sys_clone(syscall_frame_t *frame, uint64_t flags, uint64_t child_stack,
     /* Update TSS RSP0 for parent (it remains current) */
     arch_set_kernel_stack(parent_task->kernel_stack_top);
 
-    /* 8. Add child to run queue. */
-    sched_add(&child->task);
-    __atomic_fetch_add(&s_fork_count, 1, __ATOMIC_RELAXED);
-
-    /* 9. CLONE_PARENT_SETTID: write child tid to parent's *ptid. */
-    if (cl & CLONE_PARENT_SETTID) {
-        if (user_ptr_valid(ptid, 4)) {
-            uint32_t tid_val = child->pid;
-            vmm_write_user_bytes(parent->pml4_phys, ptid,
-                                 &tid_val, sizeof(tid_val));
-        }
+    /* Finish user stores before publishing a runnable child. copy_to_user
+     * enforces WRITE and breaks COW; the physical-window helper does neither. */
+    uint32_t tid_val = child->pid;
+    if (((cl & CLONE_PARENT_SETTID) &&
+         (!user_ptr_valid(ptid, sizeof(tid_val)) ||
+          copy_to_user((void *)(uintptr_t)ptid, &tid_val, sizeof(tid_val)))) ||
+        ((cl & CLONE_CHILD_SETTID) &&
+         (!user_ptr_valid(ctid, sizeof(tid_val)) ||
+          copy_to_user((void *)(uintptr_t)ctid, &tid_val, sizeof(tid_val))))) {
+        if (cl & CLONE_THREAD) parent->thread_count--;
+        kva_free_pages(kstack, 4);
+        vma_free(child);
+        fd_table_unref(child->fd_table);
+        kva_free_pages(child, 2);
+        return SYS_ERR(EFAULT);
     }
-
-    /* 10. CLONE_CHILD_SETTID: write child tid to child's *ctid.
-     * Same address space (CLONE_VM), so use parent's PML4. */
-    if (cl & CLONE_CHILD_SETTID) {
-        uint32_t tid_val = child->pid;
-        /* ctid is in the child's lazily-mmap'd TLS (shared CLONE_VM space, so
-         * current==parent); fault it in or the tid write is silently dropped. */
-        if (user_ptr_valid(ctid, sizeof(tid_val)))
-            vmm_write_user_bytes(parent->pml4_phys, ctid,
-                                 &tid_val, sizeof(tid_val));
-    }
-
-    /* 11. CLONE_VFORK: block parent until the child leaves the shared address
-     * space. Aegis wakes the vfork parent on child EXIT (the SIGCHLD path in
-     * sched_exit; exec-wake is not implemented), so wait for the child TCB to
-     * become a zombie. Loop because sched_block() may return early (lost-wakeup
-     * guard) — proceeding while the child is still RUNNING would let the parent
-     * run concurrently with a child that still shares its VM. waiting_for is
-     * set so sched_exit's wake scan targets this parent. The `child` TCB stays
-     * valid until the parent reaps it (after this returns), so the read is
-     * safe. */
-    if (cl & CLONE_VFORK) {
-        /* The child borrows our address space (step 2 shared the PML4). Mark it
-         * so the child's execve un-shares (fresh PML4 + vma_table) instead of
-         * freeing OUR pages, and wakes us. Block until the child execs (clears
-         * vfork_parent) or exits (becomes a zombie). Loop: sched_block() may
-         * return early (lost-wakeup guard), and running concurrently while the
-         * child still shares our VM would corrupt both. */
+    if (is_vfork) {
         child->vfork_parent = parent_task;
         parent_task->waiting_for = child->pid;
-        /* Freeze this thread group's OTHER threads for the vfork window so none
-         * of them races the child in the shared address space (the child shares
-         * our PML4 until it execs).  Cleared by the child's execve (before it
-         * wakes us) or by sched_exit if the child dies first.  vfork_freeze_add
-         * is self-locking (takes sched_lock); we do not hold it here. */
         vfork_freeze_add(parent->tgid);
+    }
+    uint32_t child_pid = child->pid;
+    __atomic_fetch_add(&s_fork_count, 1, __ATOMIC_RELAXED);
+    sched_add(&child->task);
+
+    /* 11. CLONE_VFORK: block until exec detaches the borrowed address space
+     * or exit makes the child a zombie. Once thawed, another parent-group
+     * thread can reap it before we resume: retain only its PID, and look the
+     * PCB up under sched_lock on each check. */
+    if (is_vfork) {
         /* Block via sched_block_locked so the condition recheck and the
          * transition to TASK_BLOCKED are ONE critical section under sched_lock,
          * closing the same lost-wakeup window fixed in sys_waitpid: a child that
@@ -666,8 +642,9 @@ sys_clone(syscall_frame_t *frame, uint64_t flags, uint64_t child_stack,
          * iteration.) */
         for (;;) {
             irqflags_t vfl = spin_lock_irqsave(&sched_lock);
-            if (!(child->task.state != TASK_ZOMBIE &&
-                  child->vfork_parent == parent_task)) {
+            aegis_process_t *vp_child = proc_find_by_pid_locked(child_pid);
+            if (!vp_child || vp_child->task.state == TASK_ZOMBIE ||
+                vp_child->vfork_parent != parent_task) {
                 spin_unlock_irqrestore(&sched_lock, vfl);
                 break;
             }
@@ -677,7 +654,7 @@ sys_clone(syscall_frame_t *frame, uint64_t flags, uint64_t child_stack,
         parent_task->waiting_for = 0;
     }
 
-    return (uint64_t)child->pid;
+    return (uint64_t)child_pid;
 }
 
 /*
@@ -713,7 +690,7 @@ sys_vfork(syscall_frame_t *frame, uint64_t u_rdi, uint64_t u_rsi, uint64_t u_rdx
  *
  * Steps:
  *   1. Allocate child PCB via kva.
- *   2. Copy parent fd table, capability table, and scalar fields.
+ *   2. Copy parent fd table, authority constraints, and scalar fields.
  *   3. Create a new PML4 and deep-copy all user pages.
  *   4. Allocate a kernel stack for the child.
  *   5. Build the initial kernel stack frame so ctx_switch resumes at
@@ -754,17 +731,7 @@ sys_fork(syscall_frame_t *frame, uint64_t u_rdi, uint64_t u_rsi, uint64_t u_rdx)
         return SYS_ERR(ENOMEM);   /* -ENOMEM */
     }
 
-    uint32_t ci;
-    for (ci = 0; ci < CAP_TABLE_SIZE; ci++)
-        child->caps[ci] = parent->caps[ci];
-    __builtin_memcpy(child->cap_ceiling, parent->cap_ceiling,
-                     sizeof(child->cap_ceiling));
-    child->cap_ceiling_active = parent->cap_ceiling_active;
-    child->authenticated = parent->authenticated;
-    child->admin_session = parent->admin_session;
-    child->admin_session_firstboot = parent->admin_session_firstboot;
-    child->auth_uid      = parent->auth_uid;
-    child->auth_gid      = parent->auth_gid;
+    init_child_authority(child, parent, 0);
 
     child->vfork_parent    = (void *)0;  /* a forked child owns its own pml4 */
     child->brk             = parent->brk;
@@ -799,7 +766,7 @@ sys_fork(syscall_frame_t *frame, uint64_t u_rdi, uint64_t u_rsi, uint64_t u_rdx)
     child->pid             = proc_alloc_pid();
     child->tgid            = child->pid;
     child->thread_count    = 1;
-    child->ppid            = parent->pid;
+    child->ppid            = parent->tgid;
     child->pgid            = parent->pgid;
     child->sid             = parent->sid;
     child->uid             = parent->uid;
@@ -1059,21 +1026,21 @@ sys_fork(syscall_frame_t *frame, uint64_t u_rdi, uint64_t u_rsi, uint64_t u_rdx)
     /* Update TSS RSP0 for parent (it remains current) */
     arch_set_kernel_stack(parent_task->kernel_stack_top);
 
-    /* 7. Add child to run queue */
-    sched_add(&child->task);
+    /* 7. Add child to run queue. A sibling can reap immediately on SMP, so
+     * capture the return value and account for the child before publication. */
+    uint32_t child_pid = child->pid;
     __atomic_fetch_add(&s_fork_count, 1, __ATOMIC_RELAXED);
+    sched_add(&child->task);
 
     /* Return child PID to parent */
-    return (uint64_t)child->pid;
+    return (uint64_t)child_pid;
 }
 
 /*
  * reap_group_zombies — free the thread zombies a reaped group leader leaves.
  *
- * A thread is waitable by nobody. sys_clone sets ppid to the CREATING thread's
- * pid for CLONE_THREAD too, so a sibling's ppid names another thread of the
- * same group and the `child->ppid == caller->pid` test in sys_waitpid can never
- * match it. Left alone the siblings sit in the task list for the rest of the
+ * A thread is waitable by nobody: waitpid reports process leaders only.
+ * Left alone the siblings sit in the task list for the rest of the
  * boot, each holding a PCB, a kernel stack, a vma reference and one of the
  * MAX_PROCESSES slots — a Go program with four worker threads burned four slots
  * per run, and about sixty runs made clone() return EAGAIN permanently.
@@ -1148,15 +1115,16 @@ reap_group_zombies(uint32_t tgid)
 /*
  * sys_waitpid — syscall 61
  *
- * pid_arg = PID to wait for (-1 = any child)
+ * pid_arg = PID (>0), any child (-1), caller's process group (0), or -pgid
  * wstatus_ptr = user pointer to write exit status (0 = ignored)
  * options = WNOHANG (1) = return 0 immediately if no zombie child
  *
  * Scans the run queue for a zombie child matching the request.
  * On match: writes exit status (if wstatus_ptr != 0), removes zombie from
  * run queue, frees its resources, and returns the child's PID.
- * If no zombie is found and WNOHANG is set: returns 0.
- * If no zombie is found and WNOHANG is not set: blocks until a child exits
+ * If no matching process child exists: returns ECHILD, even with WNOHANG.
+ * Otherwise, if WNOHANG is set: returns 0.
+ * If a matching child exists and WNOHANG is not set: blocks until a child exits
  * (sched_block), then retries via goto.
  */
 uint64_t
@@ -1191,15 +1159,28 @@ retry:;
      * vmm_window_lock, which ranks below sched_lock in the canonical
      * order (sched_lock > all others). */
     irqflags_t fl = spin_lock_irqsave(&sched_lock);
+    int has_child = 0;
     aegis_task_t *t = sched_current()->next;
     while (t != sched_current()) {
         if (t->is_user) {
             aegis_process_t *child = (aegis_process_t *)t;
 
+            /* A process's children are shared by all its threads. CLONE_THREAD
+             * tasks are joined through clear_child_tid/futex, never waitpid. */
+            int matches_pid = pid == -1 ||
+                (pid > 0 && (uint32_t)pid == child->pid) ||
+                (pid == 0 && child->pgid == caller->pgid) ||
+                (pid < -1 && child->pgid == (uint32_t)-(int64_t)pid);
+            if (child->pid != child->tgid ||
+                child->ppid != caller->tgid || !matches_pid) {
+                t = t->next;
+                continue;
+            }
+            has_child = 1;
+
             /* Check for stopped child (WUNTRACED) */
             if (t->state == TASK_STOPPED && (options & WUNTRACED) &&
-                child->ppid == caller->pid &&
-                (pid == -1 || (uint32_t)pid == child->pid)) {
+                child->stop_signum != 0) {
                 uint32_t child_pid   = child->pid;
                 uint32_t stop_signum = child->stop_signum;
                 /* Validate before consuming the stop event so EFAULT
@@ -1254,8 +1235,6 @@ retry:;
 
             /* Check for zombie child (normal reap) */
             if (t->state == TASK_ZOMBIE &&
-                child->ppid == caller->pid &&
-                (pid == -1 || (uint32_t)pid == child->pid) &&
                 !leader_not_reapable) {
                 /* Found a zombie to reap. */
                 uint32_t child_pid = child->pid;
@@ -1279,6 +1258,9 @@ retry:;
                 aegis_task_t *prev = t;
                 while (prev->next != t) prev = prev->next;
                 prev->next = t->next;
+                /* Other waiters must rescan too: the last matching child may
+                 * now be gone, so they owe ECHILD instead of sleeping forever. */
+                sched_wake_child_waiters_locked(caller->tgid);
 
                 /* The process is gone — release its slot in the
                  * MAX_PROCESSES live-process limit.  s_fork_count was a
@@ -1388,8 +1370,15 @@ retry:;
         t = t->next;
     }
 
-    /* No zombie found. */
+    /* Distinguish "no matching child" from "matching child not ready". Keep
+     * this under the same lock as the scan and the blocking transition. */
+    if (!has_child) {
+        sched_current()->waiting_for = 0;
+        spin_unlock_irqrestore(&sched_lock, fl);
+        return SYS_ERR(ECHILD);
+    }
     if (options & WNOHANG) {
+        sched_current()->waiting_for = 0;
         spin_unlock_irqrestore(&sched_lock, fl);
         return 0;
     }
@@ -1405,7 +1394,7 @@ retry:;
      * by the old woken_parent direct-switch grabbing the RUNNING parent — but
      * that direct-switch was the same-task-on-two-CPUs corruption, now correctly
      * gated on on_cpu < 0, which re-exposed this window under smp_sched. */
-    sched_current()->waiting_for = (pid == -1) ? 0 : (uint32_t)pid;
+    sched_current()->waiting_for = (pid > 0) ? (uint32_t)pid : 0;
     sched_block_locked(fl);
     goto retry;
 }

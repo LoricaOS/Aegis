@@ -9,7 +9,15 @@ function = source.split("sys_admin_session(uint64_t on)", 1)[1].split(
     "sys_install_commit", 1
 )[0]
 
-drop = function.index("if (!on)")
+# The drop branch may be spelled with the named syscall selector (current) or
+# the older bare `if (!on)`; both must keep drop reachable regardless of any
+# ceiling, so accept either shape rather than pinning one spelling.
+for opener in ("if (on == AEGIS_ADMIN_SESSION_DROP)", "if (!on)"):
+    if opener in function:
+        drop = function.index(opener)
+        break
+else:
+    raise AssertionError("no admin-session drop branch found")
 drop_return = function.index("return 0;", drop)
 ceiling_reject = function.index("parent->cap_ceiling_active")
 elevate = function.index("parent->admin_session = 1u")

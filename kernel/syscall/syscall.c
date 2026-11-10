@@ -120,7 +120,13 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case  26: num = 294; break;  /* inotify_init1 */
     case  27: num = 254; break;  /* inotify_add_watch */
     case  28: num = 255; break;  /* inotify_rm_watch (unimplemented) */
-    case 220: num = 56;  break;  /* clone */
+    case 220: {                 /* arm64 clone: TLS precedes child_tid */
+        uint64_t tls = arg4;
+        arg4 = arg5;
+        arg5 = tls;
+        num = 56;
+        break;
+    }
     case 221: num = 59;  break;  /* execve */
     case 216: num = 25;  break;  /* mremap (aarch64 __NR_mremap == 216) */
     case 222: num = 9;   break;  /* mmap */
@@ -333,6 +339,7 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 517: return sys_admin_session(arg1);
     case 519: return sys_admin_session_active();  /* Aegis: query own admin session */
     case 520: return sys_cap_rights_limit(arg1, arg2, arg3);
+    case AEGIS_SYS_ADMIN_SELF: return sys_admin_self(); /* explicit credential issuance */
     case 362: return sys_cap_query(arg1, arg2, arg3);
     /* 363 (sys_cap_grant_runtime) removed: retired in Phase 46c, zero callers,
      * and a live "inject a cap into any PID" primitive is attack surface. */

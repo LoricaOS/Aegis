@@ -19,6 +19,7 @@
 #include "kva.h"
 #include "pmm.h"
 #include "printk.h"
+#include "spinlock.h"
 
 /* -- Font data -------------------------------------------------------------
  * 256 glyphs x 16 rows x 1 byte per row = 4096 bytes total.
@@ -287,6 +288,16 @@ static const uint8_t s_font[256 * 16] = {
 /* -- Framebuffer state ----------------------------------------------------- */
 int fb_available = 0;
 static int s_fb_locked = 0;  /* 1 = compositor owns FB, suppress text output */
+/* Leaf lock: printk/TTY/scheduler locks may precede this lock, never the
+ * reverse. No allocation, logging, callbacks or user-memory access while held.
+ * IRQ-save is required: console output can also arrive from interrupt context.
+ * fb_init publishes immutable geometry once, before concurrent console use.
+ * Panic rendering deliberately bypasses this lock (the fault may hold it). */
+static spinlock_t s_text_lock = SPINLOCK_INIT;
+/* Emergency takeover cannot wait for s_text_lock: a fault can hold it.
+ * Stop new normal drawing without changing compositor ownership. An already
+ * active writer on another CPU may finish; panic output is best-effort. */
+static int s_panic_active;
 
 static volatile uint32_t *s_fb_va    = (void *)0;
 /* Shadow buffer: normal WB-cached DRAM copy of the framebuffer.
@@ -301,12 +312,22 @@ static uint32_t           s_cols     = 0;
 static uint32_t           s_rows     = 0;
 static uint32_t           s_col      = 0;
 static uint32_t           s_row      = 0;
+static uint64_t           s_fb_pixels = 0; /* pitch/4 * actual mapped height */
+
+/* Physical address and dimensions — immutable after fb_init, for sys_fb_map.
+ * s_cols/s_rows are the complete 8x16 cells inside these pixel dimensions;
+ * no text operation may use the page-rounded allocation as extra screen. */
+static uint64_t s_fb_phys;
+static uint32_t s_fb_width;
+static uint32_t s_fb_height;
+static uint32_t s_fb_pitch;
 
 /* ANSI CSI escape-sequence state machine.
  * Handles the two sequences emitted by /bin/clear: \033[2J and \033[H. */
 static int  s_esc_state = 0;    /* 0=normal 1=saw_ESC 2=in_CSI */
 static char s_esc_buf[16];
 static int  s_esc_len   = 0;
+static int  s_esc_overflow = 0; /* discard, never execute a truncated sequence */
 
 #define FB_FG  0x00FFFFFFu
 #define FB_BG  0x00000000u
@@ -315,17 +336,31 @@ static int  s_esc_len   = 0;
  * boot-tag parser in kernel/arch/x86_64/arch_mm.c can sanitise the geometry
  * at the source using the identical limits (defense in depth). */
 
+/* Shared bounds for glyphs AND cursor overlays. Use wide offsets and check
+ * the last pixel against the actual pitch*height extent, not mapped padding.
+ * Internal callers hold s_text_lock; coordinates can never escape a cell. */
+static int
+_fb_cell_base(uint32_t row, uint32_t col, uint64_t *base)
+{
+    if (!s_fb_va || row >= s_rows || col >= s_cols)
+        return 0;
+    *base = (uint64_t)row * 16u * s_pitch_px + (uint64_t)col * 8u;
+    return *base + 15u * (uint64_t)s_pitch_px + 8u <= s_fb_pixels;
+}
+
 static void
 _fb_draw_char(uint32_t row, uint32_t col, char c)
 {
+    uint64_t base_px;
+    if (!_fb_cell_base(row, col, &base_px))
+        return;
     const uint8_t *glyph = s_font + ((uint8_t)c) * 16u;
-    uint32_t base_px = row * 16u * s_pitch_px + col * 8u;
     uint32_t y, x;
     for (y = 0; y < 16u; y++) {
         uint8_t bits = glyph[y];
         for (x = 0; x < 8u; x++) {
             uint32_t color = (bits & (0x80u >> x)) ? FB_FG : FB_BG;
-            uint32_t idx   = base_px + y * s_pitch_px + x;
+            uint64_t idx  = base_px + y * s_pitch_px + x;
             if (s_shadow) s_shadow[idx] = color;
             s_fb_va[idx] = color;
         }
@@ -335,8 +370,10 @@ _fb_draw_char(uint32_t row, uint32_t col, char c)
 static void
 _fb_scroll(void)
 {
-    uint32_t row_pixels = 16u * s_pitch_px;
-    uint32_t total      = (s_rows - 1u) * row_pixels;
+    if (!s_rows || !s_cols)
+        return;
+    uint64_t row_pixels = 16u * (uint64_t)s_pitch_px;
+    uint64_t total      = (s_rows - 1u) * row_pixels;
 
     if (s_shadow) {
         /* Fast path: shift shadow in DRAM (WB-cached, fast reads),
@@ -353,7 +390,7 @@ _fb_scroll(void)
                           s_rows * row_pixels * sizeof(uint32_t));
     } else {
         /* Slow fallback (no shadow): scalar loop over WC reads */
-        uint32_t i;
+        uint64_t i;
         for (i = 0; i < total; i++)
             s_fb_va[i] = s_fb_va[i + row_pixels];
         for (i = 0; i < row_pixels; i++)
@@ -361,12 +398,6 @@ _fb_scroll(void)
     }
     s_row = s_rows - 1u;
 }
-
-/* Physical address and dimensions — saved for sys_fb_map */
-static uint64_t s_fb_phys;
-static uint32_t s_fb_width;
-static uint32_t s_fb_height;
-static uint32_t s_fb_pitch;
 
 int
 fb_get_phys_info(uint64_t *phys_out, uint32_t *width_out,
@@ -402,6 +433,7 @@ fb_init(void)
     if (info.width  == 0 || info.width  > FB_MAX_WIDTH  ||
         info.height == 0 || info.height > FB_MAX_HEIGHT ||
         info.pitch  == 0 || info.pitch  > FB_MAX_PITCH  ||
+        (info.pitch & 3u) != 0 ||
         info.pitch < (uint64_t)info.width * 4u) {
         serial_write_string("[FB] WARN: implausible framebuffer geometry, "
                             "ignoring\n");
@@ -425,6 +457,7 @@ fb_init(void)
     s_pitch_px = info.pitch / 4u;
     s_cols     = info.width  / 8u;
     s_rows     = info.height / 16u;
+    s_fb_pixels = (uint64_t)s_pitch_px * info.height;
 
     /* Save physical info for sys_fb_map */
     s_fb_phys   = info.addr;
@@ -482,6 +515,21 @@ _fb_clear_screen(void)
     s_col = 0;
 }
 
+/* Parse decimal parameters without wraparound. No terminal coordinate or
+ * relative movement needs to exceed the maximum supported pixel dimension. */
+static uint32_t
+_fb_csi_number(int *pos)
+{
+    uint32_t n = 0;
+    while (*pos < s_esc_len &&
+           s_esc_buf[*pos] >= '0' && s_esc_buf[*pos] <= '9') {
+        n = n * 10u + (uint32_t)(s_esc_buf[(*pos)++] - '0');
+        if (n > FB_MAX_WIDTH)
+            n = FB_MAX_WIDTH;
+    }
+    return n;
+}
+
 /* _fb_dispatch_csi — called when a CSI sequence final-byte is received.
  * s_esc_buf[0..s_esc_len-1] holds the parameter string; cmd is the
  * final byte ('J', 'H', 'K', …). */
@@ -497,44 +545,35 @@ _fb_dispatch_csi(char cmd)
         /* Cursor position: \033[row;colH (1-indexed, defaults to 1). */
         uint32_t row = 0, col = 0;
         int i = 0;
-        while (i < s_esc_len && s_esc_buf[i] >= '0' && s_esc_buf[i] <= '9')
-            row = row * 10u + (uint32_t)(s_esc_buf[i++] - '0');
+        row = _fb_csi_number(&i);
         if (row > 0) row--;
         if (i < s_esc_len && s_esc_buf[i] == ';') {
             i++;
-            while (i < s_esc_len && s_esc_buf[i] >= '0' && s_esc_buf[i] <= '9')
-                col = col * 10u + (uint32_t)(s_esc_buf[i++] - '0');
+            col = _fb_csi_number(&i);
             if (col > 0) col--;
         }
+        if (i != s_esc_len)
+            return;
         s_row = (row < s_rows) ? row : s_rows - 1u;
         s_col = (col < s_cols) ? col : s_cols - 1u;
     } else if (cmd == 'K') {
         /* Erase in line.  param=0 (default): clear from cursor to EOL. */
+        if (s_esc_len && !(s_esc_len == 1 && s_esc_buf[0] == '0'))
+            return;
         uint32_t c;
         for (c = s_col; c < s_cols; c++)
             _fb_draw_char(s_row, c, ' ');
-    } else if (cmd == 'C') {
-        /* Cursor forward: \033[nC (default n=1). */
-        uint32_t n = 1;
-        if (s_esc_len > 0) {
-            n = 0;
-            for (int i = 0; i < s_esc_len; i++)
-                n = n * 10u + (uint32_t)(s_esc_buf[i] - '0');
-            if (n == 0) n = 1;
-        }
-        s_col += n;
-        if (s_col >= s_cols) s_col = s_cols - 1u;
-    } else if (cmd == 'D') {
-        /* Cursor back: \033[nD (default n=1). */
-        uint32_t n = 1;
-        if (s_esc_len > 0) {
-            n = 0;
-            for (int i = 0; i < s_esc_len; i++)
-                n = n * 10u + (uint32_t)(s_esc_buf[i] - '0');
-            if (n == 0) n = 1;
-        }
-        if (n > s_col) s_col = 0;
-        else s_col -= n;
+    } else if (cmd == 'C' || cmd == 'D') {
+        /* Relative movement, default/zero n=1. Reject non-numeric params. */
+        int i = 0;
+        uint32_t n = _fb_csi_number(&i);
+        if (i != s_esc_len)
+            return;
+        if (!n) n = 1;
+        if (cmd == 'C')
+            s_col += (n < s_cols - s_col) ? n : s_cols - 1u - s_col;
+        else
+            s_col = (n > s_col) ? 0 : s_col - n;
     }
     /* Other sequences are silently ignored. */
 }
@@ -546,11 +585,13 @@ static void
 _fb_draw_cursor(void)
 {
     if (s_cursor_drawn || s_fb_locked) return;
-    uint32_t base = s_row * 16u * s_pitch_px + s_col * 8u;
+    uint64_t base;
+    if (!_fb_cell_base(s_row, s_col, &base))
+        return;
     /* Draw underline on last 2 scanlines of the cell */
     for (uint32_t y = 14; y < 16; y++)
         for (uint32_t x = 0; x < 8; x++) {
-            uint32_t idx = base + y * s_pitch_px + x;
+            uint64_t idx = base + y * s_pitch_px + x;
             if (s_shadow) s_shadow[idx] = FB_FG;
             s_fb_va[idx] = FB_FG;
         }
@@ -561,28 +602,62 @@ static void
 _fb_erase_cursor(void)
 {
     if (!s_cursor_drawn) return;
+    s_cursor_drawn = 0;
     /* Redraw the character cell at cursor position to erase the underline */
-    uint32_t base = s_row * 16u * s_pitch_px + s_col * 8u;
+    uint64_t base;
+    if (!_fb_cell_base(s_row, s_col, &base))
+        return;
     for (uint32_t y = 14; y < 16; y++)
         for (uint32_t x = 0; x < 8; x++) {
-            uint32_t idx = base + y * s_pitch_px + x;
+            uint64_t idx = base + y * s_pitch_px + x;
             if (s_shadow) s_shadow[idx] = FB_BG;
             s_fb_va[idx] = FB_BG;
         }
-    s_cursor_drawn = 0;
 }
 
-void
-fb_putchar(char c)
+/* All helpers below run under s_text_lock, including escape/control paths,
+ * cursor erase/draw and scrolling. No writer can observe the transient
+ * s_row == s_rows between a bottom-row newline/wrap and the scroll. */
+static void
+_fb_newline(void)
 {
-    if (!fb_available || s_fb_locked) return;
+    s_col = 0;
+    if (++s_row >= s_rows)
+        _fb_scroll();
+}
+
+static void
+_fb_put_glyph(char c)
+{
+    _fb_draw_char(s_row, s_col, c);
+    if (++s_col >= s_cols)
+        _fb_newline();
+}
+
+static void
+_fb_putchar_locked(char c)
+{
+    if (!fb_available || s_fb_locked ||
+        __atomic_load_n(&s_panic_active, __ATOMIC_ACQUIRE) ||
+        !s_cols || !s_rows) return;
     _fb_erase_cursor();
 
     /* ANSI CSI state machine */
+    if (c == '\033') {
+        s_esc_state = 1;
+        _fb_draw_cursor();
+        return;
+    }
+    if (c == '\030' || c == '\032') { /* CAN/SUB cancel a partial sequence */
+        s_esc_state = 0;
+        _fb_draw_cursor();
+        return;
+    }
     if (s_esc_state == 1) {
         if (c == '[') {
             s_esc_state = 2;
             s_esc_len   = 0;
+            s_esc_overflow = 0;
         } else {
             s_esc_state = 0;
         }
@@ -593,24 +668,21 @@ fb_putchar(char c)
         if ((c >= '0' && c <= '9') || c == ';') {
             if (s_esc_len < 15)
                 s_esc_buf[s_esc_len++] = c;
+            else
+                s_esc_overflow = 1;
             _fb_draw_cursor();
             return;
         }
         s_esc_state     = 0;
         s_esc_buf[s_esc_len] = '\0';
-        _fb_dispatch_csi(c);
-        _fb_draw_cursor();
-        return;
-    }
-    if (c == '\033') {
-        s_esc_state = 1;
+        if (!s_esc_overflow)
+            _fb_dispatch_csi(c);
         _fb_draw_cursor();
         return;
     }
 
     if (c == '\n') {
-        s_col = 0;
-        s_row++;
+        _fb_newline();
     } else if (c == '\r') {
         s_col = 0;
     } else if (c == '\b') {
@@ -618,18 +690,23 @@ fb_putchar(char c)
             s_col--;
             _fb_draw_char(s_row, s_col, ' ');
         }
-    } else {
-        _fb_draw_char(s_row, s_col, c);
-        s_col++;
-        if (s_col >= s_cols) {
-            s_col = 0;
-            s_row++;
-        }
+    } else if (c == '\t') {
+        uint32_t spaces = 8u - (s_col & 7u);
+        while (spaces--)
+            _fb_put_glyph(' ');
+    } else if ((uint8_t)c >= 0x20u && c != '\177') {
+        _fb_put_glyph(c);
     }
 
-    if (s_row >= s_rows)
-        _fb_scroll();
     _fb_draw_cursor();
+}
+
+void
+fb_putchar(char c)
+{
+    irqflags_t flags = spin_lock_irqsave(&s_text_lock);
+    _fb_putchar_locked(c);
+    spin_unlock_irqrestore(&s_text_lock, flags);
 }
 
 void
@@ -642,14 +719,20 @@ fb_write_string(const char *s)
 void
 fb_lock_compositor(void)
 {
+    irqflags_t flags = spin_lock_irqsave(&s_text_lock);
+    _fb_erase_cursor();
     s_fb_locked = 1;
+    spin_unlock_irqrestore(&s_text_lock, flags);
 }
 
 void
 fb_heartbeat(void)
 {
-    if (!fb_available || s_fb_va == (void *)0 || s_pitch_px == 0)
-        return;
+    irqflags_t flags = spin_lock_irqsave(&s_text_lock);
+    if (!fb_available || s_fb_locked ||
+        __atomic_load_n(&s_panic_active, __ATOMIC_ACQUIRE) ||
+        !s_fb_va || !s_pitch_px)
+        goto out;
     /* Toggle a 4x4 block in the top-left corner between green and black.
      * Called from sched_tick (~100Hz). Visible change every ~50 ticks. */
     static uint32_t counter = 0;
@@ -659,6 +742,8 @@ fb_heartbeat(void)
     for (y = 0; y < 4 && y < s_fb_height; y++)
         for (x = 0; x < 4 && x < s_fb_width; x++)
             s_fb_va[y * s_pitch_px + x] = color;
+out:
+    spin_unlock_irqrestore(&s_text_lock, flags);
 }
 
 #ifdef __x86_64__

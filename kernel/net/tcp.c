@@ -83,13 +83,16 @@ static spinlock_t tcp_lock = SPINLOCK_INIT;
  * slot goes active and then kept for the life of the table — so a raw memset
  * would NULL a reused slot's buffers and the next data op would dereference
  * NULL. A never-yet-used slot has NULL buffers here (preserved as NULL); its
- * claim site attaches them. Every claim site (tcp_alloc, tcp_listen,
- * tcp_connect) must go through this, never a bare kmemset(&s_tcp[i], ...). */
+ * completed passive handshake or outbound connect attaches them. Every claim
+ * site (tcp_alloc, tcp_listen, tcp_connect) must go through this, never a bare
+ * kmemset(&s_tcp[i], ...). */
 static void tcp_claim_slot(uint32_t i)
 {
+    uint64_t generation = s_tcp[i].generation + 1;
     uint8_t *rb = s_tcp[i].rbuf;
     uint8_t *sb = s_tcp[i].sbuf;
     kmemset(&s_tcp[i], 0, sizeof(s_tcp[i]));
+    s_tcp[i].generation = generation;
     s_tcp[i].rbuf = rb;
     s_tcp[i].sbuf = sb;
     /* NOT zero: 0 is a perfectly valid socket id (s_socks[0]), so a memset
@@ -108,9 +111,9 @@ void tcp_init(void)
      * up front (~41 MB resident before a single packet moves, and a boot-time
      * panic on any machine too small to satisfy it, even with the network
      * unused).  Each slot's rbuf/sbuf are now attached on demand the first time
-     * the slot goes active (tcp_attach_buffers, from tcp_alloc/tcp_connect) and
-     * kept for reuse, so peak residency tracks peak concurrent connections and
-     * an idle/network-less system pays nothing. */
+     * a passive handshake completes, or a local caller requests an outbound
+     * connect. Rings are kept for reuse; half-open SYNs never grow this pool,
+     * even after timeout. An idle/network-less system pays nothing. */
     kmemset(s_tcp, 0, sizeof(s_tcp));
 }
 
@@ -410,35 +413,31 @@ static tcp_conn_t *tcp_alloc(void)
     for (i = 0; i < TCP_MAX_CONNS; i++) {
         if (s_tcp[i].state == TCP_CLOSED) {
             tcp_claim_slot((uint32_t)i);
-            if (tcp_attach_buffers(&s_tcp[i]) < 0)
-                return NULL;
             return &s_tcp[i];
         }
     }
     return NULL;
 }
 
-/* tcp_conn_abort — RST the peer and free the conn slot. Used when a handshake
- * has completed but the connection can never be delivered to accept() (the
- * listener's backlog is full or the listener vanished). Leaving such a conn
- * ESTABLISHED leaks its s_tcp[] slot forever: an ESTABLISHED conn with no
- * queued data arms no retransmit timer, so nothing ever reaps it, and the table
- * is shared with every outbound connect() — a peer completing many handshakes
- * to a slow/non-accepting listener would exhaust it (remote DoS). Acquires
- * tcp_lock; must be called OUTSIDE it (respects sock_lock > tcp_lock: callers
- * invoke it after sock_get has released sock_lock). */
-static void tcp_conn_abort(uint32_t conn_id)
+/* No reassembly queue: accept only a whole in-order payload that fits.
+ * Shared by ESTABLISHED and FIN_WAIT_1/2: closing our send side does not close
+ * the peer's send side. FIN is at seq + len, and may only be consumed AFTER
+ * this advances rcv_nxt (or if duplicate payload already ends at rcv_nxt). */
+static uint16_t tcp_receive_payload(tcp_conn_t *conn, uint32_t seq,
+                                    const uint8_t *payload, uint16_t len)
 {
-    irqflags_t fl = spin_lock_irqsave(&tcp_lock);
-    if (conn_id < TCP_MAX_CONNS) {
-        tcp_conn_t *c = &s_tcp[conn_id];
-        if (c->state != TCP_CLOSED) {
-            if (c->dev)
-                tcp_send_segment(c->dev, c, TCP_RST | TCP_ACK, NULL, 0);
-            c->state = TCP_CLOSED;   /* slot reclaimable by tcp_alloc */
-        }
-    }
-    spin_unlock_irqrestore(&tcp_lock, fl);
+    if (!len || seq != conn->rcv_nxt) return 0;
+    uint32_t used = (conn->rbuf_tail - conn->rbuf_head) & (TCP_RBUF_SIZE - 1);
+    if (len > (TCP_RBUF_SIZE - 1) - used) return 0;
+    uint32_t off = conn->rbuf_tail & (TCP_RBUF_SIZE - 1);
+    uint32_t first = TCP_RBUF_SIZE - off;
+    if (first > len) first = len;
+    __builtin_memcpy(conn->rbuf + off, payload, first);
+    if (first < len)
+        __builtin_memcpy(conn->rbuf, payload + first, len - first);
+    conn->rbuf_tail += len;
+    conn->rcv_nxt += len;
+    return len;
 }
 
 /* wake_poll_waiters — wake any sys_poll / sys_epoll_wait registered on
@@ -473,10 +472,6 @@ void tcp_rx(netdev_t *dev, ip4_addr_t src_ip, ip4_addr_t dst_ip,
      * we mark it SOCK_CLOSED, so getsockopt(SO_ERROR)/poll can detect the
      * failure.  Done in the post-unlock section (sock_lock > tcp_lock). */
     uint32_t connect_fail_sock_id = SOCK_NONE;
-    /* Deferred accept queue push (SYN_RCVD → ESTABLISHED). */
-    uint32_t accept_listener_id = SOCK_NONE;
-    uint32_t accept_conn_id = 0;
-
     tcp_pseudo_hdr_t ph;
     ph.src     = src_ip;
     ph.dst     = dst_ip;
@@ -546,7 +541,7 @@ void tcp_rx(netdev_t *dev, ip4_addr_t src_ip, ip4_addr_t dst_ip,
              * SOCK_NONE (not the 0 that tcp_claim_slot zeroes it to) so the
              * `sock_id != SOCK_NONE` wake guards don't fire a spurious
              * sock_wake(0)/epoll_notify(0) on slot 0. accept() assigns the
-             * real id via tcp_conn_set_sock. */
+             * real id via tcp_accept. */
             conn->sock_id     = SOCK_NONE;
             /* RFC 7323: enable window scaling on this connection only if the
              * incoming SYN carried a Window Scale option.  If so, record the
@@ -604,20 +599,33 @@ void tcp_rx(netdev_t *dev, ip4_addr_t src_ip, ip4_addr_t dst_ip,
             break;
         }
         if ((flags & TCP_ACK) && !(flags & TCP_SYN)) {
-            if (ack == conn->snd_nxt) {
-                conn->snd_una  = ack;
-                conn->state    = TCP_ESTABLISHED;
-                printk("[TCP] ESTABLISHED port=%u\n", (uint32_t)conn->local_port);
-                conn->retransmit_at = 0;
-                /* Defer accept() queue push + wake to after tcp_lock release */
-                if (conn->listener_id != SOCK_NONE) {
-                    accept_listener_id = conn->listener_id;
-                    accept_conn_id = (uint32_t)(conn - s_tcp);
+            if (ack == conn->snd_nxt && seq == conn->rcv_nxt) {
+                tcp_conn_t *listener = tcp_find_listener(conn->local_ip,
+                                                         conn->local_port);
+                /* Do not allocate large rings for an unauthenticated SYN, a
+                 * guessed final ACK, or a connection accept cannot deliver.
+                 * Failed attachment rolls back both rings and reclaims the
+                 * half-open slot without publishing an established conn. */
+                if (!listener || listener->sock_id != conn->listener_id ||
+                    (uint8_t)(listener->accept_tail - listener->accept_head) >= 8 ||
+                    tcp_attach_buffers(conn) < 0) {
+                    tcp_send_segment(dev, conn, TCP_RST | TCP_ACK, NULL, 0);
+                    conn->state = TCP_CLOSED;
+                    conn->retransmit_at = 0;
+                } else {
+                    conn->snd_una = ack;
+                    conn->state = TCP_ESTABLISHED;
+                    conn->retransmit_at = 0;
+                    printk("[TCP] ESTABLISHED port=%u\n", (uint32_t)conn->local_port);
+                    unsigned slot = listener->accept_tail++ & 7;
+                    listener->accept_queue[slot] = (uint32_t)(conn - s_tcp);
+                    listener->accept_generation[slot] = conn->generation;
                     if (wake_count < TCP_RX_WAKE_MAX) {
                         wake_ids[wake_count] = conn->listener_id;
-                        wake_epoll_events[wake_count] = EPOLLIN;
-                        wake_count++;
+                        wake_epoll_events[wake_count++] = EPOLLIN;
                     }
+                    /* A final ACK can also carry the first data and FIN. */
+                    goto established;
                 }
             }
         }
@@ -691,6 +699,7 @@ void tcp_rx(netdev_t *dev, ip4_addr_t src_ip, ip4_addr_t dst_ip,
         break;
 
     case TCP_ESTABLISHED:
+    established:
         if (flags & TCP_ACK) {
             /* RFC 793 §3.9 / RFC 5961 §5: a valid ACK acks data we actually
              * sent — SND.UNA < SEG.ACK <= SND.NXT. An ACK above SND.NXT
@@ -741,37 +750,10 @@ void tcp_rx(netdev_t *dev, ip4_addr_t src_ip, ip4_addr_t dst_ip,
             }
         }
         if (payload_len > 0) {
-            if (seq == conn->rcv_nxt) {
-                /* In-order data. Reserve one byte: max usable ring capacity is
-                 * TCP_RBUF_SIZE - 1. Without this, a segment that fills the ring
-                 * to EXACTLY TCP_RBUF_SIZE bytes makes used mask to 0 (aliases
-                 * empty), and subsequent writes overwrite unread data while
-                 * rcv_nxt advances (silent stream corruption). Matches the
-                 * advertised-window calc in tcp_send_segment and the AF_UNIX
-                 * reserve-one-byte scheme. */
-                uint32_t used  = (conn->rbuf_tail - conn->rbuf_head) & (TCP_RBUF_SIZE - 1);
-                uint32_t space = (TCP_RBUF_SIZE - 1) - used;
-                if (payload_len <= space) {
-                    /* Two-segment memcpy into the power-of-two ring (was a byte
-                     * loop). rbuf_tail stays free-running; only the physical
-                     * index wraps. payload is a kernel buffer (RX frame copy). */
-                    uint32_t toff  = conn->rbuf_tail & (TCP_RBUF_SIZE - 1);
-                    uint32_t first = TCP_RBUF_SIZE - toff;
-                    if (first > payload_len) first = payload_len;
-                    __builtin_memcpy(&conn->rbuf[toff], payload, first);
-                    if (first < payload_len)
-                        __builtin_memcpy(&conn->rbuf[0], payload + first,
-                                         payload_len - first);
-                    conn->rbuf_tail += payload_len;
-                    conn->rcv_nxt += payload_len;
-                    /* Defer recv() wake */
-                    if (conn->sock_id != SOCK_NONE &&
-                        wake_count < TCP_RX_WAKE_MAX) {
-                        wake_ids[wake_count] = conn->sock_id;
-                        wake_epoll_events[wake_count] = EPOLLIN;
-                        wake_count++;
-                    }
-                }
+            if (tcp_receive_payload(conn, seq, payload, payload_len) &&
+                conn->sock_id != SOCK_NONE && wake_count < TCP_RX_WAKE_MAX) {
+                wake_ids[wake_count] = conn->sock_id;
+                wake_epoll_events[wake_count++] = EPOLLIN;
             }
             /* ACK every data segment. In-order data advances the cumulative ACK;
              * an out-of-order (gap) or already-received (retransmitted) segment
@@ -882,7 +864,12 @@ void tcp_rx(netdev_t *dev, ip4_addr_t src_ip, ip4_addr_t dst_ip,
         break;
 
     case TCP_FIN_WAIT_1:
-        if (flags & TCP_ACK) {
+    case TCP_FIN_WAIT_2:
+        if ((flags & TCP_ACK) && seq_gt(ack, conn->snd_nxt)) {
+            tcp_send_segment(dev, conn, TCP_ACK, NULL, 0);
+            break;
+        }
+        if (conn->state == TCP_FIN_WAIT_1 && (flags & TCP_ACK)) {
             /* Free any acked data and slide SND.UNA forward.  snd_nxt here is
              * one past our FIN, so our FIN is fully acked only when
              * ack == snd_nxt.  A peer may ack our remaining data first
@@ -898,47 +885,38 @@ void tcp_rx(netdev_t *dev, ip4_addr_t src_ip, ip4_addr_t dst_ip,
                 conn->snd_una     = ack;
             }
             if (ack == conn->snd_nxt) {
-                /* Our FIN is acknowledged. */
+                /* Our FIN is acknowledged.  Nothing remains to retransmit, so
+                 * retransmit_at stays 0 — but the state must still be bounded:
+                 * arm the FIN_WAIT_2 reclamation deadline (see tcp_tick). */
                 conn->retransmit_at    = 0;
                 conn->retransmit_count = 0;
-                if (flags & TCP_FIN) {
-                    /* This segment both ACKs our FIN and carries the peer's
-                     * FIN → straight to TIME_WAIT (not CLOSING; CLOSING is only
-                     * for when our FIN is still unacked).  Ack the peer's FIN
-                     * and start the 2MSL timer. */
-                    conn->rcv_nxt++;
-                    conn->state       = TCP_TIME_WAIT;
-                    conn->timewait_at = (uint32_t)arch_get_ticks()
-                                        + TCP_TIMEWAIT_TICKS;
-                    tcp_send_segment(dev, conn, TCP_ACK, NULL, 0);
-                    if (conn->sock_id != SOCK_NONE &&
-                        wake_count < TCP_RX_WAKE_MAX) {
-                        wake_ids[wake_count] = conn->sock_id;
-                        wake_epoll_events[wake_count] = EPOLLHUP;
-                        wake_count++;
-                    }
-                } else {
-                    conn->state = TCP_FIN_WAIT_2;
-                }
-                break;
+                conn->state = TCP_FIN_WAIT_2;
+                conn->finwait2_at = (uint32_t)arch_get_ticks() + TCP_FINWAIT2_TICKS;
             }
         }
-        if (flags & TCP_FIN) {
-            /* Peer's FIN arrived but our FIN is NOT yet acked (simultaneous
-             * close) → CLOSING.  We remain responsible for retransmitting our
-             * unacked FIN until it is acked, at which point CLOSING →
-             * TIME_WAIT. */
-            conn->rcv_nxt++;
-            conn->state = TCP_CLOSING;
+        if (payload_len > 0) {
+            if (tcp_receive_payload(conn, seq, payload, payload_len) &&
+                conn->sock_id != SOCK_NONE && wake_count < TCP_RX_WAKE_MAX) {
+                wake_ids[wake_count] = conn->sock_id;
+                wake_epoll_events[wake_count++] = EPOLLIN;
+            }
             tcp_send_segment(dev, conn, TCP_ACK, NULL, 0);
         }
-        break;
-
-    case TCP_FIN_WAIT_2:
         if (flags & TCP_FIN) {
+            /* Same rule as ESTABLISHED: FIN follows the payload in sequence
+             * space. Do not consume it over a gap or unbuffered payload. */
+            if (seq + payload_len != conn->rcv_nxt) {
+                tcp_send_segment(dev, conn, TCP_ACK, NULL, 0);
+                break;
+            }
             conn->rcv_nxt++;
-            conn->state       = TCP_TIME_WAIT;
-            conn->timewait_at = (uint32_t)arch_get_ticks() + TCP_TIMEWAIT_TICKS;
+            if (conn->state == TCP_FIN_WAIT_2) {
+                conn->state = TCP_TIME_WAIT;
+                conn->timewait_at = (uint32_t)arch_get_ticks() + TCP_TIMEWAIT_TICKS;
+            } else {
+                /* Simultaneous close: keep retransmitting our unacked FIN. */
+                conn->state = TCP_CLOSING;
+            }
             tcp_send_segment(dev, conn, TCP_ACK, NULL, 0);
             if (conn->sock_id != SOCK_NONE &&
                 wake_count < TCP_RX_WAKE_MAX) {
@@ -985,6 +963,17 @@ void tcp_rx(netdev_t *dev, ip4_addr_t src_ip, ip4_addr_t dst_ip,
         }
         break;
 
+    case TCP_TIME_WAIT:
+        /* RFC 793 §3.9: a retransmitted FIN must still be acknowledged.  Our
+         * earlier ACK may have been lost; silently ignoring the repeat makes
+         * the peer retransmit until it gives up (and report an error).
+         * Duplicate data was already ACKed, and an RST here is ignored.  The
+         * 2MSL deadline is deliberately NOT extended, so an attacker replaying
+         * a FIN cannot pin the slot in TIME_WAIT. */
+        if ((flags & TCP_FIN) && !(flags & TCP_RST))
+            tcp_send_segment(dev, conn, TCP_ACK, NULL, 0);
+        break;
+
     default:
         break;
     }
@@ -1010,24 +999,6 @@ out:
         if (sk && sk->state == SOCK_CONNECTING) sk->state = SOCK_CLOSED;
     }
 
-    /* Accept queue push for SYN_RCVD → ESTABLISHED. */
-    if (accept_listener_id != SOCK_NONE) {
-        sock_t *ls = sock_get(accept_listener_id);
-        int queued = 0;
-        if (ls) {
-            uint8_t next_tail = (uint8_t)((ls->accept_tail + 1) & 7);
-            if (next_tail != ls->accept_head) {
-                ls->accept_queue[ls->accept_tail] = accept_conn_id;
-                ls->accept_tail = next_tail;
-                queued = 1;
-            }
-        }
-        /* Backlog full or listener gone: abort instead of leaking an ESTABLISHED
-         * slot nobody will ever accept (see tcp_conn_abort). sock_get has already
-         * released sock_lock, so taking tcp_lock here honors sock_lock > tcp_lock. */
-        if (!queued)
-            tcp_conn_abort(accept_conn_id);
-    }
 
     {
         uint32_t w;
@@ -1066,6 +1037,30 @@ void tcp_tick(void)
             if ((int32_t)(now - c->timewait_at) >= 0) {
                 c->state = TCP_CLOSED;
                 /* Wake any sys_poll / sys_epoll_wait watcher. */
+                if (c->sock_id != SOCK_NONE &&
+                    tick_wake_count < TCP_TICK_WAKE_MAX) {
+                    tick_wake_ids[tick_wake_count++] = c->sock_id;
+                }
+            }
+            continue;
+        }
+
+        if (c->state == TCP_FIN_WAIT_2) {
+            /* Our FIN is acked; retransmit_at is deliberately 0 because there
+             * is nothing to resend.  Without this deadline a peer that never
+             * sends its own FIN pinned the slot — and its rbuf/sbuf ring pair
+             * (TCP_RBUF_SIZE + TCP_SBUF_SIZE) — for the rest of the boot: 128
+             * of those exhaust the whole connection table and the TCP buffer
+             * pool.  It is remotely reachable with no credentials (connect to
+             * any service that closes first, ACK its FIN, then stay silent),
+             * and close() does not free it because tcp_conn_close is a no-op
+             * outside ESTABLISHED/CLOSE_WAIT.  RFC 1122 §4.2.2.13 requires the
+             * state to be time-bounded.  The deadline is not extended by
+             * inbound traffic, so replaying a FIN cannot pin the slot. */
+            if ((int32_t)(now - c->finwait2_at) >= 0) {
+                c->state = TCP_CLOSED;
+                /* Same wake as TIME_WAIT expiry: a blocked reader waits on
+                 * poll_waiters and must re-run its peek to observe EOF. */
                 if (c->sock_id != SOCK_NONE &&
                     tick_wake_count < TCP_TICK_WAKE_MAX) {
                     tick_wake_ids[tick_wake_count++] = c->sock_id;
@@ -1264,7 +1259,7 @@ tcp_listen(uint16_t port, uint32_t sock_id)
  * still SYN_RCVD), and closing the listener discards that queue, so nothing
  * would ever close them and each leaks an s_tcp[] slot. They are identified by
  * sock_id == SOCK_NONE, which is precisely "no socket owns this yet" — accept()
- * assigns the real id via tcp_conn_set_sock, so an ALREADY-ACCEPTED connection
+ * assigns the real id via tcp_accept, so an ALREADY-ACCEPTED connection
  * fails that test and is left untouched. That distinction is load-bearing:
  * listener_id is never cleared on accept, so matching on it alone would RST
  * live, accepted connections out from under their owners when the listener
@@ -1286,8 +1281,7 @@ tcp_unlisten(uint32_t owner, uint16_t port)
         if (s_tcp[i].listener_id != owner) continue;
         if (s_tcp[i].sock_id != SOCK_NONE) continue;  /* accepted — not ours */
         /* Never delivered to a socket: RST the peer rather than leave it
-         * believing an ESTABLISHED connection survives (same reasoning as
-         * tcp_conn_abort, inlined here to keep one tcp_lock acquisition). */
+         * believing an ESTABLISHED connection survives (abort while holding tcp_lock). */
         if (s_tcp[i].dev)
             tcp_send_segment(s_tcp[i].dev, &s_tcp[i], TCP_RST | TCP_ACK, NULL, 0);
         s_tcp[i].state = TCP_CLOSED;
@@ -1295,7 +1289,10 @@ tcp_unlisten(uint32_t owner, uint16_t port)
     spin_unlock_irqrestore(&tcp_lock, fl);
 }
 
-/* tcp_connect: send SYN, allocate conn. Returns 0 on success. */
+/* tcp_connect: send SYN, allocate conn. Returns 0 on success.
+ * Unlike remote passive opens, this is an explicit local request: reserve
+ * rings before the SYN so allocation failure is reported synchronously as
+ * ENOMEM, and a SYN-ACK can always enter ESTABLISHED with usable rings. */
 int
 tcp_connect(uint32_t sock_id, ip4_addr_t dst_ip, uint16_t dst_port,
             uint32_t *conn_id_out)
@@ -1632,25 +1629,60 @@ tcp_conn_close(uint32_t sock_id, uint32_t conn_id)
     return 0;
 }
 
-/* tcp_conn_get_addr: fill remote/local address. */
-void
-tcp_conn_get_addr(uint32_t conn_id, ip4_addr_t *rip, uint16_t *rport,
-                  ip4_addr_t *lip, uint16_t *lport)
+/* An accepted connection that could not be published has no user to finish
+ * a FIN handshake. Release it immediately, checking ownership before reset. */
+void tcp_conn_abort(uint32_t sock_id, uint32_t conn_id)
 {
-    if (conn_id >= TCP_MAX_CONNS) return;
-    tcp_conn_t *c = &s_tcp[conn_id];
-    if (rip)   *rip   = c->remote_ip;
-    if (rport) *rport = c->remote_port;
-    if (lip)   *lip   = c->local_ip;
-    if (lport) *lport = c->local_port;
+    irqflags_t fl = spin_lock_irqsave(&tcp_lock);
+    tcp_conn_t *c = tcp_conn_owned_locked(conn_id, sock_id);
+    if (!c || c->state == TCP_CLOSED) {
+        spin_unlock_irqrestore(&tcp_lock, fl);
+        return;
+    }
+    tcp_conn_t wire = *c;
+    c->state = TCP_CLOSED;
+    spin_unlock_irqrestore(&tcp_lock, fl);
+    tcp_send_segment(wire.dev, &wire, TCP_RST | TCP_ACK, NULL, 0);
 }
 
-/* tcp_conn_set_sock: update sock_id back-reference after accept. */
-void
-tcp_conn_set_sock(uint32_t conn_id, uint32_t sock_id)
+static tcp_conn_t *tcp_listener_locked(uint32_t sock_id)
 {
-    if (conn_id >= TCP_MAX_CONNS) return;
-    s_tcp[conn_id].sock_id = sock_id;
+    for (unsigned i = 0; i < TCP_MAX_CONNS; i++)
+        if (s_tcp[i].state == TCP_LISTEN && s_tcp[i].sock_id == sock_id)
+            return &s_tcp[i];
+    return NULL;
+}
+
+int tcp_accept_ready(uint32_t listener_id)
+{
+    irqflags_t fl = spin_lock_irqsave(&tcp_lock);
+    tcp_conn_t *listener = tcp_listener_locked(listener_id);
+    int ready = listener && listener->accept_head != listener->accept_tail;
+    spin_unlock_irqrestore(&tcp_lock, fl);
+    return ready;
+}
+
+int tcp_accept(uint32_t listener_id, uint32_t sock_id, tcp_conn_t *out)
+{
+    irqflags_t fl = spin_lock_irqsave(&tcp_lock);
+    tcp_conn_t *listener = tcp_listener_locked(listener_id);
+    int result = -EAGAIN;
+    while (listener && listener->accept_head != listener->accept_tail) {
+        unsigned slot = listener->accept_head++ & 7;
+        uint32_t id = listener->accept_queue[slot];
+        if (id >= TCP_MAX_CONNS) continue;
+        tcp_conn_t *c = &s_tcp[id];
+        if (c->generation != listener->accept_generation[slot] ||
+            c->listener_id != listener_id || c->sock_id != SOCK_NONE ||
+            (c->state != TCP_ESTABLISHED && c->state != TCP_CLOSE_WAIT))
+            continue;
+        c->sock_id = sock_id;
+        *out = *c;
+        result = (int)id;
+        break;
+    }
+    spin_unlock_irqrestore(&tcp_lock, fl);
+    return result;
 }
 
 /* tcp_conn_get: return pointer to tcp_conn_t for conn_id, or NULL if invalid. */

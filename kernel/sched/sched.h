@@ -11,6 +11,8 @@
 extern uint8_t g_use_xsave;
 #endif
 
+extern spinlock_t sched_lock;
+
 #define TASK_RUNNING  0U
 #define TASK_BLOCKED  1U
 #define TASK_ZOMBIE   2U
@@ -321,6 +323,10 @@ void sched_wake(aegis_task_t *task);
 /* sched_wake_locked — same as sched_wake but caller already holds sched_lock.
  * Used by sched_exit -> signal_send_pid_locked -> sched_wake_locked. */
 void sched_wake_locked(aegis_task_t *task);
+
+/* Child state/reap event: wake all blocked threads in the parent process.
+ * Caller holds sched_lock, as does waitpid's scan/block transition. */
+void sched_wake_child_waiters_locked(uint32_t parent_tgid);
 
 /* sched_dequeue_locked — remove a task from the RUNNING-only run queue.
  * Caller must hold sched_lock.  Idempotent (no-op if not queued).

@@ -1749,8 +1749,7 @@ xhci_eth_rx_complete(uint32_t len)
     uint32_t i;
     /* We're in the PIT ISR. Tell arp_resolve (reachable via a synchronous reply
      * inside netdev_rx_deliver) to use its non-blocking path. */
-    int prev_inpoll = g_in_isr_poll;
-    g_in_isr_poll = 1;
+    __atomic_fetch_add(&g_in_isr_poll, 1, __ATOMIC_SEQ_CST);
     for (i = 0; i < pkt_cnt; i++, pkt_hdr += 4) {
         uint32_t h       = le32(pkt_hdr);
         uint32_t pkt_len = (h >> 16) & 0x1FFFu;
@@ -1765,7 +1764,7 @@ xhci_eth_rx_complete(uint32_t len)
         s_eth.rx_frames++;
         data += padded; remain -= padded;
     }
-    g_in_isr_poll = prev_inpoll;
+    __atomic_fetch_sub(&g_in_isr_poll, 1, __ATOMIC_SEQ_CST);
 }
 
 /* usb_eth_send — netdev TX (spec §7): prepend an 8-byte header (frame_len,

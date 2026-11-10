@@ -187,8 +187,11 @@ sys_rt_sigreturn(syscall_frame_t *frame)
         __builtin_unreachable();
     }
     rt_sigframe_t sf;
-    copy_from_user(&sf, (const void *)(uintptr_t)sigframe_addr,
-                   sizeof(sf));
+    if (copy_from_user(&sf, (const void *)(uintptr_t)sigframe_addr,
+                       sizeof(sf))) {
+        sched_exit();
+        __builtin_unreachable();
+    }
 
     /* Restore interrupted execution context */
 #ifdef __aarch64__
@@ -202,7 +205,7 @@ sys_rt_sigreturn(syscall_frame_t *frame)
 
     /* SECURITY (X1 equivalent): the restored PC must be a user address —
      * a crafted frame must not make the kernel ERET into the higher half. */
-    if (FRAME_IP(frame) > USER_ADDR_MAX) {
+    if (FRAME_IP(frame) > USER_ADDR_MAX || FRAME_SP(frame) > USER_ADDR_MAX) {
         sched_exit(); /* kernel PC in sigframe — kill the process */
         __builtin_unreachable();
     }
@@ -252,7 +255,7 @@ sys_rt_sigreturn(syscall_frame_t *frame)
 
     /* SECURITY (X1): restored RIP must be canonical user space — a crafted
      * frame must not iretq into the kernel half (CVE-2014-4699 class). */
-    if (cs.rip > 0x00007FFFFFFFFFFF) {
+    if (cs.rip > USER_ADDR_MAX || cs.rsp > USER_ADDR_MAX) {
         sched_exit(); /* non-canonical or kernel RIP — kill the process */
         __builtin_unreachable();
     }
@@ -428,7 +431,9 @@ sys_setfg(uint64_t arg1)
     tty_t *tty = tty_find_controlling(proc->sid);
     if (tty)
         tty->fg_pgrp = (uint32_t)arg1;
-    else
+    else if (tty_console_allowed())
         kbd_set_tty_pgrp((uint32_t)arg1);
+    else
+        return SYS_ERR(ENOCAP);
     return 0;
 }

@@ -53,6 +53,7 @@ int ptmx_open(int flags, vfs_file_t *out);
 /* pts_open -- open the slave side of PTY pair N.
  * Returns 0 on success, -2 (ENOENT) if not allocated, -13 (EACCES) if locked. */
 int pts_open(uint32_t index, int flags, vfs_file_t *out);
+int pty_open_controlling(uint32_t sid, vfs_file_t *out);
 
 /* pty_find_by_session -- find a PTY whose tty.session_id matches.
  * Returns pointer to tty_t, or NULL. */

@@ -22,6 +22,7 @@ static ext2_fd_priv_t s_ext2_pool[EXT2_FD_POOL];
 ext2_fd_priv_t *
 ext2_pool_alloc(uint32_t ino)
 {
+    irqflags_t fl = ext2_lock_acquire();
     uint32_t i;
     for (i = 0; i < EXT2_FD_POOL; i++) {
         /* CAS the claim, don't test-then-set. vfs_open_ex calls this holding
@@ -38,10 +39,20 @@ ext2_pool_alloc(uint32_t ino)
             s_ext2_pool[i].ino          = ino;
             s_ext2_pool[i].write_offset = 0;
             refcount_init(&s_ext2_pool[i].ref_count, 1);
+            ext2_lock_release(fl);
             return &s_ext2_pool[i];
         }
     }
+    ext2_lock_release(fl);
     return (ext2_fd_priv_t *)0;
+}
+
+/* ponytail: scan the 256 open descriptions; index by inode if this pool grows. */
+int ext2_pool_has_inode(uint32_t ino)
+{
+    for (uint32_t i = 0; i < EXT2_FD_POOL; i++)
+        if (s_ext2_pool[i].in_use && s_ext2_pool[i].ino == ino) return 1;
+    return 0;
 }
 
 void
@@ -53,8 +64,13 @@ ext2_pool_free(ext2_fd_priv_t *p)
      * release the slot twice, handing one inode to two unrelated fds.
      * RELEASE pairs with ext2_pool_alloc's ACQUIRE so the next claimer sees
      * our writes. */
-    if (refcount_dec_and_test(&p->ref_count))
+    irqflags_t fl = ext2_lock_acquire();
+    if (refcount_dec_and_test(&p->ref_count)) {
+        uint32_t ino = p->ino;
         __atomic_store_n(&p->in_use, 0u, __ATOMIC_RELEASE);
+        ext2_reclaim_unlinked(ino);
+    }
+    ext2_lock_release(fl);
 }
 
 /* ext2_vfs_ino_of — if (ops,priv) is an ext2 file, return its inode number;
