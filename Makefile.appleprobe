@@ -1,0 +1,62 @@
+# RAM-only entry diagnostic. Not a native Aegis kernel or an installer.
+CC = aarch64-linux-gnu-gcc
+LD = aarch64-linux-gnu-ld
+OBJCOPY = aarch64-linux-gnu-objcopy
+BUILD ?= build/appleprobe
+CFLAGS = -std=gnu11 -O2 -Wall -Wextra -Werror -ffreestanding -nostdlib \
+	-fpie -mgeneral-regs-only -mno-outline-atomics -fno-stack-protector \
+	-ffunction-sections -fdata-sections -fno-jump-tables \
+	-fno-tree-switch-conversion -fno-unwind-tables -fno-asynchronous-unwind-tables \
+	-DFDT_HOSTTEST $(EXTRA_CFLAGS)
+OBJECTS = $(BUILD)/entry.o $(BUILD)/probe.o $(BUILD)/console.o $(BUILD)/fdt.o \
+	$(BUILD)/mmu.o $(BUILD)/translation.o $(BUILD)/boot_memory.o $(BUILD)/memory.o \
+	$(EXTRA_OBJECTS)
+
+.PHONY: all test translation test-translation memory test-memory
+all: $(BUILD)/Image
+
+memory:
+	$(MAKE) -f Makefile.appleprobe BUILD=build/appleprobe-v4 EXTRA_CFLAGS="-DAPPLE_PROBE_TRANSLATION=1 -DAPPLE_PROBE_MEMORY=1" all
+
+test-memory: memory
+	python3 -B test/boot_memory_test.py
+	python3 -B test/apple_memory_test.py
+
+translation:
+	$(MAKE) -f Makefile.appleprobe BUILD=build/appleprobe-v3 EXTRA_CFLAGS=-DAPPLE_PROBE_TRANSLATION=1 all
+
+test-translation: translation
+	python3 -B test/apple_mmu_test.py
+	$(MAKE) -f Makefile.appleprobe BUILD=build/appleprobe-v3-unmapped EXTRA_CFLAGS="-DAPPLE_PROBE_TRANSLATION=1 -DAPPLE_PROBE_TRANSLATION_FAULT_TEST=1" all
+	$(MAKE) -f Makefile.appleprobe BUILD=build/appleprobe-v3-nx EXTRA_CFLAGS="-DAPPLE_PROBE_TRANSLATION=1 -DAPPLE_PROBE_TRANSLATION_FAULT_TEST=2" all
+	python3 -B test/apple_translation_test.py --normal build/appleprobe-v3 --unmapped build/appleprobe-v3-unmapped --nx build/appleprobe-v3-nx
+
+test: $(BUILD)/Image
+	$(MAKE) -f Makefile.appleprobe BUILD=$(BUILD)-brk EXTRA_CFLAGS=-DAPPLE_PROBE_FAULT_TEST=1 all
+	$(MAKE) -f Makefile.appleprobe BUILD=$(BUILD)-abort EXTRA_CFLAGS=-DAPPLE_PROBE_FAULT_TEST=2 all
+	$(MAKE) -f Makefile.appleprobe BUILD=$(BUILD)-badsp EXTRA_CFLAGS=-DAPPLE_PROBE_FAULT_TEST=3 all
+	python3 -B test/apple_probe_test.py --build $(BUILD) --brk $(BUILD)-brk --abort $(BUILD)-abort --badsp $(BUILD)-badsp --preview $(BUILD)/console-preview.png
+
+$(BUILD):
+	mkdir -p $@
+$(BUILD)/entry.o: kernel/arch/arm64/apple/probe_entry.S | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(BUILD)/probe.o: kernel/arch/arm64/apple/probe.c kernel/arch/arm64/apple/probe_console.h kernel/arch/arm64/apple/probe_mmu.h kernel/arch/arm64/apple/probe_report.h kernel/arch/arm64/fdt.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(BUILD)/console.o: kernel/arch/arm64/apple/probe_console.c kernel/arch/arm64/apple/probe_console.h kernel/arch/arm64/fdt.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(BUILD)/fdt.o: kernel/arch/arm64/fdt.c kernel/arch/arm64/fdt.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(BUILD)/mmu.o: kernel/arch/arm64/apple/probe_mmu.c kernel/arch/arm64/apple/probe_mmu.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(BUILD)/translation.o: kernel/arch/arm64/apple/probe_translation.c kernel/arch/arm64/apple/probe_mmu.h kernel/arch/arm64/apple/probe_console.h kernel/arch/arm64/apple/probe_report.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(BUILD)/boot_memory.o: kernel/arch/arm64/boot_memory.c kernel/arch/arm64/boot_memory.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(BUILD)/memory.o: kernel/arch/arm64/apple/probe_memory.c kernel/arch/arm64/boot_memory.h kernel/arch/arm64/apple/probe_mmu.h kernel/arch/arm64/apple/probe_console.h kernel/arch/arm64/apple/probe_report.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(BUILD)/probe.elf: $(OBJECTS) kernel/arch/arm64/apple/probe.ld
+	$(LD) --gc-sections -static -T kernel/arch/arm64/apple/probe.ld \
+		-Map=$(BUILD)/probe.map -o $@ $(OBJECTS)
+$(BUILD)/Image: $(BUILD)/probe.elf
+	$(OBJCOPY) -O binary $< $@

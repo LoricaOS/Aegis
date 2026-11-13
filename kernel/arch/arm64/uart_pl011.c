@@ -74,11 +74,18 @@ serial_putc(char c)
 void
 serial_write_string(const char *s)
 {
+#ifdef AEGIS_APPLE_CHECKPOINT
+    /* This explicit checkpoint build has no PL011. Only its validated boot
+     * framebuffer is a live output sink; no UART registers are touched. */
+    extern void probe_puts(const char *);
+    probe_puts(s);
+#else
     while (*s) {
         if (*s == '\n')
             serial_putc('\r');
         serial_putc(*s++);
     }
+#endif
 }
 
 /* ── Console input (kbd interface over PL011 RX) ───────────────────────── */

@@ -96,6 +96,18 @@ arch_mm_ingest(const struct aegis_bootinfo *bi)
 
 void arch_mm_init(void *info) { (void)info; }
 
+#ifdef APPLE_MEMORY_CHECKPOINT
+void arch_mm_init_apple(uint64_t kernel_phys, uint64_t arena, uint64_t size)
+{
+    s_kern_phys_slide = kernel_phys - ARCH_KERNEL_PHYS_BASE;
+    s_early_pv_off = 0; /* explicit WB arena identity map until VMM handover */
+    s_uart_phys = 0;
+    s_dtb_phys = 0;     /* no legacy DTB-to-free-RAM fallback */
+    regions[0] = (aegis_mem_region_t){arena, size};
+    region_count = 1;
+}
+#endif
+
 uint32_t arch_mm_region_count(void)                    { return region_count; }
 const aegis_mem_region_t *arch_mm_get_regions(void)    { return regions; }
 

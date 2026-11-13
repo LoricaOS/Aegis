@@ -17,6 +17,16 @@
 #include "../include/aegis_errno.h"
 #include <stdint.h>
 
+/* Boot-time policy loading runs before there is a current task. Never
+ * dereference the null task pointer or interpret low MMIO as credentials.
+ * User tasks still pass every DAC and capability gate below. */
+static int
+vfs_caller_is_user(void)
+{
+    aegis_task_t *task = sched_current();
+    return task && task->is_user;
+}
+
 /* Anti-brute-force throttle state for the admin elevation credential
  * (/etc/aegis/admin). See the read gate in vfs_open_ex. One read per window,
  * globally, for non-admin user processes. 200 ticks = 2 s at the 100 Hz PIT. */
@@ -198,7 +208,7 @@ vfs_open_ext2_inode(uint32_t ino, int is_protected, int flags,
     if (access == VFS_O_ACCMODE ||
         ((flags & VFS_O_TRUNC) && access == VFS_O_RDONLY))
         return -EINVAL;
-    if ((flags & VFS_O_TRUNC) && sched_current()->is_user &&
+    if ((flags & VFS_O_TRUNC) && vfs_caller_is_user() &&
         cap_check(current_proc()->caps, CAP_TABLE_SIZE,
                   CAP_KIND_VFS_WRITE, CAP_RIGHTS_WRITE) != 0)
         return -ENOCAP;
@@ -206,7 +216,7 @@ vfs_open_ext2_inode(uint32_t ino, int is_protected, int flags,
         return -EISDIR;
     if ((flags & (int)VFS_O_CREAT) && (flags & (int)VFS_O_EXCL))
         return -EEXIST;
-    if (sched_current()->is_user) {
+    if (vfs_caller_is_user()) {
         aegis_process_t *pr = current_proc();
         uint32_t shadow_ino = g_rootfs->get_shadow_ino();
         uint32_t admin_ino  = g_rootfs->get_admin_ino();
@@ -244,7 +254,7 @@ vfs_open_ext2_inode(uint32_t ino, int is_protected, int flags,
     {
         uint32_t passwd_ino = g_rootfs->get_passwd_ino();
         uint32_t group_ino  = g_rootfs->get_group_ino();
-        if (sched_current()->is_user &&
+        if (vfs_caller_is_user() &&
             ((passwd_ino != 0 && ino == passwd_ino) ||
              (group_ino  != 0 && ino == group_ino))) {
             int wr = (flags & 1) || (flags & 2) ||
@@ -259,7 +269,7 @@ vfs_open_ext2_inode(uint32_t ino, int is_protected, int flags,
         int wr = (flags & 1) || (flags & 2) ||
                  (flags & (int)VFS_O_TRUNC) ||
                  (flags & (int)VFS_O_APPEND);
-        if (sched_current()->is_user && is_protected && wr && !has_install)
+        if (vfs_caller_is_user() && is_protected && wr && !has_install)
             return -EACCES;
     }
     if (flags & (int)VFS_O_TRUNC) {
@@ -331,7 +341,7 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
     if ((flags & VFS_O_ACCMODE) == VFS_O_ACCMODE ||
         ((flags & VFS_O_TRUNC) && (flags & VFS_O_ACCMODE) == VFS_O_RDONLY))
         return -EINVAL;
-    if ((flags & (VFS_O_CREAT | VFS_O_TRUNC)) && sched_current()->is_user &&
+    if ((flags & (VFS_O_CREAT | VFS_O_TRUNC)) && vfs_caller_is_user() &&
         cap_check(current_proc()->caps, CAP_TABLE_SIZE,
                   CAP_KIND_VFS_WRITE, CAP_RIGHTS_WRITE) != 0)
         return -ENOCAP;
@@ -428,7 +438,7 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
             uint32_t parent_ino;
             const char *bname;
             if (g_rootfs->lookup_parent(path, &parent_ino, &bname) == 0 &&
-                sched_current()->is_user) {
+                vfs_caller_is_user()) {
                 aegis_process_t *pr = current_proc();
                 int pperm = g_rootfs->check_perm(parent_ino,
                     (uint16_t)pr->uid, (uint16_t)pr->gid, 2 | 1); /* W+X */
@@ -472,7 +482,7 @@ vfs_open_ex(const char *path, int flags, uint16_t create_mode, vfs_file_t *out,
         if (path[0]=='/' && path[1]=='e' && path[2]=='t' && path[3]=='c' &&
             path[4]=='/' && path[5]=='s' && path[6]=='h' && path[7]=='a' &&
             path[8]=='d' && path[9]=='o' && path[10]=='w' && path[11]=='\0') {
-            if (sched_current()->is_user) {
+            if (vfs_caller_is_user()) {
                 aegis_process_t *pr = current_proc();
                 if (cap_check(pr->caps, CAP_TABLE_SIZE,
                               CAP_KIND_AUTH, CAP_RIGHTS_READ) != 0) {

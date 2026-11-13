@@ -31,6 +31,15 @@ static int printk_quiet = 0;  /* 1 = suppress VGA+FB in printk, serial only */
 static int printk_decorate = 0; /* 1 = prefix each kernel line with [cpuN t..] */
 static int s_at_bol = 1;        /* serial cursor is at beginning of line */
 
+#ifdef AEGIS_APPLE_CHECKPOINT
+/* Read-only boot diagnostic before any other CPU, IRQ or logger is active.
+ * Never acquire/bypass/change the lock to inspect a stuck first printk. */
+uint32_t printk_checkpoint_lock_state(void)
+{
+    return (uint32_t)printk_lock.owner | (uint32_t)printk_lock.next << 16;
+}
+#endif
+
 /* ── Kernel log ring buffer ─────────────────────────────────────────────
  * 64KB circular buffer; oldest data silently overwritten when full.
  * Written under printk_lock so no separate lock needed.

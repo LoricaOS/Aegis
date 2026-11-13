@@ -48,9 +48,15 @@
 #define A64_PTE_SW_OWNED  (1UL << 57)
 
 /* MAIR_EL1 attribute indices programmed by entry.S (see MAIR_VALUE there). */
-#define A64_ATTR_NORMAL_WB 0
 #define A64_ATTR_DEVICE    1
+#ifdef APPLE_MEMORY_CHECKPOINT
+/* Retain the native-tested bridge's live MAIR palette across the switch. */
+#define A64_ATTR_NORMAL_WB 2
+#define A64_ATTR_NORMAL_NC 0
+#else
+#define A64_ATTR_NORMAL_WB 0
 #define A64_ATTR_NORMAL_NC 2
+#endif
 
 static inline uint64_t
 arch_pte_from_flags(uint64_t flags)
@@ -58,7 +64,8 @@ arch_pte_from_flags(uint64_t flags)
     uint64_t pte = 0;
 
     if (flags & (1UL << 0)) {                 /* VMM_FLAG_PRESENT */
-        pte |= A64_PTE_VALID | A64_PTE_PAGE | A64_PTE_AF | A64_PTE_SH_IS;
+        pte |= A64_PTE_VALID | A64_PTE_PAGE | A64_PTE_AF | A64_PTE_SH_IS |
+               A64_PTE_ATTR(A64_ATTR_NORMAL_WB);
         if (!(flags & (1UL << 1)))            /* !VMM_FLAG_WRITABLE → RO */
             pte |= A64_PTE_RO;
         if (flags & (1UL << 2)) {             /* VMM_FLAG_USER */
@@ -77,7 +84,7 @@ arch_pte_from_flags(uint64_t flags)
             pte = (pte & ~A64_PTE_ATTR(7)) | A64_PTE_ATTR(A64_ATTR_DEVICE);
         else if (flags & (1UL << 3))          /* VMM_FLAG_WC → Normal-NC */
             pte = (pte & ~A64_PTE_ATTR(7)) | A64_PTE_ATTR(A64_ATTR_NORMAL_NC);
-        /* else AttrIndx 0 = Normal WB (bits already 0) */
+        /* else retain Normal WB from the active bootstrap palette */
     }
     if (flags & (1UL << 9))                   /* VMM_FLAG_COW */
         pte |= A64_PTE_SW_COW;
@@ -94,6 +101,7 @@ arch_pte_from_flags(uint64_t flags)
 static inline uint64_t
 arch_pte_to_flags(uint64_t pte)
 {
+    if (!pte) return 0; /* AttrIndx 0 can mean NC in an alternate palette. */
     uint64_t f = pte & 0x0000FFFFFFFFF000UL;  /* keep the PA bits */
 
     if (pte & A64_PTE_VALID)

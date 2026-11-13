@@ -4,7 +4,9 @@ Guidance for working in this repo. Read it before making changes.
 
 ## What this repo is
 
-Aegis is a **standalone, clean-slate x86-64 kernel** — just the kernel. It
+Aegis is a **standalone, clean-slate kernel** with x86-64 and ARM64 ports
+(QEMU virt and a separate native Pi 5 path) — just the kernel. Native Apple
+Silicon support is not implemented yet. It
 embeds no userland: at boot it mounts the root filesystem the bootloader/OS
 provides and execs `/bin/vigil` as init (panicking "no init found" if there is
 none, like Linux). It publishes a versioned `aegis.elf` artifact that an OS

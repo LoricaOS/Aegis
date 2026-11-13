@@ -1,0 +1,11 @@
+# Cooperative scheduler/context-state checkpoint; timers stay disabled.
+APPLE_BUILD = build/applesched
+APPLE_SCHED = 1
+APPLE_TIMER = 1
+KERNEL_TEST = test/apple_sched_kernel_test.py
+include Makefile.applememory
+
+.PHONY: sched-host-checks
+check: sched-host-checks
+sched-host-checks:
+	python3 -B test/sched_spawn_init_test.py

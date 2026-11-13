@@ -1,0 +1,11 @@
+# Real PMM/VMM/KVA on a bounded, image-owned pool; no devices or userland.
+APPLE_BUILD ?= build/applememory
+APPLE_MEMORY = 1
+KERNEL_TEST ?= test/apple_memory_kernel_test.py
+include Makefile.applekernel
+
+.PHONY: memory-host-checks
+check: memory-host-checks
+memory-host-checks:
+	python3 -B test/pmm_base_test.py
+	python3 -B test/apple_memory_handoff_test.py

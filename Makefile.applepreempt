@@ -1,0 +1,13 @@
+# Bounded timer-driven scheduling: two threads that never yield.
+APPLE_BUILD = build/applepreempt
+APPLE_PREEMPT = 1
+APPLE_SCHED = 1
+APPLE_TIMER = 1
+KERNEL_TEST = test/apple_preempt_kernel_test.py
+include Makefile.applememory
+
+.PHONY: preempt-host-checks
+check: preempt-host-checks
+preempt-host-checks:
+	python3 -B test/apple_preempt_state_test.py
+	python3 -B test/sched_spawn_init_test.py

@@ -39,10 +39,14 @@
 #include "random.h"
 #include "poll.h"
 #include <stdint.h>
+#ifdef AEGIS_APPLE_CHECKPOINT
+#include "apple/qr_report.h"
+extern volatile uint64_t apple_kernel_atomic_report[4];
+#endif
 
 void poll_test(void);
 void arm64_map_early_uart(void);
-void uaccess_selftest(void);
+int uaccess_selftest(void);
 void kva_test_run(void);
 void pcie_brcmstb_init(void);
 void nvme_init(void);
@@ -153,9 +157,31 @@ task_idle(void)
 void
 kernel_main_arm64(void)
 {
+#ifdef AEGIS_APPLE_CHECKPOINT
+    apple_qr_progress("shared-before-percpu", apple_kernel_atomic_report);
+#endif
     smp_percpu_init_bsp();    /* TPIDR_EL1 — before any sched_current() */
+#ifdef AEGIS_APPLE_CHECKPOINT
+    apple_qr_progress("shared-before-pan", apple_kernel_atomic_report);
+#endif
     arm64_pan_init();          /* PAN + bounded uaccess windows             */
+#ifdef AEGIS_APPLE_CHECKPOINT
+    apple_qr_progress("shared-before-vectors", apple_kernel_atomic_report);
+#endif
     idt_init();               /* VBAR_EL1 — catch faults from here on   */
+
+#ifdef AEGIS_APPLE_CHECKPOINT
+    apple_qr_progress("shared-before-uaccess", apple_kernel_atomic_report);
+    /* Allocation-free native bridge checkpoint. Do not fall through into
+     * DTB RAM admission, the low-PA bootstrap PMM, or QEMU/Pi device probes. */
+    if (!uaccess_selftest()) {
+        printk("[APPLE] REFUSED: existing uaccess self-test failed\n");
+        for (;;) __asm__ volatile("wfe");
+    }
+    cap_init();
+    extern void apple_kernel_checkpoint(void) __attribute__((noreturn));
+    apple_kernel_checkpoint();
+#endif
 
     {
         const char *cmdline = arch_get_cmdline();

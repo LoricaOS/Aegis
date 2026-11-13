@@ -67,6 +67,8 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
 #define SYS_getpid       172   /* was non-colliding (x86 39 passed through) until
                                 * the mount syscall added aarch64 umount2(39) →
                                 * 39 now collides, so use the real aarch64 nr */
+#define SYS_setpgid      154
+#define SYS_getpgid      155
 #define SYS_mount        40
 #define SYS_clone        220
 #define SYS_wait4        260
@@ -93,6 +95,7 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
 #define SYS_symlinkat    36
 #define SYS_openat       56
 #define SYS_close        57
+#define SYS_dup          23
 #define SYS_readlinkat   78
 #define SYS_newfstatat   79
 #define SYS_pipe2        59
@@ -107,6 +110,9 @@ static long sys3(long n, long a, long b, long c) { return sys6(n, a, b, c, 0, 0,
 #define SYS_inotify_rm_watch 28
 #else
 #define SYS_getpid       39
+#define SYS_setpgid      109
+#define SYS_getpgid      121
+#define SYS_dup          32
 #define SYS_mount        165
 #define SYS_clone        56
 #define SYS_wait4        61
@@ -420,6 +426,37 @@ __attribute__((used)) static void test_main(const unsigned long *stack)
     total++;
     if (sys3(SYS_write, 1, (long)"ok\n", 3) == 3) { pass++; out("[KTEST] PASS write\n"); }
     else out("[KTEST] FAIL write\n");
+
+    /* dup has ONE argument. Poison the unused register: translating it to
+     * dup2 made a real musl shell fail while saving its controlling tty. */
+    total++;
+    {
+        long fd = sys3(SYS_dup, 1, 1024, 0);
+        int ok = fd >= 3 &&
+                 sys3(SYS_write, fd, (long)"", 0) == 0;
+        if (fd >= 3) sys3(SYS_close, fd, 0, 0);
+        ok = ok && sys3(SYS_write, 1, (long)"", 0) == 0;
+        if (ok) { pass++; out("[KTEST] PASS dup preserves source and ignores unused args\n"); }
+        else out("[KTEST] FAIL dup\n");
+    }
+
+    total++;
+    {
+        long group = sys3(SYS_getpgid, 0, 0, 0);
+        long pid = k_clone(SIGCHLD, 0, 0, 0, 0);
+        if (pid == 0) {
+            int ok = sys3(SYS_setpgid, 0, 0, 0) == 0 &&
+                     sys3(SYS_getpgid, 0, 0, 0) == sys3(SYS_getpid, 0, 0, 0);
+            sys3(SYS_exit, ok ? 44 : 99, 0, 0);
+            for (;;) { }
+        }
+        int status = -1;
+        int ok = group >= 0 && pid > 0 &&
+                 sys6(SYS_wait4, pid, (long)&status, 0, 0, 0, 0) == pid &&
+                 status == (44 << 8) && sys3(SYS_getpgid, 0, 0, 0) == group;
+        if (ok) { pass++; out("[KTEST] PASS process groups isolate child job control\n"); }
+        else out("[KTEST] FAIL process groups\n");
+    }
 
     total++;
     {

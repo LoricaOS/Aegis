@@ -53,10 +53,10 @@ static char *append_str(char *dst, const char *src)
  * Bootstrap problem: the PMM needs memory to hold the bitmap, but the bitmap
  * is how the PMM tracks free memory. We solve it in two phases:
  *
- *   1. pmm_init() uses a small STATIC bootstrap bitmap covering the first 4 GB
- *      (PMM_BOOT_PAGES → 128 KB of BSS). That is enough to bring up the VMM and
- *      KVA allocator, whose early allocations all live in low RAM. On a machine
- *      with <= 4 GB this is the whole story.
+ *   1. pmm_init() uses a small STATIC bootstrap bitmap covering a 4 GB window
+ *      (PMM_BOOT_PAGES → 128 KB of BSS). Normally it starts at PA zero. If
+ *      there is no whole usable page in that window, move its origin to the
+ *      first usable page. Early callers must map the admitted boot RAM.
  *
  *   2. pmm_init_late() — called after kva_init() — allocates the FULL,
  *      RAM-sized bitmap from KVA (higher-half, not the 8 MB kernel-image
@@ -76,7 +76,7 @@ static char *append_str(char *dst, const char *src)
 #endif
 #define PMM_BOOT_PAGES  (PMM_BOOT_GB * 1024 * 1024 * 1024 / PAGE_SIZE)
 
-/* The DMA-safe boundary: pages below this index have physical addresses
+/* The absolute DMA-safe boundary: physical frame numbers below this have
  * < 4 GB and may be handed to devices whose 64-bit addressing we don't want
  * to trust (see pmm_alloc_page_low / kva_alloc_pages_low). */
 #define PMM_LOW_PAGES   (4ULL * 1024 * 1024 * 1024 / PAGE_SIZE)
@@ -88,12 +88,17 @@ static uint8_t pmm_boot_bitmap[PMM_BOOT_PAGES / 8];
 /* The active bitmap and its page capacity. Start on the bootstrap bitmap. */
 static uint8_t *s_bitmap       = pmm_boot_bitmap;
 static uint64_t s_bitmap_pages = PMM_BOOT_PAGES;
+/* Keep conventional low-RAM boots indexed from zero. If every whole usable
+ * page lies beyond bootstrap coverage, slide bookkeeping to the first usable
+ * page instead of allocating arrays for the physical-address hole.
+ * Public APIs and DMA limits always remain absolute physical addresses. */
+static uint64_t s_bitmap_base;
 
 /* --------------------------------------------------------------------------
  * Dense per-frame refcount (COW fork + memfd MAP_SHARED)
  *
- * A DENSE uint16_t array indexed directly by physical frame number (page index
- * = addr / PAGE_SIZE), sized to the machine's full usable-RAM extent. Lookup
+ * A DENSE uint16_t array indexed by frame relative to s_bitmap_base
+ * (= (addr - base) / PAGE_SIZE), sized to the usable-RAM span. Lookup
  * and update are O(1) — a single array index — so the COW fork walk that calls
  * pmm_ref_page() for every present user page is O(n) and bounded, no matter how
  * many pages a process maps. It CANNOT saturate: there is exactly one slot per
@@ -132,9 +137,9 @@ static uint64_t s_total_usable_bytes;   /* raw usable RAM from the memory map */
  * MemTotal reports this (not raw physical), so RAM beyond the bitmap isn't
  * counted as bogus "used" in /proc/meminfo. */
 static uint64_t s_managed_pages;
-/* Highest page index in usable RAM (+1) from the memory map — the FULL extent,
- * independent of the current bitmap. pmm_init_late() sizes the full bitmap to
- * this. */
+/* Highest page index relative to s_bitmap_base (+1): the full tracked span,
+ * independent of bitmap capacity. The public pmm_ram_max_page() converts it
+ * back to an absolute physical frame number for direct-map callers. */
 static uint64_t s_ram_max_pages;
 /* Highest page the current bitmap can serve (= min(s_ram_max_pages,
  * s_bitmap_pages)). Bounds every scan so a large bitmap doesn't slow a small
@@ -181,19 +186,52 @@ static void refcount_set(uint64_t pg, uint16_t count)
  * Internal helpers
  * -------------------------------------------------------------------------- */
 
+struct bitmap_span { uint64_t begin, end; };
+
+static int bitmap_span(uint64_t base, uint64_t len, int reserve,
+                       uint64_t capacity, struct bitmap_span *span)
+{
+    if (!len || len > UINT64_MAX - base) return 0;
+    uint64_t end = base + len, first, last;
+    if (reserve) {
+        if (end > UINT64_MAX - (PAGE_SIZE - 1)) return 0;
+        first = base / PAGE_SIZE;
+        last = (end + PAGE_SIZE - 1) / PAGE_SIZE;
+    } else {
+        if (base > UINT64_MAX - (PAGE_SIZE - 1)) return 0;
+        first = (base + PAGE_SIZE - 1) / PAGE_SIZE;
+        last = end / PAGE_SIZE;
+    }
+    uint64_t origin = s_bitmap_base / PAGE_SIZE;
+    if (last <= origin) return 0;
+    if (first < origin) first = origin;
+    first -= origin; last -= origin;
+    if (last > capacity) last = capacity;
+    if (first >= last) return 0;
+    span->begin = first; span->end = last;
+    return 1;
+}
+
+static uint64_t page_index(uint64_t address)
+{
+    return address < s_bitmap_base ? UINT64_MAX :
+           (address - s_bitmap_base) / PAGE_SIZE;
+}
+
+static uint64_t low_page_limit(void)
+{
+    uint64_t boundary = PMM_LOW_PAGES * PAGE_SIZE;
+    uint64_t low = s_bitmap_base >= boundary ? 0 :
+                   (boundary - s_bitmap_base) / PAGE_SIZE;
+    return low < s_scan_max_pages ? low : s_scan_max_pages;
+}
+
 static void pmm_free_region(uint64_t base, uint64_t len)
 {
-    /* Align base up to PAGE_SIZE, len down to a page boundary. */
-    uint64_t start = (base + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    if (start >= base + len)
-        return;
-    uint64_t end = (base + len) & ~(PAGE_SIZE - 1);
-
-    for (uint64_t addr = start; addr < end; addr += PAGE_SIZE) {
-        uint64_t idx = addr / PAGE_SIZE;
-        if (idx < s_bitmap_pages)
-            s_bitmap[idx / 8] &= (uint8_t)~(1U << (idx % 8));
-    }
+    struct bitmap_span span;
+    if (!bitmap_span(base, len, 0, s_bitmap_pages, &span)) return;
+    for (uint64_t idx = span.begin; idx < span.end; idx++)
+        s_bitmap[idx / 8] &= (uint8_t)~(1U << (idx % 8));
 }
 
 /* Return 1 if the page at addr is fully contained in a usable-RAM region.
@@ -217,15 +255,29 @@ static int pmm_page_in_usable_ram(uint64_t addr)
 
 void pmm_reserve_region(uint64_t base, uint64_t len)
 {
-    /* Align base down, end up — reserve conservatively. */
-    uint64_t start = base & ~(PAGE_SIZE - 1);
-    uint64_t end   = (base + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    if (len && (len > UINT64_MAX - base ||
+                base + len > UINT64_MAX - (PAGE_SIZE - 1)))
+        panic_halt("[PMM] FAIL: wrapping reserved range");
+    struct bitmap_span span;
+    if (!bitmap_span(base, len, 1, s_bitmap_pages, &span)) return;
+    for (uint64_t idx = span.begin; idx < span.end; idx++)
+        s_bitmap[idx / 8] |= (uint8_t)(1U << (idx % 8));
+}
 
-    for (uint64_t addr = start; addr < end; addr += PAGE_SIZE) {
-        uint64_t idx = addr / PAGE_SIZE;
-        if (idx < s_bitmap_pages)
-            s_bitmap[idx / 8] |= (uint8_t)(1U << (idx % 8));
-    }
+/* One reservation rule for bootstrap and late bitmap activation. In
+ * particular, late admission must not release high boot-module/kernel pages
+ * merely because they were beyond the old bitmap's capacity. Boot-only;
+ * the late caller already holds pmm_lock. */
+static void reserve_boot_ranges(void)
+{
+    uint32_t n = arch_mm_reserved_region_count();
+    const aegis_mem_region_t *reserved = arch_mm_get_reserved_regions();
+    for (uint32_t i = 0; i < n; i++)
+        pmm_reserve_region(reserved[i].base, reserved[i].len);
+    pmm_reserve_region(0, PAGE_SIZE); /* physical zero is always the OOM sentinel */
+    pmm_reserve_region(ARCH_KERNEL_PHYS_BASE + arch_kern_phys_slide(),
+                       (uint64_t)(uintptr_t)_kernel_end - ARCH_KERNEL_VIRT_BASE
+                       - ARCH_KERNEL_PHYS_BASE);
 }
 
 /* --------------------------------------------------------------------------
@@ -244,50 +296,46 @@ void pmm_init(void)
     for (uint64_t i = 0; i < s_bitmap_pages / 8; i++)
         s_bitmap[i] = 0xFF;
 
-    /* Step 2: mark usable RAM as free */
+    /* Step 2: validate the usable map and select a bootstrap origin before
+     * publishing any free page. Metadata wrapping is never partial success. */
     uint32_t                  nregions = arch_mm_region_count();
     const aegis_mem_region_t *regions  = arch_mm_get_regions();
 
     uint64_t total_bytes  = 0;
     uint64_t ram_max_page = 0;     /* full extent — sizes the late bitmap */
+    uint64_t first_page = UINT64_MAX;
     for (uint32_t i = 0; i < nregions; i++) {
-        /* pmm_free_region only touches pages within the current (bootstrap)
-         * bitmap; the rest of RAM is freed by pmm_init_late(). */
-        pmm_free_region(regions[i].base, regions[i].len);
+        uint64_t base = regions[i].base, len = regions[i].len;
+        if (!len) continue;
+        if (len > UINT64_MAX - base || total_bytes > UINT64_MAX - len)
+            panic_halt("[PMM] FAIL: wrapping usable range");
         total_bytes += regions[i].len;
-
-        uint64_t end_pg = (regions[i].base + regions[i].len) / PAGE_SIZE;
+        if (base > UINT64_MAX - (PAGE_SIZE - 1)) continue;
+        uint64_t begin_pg = (base + PAGE_SIZE - 1) / PAGE_SIZE;
+        uint64_t end_pg = (base + len) / PAGE_SIZE;
+        if (begin_pg >= end_pg) continue;
+        if (begin_pg < first_page) first_page = begin_pg;
         if (end_pg > ram_max_page) ram_max_page = end_pg;
     }
+    s_bitmap_base = first_page != UINT64_MAX && first_page >= PMM_BOOT_PAGES ?
+                    first_page * PAGE_SIZE : 0;
+    for (uint32_t i = 0; i < nregions; i++)
+        pmm_free_region(regions[i].base, regions[i].len);
 
     s_total_usable_bytes = total_bytes;
-    s_ram_max_pages      = ram_max_page;
+    s_ram_max_pages      = ram_max_page - s_bitmap_base / PAGE_SIZE;
     /* Bootstrap phase: only the first PMM_BOOT_PAGES are bitmap-tracked.
      * pmm_init_late() raises this to the full extent. */
-    s_scan_max_pages     = (ram_max_page < s_bitmap_pages)
-                           ? ram_max_page : s_bitmap_pages;
+    s_scan_max_pages     = (s_ram_max_pages < s_bitmap_pages)
+                           ? s_ram_max_pages : s_bitmap_pages;
     /* MemTotal during bootstrap reflects what's tracked so far; recomputed
      * to the full usable total in pmm_init_late(). */
     s_managed_pages      = s_scan_max_pages;
     s_alloc_hint_byte    = 0;
 
-    /* Step 3: re-reserve arch platform ranges (first 1MB on x86) */
-    uint32_t                  nreserved = arch_mm_reserved_region_count();
-    const aegis_mem_region_t *reserved  = arch_mm_get_reserved_regions();
-
-    for (uint32_t i = 0; i < nreserved; i++)
-        pmm_reserve_region(reserved[i].base, reserved[i].len);
-
-    /* Step 4: reserve the kernel image + bitmap (bitmap is in .bss,
-     * inside this range).  The kernel image spans from PHYS_BASE+slide to
-     * PHYS_BASE+slide + kernel_size, where kernel_size = _kernel_end_VA -
-     * VIRT_BASE - PHYS_BASE.  slide is 0 on the multiboot2 path; under the
-     * Limine protocol the image lands wherever the bootloader put it (and
-     * that range is not usable RAM there, so this reserve is belt-and-
-     * braces — but reserving the UNslid range would eat foreign RAM). */
-    pmm_reserve_region(ARCH_KERNEL_PHYS_BASE + arch_kern_phys_slide(),
-                       (uint64_t)(uintptr_t)_kernel_end - ARCH_KERNEL_VIRT_BASE
-                       - ARCH_KERNEL_PHYS_BASE);
+    /* Steps 3/4: platform reservations, physical zero, and the slid image
+     * (including this bootstrap bitmap) never become free. */
+    reserve_boot_ranges();
 
     /* Step 5: report. Bootstrap phase — the full bitmap (and final managed
      * total) is reported by pmm_init_late(). */
@@ -303,13 +351,16 @@ void pmm_init(void)
         *p = '\0';
         printk("%s", buf);
     }
+    if (s_bitmap_base)
+        printk("[PMM] OK: bootstrap physical origin=0x%lx\n", s_bitmap_base);
 }
 
 /* --------------------------------------------------------------------------
  * pmm_init_late — replace the 4 GB bootstrap bitmap with a full RAM-sized one.
  *
  * Called once, after kva_init(), before pmm_set_alloc_high_pref(1) and before
- * any allocation needs high RAM. On a machine with <= 4 GB this is a no-op.
+ * any allocation needs RAM beyond bootstrap coverage. Refcounts are always
+ * initialized; bitmap growth is unnecessary when the span fits the window.
  * Otherwise it allocates the full bitmap from KVA (higher-half — not the 8 MB
  * kernel-image window, so there is NO size cap), migrates the bootstrap state
  * into its low portion (preserving every allocation made so far, including the
@@ -361,7 +412,7 @@ void pmm_init_late(void)
      * bitmap. No 8 MB-image limit applies here. */
     uint8_t *big = (uint8_t *)kva_alloc_pages(need_pages);
     if (!big) {
-        printk("[PMM] WARN: late bitmap alloc failed; staying at 4GB\n");
+        printk("[PMM] WARN: late bitmap alloc failed; staying in bootstrap window\n");
         return;
     }
 
@@ -382,10 +433,10 @@ void pmm_init_late(void)
     const aegis_mem_region_t *regions  = arch_mm_get_regions();
     uint64_t high_free = 0;
     for (uint32_t r = 0; r < nregions; r++) {
-        uint64_t start = (regions[r].base + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-        uint64_t end   = (regions[r].base + regions[r].len) & ~(PAGE_SIZE - 1);
-        uint64_t spg   = start / PAGE_SIZE;
-        uint64_t epg   = end   / PAGE_SIZE;
+        struct bitmap_span span;
+        if (!bitmap_span(regions[r].base, regions[r].len, 0, full_pages, &span))
+            continue;
+        uint64_t spg = span.begin, epg = span.end;
         if (spg < s_bitmap_pages) spg = s_bitmap_pages;   /* high range only */
         if (epg > full_pages)     epg = full_pages;
         for (uint64_t pg = spg; pg < epg; pg++) {
@@ -400,6 +451,7 @@ void pmm_init_late(void)
     s_scan_max_pages = full_pages;
     s_managed_pages  = s_total_usable_bytes / PAGE_SIZE;
     s_alloc_hint_byte = 0;
+    reserve_boot_ranges();
 
     spin_unlock_irqrestore(&pmm_lock, fl);
 
@@ -410,16 +462,16 @@ void pmm_init_late(void)
         p = u64_to_dec(p, (s_managed_pages * PAGE_SIZE) / (1024 * 1024));
         p = append_str(p, "MB managed (");
         p = u64_to_dec(p, (high_free * PAGE_SIZE) / (1024 * 1024));
-        p = append_str(p, "MB above 4GB)\n");
+        p = append_str(p, "MB beyond bootstrap window)\n");
         *p = '\0';
         printk("%s", buf);
     }
 }
 
 /* Prefer high (>=4GB) RAM for general allocations once set — keeps the low
- * (<4GB) pool free for device DMA. OFF during early boot so the first page
- * tables land below 1GB (they're reached through the identity map before the
- * higher-half window allocator exists). pmm_set_alloc_high_pref(1) flips it
+ * (<4GB) pool free for device DMA. OFF during early boot to prefer the lowest
+ * available mapped boot RAM. On high-base-only machines there is no low DMA
+ * pool; this never fabricates one. pmm_set_alloc_high_pref(1) flips it
  * after vmm_init/kva_init. No effect on a <=4GB machine (no high zone). */
 static int s_high_pref;
 
@@ -551,7 +603,7 @@ static uint64_t pmm_alloc_scan(uint64_t start_pg, uint64_t end_pg,
             if (s_pmm_acct) s_acct_allocs++;   /* T1 accounting (pmm_lock held) */
             if (hint_byte)
                 *hint_byte = i;
-            return pg * PAGE_SIZE;
+            return s_bitmap_base + pg * PAGE_SIZE;
         }
     }
     return 0;
@@ -560,13 +612,12 @@ static uint64_t pmm_alloc_scan(uint64_t start_pg, uint64_t end_pg,
 uint64_t pmm_alloc_page(void)
 {
     irqflags_t fl = spin_lock_irqsave(&pmm_lock);
-    uint64_t low_end = (PMM_LOW_PAGES < s_scan_max_pages)
-                       ? PMM_LOW_PAGES : s_scan_max_pages;
+    uint64_t low_end = low_page_limit();
     uint64_t phys = 0;
 
-    if (s_high_pref && s_scan_max_pages > PMM_LOW_PAGES) {
+    if (s_high_pref && s_scan_max_pages > low_end) {
         /* Prefer the high zone; fall back to low only under pressure. */
-        phys = pmm_alloc_scan(PMM_LOW_PAGES, s_scan_max_pages, &s_alloc_hint_byte);
+        phys = pmm_alloc_scan(low_end, s_scan_max_pages, &s_alloc_hint_byte);
         if (phys == 0)
             phys = pmm_alloc_scan(0, low_end, NULL);
     } else {
@@ -587,8 +638,7 @@ uint64_t pmm_alloc_page(void)
  * general allocation (above), so this stays available. Returns 0 if exhausted. */
 uint64_t pmm_alloc_page_low(void)
 {
-    uint64_t lo = (PMM_LOW_PAGES < s_scan_max_pages)
-                  ? PMM_LOW_PAGES : s_scan_max_pages;
+    uint64_t lo = low_page_limit();
     irqflags_t fl = spin_lock_irqsave(&pmm_lock);
     uint64_t phys = pmm_alloc_scan(0, lo, NULL /* no hint: scan from 0 */);
     spin_unlock_irqrestore(&pmm_lock, fl);
@@ -605,8 +655,7 @@ uint64_t pmm_alloc_contig_low(uint64_t n)
 {
     if (n == 0)
         return 0;
-    uint64_t lo = (PMM_LOW_PAGES < s_scan_max_pages)
-                  ? PMM_LOW_PAGES : s_scan_max_pages;
+    uint64_t lo = low_page_limit();
     irqflags_t fl = spin_lock_irqsave(&pmm_lock);
 
     uint64_t run = 0, run_start = 0, result = 0;
@@ -621,7 +670,7 @@ uint64_t pmm_alloc_contig_low(uint64_t n)
         if (++run == n) {
             for (uint64_t p = run_start; p < run_start + n; p++)
                 s_bitmap[p / 8] |= (uint8_t)(1U << (p % 8));
-            result = run_start * PAGE_SIZE;
+            result = s_bitmap_base + run_start * PAGE_SIZE;
             break;
         }
     }
@@ -648,8 +697,8 @@ int pmm_ref_page(uint64_t addr)
 {
     if (addr & (PAGE_SIZE - 1))
         panic_halt("[PMM] FAIL: pmm_ref_page called with unaligned addr");
-    uint64_t idx = addr / PAGE_SIZE;
-    if (idx >= s_scan_max_pages)
+    uint64_t idx = page_index(addr);
+    if (!addr || idx >= s_scan_max_pages || !pmm_page_in_usable_ram(addr))
         return 0;  /* MMIO / outside PMM-managed RAM — refcounting N/A */
 
     irqflags_t fl  = spin_lock_irqsave(&pmm_lock);
@@ -689,8 +738,8 @@ int pmm_ref_page(uint64_t addr)
  */
 uint16_t pmm_page_refcount(uint64_t addr)
 {
-    uint64_t idx = addr / PAGE_SIZE;
-    if (idx >= s_scan_max_pages)
+    uint64_t idx = page_index(addr);
+    if (!addr || idx >= s_scan_max_pages || !pmm_page_in_usable_ram(addr))
         return 0;                       /* MMIO / outside managed RAM */
     irqflags_t fl  = spin_lock_irqsave(&pmm_lock);
     uint16_t   cur = refcount_get(idx);
@@ -710,8 +759,8 @@ void pmm_free_page(uint64_t addr)
         printk("%s", buf);
         panic_halt("[PMM] FAIL: pmm_free_page called with unaligned addr");
     }
-    uint64_t idx = addr / PAGE_SIZE;
-    if (idx >= s_scan_max_pages) {
+    uint64_t idx = page_index(addr);
+    if (!addr || idx >= s_scan_max_pages || !pmm_page_in_usable_ram(addr)) {
         /* Outside PMM-managed RAM (e.g. MMIO framebuffer physical addresses
          * mapped into user space by sys_fb_map). Never allocated by PMM. */
         return;
@@ -785,17 +834,15 @@ uint64_t pmm_unreserve_region(uint64_t base, uint64_t len)
     if (len == 0 || base + len < base)   /* empty or wrapping range */
         return 0;
 
-    uint64_t start = (base + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    uint64_t end   = (base + len) & ~(PAGE_SIZE - 1);
-    if (start >= end)
+    struct bitmap_span span;
+    if (!bitmap_span(base, len, 0, s_scan_max_pages, &span))
         return 0;
 
     uint64_t   freed = 0;
     irqflags_t fl    = spin_lock_irqsave(&pmm_lock);
-    for (uint64_t addr = start; addr < end; addr += PAGE_SIZE) {
-        uint64_t idx = addr / PAGE_SIZE;
-        if (idx >= s_bitmap_pages)
-            break;      /* beyond bitmap coverage — stop */
+    for (uint64_t idx = span.begin; idx < span.end; idx++) {
+        uint64_t addr = s_bitmap_base + idx * PAGE_SIZE;
+        if (!addr) continue; /* never release the physical-zero sentinel */
         if (!pmm_page_in_usable_ram(addr))
             continue;   /* hole/MMIO — PMM never accounted this as RAM */
         uint8_t bit = (uint8_t)(1U << (idx % 8));
@@ -824,7 +871,7 @@ pmm_ram_max_page(void)
 {
     /* Highest usable-RAM page + 1 (full physical extent, incl. >4GB), set at
      * pmm_init from the memmap. Sizes the physmap direct map in vmm_init. */
-    return s_ram_max_pages;
+    return s_bitmap_base / PAGE_SIZE + s_ram_max_pages;
 }
 
 uint64_t

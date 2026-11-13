@@ -9,6 +9,7 @@
 # platform is QEMU virt (PL011 + GICv3 + generic timer). Kept as its own
 # Makefile so the x86 build stays untouched; the source lists below are the
 # arm64 subset of the top-level Makefile's (no x86 drivers, no SMP traps).
+.DEFAULT_GOAL := all
 
 CC      = aarch64-linux-gnu-gcc
 LD      = aarch64-linux-gnu-ld
@@ -20,7 +21,7 @@ DEBUGFS ?= debugfs
 
 AEGIS_VERSION := $(shell cat VERSION 2>/dev/null || echo 0.0.0)
 
-BUILD = build/arm64
+BUILD = $(if $(filter 1,$(APPLE_USER)),build/appleuser/kernel,$(if $(filter 1,$(APPLE_PREEMPT)),build/applepreempt/kernel,$(if $(filter 1,$(APPLE_SCHED)),build/applesched/kernel,$(if $(filter 1,$(APPLE_CHECKPOINT)),$(if $(filter 1,$(APPLE_TIMER)),build/appletimer/kernel,$(if $(filter 1,$(APPLE_MEMORY)),build/applememory/kernel,build/applekernel/kernel)),build/arm64))))
 
 GCC_INCLUDE := $(shell $(CC) -print-file-name=include)
 CFLAGS = \
@@ -42,6 +43,42 @@ CFLAGS = \
     $(EXTRA_CFLAGS)
 
 LDFLAGS = -T tools/linker-arm64.ld -nostdlib
+ifeq ($(APPLE_CHECKPOINT),1)
+# Explicit allocation-free bring-up build. Never changes the default artifact.
+CFLAGS += -DAEGIS_APPLE_CHECKPOINT=1 -Ibuild/applekernel/qr -Ikernel/arch/arm64/apple
+ifeq ($(APPLE_MEMORY),1)
+CFLAGS += -DAPPLE_MEMORY_CHECKPOINT=1
+endif
+ifeq ($(APPLE_TIMER),1)
+ifneq ($(APPLE_MEMORY),1)
+$(error APPLE_TIMER requires APPLE_MEMORY=1)
+endif
+CFLAGS += -DAPPLE_TIMER_CHECKPOINT=1
+endif
+ifeq ($(APPLE_SCHED),1)
+ifneq ($(APPLE_TIMER),1)
+$(error APPLE_SCHED requires APPLE_TIMER=1)
+endif
+CFLAGS += -DAPPLE_SCHED_CHECKPOINT=1
+endif
+ifeq ($(APPLE_PREEMPT),1)
+ifneq ($(APPLE_SCHED),1)
+$(error APPLE_PREEMPT requires APPLE_SCHED=1)
+endif
+CFLAGS += -DAPPLE_PREEMPT_CHECKPOINT=1
+endif
+ifeq ($(APPLE_USER),1)
+ifneq ($(APPLE_SCHED),1)
+$(error APPLE_USER requires APPLE_SCHED=1)
+endif
+CFLAGS += -DAPPLE_USER_CHECKPOINT=1 -Ibuild/appleuser
+include tools/apple-user.mk
+$(BUILD)/arch/arm64/apple/kernel_user.o: build/appleuser/apple_user_layout.h
+$(BUILD)/arch/arm64/apple/user_blob.o: build/appleuser/user.elf
+endif
+LDFLAGS = -T tools/linker-applekernel.ld -nostdlib
+include tools/apple-qr.mk
+endif
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Shared with the x86 build (kconf / Kconfig). This is NOT optional: portable
@@ -131,6 +168,32 @@ SHARED_SRCS = \
     kernel/proc/proc.c kernel/proc/elf.c \
     kernel/arch/arm64/main.c
 
+ifeq ($(APPLE_CHECKPOINT),1)
+ARCH_SRCS += kernel/arch/arm64/apple/kernel_entry.c \
+             kernel/arch/arm64/apple/probe_console.c \
+             kernel/arch/arm64/apple/qr_report.c
+ARCH_ASMS += kernel/arch/arm64/apple/kernel_start.S
+ifeq ($(APPLE_MEMORY),1)
+ARCH_SRCS += kernel/arch/arm64/apple/kernel_memory.c
+endif
+ifeq ($(APPLE_TIMER),1)
+ARCH_SRCS += kernel/arch/arm64/apple/kernel_timer.c
+ARCH_ASMS += kernel/arch/arm64/apple/timer_wait.S
+endif
+ifeq ($(APPLE_SCHED),1)
+ARCH_SRCS += kernel/arch/arm64/apple/kernel_sched.c
+ARCH_ASMS += kernel/arch/arm64/apple/sched_yield_test.S
+endif
+ifeq ($(APPLE_PREEMPT),1)
+ARCH_SRCS += kernel/arch/arm64/apple/kernel_preempt.c
+ARCH_ASMS += kernel/arch/arm64/apple/preempt_wait.S
+endif
+ifeq ($(APPLE_USER),1)
+ARCH_SRCS += kernel/arch/arm64/apple/kernel_user.c
+ARCH_ASMS += kernel/arch/arm64/apple/user_blob.S
+endif
+endif
+
 # ── Config-driven source selection ───────────────────────────────────────────
 # Mirrors the top-level Makefile. Without this the Kconfig was INERT on aarch64:
 # the TU list was byte-identical for every tier, so CONFIG_NET=n still linked
@@ -200,6 +263,14 @@ endif
 C_OBJS   = $(patsubst kernel/%.c,$(BUILD)/%.o,$(ARCH_SRCS) $(SHARED_SRCS))
 ASM_OBJS = $(patsubst kernel/%.S,$(BUILD)/%.o,$(ARCH_ASMS))
 ALL_OBJS = $(ASM_OBJS) $(C_OBJS)
+ifeq ($(APPLE_CHECKPOINT),1)
+ALL_OBJS += $(BUILD)/arch/arm64/apple/qrcodegen.o
+$(BUILD)/arch/arm64/apple/qr_report.o: $(QR_DIR)/qrcodegen.h
+$(BUILD)/arch/arm64/apple/probe_console.o: $(QR_DIR)/qrcodegen.h
+$(BUILD)/arch/arm64/apple/qrcodegen.o: $(QR_DIR)/qrcodegen.freestanding.c $(QR_DIR)/qrcodegen.h kernel/arch/arm64/apple/qr_compat.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+endif
 
 .PHONY: all iso test test-disk clean dist version
 all: $(BUILD)/aegis-arm64.elf
@@ -228,7 +299,8 @@ $(BUILD)/%.o: kernel/%.S
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Two-pass link to embed the in-kernel symbol table (same as x86).
-$(BUILD)/aegis-arm64.elf: $(ALL_OBJS) tools/gen-ksyms.sh kernel/core/ksym.h
+$(BUILD)/aegis-arm64.elf: $(ALL_OBJS) tools/gen-ksyms.sh kernel/core/ksym.h \
+    $(if $(filter 1,$(APPLE_CHECKPOINT)),tools/linker-applekernel.ld,tools/linker-arm64.ld)
 	$(LD) $(LDFLAGS) -o $@.tmp $(ALL_OBJS)
 	NM=$(NM) sh tools/gen-ksyms.sh $@.tmp > $(BUILD)/ksyms.c
 	$(CC) $(CFLAGS) -c $(BUILD)/ksyms.c -o $(BUILD)/ksyms.o
@@ -242,9 +314,13 @@ $(KERNEL_STRIPPED): $(BUILD)/aegis-arm64.elf
 # ── UEFI-only Limine ISO (BOOTAA64.EFI comes from tools/fetch-limine.sh) ────
 LIMINE_DIR = tools/limine
 
+# Both ISO targets share one fetch target so parallel builds cannot race
+# while cloning/removing the same temporary Limine checkout.
+$(LIMINE_DIR)/BOOTAA64.EFI: tools/fetch-limine.sh $(LIMINE_DIR)/VERSION
+	sh tools/fetch-limine.sh
+
 iso: $(BUILD)/aegis-arm64.iso
-$(BUILD)/aegis-arm64.iso: $(KERNEL_STRIPPED)
-	@test -f $(LIMINE_DIR)/BOOTAA64.EFI || sh tools/fetch-limine.sh
+$(BUILD)/aegis-arm64.iso: $(KERNEL_STRIPPED) $(LIMINE_DIR)/BOOTAA64.EFI
 	@rm -rf $(BUILD)/isodir
 	@mkdir -p $(BUILD)/isodir/boot/limine $(BUILD)/isodir/EFI/BOOT
 	cp $(KERNEL_STRIPPED) $(BUILD)/isodir/boot/aegis.elf
@@ -273,8 +349,7 @@ $(BUILD)/test-rootfs.img: $(BUILD)/test-init $(BUILD)/test-exectgt test/exectest
 	$(MKE2FS) -t ext2 -F -b 4096 -L aegis-test $@ >/dev/null 2>&1
 	printf 'mkdir /bin\nwrite $(BUILD)/test-init /bin/vigil\nwrite $(BUILD)/test-exectgt /bin/exectest\nmkdir /etc\nmkdir /etc/aegis\nmkdir /etc/aegis/caps.d\nwrite test/exectest.caps /etc/aegis/caps.d/exectest\n' | $(DEBUGFS) -w $@ >/dev/null 2>&1
 
-$(BUILD)/aegis-arm64-test.iso: $(KERNEL_STRIPPED) $(BUILD)/test-rootfs.img
-	@test -f $(LIMINE_DIR)/BOOTAA64.EFI || sh tools/fetch-limine.sh
+$(BUILD)/aegis-arm64-test.iso: $(KERNEL_STRIPPED) $(BUILD)/test-rootfs.img $(LIMINE_DIR)/BOOTAA64.EFI
 	@rm -rf $(BUILD)/test-isodir
 	@mkdir -p $(BUILD)/test-isodir/boot/limine $(BUILD)/test-isodir/EFI/BOOT
 	cp $(KERNEL_STRIPPED) $(BUILD)/test-isodir/boot/aegis.elf

@@ -82,19 +82,31 @@ exception_vectors:
      * interrupts instead of silently hanging. */
     VECTOR vec_el1_sync      // sync
     VECTOR vec_el1_irq       // irq
+#ifdef APPLE_TIMER_CHECKPOINT
+    VECTOR vec_timer_fiq
+#else
     VECTOR vec_hang          // fiq
+#endif
     VECTOR vec_el1_sync      // serror
 
     /* Current EL with SP_ELx — exceptions while in the kernel. */
     VECTOR vec_el1_sync
     VECTOR vec_el1_irq
+#ifdef APPLE_TIMER_CHECKPOINT
+    VECTOR vec_timer_fiq
+#else
     VECTOR vec_hang          // fiq
+#endif
     VECTOR vec_el1_sync      // serror → same panic path
 
     /* Lower EL, AArch64 — user space. */
     VECTOR vec_el0_sync
     VECTOR vec_el0_irq
+#ifdef APPLE_TIMER_CHECKPOINT
+    VECTOR vec_timer_fiq
+#else
     VECTOR vec_hang          // fiq
+#endif
     VECTOR vec_el0_sync      // serror → fault path (kills the process)
 
     /* Lower EL, AArch32 — unsupported. */
@@ -146,3 +158,14 @@ vec_el0_irq:
     RESTORE_ALL
     eret
 .size vec_el0_irq, . - vec_el0_irq
+
+#ifdef APPLE_TIMER_CHECKPOINT
+.type vec_timer_fiq, %function
+vec_timer_fiq:
+    SAVE_ALL
+    mov x0, sp
+    bl apple_timer_fiq
+    RESTORE_ALL
+    eret
+.size vec_timer_fiq, . - vec_timer_fiq
+#endif

@@ -116,6 +116,10 @@ uint64_t arch_mm_get_uart_phys(void);
  * the QEMU-virt device window mapped Device-nGnRE. This replaces both the
  * x86 identity map and the mapped-window allocator. */
 #define ARCH_DMAP_BASE 0xFFFF900000000000UL
+#ifdef APPLE_MEMORY_CHECKPOINT
+#define ARCH_KVA_BASE (ARCH_KERNEL_VIRT_BASE + 0x4000000UL)
+void arch_mm_init_apple(uint64_t kernel_phys, uint64_t arena, uint64_t size);
+#endif
 
 static inline void *arch_dmap(uint64_t phys)
 {
@@ -172,6 +176,10 @@ void gic_init(void);
 void timer_init(void);
 
 uint64_t arch_get_ticks(void);
+/* Clock/accounting without enabling a timer or probing an interrupt controller.
+ * timer_init and the bounded Apple preemption gate share this timekeeping. */
+void arm64_timer_clock_init(void);
+void arm64_timer_account_tick(void);
 void arch_tsc_calibrate(uint64_t cycles_per_10ms);
 uint64_t arch_tsc_hz(void);
 uint64_t arch_clock_mono_ns(void);   /* ns since counter start (CNTVCT-derived) */
@@ -237,14 +245,29 @@ void arm64_pan_init(void);
 
 static inline void arch_wmb(void) { __asm__ volatile("dsb st" ::: "memory"); }
 
-static inline void arch_enable_irq(void)  { __asm__ volatile("msr daifclr, #2" ::: "memory"); }
-static inline void arch_disable_irq(void) { __asm__ volatile("msr daifset, #2" ::: "memory"); }
+/* Apple timer preemption uses FIQ. Keep unqualified IRQ sources masked, and
+ * mask both classes in shared critical sections. Normal GIC builds retain
+ * their IRQ-only routing. Restore always reinstates the exact saved DAIF. */
+#ifdef APPLE_SCHED_CHECKPOINT
+#define ARM64_PREEMPT_MASK "3"
+static inline void arch_enable_irq(void)
+{
+    __asm__ volatile("msr daifset, #2\n\tmsr daifclr, #1\n\tisb" ::: "memory");
+}
+#else
+#define ARM64_PREEMPT_MASK "2"
+static inline void arch_enable_irq(void) { __asm__ volatile("msr daifclr, #2" ::: "memory"); }
+#endif
+static inline void arch_disable_irq(void)
+{
+    __asm__ volatile("msr daifset, #" ARM64_PREEMPT_MASK ::: "memory");
+}
 
 static inline unsigned long
 arch_irq_save(void)
 {
     unsigned long flags;
-    __asm__ volatile("mrs %0, daif\n\tmsr daifset, #2" : "=r"(flags) : : "memory");
+    __asm__ volatile("mrs %0, daif\n\tmsr daifset, #" ARM64_PREEMPT_MASK : "=r"(flags) : : "memory");
     return flags;
 }
 
@@ -271,7 +294,13 @@ static inline void arch_halt(void) { __asm__ volatile("wfi" ::: "memory"); }
  * before the enable window, so no lost-wakeup race like x86's sti;hlt. */
 static inline void arch_wait_for_irq(void)
 {
+#ifdef APPLE_SCHED_CHECKPOINT
+    arch_enable_irq();
+    __asm__ volatile("wfi" ::: "memory");
+    arch_disable_irq();
+#else
     __asm__ volatile("msr daifclr, #2\n\twfi\n\tmsr daifset, #2" ::: "memory");
+#endif
 }
 
 static inline int arch_early_key_held(void) { return 0; }

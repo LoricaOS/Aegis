@@ -1,0 +1,36 @@
+# Allocation-free bridge into the real ARM64 kernel. Not a normal boot image.
+.DEFAULT_GOAL := all
+APPLE_BUILD ?= build/applekernel
+KERNEL_TEST ?= test/apple_kernel_test.py
+BUILD = $(APPLE_BUILD)/loader
+EXTRA_CFLAGS = -DAPPLE_PROBE_TRANSLATION=1 -DAPPLE_KERNEL_BRIDGE=1 -I$(APPLE_BUILD) \
+              -Ibuild/applekernel/qr -Ikernel/arch/arm64/apple \
+              $(if $(filter 1,$(APPLE_MEMORY)),-DAPPLE_MEMORY_CHECKPOINT=1) \
+              $(if $(filter 1,$(APPLE_TIMER)),-DAPPLE_TIMER_CHECKPOINT=1) \
+              $(if $(filter 1,$(APPLE_SCHED)),-DAPPLE_SCHED_CHECKPOINT=1) \
+              $(if $(filter 1,$(APPLE_PREEMPT)),-DAPPLE_PREEMPT_CHECKPOINT=1) \
+              $(if $(filter 1,$(APPLE_USER)),-DAPPLE_USER_CHECKPOINT=1)
+EXTRA_OBJECTS = $(BUILD)/kernel_bridge.o $(BUILD)/kernel_blob.o \
+                $(BUILD)/qr_report.o $(BUILD)/qrcodegen.o $(BUILD)/string.o
+include Makefile.appleprobe
+include tools/apple-qr.mk
+$(BUILD)/console.o: $(QR_DIR)/qrcodegen.h
+
+.PHONY: kernel-layout check
+kernel-layout:
+	$(MAKE) -f Makefile.arm64 APPLE_CHECKPOINT=1 APPLE_MEMORY=$(APPLE_MEMORY) APPLE_TIMER=$(APPLE_TIMER) APPLE_SCHED=$(APPLE_SCHED) APPLE_PREEMPT=$(APPLE_PREEMPT) APPLE_USER=$(APPLE_USER) BUILD=$(APPLE_BUILD)/kernel all
+	python3 -B tools/apple-kernel-layout.py $(APPLE_BUILD)
+
+$(BUILD)/kernel_bridge.o: kernel/arch/arm64/apple/kernel_bridge.c kernel/arch/arm64/apple/kernel_handoff.h kernel/arch/arm64/apple/qr_report.h kernel-layout | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(BUILD)/kernel_blob.o: kernel/arch/arm64/apple/kernel_blob.S kernel-layout | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(BUILD)/qr_report.o: kernel/arch/arm64/apple/qr_report.c kernel/arch/arm64/apple/qr_report.h kernel/arch/arm64/apple/probe_console.h $(QR_DIR)/qrcodegen.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(BUILD)/qrcodegen.o: $(QR_DIR)/qrcodegen.freestanding.c $(QR_DIR)/qrcodegen.h kernel/arch/arm64/apple/qr_compat.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(BUILD)/string.o: kernel/lib/string.c kernel/lib/string.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+check: all
+	python3 -B $(KERNEL_TEST)

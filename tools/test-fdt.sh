@@ -5,12 +5,15 @@
 # extracts the GIC / ECAM bases from it. Independent of the kernel boot
 # (the Limine+edk2 path presents ACPI, so the parser can't be verified
 # through a boot). Exits non-zero on any failure.
-set -e
+set -eu
 
-DTB="${TMPDIR:-/tmp}/aegis-virt.dtb"
-BIN="${TMPDIR:-/tmp}/aegis-fdt-test"
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/aegis-fdt.XXXXXXXX")
+trap 'rm -rf "$WORK"' EXIT
+DTB="$WORK/virt.dtb"
+BIN="$WORK/fdt-test"
 
-qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a72 -smp 4 \
+qemu-system-aarch64 -nodefaults -display none \
+    -M virt,gic-version=3 -cpu cortex-a72 -smp 4 \
     -machine dumpdtb="$DTB" >/dev/null 2>&1
 
 cc -O2 -Wall -Wextra -DFDT_HOSTTEST -Ikernel/arch/arm64 \
@@ -23,7 +26,7 @@ cc -O2 -Wall -Wextra -DFDT_HOSTTEST -Ikernel/arch/arm64 \
 # passed because it overflowed too, and `off` failed to advance. The walker then
 # handed that ~4 GiB length to compat_list_has, which is an out-of-range read
 # (SIGBUS, reproduced). The parser must now reject the property and return.
-EVIL="${TMPDIR:-/tmp}/aegis-fdt-crafted"
+EVIL="$WORK/fdt-crafted"
 cc -O2 -w -DFDT_HOSTTEST -Ikernel/arch/arm64 \
     test/fdt_crafted_test.c kernel/arch/arm64/fdt.c -o "$EVIL"
 if "$EVIL"; then
@@ -32,3 +35,5 @@ else
     echo "FDT-CRAFTED FAIL (rc=$?) — crafted length not rejected"
     exit 1
 fi
+
+python3 -B test/fdt_root_test.py

@@ -1,0 +1,10 @@
+# One bounded physical-timer FIQ and exception return after real memory init.
+APPLE_BUILD = build/appletimer
+APPLE_TIMER = 1
+KERNEL_TEST = test/apple_timer_kernel_test.py
+include Makefile.applememory
+
+.PHONY: timer-host-checks
+check: timer-host-checks
+timer-host-checks:
+	python3 -B test/apple_timer_state_test.py

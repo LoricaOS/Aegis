@@ -13,8 +13,12 @@ void pmm_init(void);
 
 /* Second-phase init: swap the 4GB static bootstrap bitmap for a full
  * RAM-sized one (allocated from KVA, so no fixed cap). Call once, after
- * kva_init() and before pmm_set_alloc_high_pref(1). No-op on <= 4GB machines.
- * Without this, only the first 4GB of RAM is usable. */
+ * kva_init() and before pmm_set_alloc_high_pref(1). Refcounts are initialized
+ * even when bitmap growth is unnecessary.
+ * Without this, only the bootstrap window is usable. Normally its physical
+ * origin is zero; when all usable RAM lies beyond bootstrap coverage it
+ * starts at the first whole usable page. Public addresses and the <4GB DMA
+ * limit remain absolute. Late refcount storage uses the same origin. */
 void pmm_init_late(void);
 
 /* Allocate one 4KB physical page.
@@ -42,8 +46,9 @@ uint64_t pmm_alloc_contig_low(uint64_t n);
 
 /* Enable/disable preferring high (>=4GB) RAM for general pmm_alloc_page().
  * Call with 1 AFTER vmm_init/kva_init so the low pool stays free for DMA;
- * leave it off during early boot so the first page tables land below 1 GB
- * (reached via the identity map before the window allocator exists). */
+ * leave it off during early boot to prefer the lowest available boot RAM.
+ * Early mappings must cover the admitted pool; a high-base-only machine does
+ * not gain any physical pages below 4 GB through this preference. */
 void pmm_set_alloc_high_pref(int on);
 
 /* Free a page previously returned by pmm_alloc_page().

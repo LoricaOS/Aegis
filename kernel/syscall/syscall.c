@@ -21,7 +21,7 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     switch (num) {
     /* File I/O */
     case  17: num = 79;  break;  /* getcwd */
-    case  23: num = 33;  break;  /* dup */
+    case  23: num = 32;  break;  /* dup (33 is dup2 and consumes an absent arg2) */
     case  24: num = 292; break;  /* dup3 */
     case 165: num = 98;  break;  /* getrusage */
     case  88: num = 280; break;  /* utimensat (same arg order) */
@@ -94,6 +94,8 @@ syscall_dispatch(syscall_frame_t *frame, uint64_t num,
     case 135: num = 14;  break;  /* rt_sigprocmask */
     case 139: num = 15;  break;  /* rt_sigreturn */
     case 160: num = 63;  break;  /* uname */
+    case 154: num = 109; break;  /* setpgid — interactive shell job control */
+    case 155: num = 121; break;  /* getpgid (musl getpgrp uses getpgid(0)) */
     case 172: num = 39;  break;  /* getpid */
     case 173: num = 110; break;  /* getppid */
     case 174: num = 102; break;  /* getuid */

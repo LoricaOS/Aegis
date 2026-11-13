@@ -623,6 +623,9 @@ sched_spawn_task_locked(void (*fn)(void))
     aegis_task_t *task = kva_alloc_pages(1);
     if (!task)
         return NULL;
+    /* KVA pages may be recycled. Fields without explicit creation values
+     * (TLS, sleep deadlines, debug state) must not inherit another task. */
+    __builtin_memset(task, 0, sizeof(*task));
 
     /* Allocate stack: STACK_PAGES usable pages plus one unmapped guard page
      * at the bottom.  Stack grows downward; the guard page causes a #PF on

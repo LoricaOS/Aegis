@@ -142,7 +142,7 @@ kva_alloc_pages(uint64_t n)
             return NULL;
         }
         if (vmm_try_map_page(base + i * 4096UL, phys,
-                             VMM_FLAG_WRITABLE) < 0) {
+                             VMM_FLAG_WRITABLE | VMM_FLAG_NX) < 0) {
             pmm_free_page(phys);
             rollback_alloc(base, n, i);
             return NULL;
@@ -198,7 +198,7 @@ kva_alloc_pages_low_flags(uint64_t n, uint64_t map_flags)
             rollback_alloc(base, n, i);
             return NULL;
         }
-        if (vmm_try_map_page(base + i * 4096UL, phys, map_flags) < 0) {
+        if (vmm_try_map_page(base + i * 4096UL, phys, map_flags | VMM_FLAG_NX) < 0) {
             pmm_free_page(phys);
             rollback_alloc(base, n, i);
             return NULL;
@@ -242,7 +242,7 @@ kva_map_phys_pages(uint64_t phys_base, uint32_t num_pages)
     for (i = 0; i < num_pages; i++) {
         if (vmm_try_map_page(base + (uint64_t)i * 4096UL,
                              phys_base + (uint64_t)i * 4096UL,
-                             VMM_FLAG_WRITABLE) < 0) {
+                             VMM_FLAG_WRITABLE | VMM_FLAG_NX) < 0) {
             rollback_mapping(base, num_pages, i);
             return NULL;
         }
@@ -277,7 +277,7 @@ kva_map_mmio(uint64_t phys_base, uint32_t num_pages)
         if (vmm_try_map_page(base + (uint64_t)i * 4096UL,
                              phys_base + (uint64_t)i * 4096UL,
                              VMM_FLAG_WRITABLE | VMM_FLAG_WC |
-                             VMM_FLAG_UCMINUS) < 0) {
+                             VMM_FLAG_UCMINUS | VMM_FLAG_NX) < 0) {
             rollback_mapping(base, num_pages, i);
             return NULL;
         }

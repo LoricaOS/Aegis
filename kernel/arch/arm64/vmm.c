@@ -42,6 +42,9 @@
 #include "proc.h"
 #include <stdint.h>
 #include <stddef.h>
+#ifdef APPLE_MEMORY_CHECKPOINT
+#include "apple/kernel_memory.h"
+#endif
 
 #define VMM_PAGE_SIZE   AEGIS_PAGE_SIZE
 #define VMM_PAGE_MASK   (~(VMM_PAGE_SIZE - 1))
@@ -207,10 +210,19 @@ vmm_init(void)
 {
     lockrank_register(&vmm_lock, LOCK_RANK_VMM);
 
-    uint64_t slide = arch_kern_phys_slide();
     uint64_t root  = alloc_table_or_panic();
     pr_dbg("[VMM] diagnostic: root table allocated (native-boot bring-up)\n");
 
+#ifdef APPLE_MEMORY_CHECKPOINT
+    unsigned count;
+    const struct apple_boot_mapping *maps = apple_memory_mappings(&count);
+    for (unsigned i = 0; i < count; i++)
+        for (uint64_t off = 0; off < maps[i].size; off += VMM_PAGE_SIZE)
+            if (map_page_in(root, maps[i].va + off, maps[i].pa + off,
+                            maps[i].flags | VMM_FLAG_PRESENT, 0))
+                panic_halt("[VMM] FAIL: owned Apple bootstrap map");
+#else
+    uint64_t slide = arch_kern_phys_slide();
     /* 1. Kernel image: KERN_VMA+PHYS_BASE .. _kernel_end → slide'd phys,
      *    4K pages (Limine guarantees contiguity, not 2MB alignment).
      *    Kernel RWX per page table (W^X refinement is a follow-up; the
@@ -325,6 +337,7 @@ vmm_init(void)
         }
     }
     pr_dbg("[VMM] diagnostic: step 3 (RAM direct map) done\n");
+#endif
 
     /* 4. Empty user table — the "master pml4" loaded while no user task
      *    runs (fail closed: kernel-only context has NO user mappings). */
@@ -344,6 +357,24 @@ vmm_init(void)
      * memory. A trailing dsb does not retroactively close that window. Real
      * defect on the A76: fits an intermittent hang right after "step 3 done". */
     s_ttbr1_phys = root;
+#ifdef APPLE_MEMORY_CHECKPOINT
+    uint64_t mair, tcr;
+    __asm__ volatile("mrs %0, mair_el1" : "=r"(mair));
+    __asm__ volatile("mrs %0, tcr_el1" : "=r"(tcr));
+    if (mair != 0xff0044)
+        panic_halt("[VMM] FAIL: unexpected live Apple MAIR");
+    tcr &= ~((15ULL << 8) | (3ULL << 12) | (15ULL << 24) | (3ULL << 28));
+    tcr |= (1ULL << 8) | (1ULL << 10) | (3ULL << 12) |
+           (1ULL << 24) | (1ULL << 26) | (3ULL << 28);
+    apple_memory_vmm_ready(root);
+    apple_memory_rebase_console();
+    /* The new tables live in WB arena pages. Publish them before replacing
+     * either root, use WB/shareable walks, and retire all identity mappings.
+     * The high kernel mappings and MAIR palette stay bit-for-bit consistent. */
+    __asm__ volatile("dsb sy\nmsr tcr_el1, %2\nmsr ttbr1_el1, %0\n"
+                     "msr ttbr0_el1, %1\nisb\ntlbi vmalle1is\ndsb ish\nisb"
+                     : : "r"(root), "r"(s_empty_user), "r"(tcr) : "memory");
+#else
     __asm__ volatile(
         "dsb ish\n\t"               /* table stores observable before the switch */
         "msr ttbr1_el1, %0\n\t"
@@ -352,6 +383,7 @@ vmm_init(void)
         "dsb ish\n\t"
         "isb"
         : : "r"(root) : "memory");
+#endif
     s_dmap_live = 1;
 
     printk("[VMM] OK: kernel mapped to 0xFFFFFFFF80000000\n");

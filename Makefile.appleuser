@@ -1,0 +1,14 @@
+# Bounded first EL0 process; no rootfs, devices or user timer preemption.
+APPLE_BUILD = build/appleuser
+APPLE_USER = 1
+APPLE_SCHED = 1
+APPLE_TIMER = 1
+KERNEL_TEST = test/apple_user_kernel_test.py
+include Makefile.applememory
+include tools/apple-user.mk
+kernel-layout: user-layout
+
+.PHONY: user-host-checks
+check: user-host-checks
+user-host-checks: user-layout
+	python3 -B test/apple_user_state_test.py

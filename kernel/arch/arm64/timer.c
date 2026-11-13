@@ -24,7 +24,7 @@
  * may access it and zeros CNTVOFF. QEMU virt / Limine keep the virtual timer,
  * which works at EL1 on that path. The PPI number is mirrored in gic_v2.c
  * (enable) and traps.c (dispatch) under the same guard. */
-#ifdef AEGIS_BOOT_NATIVE
+#if defined(AEGIS_BOOT_NATIVE) || defined(APPLE_PREEMPT_CHECKPOINT)
 #define TMR_CTL_EL0   "cntp_ctl_el0"
 #define TMR_CVAL_EL0  "cntp_cval_el0"
 #define TMR_CT_EL0    "cntpct_el0"
@@ -55,7 +55,7 @@ rearm(void)
 }
 
 void
-timer_init(void)
+arm64_timer_clock_init(void)
 {
     __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(s_freq));
     if (s_freq == 0)
@@ -64,7 +64,12 @@ timer_init(void)
     /* ns/count in Q32 fixed point — u128 multiply (inline) instead of u128
      * divide (__udivti3 libcall the freestanding kernel can't link). */
     s_ns_per_cnt_fp = (1000000000ULL << 32) / s_freq;
+}
 
+void
+timer_init(void)
+{
+    arm64_timer_clock_init();
     rearm();
     __asm__ volatile("msr " TMR_CTL_EL0 ", %0" : : "r"(1UL));  /* enable, unmasked */
     /* The timer PPI is enabled per-core in gic_cpu_init. */
@@ -88,6 +93,14 @@ timer_ap_init(void)
 void native_watchdog_tick(void);   /* kernel/arch/arm64/main.c — petted watchdog */
 #endif
 
+/* Shared BSP tick accounting, without pollers, device I/O or scheduling. */
+void
+arm64_timer_account_tick(void)
+{
+    if (percpu_self()->cpu_id == 0)
+        s_ticks++;
+}
+
 /* timer_irq — INTID 27 handler (called from arm64_irq AFTER gic_eoi:
  * sched_tick may context-switch away and not return promptly). */
 void
@@ -96,7 +109,7 @@ timer_irq(void)
     rearm();
     uint32_t cpu = percpu_self()->cpu_id;
     if (cpu == 0) {
-        s_ticks++;
+        arm64_timer_account_tick();
 #ifdef AEGIS_BOOT_NATIVE
         native_watchdog_tick(); /* pet BCM2712 watchdog during its boot window */
         {

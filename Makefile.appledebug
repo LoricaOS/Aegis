@@ -1,0 +1,20 @@
+# Separate debug-only resident-monitor transport; not linked into aegis.elf.
+CC = aarch64-linux-gnu-gcc
+LD = aarch64-linux-gnu-ld
+OBJCOPY = aarch64-linux-gnu-objcopy
+BUILD = build/appledebug
+
+.PHONY: all test
+all: $(BUILD)/guest.bin
+
+$(BUILD):
+	mkdir -p $@
+$(BUILD)/guest.o: kernel/arch/arm64/apple/debug_transport.S | $(BUILD)
+	$(CC) -c -mgeneral-regs-only $< -o $@
+$(BUILD)/guest.elf: $(BUILD)/guest.o kernel/arch/arm64/apple/debug_transport.ld
+	$(LD) -static -T kernel/arch/arm64/apple/debug_transport.ld -o $@ $<
+$(BUILD)/guest.bin: $(BUILD)/guest.elf
+	$(OBJCOPY) -O binary $< $@
+
+test: all
+	python3 -B test/apple_debug_test.py

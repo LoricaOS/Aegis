@@ -29,6 +29,22 @@ int fdt_reg_by_compat(const char *compat, int index,
 /* 1 if any node advertises `compat` in its "compatible" list. */
 int fdt_compat_exists(const char *compat);
 
+/* Root-node identity only, for platform selection. Unlike the any-node
+ * query above, a peripheral cannot make the machine match a platform.
+ * Rejects malformed/duplicate root compatible properties. This checks the
+ * root property prefix, not the validity of every descendant or MMIO range. */
+int fdt_root_compatible(const char *compat);
+
+/* Firmware-owned linear boot framebuffer. This describes the handoff,
+ * not a display controller mode; callers must preserve its reservation. */
+enum fdt_fb_format { FDT_FB_XRGB8888 = 1, FDT_FB_XRGB2101010 = 2 };
+struct fdt_bootfb {
+    uint64_t base, size;
+    uint32_t width, height, stride;
+    enum fdt_fb_format format;
+};
+int fdt_boot_framebuffer(struct fdt_bootfb *out);
+
 /* Like fdt_reg_by_compat, but for compat strings shared by more than one
  * node (e.g. BCM2712's three "brcm,bcm2712-pcie" root complexes at
  * different reg bases) -- node_index selects which MATCHING NODE (0 = the

@@ -28,9 +28,10 @@
 #define FDT_NOP         0x4u
 #define FDT_END         0x9u
 
-/* virt DTBs are a few KiB; VZ's is larger but nowhere near this. A blob
- * bigger than the buffer simply isn't captured (fdt stays unavailable). */
-#define FDT_BUF_SIZE    (128u * 1024u)
+/* QEMU virt is a few KiB, but the observed J514s loader-expanded boot tree
+ * has 211269 meaningful bytes (versus 91529 in its staged DTB). Keep bounded
+ * headroom for firmware nodes; reject larger trees rather than truncate. */
+#define FDT_BUF_SIZE    (512u * 1024u)
 #define FDT_MAX_DEPTH   32
 
 static uint8_t  s_buf[FDT_BUF_SIZE];
@@ -258,6 +259,55 @@ fdt_compat_exists(const char *compat)
     return walk(compat, 0, 0, NULL, NULL);
 }
 
+/* Platform identity is the root's string list, never a peripheral's.
+ * Root properties precede child nodes in an FDT. Stay inside that prefix;
+ * later device queries remain responsible for validating their own data. */
+int
+fdt_root_compatible(const char *compat)
+{
+    if (!s_ok || !compat || !compat[0] ||
+        s_struct_off < 40 || s_struct_end - s_struct_off < 8)
+        return 0;
+    uint32_t off = s_struct_off;
+    if (be32(s_buf + off) != FDT_BEGIN_NODE || s_buf[off + 4] != 0)
+        return 0;                       /* root name must be empty */
+    off += 8;                           /* token + empty name/padding */
+    int seen = 0, found = 0;
+    while ((uint64_t)off + 4 <= s_struct_end) {
+        uint32_t tok = be32(s_buf + off);
+        off += 4;
+        if (tok == FDT_NOP)
+            continue;
+        if (tok == FDT_BEGIN_NODE || tok == FDT_END_NODE)
+            return seen && found;       /* end of root property prefix */
+        if (tok != FDT_PROP || (uint64_t)off + 8 > s_struct_end)
+            return 0;
+        uint32_t len = be32(s_buf + off);
+        uint32_t name = be32(s_buf + off + 4);
+        uint32_t val = off + 8;
+        uint64_t next = ((uint64_t)val + len + 3) & ~3ULL;
+        if (next > s_struct_end || name >= s_strings_size)
+            return 0;
+        uint32_t n = name;
+        while (n < s_strings_size && s_buf[s_strings_off + n])
+            n++;
+        if (n == s_strings_size)
+            return 0;                   /* unterminated property name */
+        if (str_at_is(name, "compatible")) {
+            if (seen || !len || s_buf[val + len - 1] != 0)
+                return 0;
+            /* Validate the whole list, even after an early matching entry. */
+            for (uint32_t i = 0; i < len; i++)
+                if (!s_buf[val + i] && (!i || !s_buf[val + i - 1]))
+                    return 0;           /* empty list member */
+            seen = 1;
+            found = compat_list_has(s_buf + val, len, compat);
+        }
+        off = (uint32_t)next;
+    }
+    return 0;
+}
+
 /* Same node-walking shape as walk() above, but counts NODE matches instead
  * of returning on the first one -- needed for BCM2712's three identically-
  * compatible PCIe root complexes (pcie0/pcie1/pcie2), which walk() cannot
@@ -459,6 +509,53 @@ prop_by_match(const char *compat, const char *devtype, const char *propname,
         }
     }
     return 0;
+}
+
+/* Exact-width simplefb properties; do not silently truncate malformed input. */
+static int
+bootfb_u32(const char *name, uint32_t *out)
+{
+    uint32_t val, len;
+    if (!prop_by_match("simple-framebuffer", 0, name, 0, &val, &len, 0) ||
+        len != 4)
+        return 0;
+    *out = be32(s_buf + val);
+    return 1;
+}
+
+int
+fdt_boot_framebuffer(struct fdt_bootfb *out)
+{
+    struct fdt_bootfb fb;
+    uint64_t other_base, other_size;
+    uint32_t val, len;
+    if (!out ||
+        !fdt_reg_by_compat("simple-framebuffer", 0, &fb.base, &fb.size) ||
+        fdt_reg_by_compat_nth("simple-framebuffer", 1, &other_base, &other_size) ||
+        !bootfb_u32("width", &fb.width) || !bootfb_u32("height", &fb.height) ||
+        !bootfb_u32("stride", &fb.stride))
+        return 0;
+    if (!fb.base || (fb.base & 3) || !fb.size ||
+        fb.size > UINT64_MAX - fb.base ||
+        !fb.width || fb.width > 8192 || !fb.height || fb.height > 8192 ||
+        (fb.stride & 3) || fb.stride < (uint64_t)fb.width * 4 ||
+        fb.stride > 65536 || (uint64_t)fb.stride * fb.height > fb.size ||
+        fb.size > 64ULL * 1024 * 1024)
+        return 0;
+    if (prop_by_match("simple-framebuffer", 0, "status", 0, &val, &len, 0) &&
+        !((len == sizeof("okay") && val_str_is(val, len, "okay")) ||
+          (len == sizeof("ok") && val_str_is(val, len, "ok"))))
+        return 0;
+    if (!prop_by_match("simple-framebuffer", 0, "format", 0, &val, &len, 0))
+        return 0;
+    if (len == sizeof("x2r10g10b10") && val_str_is(val, len, "x2r10g10b10"))
+        fb.format = FDT_FB_XRGB2101010;
+    else if (len == sizeof("x8r8g8b8") && val_str_is(val, len, "x8r8g8b8"))
+        fb.format = FDT_FB_XRGB8888;
+    else
+        return 0;
+    *out = fb;
+    return 1;
 }
 
 /* PSCI conduit from the /psci node's "method": 1 = SMC, 0 = HVC, -1 = no

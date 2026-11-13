@@ -11,7 +11,8 @@ void kva_init(void);
 /* kva_alloc_pages — allocate n 4KB pages, map them to consecutive higher-half
  * virtual addresses, and return the base VA as a pointer.
  * Returns NULL on physical-memory or page-table exhaustion and rolls back the
- * complete request. Never pass VMM_FLAG_USER — kva pages are kernel-only; USER
+ * complete request. Allocator/physical/MMIO mappings are kernel data (NX).
+ * Never pass VMM_FLAG_USER — kva pages are kernel-only; USER
  * must be absent so the MMU denies ring-3 access to kernel objects. */
 void *kva_alloc_pages(uint64_t n);
 

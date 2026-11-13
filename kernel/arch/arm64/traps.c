@@ -23,6 +23,19 @@
 #include "../../syscall/syscall.h"
 #include "stackshot.h"
 #include <stdint.h>
+#ifdef APPLE_USER_CHECKPOINT
+#include "apple/kernel_user.h"
+#endif
+#ifdef AEGIS_APPLE_CHECKPOINT
+#include "apple/qr_report.h"
+extern volatile uint64_t apple_kernel_atomic_report[4];
+#ifdef APPLE_MEMORY_CHECKPOINT
+#include "apple/kernel_memory.h"
+#endif
+#ifdef APPLE_TIMER_CHECKPOINT
+#include "apple/kernel_timer.h"
+#endif
+#endif
 
 extern char exception_vectors[];
 
@@ -74,7 +87,7 @@ idt_init(void)
  * Runs once after vmm_init (device idmap active in TTBR0). */
 uint64_t arm64_copy_from_user(void *dst, const void *src, uint64_t len);
 
-void
+int
 uaccess_selftest(void)
 {
     uint8_t buf[8];
@@ -83,6 +96,7 @@ uaccess_selftest(void)
         printk("[UACCESS] OK: EL1 fault fixup (%lu/8 uncopied)\n", not_copied);
     else
         printk("[UACCESS] WARN: fixup returned %lu, expected 8\n", not_copied);
+    return not_copied == 8;
 }
 
 static inline uint64_t
@@ -165,6 +179,10 @@ arm64_sync_el0(cpu_state_t *s)
     uint64_t esr = read_esr();
     uint64_t ec  = (esr >> 26) & 0x3F;
 
+#ifdef APPLE_USER_CHECKPOINT
+    if (apple_user_exception(s, esr))
+        return; /* exact diagnostic fault fixup only; no syscall bypass */
+#endif
     if (ec == EC_SVC64) {
         /* Linux aarch64 ABI: x8 = syscall number, x0-x5 = args, x0 = ret.
          * syscall_frame_t is the same memory layout as cpu_state_t. */
@@ -172,6 +190,9 @@ arm64_sync_el0(cpu_state_t *s)
         s->x[0] = syscall_dispatch(f, s->x[8],
                                    s->x[0], s->x[1], s->x[2],
                                    s->x[3], s->x[4], s->x[5]);
+#ifdef APPLE_USER_CHECKPOINT
+        apple_user_syscall_result(s);
+#endif
     } else {
         el0_fault(s, esr);
     }
@@ -185,6 +206,10 @@ arm64_sync_el0(cpu_state_t *s)
 void
 arm64_irq(cpu_state_t *s)
 {
+#ifdef APPLE_TIMER_CHECKPOINT
+    apple_timer_unexpected_irq(s);
+    return; /* no GIC/MMIO fallback in the explicit Apple FIQ diagnostic */
+#endif
     for (;;) {
         uint32_t intid = gic_ack();
         if (intid >= 1020 && intid <= 1023)
@@ -271,6 +296,12 @@ arm64_fault_el1(cpu_state_t *s)
     }
 
     uint64_t far = read_far();
+#ifdef AEGIS_APPLE_CHECKPOINT
+    apple_qr_progress("kernel-fault", apple_kernel_atomic_report);
+#ifdef APPLE_MEMORY_CHECKPOINT
+    apple_memory_report.stage = 255;
+#endif
+#endif
     printk("[PANIC] EL1 sync exception ESR=0x%lx EC=0x%lx FAR=0x%lx ELR=0x%lx\n",
            esr, (esr >> 26) & 0x3F, far, s->elr);
     printk("[PANIC] x0=0x%lx x1=0x%lx x29=0x%lx x30=0x%lx sp_el0=0x%lx\n",

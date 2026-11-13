@@ -37,6 +37,8 @@ if [ "$guards" != 2 ]; then
 fi
 
 for marker in \
+    "dup preserves source and ignores unused args" \
+    "process groups isolate child job control" \
     "independent child empty and admin-drop cannot regrant" \
     "admin SELF denied + invalid legacy selectors preserve caller/parent authority" \
     "vfork shared VM control and empty authority" \
