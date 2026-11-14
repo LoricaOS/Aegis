@@ -145,6 +145,11 @@ static uint64_t s_scan_max_pages;
  * allocated low region from 0 every time — important once low RAM fills on a
  * big machine. */
 static uint64_t s_alloc_hint_byte;
+/* Independent next-fit cursor for the <4GB DMA zone. */
+static uint64_t s_low_hint_byte;
+/* Exact count of clear, usable bitmap bits. Updated on actual bit transitions
+ * under pmm_lock (or during single-threaded bootstrap initialization). */
+static uint64_t s_free_pages;
 
 static spinlock_t pmm_lock = SPINLOCK_INIT;
 
@@ -191,8 +196,13 @@ static void pmm_free_region(uint64_t base, uint64_t len)
 
     for (uint64_t addr = start; addr < end; addr += PAGE_SIZE) {
         uint64_t idx = addr / PAGE_SIZE;
-        if (idx < s_bitmap_pages)
-            s_bitmap[idx / 8] &= (uint8_t)~(1U << (idx % 8));
+        if (idx < s_bitmap_pages) {
+            uint8_t bit = (uint8_t)(1U << (idx % 8));
+            if (s_bitmap[idx / 8] & bit) {
+                s_bitmap[idx / 8] &= (uint8_t)~bit;
+                s_free_pages++;
+            }
+        }
     }
 }
 
@@ -217,15 +227,24 @@ static int pmm_page_in_usable_ram(uint64_t addr)
 
 void pmm_reserve_region(uint64_t base, uint64_t len)
 {
+    if (len == 0 || base + len < base || base + len > UINT64_MAX - (PAGE_SIZE - 1))
+        return;
+    irqflags_t fl = spin_lock_irqsave(&pmm_lock);
     /* Align base down, end up — reserve conservatively. */
     uint64_t start = base & ~(PAGE_SIZE - 1);
     uint64_t end   = (base + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
     for (uint64_t addr = start; addr < end; addr += PAGE_SIZE) {
         uint64_t idx = addr / PAGE_SIZE;
-        if (idx < s_bitmap_pages)
-            s_bitmap[idx / 8] |= (uint8_t)(1U << (idx % 8));
+        if (idx < s_bitmap_pages) {
+            uint8_t bit = (uint8_t)(1U << (idx % 8));
+            if (!(s_bitmap[idx / 8] & bit)) {
+                s_bitmap[idx / 8] |= bit;
+                s_free_pages--;
+            }
+        }
     }
+    spin_unlock_irqrestore(&pmm_lock, fl);
 }
 
 /* --------------------------------------------------------------------------
@@ -240,6 +259,8 @@ void pmm_init(void)
      * and every frame reads as the implicit refcount 1; no COW/fork/memfd
      * sharing occurs before init. */
 
+    s_free_pages = 0;
+    s_low_hint_byte = 0;
     /* Step 1: start with everything reserved (safe default) */
     for (uint64_t i = 0; i < s_bitmap_pages / 8; i++)
         s_bitmap[i] = 0xFF;
@@ -389,11 +410,15 @@ void pmm_init_late(void)
         if (spg < s_bitmap_pages) spg = s_bitmap_pages;   /* high range only */
         if (epg > full_pages)     epg = full_pages;
         for (uint64_t pg = spg; pg < epg; pg++) {
-            big[pg / 8] &= (uint8_t)~(1U << (pg % 8));
-            high_free++;
+            uint8_t bit = (uint8_t)(1U << (pg % 8));
+            if (big[pg / 8] & bit) {
+                big[pg / 8] &= (uint8_t)~bit;
+                high_free++;
+            }
         }
     }
 
+    s_free_pages += high_free;
     /* Switch over. From here the allocator sees all of RAM. */
     s_bitmap         = big;
     s_bitmap_pages   = full_pages;
@@ -547,6 +572,7 @@ static uint64_t pmm_alloc_scan(uint64_t start_pg, uint64_t end_pg,
             if (pg < start_pg || pg >= end_pg)
                 continue;                      /* outside the requested range */
             s_bitmap[i] |= (uint8_t)(1U << bit);
+            s_free_pages--;
             /* Fresh allocation: implicit refcount 1 (not stored). */
             if (s_pmm_acct) s_acct_allocs++;   /* T1 accounting (pmm_lock held) */
             if (hint_byte)
@@ -568,7 +594,7 @@ uint64_t pmm_alloc_page(void)
         /* Prefer the high zone; fall back to low only under pressure. */
         phys = pmm_alloc_scan(PMM_LOW_PAGES, s_scan_max_pages, &s_alloc_hint_byte);
         if (phys == 0)
-            phys = pmm_alloc_scan(0, low_end, NULL);
+            phys = pmm_alloc_scan(0, low_end, &s_low_hint_byte);
     } else {
         /* Boot / <=4GB machine: low-first across the managed range. The
          * hint keeps the scan cheap once low RAM fills. */
@@ -590,7 +616,7 @@ uint64_t pmm_alloc_page_low(void)
     uint64_t lo = (PMM_LOW_PAGES < s_scan_max_pages)
                   ? PMM_LOW_PAGES : s_scan_max_pages;
     irqflags_t fl = spin_lock_irqsave(&pmm_lock);
-    uint64_t phys = pmm_alloc_scan(0, lo, NULL /* no hint: scan from 0 */);
+    uint64_t phys = pmm_alloc_scan(0, lo, &s_low_hint_byte);
     spin_unlock_irqrestore(&pmm_lock, fl);
     if (phys == 0)
         printk("[PMM] WARN: out of low (<4GB) DMA memory\n");
@@ -621,6 +647,7 @@ uint64_t pmm_alloc_contig_low(uint64_t n)
         if (++run == n) {
             for (uint64_t p = run_start; p < run_start + n; p++)
                 s_bitmap[p / 8] |= (uint8_t)(1U << (p % 8));
+            s_free_pages -= n;
             result = run_start * PAGE_SIZE;
             break;
         }
@@ -748,6 +775,7 @@ void pmm_free_page(uint64_t addr)
         if (cur == 1)
             refcount_set(idx, 0);              /* shouldn't be stored, defensive */
         s_bitmap[idx / 8] &= (uint8_t)~bit;
+        s_free_pages++;
         if (s_pmm_acct) s_acct_frees++;        /* T1 accounting (pmm_lock held) */
     } else {
         uint16_t nv = (uint16_t)(cur - 1);
@@ -761,6 +789,8 @@ void pmm_free_page(uint64_t addr)
      * pull the hint back so it's reconsidered. */
     if (idx / 8 < s_alloc_hint_byte)
         s_alloc_hint_byte = idx / 8;
+    if (idx < PMM_LOW_PAGES && idx / 8 < s_low_hint_byte)
+        s_low_hint_byte = idx / 8;
     spin_unlock_irqrestore(&pmm_lock, fl);
 }
 
@@ -804,8 +834,11 @@ uint64_t pmm_unreserve_region(uint64_t base, uint64_t len)
         if (refcount_get(idx) != 0)
             continue;   /* defensively skip anything that is COW/memfd shared */
         s_bitmap[idx / 8] &= (uint8_t)~bit;
+        s_free_pages++;
         if (idx / 8 < s_alloc_hint_byte)
             s_alloc_hint_byte = idx / 8;
+        if (idx < PMM_LOW_PAGES && idx / 8 < s_low_hint_byte)
+            s_low_hint_byte = idx / 8;
         freed++;
     }
     spin_unlock_irqrestore(&pmm_lock, fl);
@@ -831,15 +864,7 @@ uint64_t
 pmm_free_pages(void)
 {
     irqflags_t fl = spin_lock_irqsave(&pmm_lock);
-    uint64_t free_count = 0;
-    uint64_t nbytes = (s_scan_max_pages + 7) / 8;
-    for (uint64_t i = 0; i < nbytes; i++) {
-        uint8_t inv = (uint8_t)~s_bitmap[i];
-        while (inv) {
-            free_count++;
-            inv &= (inv - 1);  /* clear lowest set bit */
-        }
-    }
+    uint64_t free_count = s_free_pages;
     spin_unlock_irqrestore(&pmm_lock, fl);
     return free_count;
 }

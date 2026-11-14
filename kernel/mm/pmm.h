@@ -119,7 +119,7 @@ uint64_t pmm_total_pages(void);
 uint64_t pmm_ram_max_page(void);
 
 /* pmm_free_pages — return count of currently free physical pages.
- * Scans the bitmap; O(n) where n = PMM_MAX_PAGES/8. */
+ * O(1), with an exact counter protected by the PMM lock. */
 uint64_t pmm_free_pages(void);
 
 #endif /* PMM_H */
