@@ -48,7 +48,7 @@ sys_nanosleep(uint64_t arg1, uint64_t arg2)
 
 /*
  * sys_clock_nanosleep — syscall 230
- * arg1 = clk_id, arg2 = flags, arg3 = user *req timespec, arg4 = *rem (ignored)
+ * arg1 = clk_id, arg2 = flags, arg3 = user *req timespec, arg4 = *rem (relative sleep remainder on interruption)
  *
  * Was aliased to nanosleep(req) on arm64, silently discarding clk_id AND flags —
  * so TIMER_ABSTIME (an absolute deadline) became a relative sleep of the whole
@@ -61,7 +61,6 @@ sys_nanosleep(uint64_t arg1, uint64_t arg2)
 uint64_t
 sys_clock_nanosleep(uint64_t clk_id, uint64_t flags, uint64_t req_uptr, uint64_t rem_uptr)
 {
-    (void)rem_uptr;
     int is_realtime  = (clk_id == 0 || clk_id == 5);
     int is_monotonic = (clk_id == 1 || clk_id == 6);
     if (!is_realtime && !is_monotonic) return SYS_ERR(EINVAL);
@@ -98,7 +97,21 @@ sys_clock_nanosleep(uint64_t clk_id, uint64_t flags, uint64_t req_uptr, uint64_t
     aegis_task_t *cur = sched_current();
     uint64_t now;
     while ((now = arch_clock_mono_ns()) < target_mono) {
-        if (signal_check_pending()) break;                  /* interruptible */
+        if (signal_check_pending()) {
+            cur->sleep_deadline = 0;
+            if (!(flags & TIMER_ABSTIME) && rem_uptr) {
+                uint64_t remaining = target_mono - now;
+                struct { int64_t tv_sec; int64_t tv_nsec; } rem = {
+                    (int64_t)(remaining / 1000000000ULL),
+                    (int64_t)(remaining % 1000000000ULL)
+                };
+                if (!user_ptr_valid(rem_uptr, sizeof(rem)) ||
+                    copy_to_user((void *)(uintptr_t)rem_uptr, &rem,
+                                 sizeof(rem)) != 0)
+                    return SYS_ERR(EFAULT);
+            }
+            return SYS_ERR(EINTR);
+        }
         uint64_t ticks = (target_mono - now) / 10000000ULL; /* ~10 ms/tick */
         if (ticks == 0) ticks = 1;                          /* wake next tick */
         cur->sleep_deadline = arch_get_ticks() + ticks;
