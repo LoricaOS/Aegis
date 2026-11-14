@@ -110,6 +110,8 @@ typedef struct aegis_process {
     /* Phase 17 — signal subsystem */
     uint64_t      pending_signals;   /* bitmask; bit N = signal N pending */
     uint64_t      signal_mask;       /* blocked signals; 0 = nothing blocked */
+    uint64_t      suspend_saved_mask; /* internal mask restored by sigreturn */
+    uint32_t      suspend_restore;    /* temporary sigsuspend mask is active */
     k_sigaction_t sigactions[64];    /* per-signal handler/mask/flags */
 } aegis_process_t;
 

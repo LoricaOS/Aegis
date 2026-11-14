@@ -31,6 +31,17 @@
 #define SIG_DFL ((void (*)(int))0)
 #define SIG_IGN ((void (*)(int))1)
 
+/* The kernel keeps bit N for signal N (signals 1..63). Linux sigsets use
+ * bit N-1. Convert only at ABI boundaries, never mix the representations. */
+static inline uint64_t signal_mask_from_user(uint64_t mask)
+{
+    return (mask << 1) & ~((1ULL << SIGKILL) | (1ULL << SIGSTOP));
+}
+static inline uint64_t signal_mask_to_user(uint64_t mask)
+{
+    return mask >> 1;
+}
+
 /* ── Alternate signal stack (sigaltstack / SA_ONSTACK) ─────────── */
 #define SA_ONSTACK   0x08000000u   /* deliver this signal on the alt stack */
 #define SS_ONSTACK   1             /* ss_flags: currently executing on it   */

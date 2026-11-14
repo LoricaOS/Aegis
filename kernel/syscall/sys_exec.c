@@ -467,6 +467,8 @@ reload_binary:
      * signal dispositions must be cleared.  Matches POSIX exec semantics:
      * caught signals are reset to SIG_DFL, pending signals are discarded. */
     proc->pending_signals = 0;
+    proc->suspend_saved_mask = 0;
+    proc->suspend_restore = 0;
     proc->signal_mask = 0;
     __builtin_memset(proc->sigactions, 0, sizeof(proc->sigactions));
     proc->altstack_sp = 0;          /* execve resets the alternate signal stack */
@@ -1278,6 +1280,8 @@ sys_spawn(uint64_t path_uptr, uint64_t argv_uptr,
 
     /* Signal state: default dispositions, no pending, no mask. */
     child->pending_signals = 0;
+    child->suspend_saved_mask = 0;
+    child->suspend_restore = 0;
     child->signal_mask     = 0;
     __builtin_memset(child->sigactions, 0, sizeof(child->sigactions));
 

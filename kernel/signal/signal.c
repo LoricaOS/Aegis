@@ -4,6 +4,46 @@
 #include "printk.h"
 #include <stdint.h>
 
+/* Skip ignored signals without consuming an entire return-to-user attempt.
+ * A suspended syscall must not return merely because of a stop/continue pair
+ * or a spurious wake. The saved original mask remains pending until a handler
+ * frame consumes it (or the process terminates). */
+static int signal_next_delivery(aegis_process_t *proc)
+{
+    for (;;) {
+        uint64_t bits = __atomic_load_n(&proc->pending_signals, __ATOMIC_RELAXED)
+                        & ~proc->signal_mask;
+        if (!bits) {
+            if (!proc->suspend_restore) return 0;
+            sched_block();
+            continue;
+        }
+        int sig = (int)__builtin_ctzll(bits);
+        void (*handler)(int) = proc->sigactions[sig].sa_handler;
+        if (handler == SIG_IGN ||
+            (handler == SIG_DFL && (sig == SIGCHLD || sig == SIGCONT))) {
+            (void)__atomic_and_fetch(&proc->pending_signals, ~(1ULL << sig), __ATOMIC_RELAXED);
+            continue;
+        }
+        if (handler == SIG_DFL &&
+            (sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU)) {
+            (void)__atomic_and_fetch(&proc->pending_signals, ~(1ULL << sig), __ATOMIC_RELAXED);
+            proc->stop_signum = (uint32_t)sig;
+            sched_stop((aegis_task_t *)proc);
+            if (!proc->suspend_restore) return 0;
+            continue;
+        }
+        return sig;
+    }
+}
+
+static uint64_t signal_frame_mask(aegis_process_t *proc)
+{
+    uint64_t mask = proc->suspend_restore ? proc->suspend_saved_mask : proc->signal_mask;
+    proc->suspend_restore = 0;
+    return signal_mask_to_user(mask);
+}
+
 #ifdef __aarch64__
 /* ARM64 signal delivery — builds a signal frame on the user stack
  * and redirects ELR to the signal handler. On sigreturn, the saved
@@ -21,15 +61,8 @@ signal_deliver(cpu_state_t *s)
     if (!task || !task->is_user) return;
 
     aegis_process_t *proc = (aegis_process_t *)task;
-    uint64_t deliverable = proc->pending_signals & ~proc->signal_mask;
-    if (!deliverable) return;
-
-    /* Find lowest pending signal */
-    int signum;
-    for (signum = 1; signum < 32; signum++) {
-        if (deliverable & (1ULL << signum)) break;
-    }
-    if (signum >= 32) return;
+    int signum = signal_next_delivery(proc);
+    if (!signum) return;
 
     k_sigaction_t *sa = &proc->sigactions[signum];
 
@@ -87,7 +120,7 @@ signal_deliver(cpu_state_t *s)
     }
 
     sf.pretcode  = (uint64_t)sa->sa_restorer;
-    sf.uc_sigmask = proc->signal_mask;
+    sf.uc_sigmask = signal_frame_mask(proc);
 
     /* Copy frame to user stack */
     copy_to_user((void *)(uintptr_t)new_sp, &sf, sizeof(sf));
@@ -123,15 +156,8 @@ signal_deliver_sysret(syscall_frame_t *frame, uint64_t *saved_rdi_ptr)
     if (!task || !task->is_user) return 0;
 
     aegis_process_t *proc = (aegis_process_t *)task;
-    uint64_t deliverable = proc->pending_signals & ~proc->signal_mask;
-    if (!deliverable) return 0;
-
-    /* Find lowest pending signal */
-    int signum;
-    for (signum = 1; signum < 32; signum++) {
-        if (deliverable & (1ULL << signum)) break;
-    }
-    if (signum >= 32) return 0;
+    int signum = signal_next_delivery(proc);
+    if (!signum) return 0;
 
     k_sigaction_t *sa = &proc->sigactions[signum];
 
@@ -183,7 +209,7 @@ signal_deliver_sysret(syscall_frame_t *frame, uint64_t *saved_rdi_ptr)
     }
 
     sf.pretcode   = (uint64_t)sa->sa_restorer;
-    sf.uc_sigmask = proc->signal_mask;
+    sf.uc_sigmask = signal_frame_mask(proc);
 
     copy_to_user((void *)(uintptr_t)new_sp, &sf, sizeof(sf));
 
@@ -243,10 +269,8 @@ signal_deliver(cpu_state_t *s)
     if (!task || !task->is_user) return;
     aegis_process_t *proc = (aegis_process_t *)task;
 
-    uint64_t deliverable = proc->pending_signals & ~proc->signal_mask;
-    if (!deliverable) return;
-
-    int signum = (int)__builtin_ctzll(deliverable);
+    int signum = signal_next_delivery(proc);
+    if (!signum) return;
     (void)__atomic_and_fetch(&proc->pending_signals, ~(1ULL << (uint32_t)signum), __ATOMIC_RELAXED);
 
     k_sigaction_t *sa = &proc->sigactions[signum];
@@ -310,7 +334,7 @@ signal_deliver(cpu_state_t *s)
     sf.gregs[REG_RIP]      = (int64_t)s->rip;
     sf.gregs[REG_EFL]      = (int64_t)s->rflags;
     sf.gregs[REG_CSGSFS]   = (int64_t)s->cs;
-    sf.uc_sigmask          = proc->signal_mask;
+    sf.uc_sigmask = signal_frame_mask(proc);
 
     /* Validate the destination before writing — terminate if the frame
      * address is not in user space (signal stack overflow or bad RSP). */
@@ -337,6 +361,7 @@ signal_deliver(cpu_state_t *s)
 
     /* Mask: block this signal and sa_mask while handler runs */
     proc->signal_mask |= sa->sa_mask | (1ULL << (uint32_t)signum);
+    proc->signal_mask &= ~((1ULL << SIGKILL) | (1ULL << SIGSTOP));
 }
 
 /*
@@ -366,10 +391,8 @@ signal_deliver_sysret(syscall_frame_t *frame, uint64_t *saved_rdi_ptr)
     if (!task || !task->is_user) return 0;
     aegis_process_t *proc = (aegis_process_t *)task;
 
-    uint64_t deliverable = proc->pending_signals & ~proc->signal_mask;
-    if (!deliverable) return 0;
-
-    int signum = (int)__builtin_ctzll(deliverable);
+    int signum = signal_next_delivery(proc);
+    if (!signum) return 0;
     (void)__atomic_and_fetch(&proc->pending_signals, ~(1ULL << (uint32_t)signum), __ATOMIC_RELAXED);
 
     k_sigaction_t *sa = &proc->sigactions[signum];
@@ -437,7 +460,7 @@ signal_deliver_sysret(syscall_frame_t *frame, uint64_t *saved_rdi_ptr)
     sf.gregs[REG_RIP]    = (int64_t)frame->rip;
     sf.gregs[REG_EFL]    = (int64_t)frame->rflags;
     sf.gregs[REG_RSP]    = (int64_t)frame->user_rsp;
-    sf.uc_sigmask        = proc->signal_mask;
+    sf.uc_sigmask = signal_frame_mask(proc);
 
     if (!user_ptr_valid(new_rsp, sizeof(sf))) {
         signal_terminate(proc, signum);  /* bad sigframe address */
@@ -453,6 +476,7 @@ signal_deliver_sysret(syscall_frame_t *frame, uint64_t *saved_rdi_ptr)
     *saved_rdi_ptr = (uint64_t)signum;
 
     proc->signal_mask |= sa->sa_mask | (1ULL << (uint32_t)signum);
+    proc->signal_mask &= ~((1ULL << SIGKILL) | (1ULL << SIGSTOP));
     return 1;
 }
 

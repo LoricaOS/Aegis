@@ -454,6 +454,8 @@ sys_clone(syscall_frame_t *frame, uint64_t flags, uint64_t child_stack,
     __builtin_memcpy(child->sigactions, parent->sigactions,
                      sizeof(parent->sigactions));
     child->pending_signals = 0;
+    child->suspend_saved_mask = 0;
+    child->suspend_restore = 0;
     child->stop_signum     = 0;
     child->exit_status     = 0;
     child->term_signal     = 0;  /* PCB not memset; stale value would forge a signal death */
@@ -779,6 +781,8 @@ sys_fork(syscall_frame_t *frame, uint64_t u_rdi, uint64_t u_rsi, uint64_t u_rdx)
     child->signal_mask     = parent->signal_mask;
     __builtin_memcpy(child->sigactions, parent->sigactions, sizeof(parent->sigactions));
     child->pending_signals = 0;
+    child->suspend_saved_mask = 0;
+    child->suspend_restore = 0;
     child->task.state      = TASK_RUNNING;
     child->task.wake_pending = 0;
     child->task.waiting_for = 0;

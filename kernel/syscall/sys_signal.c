@@ -43,7 +43,9 @@ sys_rt_sigaction(uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4)
 
     /* Copy out old action first (before overwriting) */
     if (arg3 != 0) {
-        COPY_TO_USER(arg3, &proc->sigactions[signum]);
+        k_sigaction_t old = proc->sigactions[signum];
+        old.sa_mask = signal_mask_to_user(old.sa_mask);
+        COPY_TO_USER(arg3, &old);
     }
 
     /* Install new action */
@@ -61,6 +63,7 @@ sys_rt_sigaction(uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4)
             if (!user_ptr_valid((uint64_t)(uintptr_t)sa.sa_restorer, 1))
                 return SYS_ERR(EFAULT);
         }
+        sa.sa_mask = signal_mask_from_user(sa.sa_mask);
         proc->sigactions[signum] = sa;
     }
     return 0;
@@ -132,13 +135,15 @@ sys_rt_sigprocmask(uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4)
 
     /* Copy out old mask */
     if (arg3 != 0) {
-        COPY_TO_USER(arg3, &proc->signal_mask);
+        uint64_t old = signal_mask_to_user(proc->signal_mask);
+        COPY_TO_USER(arg3, &old);
     }
 
     /* Apply new mask */
     if (arg2 != 0) {
         uint64_t newset;
         COPY_FROM_USER(&newset, arg2);
+        newset = signal_mask_from_user(newset);
         switch (arg1) {
         case 0: proc->signal_mask |=  newset; break; /* SIG_BLOCK */
         case 1: proc->signal_mask &= ~newset; break; /* SIG_UNBLOCK */
@@ -267,14 +272,14 @@ sys_rt_sigreturn(syscall_frame_t *frame)
     cs.rflags = ((uint64_t)sf.gregs[REG_EFL] & 0xCD5) | 0x202;
 
     /* Restore signal mask (SIGKILL/SIGSTOP can never be masked). */
-    proc->signal_mask = sf.uc_sigmask & ~((1ULL << SIGKILL) | (1ULL << SIGSTOP));
+    proc->signal_mask = signal_mask_from_user(sf.uc_sigmask);
 
     sigreturn_iretq(&cs, proc->pml4_phys);  /* noreturn: iretq to user space */
     __builtin_unreachable();
 #endif
 
     /* Restore signal mask from saved uc_sigmask */
-    proc->signal_mask = sf.uc_sigmask;
+    proc->signal_mask = signal_mask_from_user(sf.uc_sigmask);
     /* SIGKILL and SIGSTOP cannot be masked */
     proc->signal_mask &= ~((1ULL << SIGKILL) | (1ULL << SIGSTOP));
 
@@ -289,8 +294,8 @@ sys_rt_sigreturn(syscall_frame_t *frame)
  * arg2 = sigset size in bytes (must be 8)
  *
  * Atomically replaces the signal mask, blocks until a signal arrives, then
- * restores the original mask and returns -EINTR.  If a signal is already
- * pending and unmasked when sigsuspend is called, skips the block and returns
+ * returns -EINTR after delivery; sigreturn restores the original mask.
+ * If a signal is already pending and unmasked when sigsuspend is called, skips the block and returns
  * immediately so signal_deliver_sysret can run the handler.
  *
  * oksh's j_waitj() uses this to wait for foreground job completion:
@@ -307,19 +312,16 @@ sys_rt_sigsuspend(uint64_t arg1, uint64_t arg2)
 
     uint64_t newmask;
     COPY_FROM_USER(&newmask, arg1);
-    /* SIGKILL and SIGSTOP cannot be masked */
-    newmask &= ~((1ULL << SIGKILL) | (1ULL << SIGSTOP));
-
-    uint64_t old_mask = proc->signal_mask;
+    newmask = signal_mask_from_user(newmask);
+    proc->suspend_saved_mask = proc->signal_mask;
+    proc->suspend_restore = 1;
     proc->signal_mask = newmask;
 
-    /* Block only if no unmasked signal is already pending. */
-    if (!(proc->pending_signals & ~newmask))
+    /* Wakes may be spurious or caused by masked/ignored signals. Keep the
+     * temporary mask until delivery builds a frame carrying the original mask. */
+    while (!signal_check_pending())
         sched_block();
 
-    /* Restore original mask before returning — signal_deliver_sysret then
-     * fires the pending handler (e.g. j_sigchld for SIGCHLD). */
-    proc->signal_mask = old_mask;
     return SYS_ERR(EINTR);
 }
 
