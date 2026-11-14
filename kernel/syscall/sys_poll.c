@@ -79,6 +79,8 @@ typedef struct {
 static uint16_t
 poll_fd(aegis_process_t *proc, int fd, uint16_t events)
 {
+    /* Negative entries disable a poll slot; they are not invalid open fds. */
+    if (fd < 0) return 0;
     fd_table_pin_t pin;
     if (!fd_table_pin(proc->fd_table, fd, &pin))
         return POLLNVAL;

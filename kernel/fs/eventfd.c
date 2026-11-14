@@ -75,6 +75,7 @@ eventfd_read_fn(void *priv, void *buf, uint64_t off, uint64_t len)
         __builtin_memcpy(buf, &val, 8);
         /* Draining freed counter space — wake writers + POLLOUT pollers. */
         waitq_wake_all(&e->write_waiters);
+        waitq_wake_all(&e->read_waiters); /* shared poll/epoll state queue */
         return 8;
     }
 }
@@ -134,8 +135,8 @@ eventfd_read_get_waitq_fn(void *priv)
 {
     /* One queue is enough for poll registration: any state change (a write
      * makes it readable, a read makes it writable) wakes read_waiters. Writers
-     * also wake read_waiters; readers wake write_waiters. sys_poll registers on
-     * this one; the producer paths wake both queues so nothing is missed. */
+     * wake read_waiters; readers wake both queues. Poll/epoll register here
+     * regardless of the requested direction, so reads must wake this queue too. */
     return &((eventfd_t *)priv)->read_waiters;
 }
 

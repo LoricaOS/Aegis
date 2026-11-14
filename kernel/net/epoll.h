@@ -3,6 +3,7 @@
 #define EPOLL_H
 
 #include "sched.h"
+#include "waitq.h"
 #include "vfs.h"
 #include "proc.h"
 #include "../lib/refcount.h"
@@ -65,6 +66,8 @@ typedef struct {
     refcount_t     refcount;
     epoll_watch_t  watches[EPOLL_MAX_WATCHES];
     uint8_t        nwatches;
+    uint64_t       generation; /* watch-list mutations, guarded by epoll_lock */
+    waitq_t        change_waiters;
 } epoll_fd_t;
 
 /* epoll_alloc: allocate an epoll instance. Returns epoll_id >= 0 or -1. */

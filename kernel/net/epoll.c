@@ -92,6 +92,7 @@ int epoll_alloc(void)
             s_epoll[i].in_use = 1;
             /* One reference for the creating fd (memset zeroed the count). */
             refcount_init(&s_epoll[i].refcount, 1);
+            waitq_init(&s_epoll[i].change_waiters);
             spin_unlock_irqrestore(&epoll_lock, fl);
             return (int)i;
         }
@@ -165,7 +166,9 @@ int epoll_ctl_impl(uint32_t epoll_id, int op, int fd, k_epoll_event_t *ev)
                 ep->watches[i].in_use           = 1;
                 ep->watches[i].oneshot_disabled = 0;
                 ep->nwatches++;
+                ep->generation++;
                 spin_unlock_irqrestore(&epoll_lock, fl);
+                waitq_wake_all(&ep->change_waiters);
                 return 0;
             }
         }
@@ -187,7 +190,9 @@ int epoll_ctl_impl(uint32_t epoll_id, int op, int fd, k_epoll_event_t *ev)
                      * disabled EPOLLONESHOT fd is re-enabled by MOD). */
                     ep->watches[i].oneshot_disabled = 0;
                 }
+                ep->generation++;
                 spin_unlock_irqrestore(&epoll_lock, fl);
+                waitq_wake_all(&ep->change_waiters);
                 return 0;
             }
         }
@@ -315,8 +320,10 @@ int epoll_wait_impl(uint32_t epoll_id, uint64_t events_uptr,
             uint64_t data;
         } snap[EPOLL_MAX_WATCHES];
         int nsnap = 0;
+        uint64_t generation;
 
         irqflags_t efl = spin_lock_irqsave(&epoll_lock);
+        generation = ep->generation;
         for (uint8_t w = 0; w < EPOLL_MAX_WATCHES; w++) {
             if (!ep->watches[w].in_use) continue;
             if (ep->watches[w].oneshot_disabled) continue;
@@ -408,6 +415,11 @@ int epoll_wait_impl(uint32_t epoll_id, uint64_t events_uptr,
         fd_pin_t      fd_pins[EPOLL_MAX_WATCHES];  /* refs held across block */
         waitq_entry_t timer_entry;
         int n = 0;
+        /* ctl must wake even an empty set or a disabled ONESHOT watch.
+         * The wrapper pins this instance for the entire wait. Register before
+         * checking generation so a mutation since our snapshot cannot be lost. */
+        waitq_entry_t change_entry = { .task = sched_current() };
+        waitq_add(&ep->change_waiters, &change_entry);
 
         for (int i = 0; i < nsnap; i++) {
             /* Pinned for the duration — see fd_waitq.h. A watched fd closed
@@ -445,13 +457,17 @@ int epoll_wait_impl(uint32_t epoll_id, uint64_t events_uptr,
                 fd_waitq_unpin(&fd_pins[i]);
             }
             if (has_deadline) waitq_remove(&g_timer_waitq, &timer_entry);
+            waitq_remove(&ep->change_waiters, &change_entry);
             return -EINTR;
         }
 
         /* Producers may have become ready between the first sweep and our
          * registration. Recheck after every queue is linked; a later producer
          * then wakes a registered waiter (sched_block consumes the wake latch). */
-        int ready_now = has_deadline && arch_get_ticks() >= deadline;
+        efl = spin_lock_irqsave(&epoll_lock);
+        int ready_now = ep->generation != generation;
+        spin_unlock_irqrestore(&epoll_lock, efl);
+        ready_now |= has_deadline && arch_get_ticks() >= deadline;
         for (int i = 0; i < nsnap && !ready_now; i++) {
             uint32_t interest = (snap[i].events & ~EPOLL_BEHAVIOUR_FLAGS)
                               | EPOLL_ALWAYS_REPORT;
@@ -464,6 +480,7 @@ int epoll_wait_impl(uint32_t epoll_id, uint64_t events_uptr,
             fd_waitq_unpin(&fd_pins[i]);
         }
         if (has_deadline) waitq_remove(&g_timer_waitq, &timer_entry);
+        waitq_remove(&ep->change_waiters, &change_entry);
 
         /* Loop: recompute readiness after wake. */
     }
