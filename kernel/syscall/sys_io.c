@@ -185,7 +185,9 @@ sys_write(uint64_t arg1, uint64_t arg2, uint64_t arg3)
             fd_table_unpin(&pin);
             return total ? total : SYS_ERR(EFAULT);
         }
-        int r = f->ops->write(f->priv, staging, chunk);
+        int r = f->ops->write_next
+                    ? f->ops->write_next(f->priv, staging, chunk, f->flags)
+                    : f->ops->write(f->priv, staging, chunk);
         if (r <= 0) {
             sched_current()->write_nonblock = 0;
             fd_table_advance_offset(proc->fd_table, (int)arg1, &pin, total);
@@ -193,7 +195,10 @@ sys_write(uint64_t arg1, uint64_t arg2, uint64_t arg3)
             return total ? total : (uint64_t)(int64_t)r;
         }
         total += (uint64_t)r;
-        if ((uint64_t)r < chunk) break;  /* short write — don't retry */
+        /* Description-owned callbacks commit a single atomic transfer.
+         * Return it as a short syscall result rather than interleaving pages
+         * from different users of the same open description. */
+        if (f->ops->write_next || (uint64_t)r < chunk) break;
     }
     sched_current()->write_nonblock = 0;
     /* Advance the file offset by the bytes written, mirroring sys_read. POSIX
@@ -296,7 +301,9 @@ sys_writev(uint64_t arg1, uint64_t arg2, uint64_t arg3)
                     goto fault;
                 goto done;
             }
-            int r = f->ops->write(f->priv, staging, chunk);
+            int r = f->ops->write_next
+                    ? f->ops->write_next(f->priv, staging, chunk, f->flags)
+                    : f->ops->write(f->priv, staging, chunk);
             if (r <= 0) {
                 if (r < 0 && total == 0) {
                     fd_table_unpin(&pin);
@@ -305,8 +312,9 @@ sys_writev(uint64_t arg1, uint64_t arg2, uint64_t arg3)
                 goto done;
             }
             vec_written += (uint64_t)r;
+            total += (uint64_t)r; /* retain partial iovec progress on errors */
+            if (f->ops->write_next) goto done; /* one atomic transfer */
         }
-        total += vec_written;
     }
 done:
     /* Advance the file offset by bytes written — same reason as sys_write, and
@@ -347,6 +355,12 @@ sys_readv(uint64_t arg1, uint64_t arg2, uint64_t arg3)
     if (!user_ptr_valid(arg2, arg3 * sizeof(aegis_iovec_t)))
         return SYS_ERR(EFAULT);
 
+    fd_table_pin_t position_pin;
+    if (!fd_table_pin(current_proc()->fd_table, (int)arg1, &position_pin))
+        return SYS_ERR(EBADF);
+    int description_position = position_pin.file.ops->read_next != 0;
+    fd_table_unpin(&position_pin);
+
     uint64_t total = 0;
     uint64_t i;
     for (i = 0; i < arg3; i++) {
@@ -362,8 +376,8 @@ sys_readv(uint64_t arg1, uint64_t arg2, uint64_t arg3)
         if ((int64_t)r < 0)
             return (total > 0) ? total : r;
         total += r;
-        if (r < iov.iov_len)
-            break;  /* short read — don't block for the next vector */
+        if (description_position || r < iov.iov_len)
+            break;  /* one atomic description transfer, or short read */
     }
     return total;
 }
@@ -436,7 +450,9 @@ sys_read(uint64_t arg1, uint64_t arg2, uint64_t arg3)
     /* Per-task nonblock flag — safe under preemption (unlike the global). */
     sched_current()->read_nonblock = (f->flags & VFS_O_NONBLOCK) ? 1 : 0;
     vfs_read_nonblock = sched_current()->read_nonblock;  /* compat: kept for non-PTY readers */
-    int64_t got = (int64_t)f->ops->read(f->priv, kbuf, f->offset, n);
+    int64_t got = f->ops->read_next
+        ? f->ops->read_next(f->priv, kbuf, n)
+        : f->ops->read(f->priv, kbuf, f->offset, n);
     sched_current()->read_nonblock = 0;
     vfs_read_nonblock = 0;
     if (got < 0) {
@@ -552,7 +568,7 @@ sys_pwrite64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t off)
         fd_table_unpin(&pin);
         return SYS_ERR(EACCES);
     }
-    if (!f->ops->seek) {
+    if (!f->ops->seek && !f->ops->write_at) {
         fd_table_unpin(&pin);
         return SYS_ERR(ESPIPE);          /* not positionable → can't pwrite */
     }
@@ -572,9 +588,14 @@ sys_pwrite64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t off)
         fd_table_unpin(&pin);
         return SYS_ERR(EFAULT);
     }
-    f->ops->seek(f->priv, off);
-    int64_t wrote = (int64_t)f->ops->write(f->priv, kbuf, n);
-    f->ops->seek(f->priv, f->offset);    /* restore driver cursor to fd offset */
+    int64_t wrote;
+    if (f->ops->write_at) {
+        wrote = f->ops->write_at(f->priv, kbuf, n, off);
+    } else {
+        f->ops->seek(f->priv, off);
+        wrote = (int64_t)f->ops->write(f->priv, kbuf, n);
+        f->ops->seek(f->priv, f->offset);
+    }
     if (wrote < 0) {
         fd_table_unpin(&pin);
         return (uint64_t)wrote;

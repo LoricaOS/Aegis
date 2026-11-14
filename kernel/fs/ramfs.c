@@ -1,8 +1,7 @@
 /* kernel/fs/ramfs.c — in-memory filesystem, multi-instance.
  * See ramfs.h for the inode/dentry design.  Inodes own data + identity;
  * dentries are flat-named links.  An inode is freed only when its last dentry
- * (nlink) and last open fd (open_count) are gone, so the vfs handle (priv =
- * inode*) is never aliased to the wrong file. */
+ * (nlink) and last open fd (open_count) are gone, so each open description retains its inode across namespace changes. */
 #include "ramfs.h"
 #include "kva.h"
 #include "uaccess.h"
@@ -213,14 +212,23 @@ inode_page(ramfs_inode_t *n, uint32_t idx, int alloc)
     return n->pages[idx];
 }
 
-/* ── file-handle vfs_ops (priv = ramfs_inode_t *) ─────────────────────── */
+/* Each open owns a description; dup/pins share it, independent opens do not.
+ * One KVA page per description keeps allocation out of the namespace lock.
+ * Directory descriptions retain inode identity, not a path that rename can stale. */
+typedef struct {
+    ramfs_t *owner;
+    ramfs_inode_t *inode; /* NULL for the mount root */
+    uint64_t position;
+    uint32_t refs;
+    int flags;
+} ramfs_handle_t;
+
+/* ── file-handle vfs_ops (priv = ramfs_handle_t *) ─────────────────────── */
 
 static int
-ramfs_read_fn(void *priv, void *buf, uint64_t off, uint64_t len)
+ramfs_read_locked(ramfs_inode_t *n, void *buf, uint64_t off, uint64_t len)
 {
-    ramfs_inode_t *n = (ramfs_inode_t *)priv;
-    irqflags_t fl = spin_lock_irqsave(&n->owner->lock);
-    if (off >= n->size) { spin_unlock_irqrestore(&n->owner->lock, fl); return 0; }
+    if (off >= n->size) return 0;
     uint64_t avail = n->size - off;
     if (len > avail) len = avail;
     uint8_t *dst = (uint8_t *)buf;
@@ -238,17 +246,36 @@ ramfs_read_fn(void *priv, void *buf, uint64_t off, uint64_t len)
             __builtin_memset(dst + done, 0, chunk);  /* sparse hole reads zero */
         done += chunk;
     }
-    spin_unlock_irqrestore(&n->owner->lock, fl);
     return (int)len;
 }
 
-static int
-ramfs_write_fn(void *priv, const void *buf, uint64_t len)
+static int ramfs_read_fn(void *priv, void *buf, uint64_t off, uint64_t len)
 {
-    ramfs_inode_t *n = (ramfs_inode_t *)priv;
+    ramfs_handle_t *h = priv;
+    irqflags_t fl = spin_lock_irqsave(&h->owner->lock);
+    int r = ramfs_read_locked(h->inode, buf, off, len);
+    spin_unlock_irqrestore(&h->owner->lock, fl);
+    return r;
+}
+
+static int ramfs_read_next(void *priv, void *buf, uint64_t len)
+{
+    ramfs_handle_t *h = priv;
+    irqflags_t fl = spin_lock_irqsave(&h->owner->lock);
+    int r = ramfs_read_locked(h->inode, buf, h->position, len);
+    if (r > 0) h->position += (uint64_t)r;
+    spin_unlock_irqrestore(&h->owner->lock, fl);
+    return r;
+}
+
+static int
+ramfs_write_impl(void *priv, const void *buf, uint64_t len, uint64_t at, int positional, int flags)
+{
+    ramfs_handle_t *h = (ramfs_handle_t *)priv;
+    ramfs_inode_t *n = h->inode;
     uint64_t done = 0;
     while (done < len) {
-        uint8_t staged[256];
+        uint8_t staged[4096];
         uint64_t chunk = len - done;
         if (chunk > sizeof(staged)) chunk = sizeof(staged);
         if (copy_from_user(staged, (const uint8_t *)buf + done, chunk) != 0)
@@ -256,7 +283,7 @@ ramfs_write_fn(void *priv, const void *buf, uint64_t len)
         uint8_t *candidate = 0;
         for (;;) {
             irqflags_t fl = spin_lock_irqsave(&n->owner->lock);
-            uint32_t pos = n->size;
+            uint64_t pos = positional ? at + done : (flags & VFS_O_APPEND) ? n->size : h->position;
             if (pos >= RAMFS_MAX_SIZE || n->is_dir) {
                 spin_unlock_irqrestore(&n->owner->lock, fl);
                 if (candidate) kva_free_pages(candidate, 1);
@@ -277,43 +304,82 @@ ramfs_write_fn(void *priv, const void *buf, uint64_t len)
             }
             if (chunk > 4096u - off) chunk = 4096u - off;
             __builtin_memcpy(n->pages[idx] + off, staged, chunk);
-            n->size += (uint32_t)chunk;
+            if (!positional) h->position = pos + chunk;
+            if (pos + chunk > n->size) n->size = (uint32_t)(pos + chunk);
             spin_unlock_irqrestore(&n->owner->lock, fl);
             if (candidate) kva_free_pages(candidate, 1);
+            /* One page-bounded transfer per call keeps the chosen cursor
+             * and its bytes atomic against other users of this description.
+             * Crossing a page returns a valid short write for the caller to
+             * retry, rather than releasing the lock between partial records. */
             done += chunk;
-            break;
+            return (int)done;
         }
     }
     return (int)done;
 }
 
+static int ramfs_write_next(void *priv, const void *buf, uint64_t len, int flags)
+{ return ramfs_write_impl(priv, buf, len, 0, 0, flags); }
+
+static int ramfs_write_fn(void *priv, const void *buf, uint64_t len)
+{ return ramfs_write_next(priv, buf, len, ((ramfs_handle_t *)priv)->flags); }
+
+static int ramfs_write_at(void *priv, const void *buf, uint64_t len, uint64_t off)
+{
+    if (off > RAMFS_MAX_SIZE || len > UINT64_MAX - off) return -EINVAL;
+    return ramfs_write_impl(priv, buf, len, off, 1, 0);
+}
+
+static int64_t ramfs_lseek(void *priv, int64_t off, int whence)
+{
+    ramfs_handle_t *h = priv;
+    irqflags_t fl = spin_lock_irqsave(&h->owner->lock);
+    uint64_t base = whence == 0 ? 0 : whence == 1 ? h->position : h->inode->size;
+    if (whence < 0 || whence > 2 || base > INT64_MAX ||
+        (off > 0 && base > (uint64_t)(INT64_MAX - off)) ||
+        (off < 0 && (uint64_t)(-(off + 1)) + 1 > base)) {
+        spin_unlock_irqrestore(&h->owner->lock, fl); return -EINVAL;
+    }
+    h->position = (uint64_t)((int64_t)base + off);
+    int64_t result = (int64_t)h->position;
+    spin_unlock_irqrestore(&h->owner->lock, fl);
+    return result;
+}
+
 static void
 ramfs_close_fn(void *priv)
 {
-    ramfs_inode_t *n = (ramfs_inode_t *)priv;
-    if (!n || !n->owner) return;
-    irqflags_t fl = spin_lock_irqsave(&n->owner->lock);
-    if (n->open_count) n->open_count--;
+    ramfs_handle_t *h = priv;
+    if (!h) return;
+    ramfs_t *inst = h->owner;
+    irqflags_t fl = spin_lock_irqsave(&inst->lock);
+    if (--h->refs) { spin_unlock_irqrestore(&inst->lock, fl); return; }
     uint8_t *pages[RAMFS_PAGES_PER_FILE];
-    uint32_t count = inode_release(n, pages);
-    spin_unlock_irqrestore(&n->owner->lock, fl);
+    uint32_t count = 0;
+    if (h->inode) {
+        h->inode->open_count--;
+        count = inode_release(h->inode, pages);
+    } else {
+        inst->open_dirs--;
+    }
+    spin_unlock_irqrestore(&inst->lock, fl);
     rfs_free_pages(pages, count);
+    kva_free_pages(h, 1);
 }
 
 static void
 ramfs_dup_fn(void *priv)
 {
-    ramfs_inode_t *n = (ramfs_inode_t *)priv;
-    if (!n || !n->owner) return;
-    irqflags_t fl = spin_lock_irqsave(&n->owner->lock);
-    n->open_count++;
-    spin_unlock_irqrestore(&n->owner->lock, fl);
+    ramfs_handle_t *h = priv;
+    irqflags_t fl = spin_lock_irqsave(&h->owner->lock);
+    h->refs++;
+    spin_unlock_irqrestore(&h->owner->lock, fl);
 }
 
 static int
-ramfs_stat_fn(void *priv, k_stat_t *st)
+ramfs_inode_stat(ramfs_inode_t *n, k_stat_t *st)
 {
-    ramfs_inode_t *n = (ramfs_inode_t *)priv;
     __builtin_memset(st, 0, sizeof(*st));
     st->st_dev   = 3;
     /* Real, distinct inode number (index+1). Every ramfs file used to report
@@ -327,8 +393,28 @@ ramfs_stat_fn(void *priv, k_stat_t *st)
     return 0;
 }
 
+static int
+ramfs_stat_fn(void *priv, k_stat_t *st)
+{
+    ramfs_handle_t *h = priv;
+    irqflags_t fl = spin_lock_irqsave(&h->owner->lock);
+    if (h->inode) ramfs_inode_stat(h->inode, st);
+    else {
+        __builtin_memset(st, 0, sizeof(*st));
+        st->st_dev = 3;
+        st->st_mode = S_IFDIR | 01777;
+        st->st_nlink = 1;
+    }
+    spin_unlock_irqrestore(&h->owner->lock, fl);
+    return 0;
+}
+
 static const vfs_ops_t s_ramfs_ops = {
     .seekable = 1,
+    .read_next = ramfs_read_next,
+    .write_next = ramfs_write_next,
+    .write_at = ramfs_write_at,
+    .lseek = ramfs_lseek,
     .read    = ramfs_read_fn,
     .write   = ramfs_write_fn,
     .close   = ramfs_close_fn,
@@ -430,7 +516,7 @@ ramfs_dir_stat_fn(void *priv, k_stat_t *st)
 {
     ramfs_dir_handle_t *h = priv;
     irqflags_t fl = spin_lock_irqsave(&h->owner->lock);
-    if (h->inode) ramfs_stat_fn(h->inode, st);
+    if (h->inode) ramfs_inode_stat(h->inode, st);
     else {
         __builtin_memset(st, 0, sizeof(*st));
         st->st_dev = 3;
@@ -444,7 +530,7 @@ ramfs_dir_stat_fn(void *priv, k_stat_t *st)
 static const vfs_ops_t s_ramfs_dir_ops = {
     .close = ramfs_dir_close_fn,
     .readdir = ramfs_dir_readdir_fn,
-    .dup = ramfs_dir_dup_fn,
+    .dup     = ramfs_dir_dup_fn,
     .stat = ramfs_dir_stat_fn,
 };
 
@@ -495,6 +581,9 @@ ramfs_open_handle(ramfs_t *inst, const char *name, int flags, uint16_t mode, vfs
     ramfs_dent_t *d = dent_find(inst, name);
     ramfs_inode_t *n;
     if (!d) {
+        if (!h && (flags & VFS_O_CREAT)) {
+            spin_unlock_irqrestore(&inst->lock, fl); return 1;
+        }
         if (!(flags & VFS_O_CREAT)) { spin_unlock_irqrestore(&inst->lock, fl); return -ENOENT; }
         rc = rfs_path_may(inst, name, 1);
         if (rc) { spin_unlock_irqrestore(&inst->lock, fl); return rc; }
@@ -511,9 +600,9 @@ ramfs_open_handle(ramfs_t *inst, const char *name, int flags, uint16_t mode, vfs
     if (n->is_dir && access != VFS_O_RDONLY) {
         spin_unlock_irqrestore(&inst->lock, fl); return -EISDIR;
     }
-    if (n->is_dir && !h) {
+    if (!h) {
         spin_unlock_irqrestore(&inst->lock, fl);
-        return 1; /* internal retry: allocate directory description unlocked */
+        return 1; /* internal retry: allocate open description unlocked */
     }
     if (flags & VFS_O_TRUNC) count = inode_detach_pages(n, pages);
     n->open_count++;
@@ -522,8 +611,10 @@ ramfs_open_handle(ramfs_t *inst, const char *name, int flags, uint16_t mode, vfs
         out->ops = &s_ramfs_dir_ops;
         out->priv = h;
     } else {
+        ramfs_handle_t *file = (ramfs_handle_t *)h;
+        *file = (ramfs_handle_t){ .owner = inst, .inode = n, .refs = 1, .flags = flags };
         out->ops = &s_ramfs_ops;
-        out->priv = n;
+        out->priv = file;
     }
     out->offset = 0;
     out->size = n->size;
@@ -544,7 +635,7 @@ ramfs_open(ramfs_t *inst, const char *name, int flags, uint16_t mode, vfs_file_t
     ramfs_dir_handle_t *h = kva_alloc_pages(1);
     if (!h) return -ENOMEM;
     rc = ramfs_open_handle(inst, name, flags, mode, out, h);
-    if (rc || out->ops != &s_ramfs_dir_ops) kva_free_pages(h, 1);
+    if (rc) kva_free_pages(h, 1);
     return rc;
 }
 
@@ -555,7 +646,7 @@ ramfs_stat(ramfs_t *inst, const char *name, k_stat_t *st)
     int rc = rfs_path_may(inst, name, 0);
     ramfs_dent_t *d = rc ? 0 : dent_find(inst, name);
     if (!d) { spin_unlock_irqrestore(&inst->lock, fl); return rc ? rc : -ENOENT; }
-    rc = ramfs_stat_fn(&inst->inodes[d->inode], st);
+    rc = ramfs_inode_stat(&inst->inodes[d->inode], st);
     spin_unlock_irqrestore(&inst->lock, fl);
     return rc;
 }

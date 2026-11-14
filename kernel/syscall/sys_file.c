@@ -900,6 +900,13 @@ sys_lseek(uint64_t arg1, uint64_t arg2, uint64_t arg3)
         return SYS_ERR(EBADF);
     vfs_file_t *f = &pin.file;
 
+    if (f->ops->lseek) {
+        if (arg3 > 2) { fd_table_unpin(&pin); return SYS_ERR(EINVAL); }
+        int64_t result = f->ops->lseek(f->priv, (int64_t)arg2, (int)arg3);
+        fd_table_unpin(&pin);
+        return (uint64_t)result;
+    }
+
     /* Stream fds (pipe/console/kbd/char devices) are non-seekable: ESPIPE.
      * We only need to disambiguate at size==0 — a non-empty fd is already a
      * real file. A size-0 fd is a stream UNLESS its driver marks itself

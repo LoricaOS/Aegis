@@ -103,7 +103,7 @@ typedef struct {
      * update it — otherwise a seek-then-write (e.g. `as` patching an ELF header
      * after writing sections) writes at the stale position and corrupts the
      * file. sys_lseek calls this after updating f->offset. NULL = writes ignore
-     * lseek (streams; append-only ramfs). */
+     * lseek (streams). */
     void (*seek)(void *priv, uint64_t offset);
     /* seekable — 1 if this driver backs a byte-addressable regular file whose
      * f->offset is meaningful (ext2/ramfs/memfd/initrd). 0 (default) for stream
@@ -112,6 +112,15 @@ typedef struct {
      * seekable (e.g. `as` seeks around a freshly-created .o to lay out the ELF),
      * whereas a size-0 stream is not. */
     int seekable;
+    /* Optional description-owned position operations. Drivers implementing
+     * these keep one shared cursor across dup/fork; fd slot offsets are not
+     * authoritative. Explicit read remains pread; write_at must not move the
+     * cursor. Sequential callbacks serialize offset selection and data access.
+     * Legacy drivers retain the existing read/write/seek dispatch. */
+    int (*read_next)(void *priv, void *buf, uint64_t len);
+    int (*write_next)(void *priv, const void *buf, uint64_t len, int flags);
+    int (*write_at)(void *priv, const void *buf, uint64_t len, uint64_t off);
+    int64_t (*lseek)(void *priv, int64_t off, int whence);
 } vfs_ops_t;
 
 /* Open file descriptor. Stored in fd_table_t.fds[].

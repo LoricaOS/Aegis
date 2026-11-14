@@ -50,7 +50,7 @@ typedef struct {
     uint8_t        in_use;
     uint8_t        is_dir;
     uint32_t       nlink;       /* # dentries naming this inode                */
-    uint32_t       open_count;  /* # open fds (unlink-while-open keeps it live) */
+    uint32_t       open_count;  /* # open descriptions; dup shares one */
     uint32_t       size;        /* byte count                                  */
     /* Ownership + mode. /tmp and /run had NONE of this: every file reported a
      * fixed S_IFREG|0644 and nothing was checked on any path, so any process

@@ -42,7 +42,7 @@ static inline void spin_unlock_irqrestore(spinlock_t *s,irqflags_t f) { (void)f;
 static inline void arch_pause(void) {}
 ''',
 'sched.h': r'''#pragma once
-typedef struct { int is_user; } aegis_task_t;
+typedef struct { int is_user; int read_nonblock,write_nonblock; } aegis_task_t;
 extern _Thread_local aegis_task_t host_task;
 static inline aegis_task_t *sched_current(void) { return &host_task; }
 ''',
@@ -196,6 +196,73 @@ int main(void) {
  assert(!ramfs_busy(&fs));assert(host_pages==0);
  puts("ramfs: nested directory enumeration and retained inode lifetime PASS");
  puts("ramfs: private modes, namespace DAC, open-unlinked, concurrent truncate/write PASS");
+}
+'''
+RAMFS_POSITION = r'''
+#include "kernel/fs/ramfs.c"
+int vfs_read_nonblock;
+typedef struct { uint64_t iov_base, iov_len; } aegis_iovec_t;
+static int user_ptr_valid(uint64_t p,uint64_t n){return !n||p!=0;}
+static uint64_t copy_to_user(void*d,const void*s,uint64_t n){if(host_fault)return n;memcpy(d,s,n);return 0;}
+static void fd_table_assert_live(fd_table_t*t,const char*w){(void)w;assert(t->magic==FD_TABLE_MAGIC);}
+''' + '\n'.join(function('kernel/fs/fd_table.c', n) for n in ['fd_table_pin','fd_table_unpin','fd_table_advance_offset','fd_table_set_offset']) + '\n' + function('kernel/syscall/sys_io.c','fd_content_write_allowed') + '\n' + '\n'.join(function('kernel/syscall/sys_io.c', n) for n in ['sys_read','sys_write','sys_writev','sys_readv','sys_pread64','sys_pwrite64']) + '\n' + '\n'.join(function('kernel/syscall/sys_file.c', n) for n in ['fd_dup_lowest','sys_dup','sys_lseek']) + r'''
+static ramfs_t fs;
+static fd_table_t table;
+static char data[8192] __attribute__((aligned(4096)));
+static unsigned legacy_calls;
+static int legacy_partial(void*p,const void*b,uint64_t n){(void)p;(void)b;(void)n;return legacy_calls++ ? -ENOSPC : 3;}
+static const vfs_ops_t legacy_ops={.write=legacy_partial};
+static uint64_t addr(void*p){return (uint64_t)(uintptr_t)p;}
+int main(void){
+ ramfs_init(&fs);host_proc.fd_table=&table;table.magic=FD_TABLE_MAGIC;
+ assert(cap_grant(host_proc.caps,64,CAP_KIND_VFS_READ,CAP_RIGHTS_READ)>=0);
+ assert(cap_grant(host_proc.caps,64,CAP_KIND_VFS_WRITE,CAP_RIGHTS_WRITE)>=0);
+ assert(!ramfs_open(&fs,"pos",VFS_O_CREAT|VFS_O_RDWR,0600,&table.fds[0]));
+ memcpy(data,"abcdef",6);assert(sys_write(0,addr(data),6)==6);
+ assert(sys_lseek(0,0,2)==6); /* live size, not open-time zero */
+ assert(sys_lseek(0,0,0)==0);assert(sys_read(0,addr(data),1)==1&&data[0]=='a');
+ data[0]='X';assert(sys_write(0,addr(data),1)==1);assert(sys_lseek(0,0,1)==2);
+ assert(sys_pread64(0,addr(data),6,0)==6&&!memcmp(data,"aXcdef",6));
+ assert(sys_lseek(0,0,1)==2); /* pread leaves shared offset */
+ data[0]='Y';assert(sys_pwrite64(0,addr(data),1,4)==1);assert(sys_lseek(0,0,1)==2);
+ assert(sys_pread64(0,addr(data),6,0)==6&&!memcmp(data,"aXcdYf",6));
+ uint64_t alias=sys_dup(0);assert(alias==1);
+ assert(sys_read(alias,addr(data),1)==1&&data[0]=='c');assert(sys_lseek(0,0,1)==3);
+ data[0]='Z';assert(sys_write(0,addr(data),1)==1);assert(sys_lseek(alias,0,1)==4);
+ assert(sys_lseek(alias,1,0)==1);assert(sys_read(0,addr(data),1)==1&&data[0]=='X');
+ assert(!ramfs_open(&fs,"pos",VFS_O_RDWR,0,&table.fds[2]));
+ assert(sys_read(2,addr(data),1)==1&&data[0]=='a');assert(sys_lseek(0,0,1)==2);
+ assert(sys_lseek(0,2,2)==8);data[0]='Q';assert(sys_write(0,addr(data),1)==1);
+ assert(sys_pread64(0,addr(data),9,0)==9&&!memcmp(data,"aXcZYf\0\0Q",9));
+ assert(sys_lseek(alias,0,2)==9);
+ assert(!ramfs_open(&fs,"pos",VFS_O_WRONLY|VFS_O_APPEND,0,&table.fds[3]));
+ assert(sys_lseek(3,0,0)==0);data[0]='!';assert(sys_write(3,addr(data),1)==1);assert(sys_lseek(3,0,1)==10);
+ assert(sys_pwrite64(3,addr(data),1,0)==1);assert(sys_lseek(3,0,1)==10); /* POSIX positional write ignores append */
+ assert((int64_t)sys_lseek(0,(uint64_t)-11,2)==-EINVAL);
+ assert((int64_t)sys_lseek(0,0,7)==-EINVAL);
+ assert(sys_lseek(0,0,1)==9);
+ assert((int64_t)sys_lseek(0,0,UINT64_C(0x100000000))==-EINVAL);
+ assert(sys_lseek(0,0,0)==0);
+ data[0]='M';data[1]='N';aegis_iovec_t vectors[2]={{addr(data),1},{addr(data+1),1}};
+ assert(sys_writev(alias,addr(vectors),2)==1);assert(sys_writev(alias,addr(vectors+1),1)==1);assert(sys_lseek(0,0,1)==2);
+ assert(sys_lseek(alias,0,0)==0);data[0]=data[1]=0;
+ assert(sys_readv(0,addr(vectors),2)==1);assert(sys_readv(0,addr(vectors+1),1)==1&&!memcmp(data,"MN",2));assert(sys_lseek(alias,0,1)==2);
+ assert((int64_t)sys_pwrite64(0,addr(data),1,UINT64_MAX)==-EINVAL);assert(sys_lseek(0,0,1)==2);
+ /* A short final-page transfer followed by ENOSPC must report the bytes
+  * already committed inside the current iovec, not the later error. */
+ assert(sys_lseek(0,RAMFS_MAX_SIZE-3,0)==RAMFS_MAX_SIZE-3);
+ memset(data,'R',8);vectors[0]=(aegis_iovec_t){addr(data),8};
+ assert(sys_writev(0,addr(vectors),1)==3);assert(sys_lseek(alias,0,1)==RAMFS_MAX_SIZE);
+ assert(sys_lseek(2,0,0)==0);memset(data,'B',sizeof(data));
+ assert(sys_write(2,addr(data),sizeof(data))==4096); /* single atomic transfer */
+ assert(sys_lseek(2,0,1)==4096);
+ table.fds[4]=(vfs_file_t){.ops=&legacy_ops,.flags=VFS_O_WRONLY};
+ vectors[0]=(aegis_iovec_t){addr(data),8};
+ assert(sys_writev(4,addr(vectors),1)==3);assert(table.fds[4].offset==3);
+ assert(!ramfs_unlink(&fs,"pos"));
+ for(unsigned i=0;i<4;i++)table.fds[i].ops->close(table.fds[i].priv);
+ assert(!ramfs_busy(&fs)&&host_pages==0);
+ puts("ramfs syscall positions: read/write, pread/pwrite, dup, independent opens, seek-end, append PASS");
 }
 '''
 FAT = r'''
@@ -437,7 +504,7 @@ int main(void){blkdev_t diskdev={.block_count=1,.block_size=4096,.read=disk_read
 '''
 
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--case', choices=('ramfs', 'fat', 'memfd', 'ext2', 'gpt'),
+parser.add_argument('--case', choices=('ramfs', 'ramfs-position', 'fat', 'memfd', 'ext2', 'gpt'),
                     help='run just one production-code host fixture')
 parser.add_argument('--no-sanitize', action='store_true',
                     help='disable sanitizers when the host runtime is unavailable')
@@ -447,7 +514,7 @@ with tempfile.TemporaryDirectory(prefix='aegis-fs-security-') as temp:
     temp = Path(temp)
     for name, contents in STUBS.items():
         (temp / name).write_text(contents)
-    for name, source in [('ramfs', RAMFS), ('fat', FAT), ('memfd', MEMFD), ('ext2', EXT2), ('gpt', GPT)]:
+    for name, source in [('ramfs', RAMFS), ('ramfs-position', RAMFS_POSITION), ('fat', FAT), ('memfd', MEMFD), ('ext2', EXT2), ('gpt', GPT)]:
         if args.case and name != args.case:
             continue
         file = temp / f'{name}.c'
