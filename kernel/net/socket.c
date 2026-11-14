@@ -155,7 +155,7 @@ static int sock_vfs_read(void *priv, void *buf, uint64_t off, uint64_t len)
  * at ~8 KB.  Honors O_NONBLOCK (EAGAIN).  `ubuf` is a user pointer.
  * Returns bytes sent (>=0) or -errno.  Shared by sock_vfs_write (write()) and
  * sys_send (send()/sendto()). */
-int64_t sock_stream_send(sock_t *s, uint64_t ubuf, uint64_t len)
+int64_t sock_stream_send(sock_t *s, uint64_t ubuf, uint64_t len, int force_nb)
 {
     uint8_t sndbuf[1460];
     uint64_t sent = 0;
@@ -174,7 +174,7 @@ int64_t sock_stream_send(sock_t *s, uint64_t ubuf, uint64_t len)
         if (n > 0) { sent += (uint64_t)n; continue; }
         if (n < 0) return sent > 0 ? (int64_t)sent : n;       /* EPIPE etc. */
         /* n == 0: send ring full (would-block). */
-        if (s->nonblocking) return sent > 0 ? (int64_t)sent : -EAGAIN;
+        if (s->nonblocking || force_nb) return sent > 0 ? (int64_t)sent : -EAGAIN;
         int rc = 0;
         wait_event_interruptible(&s->poll_waiters,
                                  tcp_conn_send_ready(s->sock_id, s->tcp_conn_id) != 0, rc);
@@ -198,7 +198,7 @@ static int sock_vfs_write(void *priv, const void *buf, uint64_t len)
          * can't free the slot / re-init s->poll_waiters while we're parked in
          * sock_stream_send. See sock_vfs_read. */
         sock_vfs_dup(priv);
-        int r = (int)sock_stream_send(s, (uint64_t)(uintptr_t)buf, len);
+        int r = (int)sock_stream_send(s, (uint64_t)(uintptr_t)buf, len, 0);
         sock_vfs_close(priv);
         return r;
     }

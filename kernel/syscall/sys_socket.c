@@ -608,6 +608,68 @@ udp_ensure_local_port(sock_t *s, uint32_t sid)
     return -1;
 }
 
+/* Send one complete datagram from kernel memory. Both sendto and sendmsg
+ * validate/copy their payload before reaching here, so failed copies cannot
+ * publish a partial datagram. No fragmentation: oversized messages fail. */
+static uint64_t
+sock_send_datagram(sock_t *s, uint32_t sid, const void *data, uint64_t len,
+                   uint64_t addr, uint64_t addrlen)
+{
+    if (s->domain == AF_INET6) {
+        ip6_addr_t dst;
+        uint16_t dst_port;
+        if (addr && addrlen >= sizeof(k_sockaddr_in6_t)) {
+            if (!user_ptr_valid(addr, sizeof(k_sockaddr_in6_t))) return SYS_ERR(EFAULT);
+            k_sockaddr_in6_t sa;
+            if (copy_from_user(&sa, (const void *)(uintptr_t)addr, sizeof(sa)) != 0)
+                return SYS_ERR(EFAULT);
+            if (sa.sin6_family != AF_INET6) return SYS_ERR(EINVAL);
+            dst = sa.sin6_addr; dst_port = ntohs(sa.sin6_port);
+        } else if (s->state == SOCK_CONNECTED) {
+            dst = s->remote_ip6; dst_port = s->remote_port;
+        } else return SYS_ERR(EDESTADDRREQ);
+        if (len > 1452) return SYS_ERR(EMSGSIZE);
+        netdev_t *dev = netdev_get("eth0");
+        if (!dev) return SYS_ERR(ENETDOWN);
+        if (udp_ensure_local_port(s, sid) != 0) return SYS_ERR(EADDRINUSE);
+        if (ipv6_addr_equal(&s->local_ip6, &(ip6_addr_t){0}))
+            ipv6_get_linklocal(&s->local_ip6);
+        int r = udp6_send(dev, s->local_port, &dst, dst_port, data, (uint16_t)len);
+        return r < 0 ? SYS_ERR(EHOSTUNREACH) : len;
+    }
+
+    ip4_addr_t dst_ip;
+    uint16_t   dst_port;
+    if (addr && addrlen >= sizeof(k_sockaddr_in_t)) {
+        /* Validate the address and reject short copies before using fields. */
+        if (!user_ptr_valid(addr, sizeof(k_sockaddr_in_t))) return SYS_ERR(EFAULT);
+        k_sockaddr_in_t sa;
+        if (copy_from_user(&sa, (const void *)(uintptr_t)addr, sizeof(sa)) != 0)
+            return SYS_ERR(EFAULT);
+        dst_ip   = sa.sin_addr;
+        dst_port = ntohs(sa.sin_port);
+    } else if (s->state == SOCK_CONNECTED) {
+        dst_ip   = s->remote_ip;
+        dst_port = s->remote_port;
+    } else {
+        return SYS_ERR(EDESTADDRREQ);
+    }
+
+    if (len > 1472) return SYS_ERR(EMSGSIZE);
+
+    netdev_t *dev = netdev_get("eth0");
+    if (!dev) return SYS_ERR(ENETDOWN);
+
+    /* Implicit ephemeral source-port bind so the reply can be demuxed back to
+     * this socket (see udp_ensure_local_port).  Without it an unbound socket
+     * sends with source port 0 and never receives a response. */
+    if (udp_ensure_local_port(s, sid) != 0)
+        return SYS_ERR(EADDRINUSE);  /* EADDRINUSE — no free ephemeral port */
+
+    int r = udp_send(dev, s->local_port, dst_ip, dst_port, data, (uint16_t)len);
+    return r < 0 ? SYS_ERR(ENETDOWN) : len;
+}
+
 /* ── sys_sendto ────────────────────────────────────────────────────────── */
 
 uint64_t
@@ -615,12 +677,7 @@ sys_sendto(uint64_t fd, uint64_t buf, uint64_t len,
            uint64_t flags, uint64_t addr, uint64_t addrlen)
 {
     SCOPED_FD_PIN(pin);
-    /* flags is intentionally ignored: neither the TCP nor UDP send path here
-     * ever blocks (both copy into a static TX buffer and hand off to the NIC),
-     * so MSG_DONTWAIT is a no-op; we never raise SIGPIPE so MSG_NOSIGNAL is
-     * implicitly satisfied; MSG_OOB/MSG_MORE are unsupported but ignoring them
-     * degrades to a normal send rather than erroring. */
-    (void)flags;
+    /* MSG_DONTWAIT is per-call: never change shared O_NONBLOCK state. */
     if (!user_ptr_valid(buf, len)) return SYS_ERR(EFAULT);
 
     /* AF_UNIX stream send: send()/sendto(NULL addr) on a connected AF_UNIX
@@ -663,79 +720,17 @@ sys_sendto(uint64_t fd, uint64_t buf, uint64_t len,
          * sock_vfs_read). */
         if (s->state != SOCK_CONNECTED) return SYS_ERR(ENOTCONN);
         sock_ref(sid);
-        int64_t r = sock_stream_send(s, buf, len);
+        int64_t r = sock_stream_send(s, buf, len, (flags & MSG_DONTWAIT) != 0);
         sock_unref(sid);
         return (uint64_t)r;  /* bytes (>=0), or -errno == SYS_ERR(errno) form */
     }
 
-    /* UDP send */
-    if (s->domain == AF_INET6) {
-        ip6_addr_t dst;
-        uint16_t dst_port;
-        if (addr && addrlen >= sizeof(k_sockaddr_in6_t)) {
-            if (!user_ptr_valid(addr, sizeof(k_sockaddr_in6_t))) return SYS_ERR(EFAULT);
-            k_sockaddr_in6_t sa;
-            if (copy_from_user(&sa, (const void *)(uintptr_t)addr, sizeof(sa)) != 0)
-                return SYS_ERR(EFAULT);
-            if (sa.sin6_family != AF_INET6) return SYS_ERR(EINVAL);
-            dst = sa.sin6_addr; dst_port = ntohs(sa.sin6_port);
-        } else if (s->state == SOCK_CONNECTED) {
-            dst = s->remote_ip6; dst_port = s->remote_port;
-        } else return SYS_ERR(EDESTADDRREQ);
-        if (len > 1452) len = 1452;
-        uint8_t udpbuf6[1452];
-        if (copy_from_user(udpbuf6, (const void *)(uintptr_t)buf, len) != 0)
-            return SYS_ERR(EFAULT);
-        netdev_t *dev = netdev_get("eth0");
-        if (!dev) return SYS_ERR(ENETDOWN);
-        if (udp_ensure_local_port(s, sid) != 0) return SYS_ERR(EADDRINUSE);
-        if (ipv6_addr_equal(&s->local_ip6, &(ip6_addr_t){0}))
-            ipv6_get_linklocal(&s->local_ip6);
-        int r = udp6_send(dev, s->local_port, &dst, dst_port, udpbuf6, (uint16_t)len);
-        return r < 0 ? SYS_ERR(EHOSTUNREACH) : len;
-    }
-
-    ip4_addr_t dst_ip;
-    uint16_t   dst_port;
-    if (addr && addrlen >= sizeof(k_sockaddr_in_t)) {
-        /* Validate the address and reject short copies before using fields. */
-        if (!user_ptr_valid(addr, sizeof(k_sockaddr_in_t))) return SYS_ERR(EFAULT);
-        k_sockaddr_in_t sa;
-        if (copy_from_user(&sa, (const void *)(uintptr_t)addr, sizeof(sa)) != 0)
-            return SYS_ERR(EFAULT);
-        dst_ip   = sa.sin_addr;
-        dst_port = ntohs(sa.sin_port);
-    } else if (s->state == SOCK_CONNECTED) {
-        dst_ip   = s->remote_ip;
-        dst_port = s->remote_port;
-    } else {
-        return SYS_ERR(EDESTADDRREQ);
-    }
-
-    if (len > 1472) len = 1472;  /* max UDP payload for 1500-byte MTU */
-    /* STACK buffer, not a shared static: copy_from_user fills it here but
-     * udp_send only reads it several calls later (netdev_get,
-     * udp_ensure_local_port), a preemptible window in which a concurrent
-     * sendto() would overwrite a static — caller A would then transmit
-     * caller B's payload to A's destination (cross-socket corruption / leak).
-     * 1472 B is safe on the 16 KB kernel stack. */
+    uint64_t max_payload = s->domain == AF_INET6 ? 1452 : 1472;
+    if (len > max_payload) return SYS_ERR(EMSGSIZE);
     uint8_t udpbuf[1472];
-    /* A short copy would put up to 1472 bytes of uninitialised kernel stack on
-     * the wire, to an attacker-chosen destination. */
-    if (copy_from_user(udpbuf, (const void *)(uintptr_t)buf, (uint32_t)len) != 0)
+    if (copy_from_user(udpbuf, (const void *)(uintptr_t)buf, len) != 0)
         return SYS_ERR(EFAULT);
-
-    netdev_t *dev = netdev_get("eth0");
-    if (!dev) return SYS_ERR(ENETDOWN);
-
-    /* Implicit ephemeral source-port bind so the reply can be demuxed back to
-     * this socket (see udp_ensure_local_port).  Without it an unbound socket
-     * sends with source port 0 and never receives a response. */
-    if (udp_ensure_local_port(s, sid) != 0)
-        return SYS_ERR(EADDRINUSE);  /* EADDRINUSE — no free ephemeral port */
-
-    int r = udp_send(dev, s->local_port, dst_ip, dst_port, udpbuf, (uint16_t)len);
-    return r < 0 ? SYS_ERR(ENETDOWN) : len;
+    return sock_send_datagram(s, sid, udpbuf, len, addr, addrlen);
 }
 
 /* ── sys_recvfrom ──────────────────────────────────────────────────────── */
@@ -980,41 +975,53 @@ uint64_t sys_sendmsg(uint64_t fd, uint64_t msg_ptr, uint64_t flags)
     SCOPED_FD_PIN(pin);
     uint32_t uid = get_proc_unix_sock(fd, &pin);
 
-    /* AF_INET sendmsg: gather the iovecs and route each through sys_sendto,
-     * which already handles TCP/UDP, implicit ephemeral bind, MSG_* flags and
-     * full user-pointer validation. Ancillary data (SCM_RIGHTS) is AF_UNIX-only;
-     * we ignore msg_control for AF_INET. Returning ENOSYS here (the old
-     * behavior) broke any program that uses sendmsg() on a network socket —
-     * e.g. anything built on writev-over-socket or sendmmsg fallbacks. */
+    /* Datagram iovecs form one atomic message; stream iovecs may make
+     * partial progress. Keep the original descriptor pin throughout. */
     if (uid == UNIX_NONE) {
-        if (!user_ptr_valid(msg_ptr, sizeof(k_msghdr_t)))
-            return SYS_ERR(EFAULT);
+        sock_t *s; uint32_t sid;
+        uint64_t err = get_sock_from_pin(&pin, &s, &sid);
+        if (err) return err;
+        if (!user_ptr_valid(msg_ptr, sizeof(k_msghdr_t))) return SYS_ERR(EFAULT);
         k_msghdr_t imh;
         if (copy_from_user(&imh, (const void *)(uintptr_t)msg_ptr, sizeof(imh)))
-            return SYS_ERR(EFAULT);  /* short copy → stale iov/name fields */
-        uint64_t name    = (uint64_t)(uintptr_t)imh.msg_name;
+            return SYS_ERR(EFAULT);
+        if (imh.msg_iovlen > 8) return SYS_ERR(EINVAL);
+        uint64_t name = (uint64_t)(uintptr_t)imh.msg_name;
         uint64_t namelen = imh.msg_namelen;
-        int64_t  sent    = 0;
-        for (uint64_t i = 0; i < imh.msg_iovlen && i < 8; i++) {
+        uint64_t sent = 0;
+        uint8_t datagram[1472];
+        uint64_t max_payload = s->domain == AF_INET6 ? 1452 : 1472;
+        if (s->type == SOCK_TYPE_STREAM && s->state != SOCK_CONNECTED)
+            return SYS_ERR(ENOTCONN);
+        for (uint64_t i = 0; i < imh.msg_iovlen; i++) {
             k_iovec_t iov;
-            if (!user_ptr_valid((uint64_t)(uintptr_t)imh.msg_iov + i * sizeof(k_iovec_t),
-                                sizeof(k_iovec_t)))
+            uint64_t iptr = (uint64_t)(uintptr_t)imh.msg_iov;
+            if (iptr > UINT64_MAX - i * sizeof(iov)) return SYS_ERR(EFAULT);
+            iptr += i * sizeof(iov);
+            if (!user_ptr_valid(iptr, sizeof(iov)) ||
+                copy_from_user(&iov, (const void *)(uintptr_t)iptr, sizeof(iov)) != 0)
                 return SYS_ERR(EFAULT);
-            if (copy_from_user(&iov,
-                (const void *)((uintptr_t)imh.msg_iov + i * sizeof(k_iovec_t)),
-                sizeof(iov)))
-                return SYS_ERR(EFAULT);  /* short copy → stale iov_base/iov_len */
-            if (iov.iov_len == 0) continue;
-            uint64_t r = sys_sendto(fd, (uint64_t)(uintptr_t)iov.iov_base,
-                                    iov.iov_len, flags, name, namelen);
-            /* sys_sendto returns errno as a huge unsigned (>= -4095 wrapped). */
-            if ((int64_t)r < 0)
-                return sent > 0 ? (uint64_t)sent : r;
-            sent += (int64_t)r;
-            /* Short datagram/stream send: stop (don't reorder the stream). */
-            if (r < iov.iov_len) break;
+            if (s->type != SOCK_TYPE_STREAM) {
+                if (iov.iov_len > max_payload - sent) return SYS_ERR(EMSGSIZE);
+                if (iov.iov_len &&
+                    (!user_ptr_valid((uint64_t)(uintptr_t)iov.iov_base, iov.iov_len) ||
+                     copy_from_user(datagram + sent, iov.iov_base, iov.iov_len) != 0))
+                    return SYS_ERR(EFAULT);
+                sent += iov.iov_len;
+            } else {
+                if (!iov.iov_len) continue;
+                if (!user_ptr_valid((uint64_t)(uintptr_t)iov.iov_base, iov.iov_len))
+                    return sent ? sent : SYS_ERR(EFAULT);
+                int64_t r = sock_stream_send(s, (uint64_t)(uintptr_t)iov.iov_base,
+                                            iov.iov_len, (flags & MSG_DONTWAIT) != 0);
+                if (r < 0) return sent ? sent : (uint64_t)r;
+                sent += (uint64_t)r;
+                if ((uint64_t)r < iov.iov_len) break;
+            }
         }
-        return (uint64_t)sent;
+        if (s->type != SOCK_TYPE_STREAM)
+            return sock_send_datagram(s, sid, datagram, sent, name, namelen);
+        return sent;
     }
 
     (void)flags;

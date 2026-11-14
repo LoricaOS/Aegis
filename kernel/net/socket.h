@@ -125,9 +125,10 @@ void sock_unref(uint32_t sock_id);
 void sock_wake(uint32_t sock_id);
 
 /* sock_stream_send: blocking TCP send of a user buffer (`ubuf`), segmenting
- * over time and blocking on send-space when the ring fills (honors O_NONBLOCK).
+ * over time and blocking on send-space when the ring fills (honors O_NONBLOCK
+ * and per-call force_nb, without changing shared socket flags).
  * Returns bytes sent (>=0) or -errno.  Shared by write() and send()/sendto(). */
-int64_t sock_stream_send(sock_t *s, uint64_t ubuf, uint64_t len);
+int64_t sock_stream_send(sock_t *s, uint64_t ubuf, uint64_t len, int force_nb);
 
 /* sock_open_fd: allocate an fd backed by sock_id. Returns fd >= 0 or -1. */
 int sock_open_fd(uint32_t sock_id, aegis_process_t *proc, uint32_t flags);
