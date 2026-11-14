@@ -2816,6 +2816,22 @@ int ext2_rename(const char *old_path, const char *new_path, int has_install)
     uint8_t ftype = ((inode.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR)
                     ? EXT2_FT_DIR : EXT2_FT_REG_FILE;
 
+    /* A directory cannot become its own ancestor. Resolve ancestry by inode,
+     * not path spelling: symlink aliases can hide the destination subtree.
+     * First require a valid chain to root so corrupt/cyclic ancestry fails
+     * closed rather than looking like a harmless non-descendant. The namespace
+     * lock remains held across both walks and the following mutation. */
+    if (ftype == EXT2_FT_DIR) {
+        if (!ext2_descends_from(new_parent_ino, EXT2_ROOT_INODE)) {
+            ext2_lock_release(fl);
+            return -EIO;
+        }
+        if (ext2_descends_from(new_parent_ino, ino)) {
+            ext2_lock_release(fl);
+            return -EINVAL;
+        }
+    }
+
     /* If the destination name already exists, deal with it BEFORE adding the
      * new entry — otherwise ext2_dir_add_entry appends a SECOND dirent with the
      * same name (duplicate entry) and the old target's inode + blocks leak. */

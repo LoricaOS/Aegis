@@ -343,6 +343,18 @@ int main(void){
  host_proc.uid=12;host_proc.gid=12;uint32_t x;assert(ext2_open("/private/readable",&x)==-EACCES);assert(ext2_symlink("/private/link","/other",1)<0);assert(ext2_link("/other","/private/link",1)<0);
  host_proc.uid=0;host_proc.gid=0;assert(!ext2_mkdir("/grant",0777,1));assert(!ext2_mkdir("/grant/child",0777,1));assert(!ext2_mkdir("/outside",0777,1));
  uint32_t grant,child;assert(!ext2_open("/grant",&grant));assert(!ext2_open("/grant/child",&child));int prot=0;assert(!ext2_openat_protected(child,grant,".",&x,&prot));assert(!ext2_rename("/grant/child","/outside/child",1));assert(ext2_openat_protected(child,grant,"..",&x,&prot)==-EACCES);
+ /* Renaming into one's own subtree must leave every source name intact,
+  * including when the destination parent is reached through a symlink. */
+ assert(!ext2_mkdir("/cycle",0777,1));assert(!ext2_mkdir("/cycle/child",0777,1));
+ uint32_t cycle,cycle_child;assert(!ext2_open("/cycle",&cycle));assert(!ext2_open("/cycle/child",&cycle_child));
+ assert(ext2_rename("/cycle","/cycle/child/moved",0)==-EINVAL);
+ assert(ext2_rename("/cycle","/cycle/moved",0)==-EINVAL);
+ assert(!ext2_symlink("/alias-child","/cycle/child",1));
+ assert(ext2_rename("/cycle","/alias-child/moved",0)==-EINVAL);
+ assert(!ext2_open("/cycle",&x)&&x==cycle);assert(!ext2_open("/cycle/child",&x)&&x==cycle_child);
+ assert(!ext2_rename("/cycle","/cycle",0));
+ assert(!ext2_rename("/cycle","/moved-cycle",0));
+ assert(!ext2_open("/moved-cycle/child",&x)&&x==cycle_child);
  assert(!ext2_create("/destination",0600,1));uint32_t dst;assert(!ext2_open("/destination",&dst));assert(ext2_write(dst,"old",0,3)==3);held=ext2_pool_alloc(dst);assert(!ext2_rename("/other","/destination",1));assert(s_ext2_ops.read(held,data,0,3)==3&&!memcmp(data,"old",3));ext2_pool_free(held);
  assert(!ext2_mkdir("/empty",0700,1));assert(!ext2_open("/empty",&dst));held=ext2_pool_alloc(dst);assert(!ext2_rmdir("/empty",1));assert(!ext2_read_inode(dst,&old)&&!old.i_dtime);ext2_pool_free(held);assert(!ext2_read_inode(dst,&old)&&old.i_dtime);
  host_task.is_user=0;assert(!ext2_mkdir("/etc",0755,1));assert(!ext2_mkdir("/etc/aegis",0755,1));marker_absent();
