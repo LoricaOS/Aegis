@@ -338,64 +338,114 @@ static const vfs_ops_t s_ramfs_ops = {
     .poll    = 0,
 };
 
-/* ── directory-handle vfs_ops (priv = ramfs_t *) ──────────────────────── */
+/* Directory descriptions retain an inode, not a rename-sensitive path.
+ * Root descriptions have no inode and pin the instance through open_dirs. */
+typedef struct {
+    ramfs_t *owner;
+    ramfs_inode_t *inode;
+    uint32_t refs;
+} ramfs_dir_handle_t;
 
 static int
 ramfs_dir_readdir_fn(void *priv, uint64_t index, char *name_out, uint8_t *type_out)
 {
-    ramfs_t *inst = (ramfs_t *)priv;
+    ramfs_dir_handle_t *h = priv;
+    ramfs_t *inst = h->owner;
     irqflags_t fl = spin_lock_irqsave(&inst->lock);
+    const char *prefix = "";
+    uint32_t plen = 0;
+    if (h->inode) {
+        /* A removed directory remains valid but empty; do not follow a new
+         * directory created under its former name. Renamed directories find
+         * their current dentry by retained inode identity. */
+        ramfs_dent_t *self = 0;
+        for (uint32_t i = 0; i < RAMFS_MAX_DENTS; i++)
+            if (inst->dents[i].in_use &&
+                &inst->inodes[inst->dents[i].inode] == h->inode) {
+                self = &inst->dents[i]; break;
+            }
+        if (!self) { spin_unlock_irqrestore(&inst->lock, fl); return -1; }
+        if (rfs_path_may(inst, self->name, 0) || !rfs_may(h->inode, 5)) {
+            spin_unlock_irqrestore(&inst->lock, fl); return -EACCES;
+        }
+        prefix = self->name;
+        while (prefix[plen]) plen++;
+    }
     uint64_t found = 0;
-    uint32_t i;
-    for (i = 0; i < RAMFS_MAX_DENTS; i++) {
-        if (!inst->dents[i].in_use ||
-            rfs_path_may(inst, inst->dents[i].name, 0) != 0) continue;
-        if (found == index) {
-            rfs_strcpy(name_out, inst->dents[i].name, RAMFS_MAX_NAMELEN);
-            ramfs_inode_t *n = &inst->inodes[inst->dents[i].inode];
-            *type_out = n->is_dir ? 4 /* DT_DIR */ : 8 /* DT_REG */;
+    for (uint32_t i = 0; i < RAMFS_MAX_DENTS; i++) {
+        ramfs_dent_t *d = &inst->dents[i];
+        if (!d->in_use) continue;
+        const char *name = d->name;
+        if (plen) {
+            uint32_t k = 0;
+            while (k < plen && name[k] && name[k] == prefix[k]) k++;
+            if (k != plen || name[k] != '/') continue;
+            name += plen + 1;
+        }
+        int direct = *name != 0;
+        for (uint32_t k = 0; name[k]; k++) if (name[k] == '/') direct = 0;
+        if (!direct || rfs_path_may(inst, d->name, 0)) continue;
+        if (found++ == index) {
+            rfs_strcpy(name_out, name, RAMFS_MAX_NAMELEN);
+            *type_out = inst->inodes[d->inode].is_dir ? 4 : 8;
             spin_unlock_irqrestore(&inst->lock, fl);
             return 0;
         }
-        found++;
     }
     spin_unlock_irqrestore(&inst->lock, fl);
     return -1;
 }
 
-/* Directory-handle close: priv is the ramfs_t instance (NOT an inode), so it
- * must NOT go through ramfs_close_fn (which dereferences priv as an inode).
- * It must also be NON-NULL: the VFS close path calls ops->close
- * unconditionally, so a NULL here is a jump-to-0 panic when a dir fd closes
- * (e.g. `find /tmp`). Drops the instance's open-dir count (see open_dirs). */
 static void
 ramfs_dir_close_fn(void *priv)
 {
-    ramfs_t *inst = (ramfs_t *)priv;
-    if (!inst) return;
+    ramfs_dir_handle_t *h = priv;
+    ramfs_t *inst = h->owner;
     irqflags_t fl = spin_lock_irqsave(&inst->lock);
-    if (inst->open_dirs) inst->open_dirs--;
+    if (--h->refs) { spin_unlock_irqrestore(&inst->lock, fl); return; }
+    uint8_t *pages[RAMFS_PAGES_PER_FILE];
+    uint32_t count = 0;
+    if (h->inode) {
+        h->inode->open_count--;
+        count = inode_release(h->inode, pages);
+    } else {
+        inst->open_dirs--;
+    }
     spin_unlock_irqrestore(&inst->lock, fl);
+    rfs_free_pages(pages, count);
+    kva_free_pages(h, 1);
 }
 
 static void
 ramfs_dir_dup_fn(void *priv)
 {
-    ramfs_t *inst = (ramfs_t *)priv;
-    if (!inst) return;
-    irqflags_t fl = spin_lock_irqsave(&inst->lock);
-    inst->open_dirs++;
-    spin_unlock_irqrestore(&inst->lock, fl);
+    ramfs_dir_handle_t *h = priv;
+    irqflags_t fl = spin_lock_irqsave(&h->owner->lock);
+    h->refs++;
+    spin_unlock_irqrestore(&h->owner->lock, fl);
+}
+
+static int
+ramfs_dir_stat_fn(void *priv, k_stat_t *st)
+{
+    ramfs_dir_handle_t *h = priv;
+    irqflags_t fl = spin_lock_irqsave(&h->owner->lock);
+    if (h->inode) ramfs_stat_fn(h->inode, st);
+    else {
+        __builtin_memset(st, 0, sizeof(*st));
+        st->st_dev = 3;
+        st->st_mode = S_IFDIR | 01777;
+        st->st_nlink = 1;
+    }
+    spin_unlock_irqrestore(&h->owner->lock, fl);
+    return 0;
 }
 
 static const vfs_ops_t s_ramfs_dir_ops = {
-    .read    = 0,
-    .write   = 0,
-    .close   = ramfs_dir_close_fn,
+    .close = ramfs_dir_close_fn,
     .readdir = ramfs_dir_readdir_fn,
-    .dup     = ramfs_dir_dup_fn,
-    .stat    = 0,
-    .poll    = 0,
+    .dup = ramfs_dir_dup_fn,
+    .stat = ramfs_dir_stat_fn,
 };
 
 /* ── Public API ───────────────────────────────────────────────────────── */
@@ -431,8 +481,8 @@ ramfs_init(ramfs_t *inst)
     inst->lock = init;
 }
 
-int
-ramfs_open(ramfs_t *inst, const char *name, int flags, uint16_t mode, vfs_file_t *out)
+static int
+ramfs_open_handle(ramfs_t *inst, const char *name, int flags, uint16_t mode, vfs_file_t *out, ramfs_dir_handle_t *h)
 {
     int access = flags & VFS_O_ACCMODE;
     if (access == VFS_O_ACCMODE || ((flags & VFS_O_TRUNC) && access == VFS_O_RDONLY))
@@ -461,10 +511,20 @@ ramfs_open(ramfs_t *inst, const char *name, int flags, uint16_t mode, vfs_file_t
     if (n->is_dir && access != VFS_O_RDONLY) {
         spin_unlock_irqrestore(&inst->lock, fl); return -EISDIR;
     }
+    if (n->is_dir && !h) {
+        spin_unlock_irqrestore(&inst->lock, fl);
+        return 1; /* internal retry: allocate directory description unlocked */
+    }
     if (flags & VFS_O_TRUNC) count = inode_detach_pages(n, pages);
     n->open_count++;
-    out->ops = &s_ramfs_ops;
-    out->priv = n;
+    if (n->is_dir) {
+        *h = (ramfs_dir_handle_t){ .owner = inst, .inode = n, .refs = 1 };
+        out->ops = &s_ramfs_dir_ops;
+        out->priv = h;
+    } else {
+        out->ops = &s_ramfs_ops;
+        out->priv = n;
+    }
     out->offset = 0;
     out->size = n->size;
     out->flags = flags;
@@ -472,6 +532,20 @@ ramfs_open(ramfs_t *inst, const char *name, int flags, uint16_t mode, vfs_file_t
     spin_unlock_irqrestore(&inst->lock, fl);
     rfs_free_pages(pages, count);
     return 0;
+}
+
+int
+ramfs_open(ramfs_t *inst, const char *name, int flags, uint16_t mode, vfs_file_t *out)
+{
+    int rc = ramfs_open_handle(inst, name, flags, mode, out, 0);
+    if (rc != 1) return rc;
+    /* Allocate outside the namespace lock, then repeat lookup/authorization:
+     * a concurrent rename can change the target while allocation is in flight. */
+    ramfs_dir_handle_t *h = kva_alloc_pages(1);
+    if (!h) return -ENOMEM;
+    rc = ramfs_open_handle(inst, name, flags, mode, out, h);
+    if (rc || out->ops != &s_ramfs_dir_ops) kva_free_pages(h, 1);
+    return rc;
 }
 
 int
@@ -489,11 +563,14 @@ ramfs_stat(ramfs_t *inst, const char *name, k_stat_t *st)
 int
 ramfs_opendir(ramfs_t *inst, vfs_file_t *out)
 {
+    ramfs_dir_handle_t *h = kva_alloc_pages(1);
+    if (!h) return -ENOMEM;
+    *h = (ramfs_dir_handle_t){ .owner = inst, .refs = 1 };
     irqflags_t fl = spin_lock_irqsave(&inst->lock);
     inst->open_dirs++;                            /* fd holds the instance */
     spin_unlock_irqrestore(&inst->lock, fl);
     out->ops    = &s_ramfs_dir_ops;
-    out->priv   = (void *)inst;
+    out->priv   = h;
     out->offset = 0;
     out->size   = 0;
     out->flags  = 0;

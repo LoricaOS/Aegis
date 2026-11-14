@@ -169,6 +169,32 @@ int main(void) {
  assert(!ramfs_open(&fs,"race",VFS_O_CREAT|VFS_O_RDWR,0600,&f));
  pthread_t a,b;assert(!pthread_create(&a,0,writer,0));assert(!pthread_create(&b,0,truncater,0));pthread_join(a,0);pthread_join(b,0);
  assert(!ramfs_unlink(&fs,"race"));f.ops->close(f.priv);assert(host_pages==0);
+ /* Directory descriptors follow inode identity across rename/removal. */
+ assert(!ramfs_mkdir(&fs,"tree",0700));assert(!ramfs_mkdir(&fs,"tree/sub",0700));
+ assert(!ramfs_open(&fs,"tree/item",VFS_O_CREAT|VFS_O_RDWR,0600,&f));f.ops->close(f.priv);
+ assert(!ramfs_open(&fs,"tree/sub/deep",VFS_O_CREAT|VFS_O_RDWR,0600,&f));f.ops->close(f.priv);
+ assert(!ramfs_open(&fs,"tree",VFS_O_RDONLY,0,&f));assert(f.ops->readdir);
+ assert(!f.ops->stat(f.priv,&st)&&(st.st_mode&S_IFMT)==S_IFDIR);
+ char name[128];uint8_t type;
+ assert(!f.ops->readdir(f.priv,0,name,&type)&&!strcmp(name,"sub")&&type==4);
+ assert(!f.ops->readdir(f.priv,1,name,&type)&&!strcmp(name,"item")&&type==8);
+ assert(f.ops->readdir(f.priv,2,name,&type)<0);
+ assert(!ramfs_rename(&fs,"tree","movedtree"));
+ assert(!f.ops->readdir(f.priv,1,name,&type)&&!strcmp(name,"item"));
+ assert(!ramfs_opendir(&fs,&g));unsigned trees=0;
+ for(uint64_t i=0;!g.ops->readdir(g.priv,i,name,&type);i++){assert(!strchr(name,'/'));if(!strcmp(name,"movedtree"))trees++;}assert(trees==1);g.ops->close(g.priv);
+ assert(!ramfs_unlink(&fs,"movedtree/sub/deep"));assert(!ramfs_rmdir(&fs,"movedtree/sub"));
+ assert(!ramfs_unlink(&fs,"movedtree/item"));assert(!ramfs_rmdir(&fs,"movedtree"));
+ assert(!ramfs_mkdir(&fs,"movedtree",0700));
+ assert(!ramfs_open(&fs,"movedtree/new",VFS_O_CREAT|VFS_O_RDWR,0600,&g));g.ops->close(g.priv);
+ assert(f.ops->readdir(f.priv,0,name,&type)<0); /* not the replacement directory */
+ f.ops->dup(f.priv);vfs_file_t alias=f;f.ops->close(f.priv);assert(ramfs_busy(&fs));alias.ops->close(alias.priv);
+ assert(!ramfs_unlink(&fs,"movedtree/new"));assert(!ramfs_rmdir(&fs,"movedtree"));
+ assert(!ramfs_busy(&fs));assert(host_pages==0);
+ assert(!ramfs_opendir(&fs,&g));g.ops->dup(g.priv);vfs_file_t root_alias=g;
+ g.ops->close(g.priv);assert(ramfs_busy(&fs));root_alias.ops->close(root_alias.priv);
+ assert(!ramfs_busy(&fs));assert(host_pages==0);
+ puts("ramfs: nested directory enumeration and retained inode lifetime PASS");
  puts("ramfs: private modes, namespace DAC, open-unlinked, concurrent truncate/write PASS");
 }
 '''
