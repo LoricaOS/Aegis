@@ -145,6 +145,8 @@ int unix_sock_wait_recv(uint32_t id, int force_nb);
 
 /* Write to unix socket (to own tx_ring). Returns bytes written or -errno. */
 int unix_sock_write(uint32_t id, const void *buf, uint32_t len);
+/* Per-call nonblocking write; does not change shared O_NONBLOCK state. */
+int unix_sock_write_nonblock(uint32_t id, const void *buf, uint32_t len, int force_nb);
 
 /* Get peer credentials. Returns 0 or -errno. */
 int unix_sock_peercred(uint32_t id, uint32_t *pid, uint32_t *uid, uint32_t *gid);

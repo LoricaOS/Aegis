@@ -114,7 +114,7 @@ int main(void) {
 run(permissions)
 
 sockets = base + r"""
-typedef struct { void (*close)(void *); } vfs_ops_t;
+typedef struct { void (*close)(void *); void (*dup)(void *); } vfs_ops_t;
 """
 vfs = text("kernel/fs/vfs.h")
 sockets += vfs[vfs.index("typedef struct {\n    const vfs_ops_t *ops;"):
@@ -412,8 +412,15 @@ void unix_sock_free(uint32_t id) {
 """
 for name in ("ring_used", "ring_free", "unix_read_ready", "unix_sock_read_impl",
              "unix_sock_read", "unix_sock_wait_recv", "unix_write_ready",
-             "unix_sock_write", "unix_reaches_locked", "unix_sock_stage_fds"):
+             "unix_sock_write_nonblock", "unix_sock_write", "unix_reaches_locked", "unix_sock_stage_fds"):
     real += body("kernel/net/unix_socket.c", name)
+# Exercise the production AF_UNIX sendmsg branch against the real ring writer.
+# The network branch is covered separately by socket_send_test.py.
+real += "static int scm_fd_passable(const vfs_file_t *f) { (void)f; return 1; }\n"
+sendmsg = body("kernel/syscall/sys_socket.c", "sys_sendmsg")
+start = sendmsg.index("    /* Datagram iovecs")
+end = sendmsg.index("\n    if (!user_ptr_valid(msg_ptr", sendmsg.index("return sent;"))
+real += sendmsg[:start] + "    if (uid == UNIX_NONE) return SYS_ERR(ENOSYS);\n" + sendmsg[end:]
 real += r"""
 static uint8_t rings[2][UNIX_BUF_SIZE];
 static void reset_real(void) {
@@ -548,6 +555,39 @@ int main(void) {
         sock.udp_rx_head=sock.udp_rx_tail;
         assert(sys_recvmsg(0,(uintptr_t)&msg,MSG_DONTWAIT)==SYS_ERR(EAGAIN));
     }
+    /* Full/partial UNIX rings honor per-call nonblocking without waiting or
+     * mutating the persistent mode; ordinary blocking write still waits. */
+    reset_real(); s_unix[0].ring_head=UNIX_BUF_SIZE-1;
+    assert(unix_sock_write_nonblock(0,"DATA",4,1)==-EAGAIN);
+    assert(!waits && !s_unix[0].nonblocking);
+    assert(unix_sock_write(0,"DATA",4)==-EINTR && waits==1);
+    reset_real(); s_unix[0].nonblocking=1; s_unix[0].ring_head=UNIX_BUF_SIZE-1;
+    assert(unix_sock_write(0,"DATA",4)==-EAGAIN && !waits);
+    reset_real(); s_unix[0].ring_head=UNIX_BUF_SIZE-3;
+    assert(unix_sock_write_nonblock(0,"DATA",4,1)==2);
+    assert(!waits && !s_unix[0].nonblocking && !held);
+    reset_real(); s_unix[0].ring_head=UNIX_BUF_SIZE-1;
+    k_iovec_t send_iov[2]={{"DATA",4},{"TAIL",4}};
+    k_msghdr_t send_msg={.msg_iov=send_iov,.msg_iovlen=2};
+    assert(sys_sendmsg(0,(uintptr_t)&send_msg,MSG_DONTWAIT)==SYS_ERR(EAGAIN));
+    assert(!waits && !s_unix[0].nonblocking);
+    reset_real(); s_unix[0].ring_head=UNIX_BUF_SIZE-3;
+    assert(sys_sendmsg(0,(uintptr_t)&send_msg,MSG_DONTWAIT)==2);
+    assert(!waits && !s_unix[0].nonblocking && !held);
+    /* Progress ending exactly on an iovec boundary must still publish
+     * attached rights once the next iovec would block. */
+    reset_real(); s_unix[0].ring_head=UNIX_BUF_SIZE-5;
+    k_cmsghdr_t send_cm={.cmsg_len=sizeof(k_cmsghdr_t)+sizeof(int),
+                        .cmsg_level=SOL_SOCKET,.cmsg_type=SCM_RIGHTS};
+    memcpy(control,&send_cm,sizeof(send_cm)); int send_fd=3;
+    memcpy(control+sizeof(send_cm),&send_fd,sizeof(send_fd));
+    table.fds[3]=(vfs_file_t){.ops=&right_ops,.priv=(void*)1};
+    send_msg.msg_control=control;send_msg.msg_controllen=send_cm.cmsg_len;
+    assert(sys_sendmsg(0,(uintptr_t)&send_msg,MSG_DONTWAIT)==4);
+    assert(!waits && s_unix[1].passed_fd_count==1);
+    send_msg.msg_control=NULL;send_msg.msg_controllen=0;
+    reset_real(); s_unix[0].ring_head=UNIX_BUF_SIZE-1;
+    assert(sys_sendmsg(0,(uintptr_t)&send_msg,0)==SYS_ERR(EINTR) && waits==1);
     reset_real(); is_unix=0; udp_packets();
     msg=(k_msghdr_t){.msg_flags=-1}; fault_ptr=(uintptr_t)&msg.msg_flags; fault_left=sizeof(int);
     assert(sys_recvmsg(0,(uintptr_t)&msg,MSG_DONTWAIT)==SYS_ERR(EFAULT));

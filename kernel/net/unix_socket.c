@@ -826,7 +826,7 @@ static int unix_write_ready(uint32_t id, uint32_t peer)
     return ring_free(us) > 0;
 }
 
-int unix_sock_write(uint32_t id, const void *buf, uint32_t len)
+int unix_sock_write_nonblock(uint32_t id, const void *buf, uint32_t len, int force_nb)
 {
     if (len == 0) return 0;
     irqflags_t fl = spin_lock_irqsave(&unix_lock);
@@ -895,7 +895,7 @@ int unix_sock_write(uint32_t id, const void *buf, uint32_t len)
         }
 
         /* Ring full — block */
-        if (us->nonblocking) break;
+        if (us->nonblocking || force_nb) break;
         /* Block on OUR poll_waiters until a reader drains space (the peer's
          * read path wakes us via this queue) or the peer closes.  Drop
          * unix_lock first (unix_lock < sched_lock); wait_event registers BEFORE
@@ -920,7 +920,13 @@ int unix_sock_write(uint32_t id, const void *buf, uint32_t len)
     }
 
     spin_unlock_irqrestore(&unix_lock, fl);
-    return (int)written;
+    return written ? (int)written : -EAGAIN;
+}
+
+/* VFS write uses the persistent socket mode; send syscalls may force NB. */
+int unix_sock_write(uint32_t id, const void *buf, uint32_t len)
+{
+    return unix_sock_write_nonblock(id, buf, len, 0);
 }
 
 /* ── Peer credentials ──────────────────────────────────────────────────── */

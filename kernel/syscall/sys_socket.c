@@ -697,7 +697,7 @@ sys_sendto(uint64_t fd, uint64_t buf, uint64_t len,
                  * (kernel stack, or the previous chunk's bytes). */
                 if (copy_from_user(kbuf, (const void *)(uintptr_t)(buf + off), chunk) != 0)
                     return total > 0 ? (uint64_t)total : SYS_ERR(EFAULT);
-                int n = unix_sock_write(uuid, kbuf, chunk);
+                int n = unix_sock_write_nonblock(uuid, kbuf, chunk, (flags & MSG_DONTWAIT) != 0);
                 if (n < 0)
                     return total > 0 ? (uint64_t)total : (uint64_t)(int64_t)n;
                 total  += (uint64_t)n;
@@ -1024,7 +1024,6 @@ uint64_t sys_sendmsg(uint64_t fd, uint64_t msg_ptr, uint64_t flags)
         return sent;
     }
 
-    (void)flags;
     if (!user_ptr_valid(msg_ptr, sizeof(k_msghdr_t))) return SYS_ERR(EFAULT);
     k_msghdr_t mh;
     /* A partial copy (sibling CLONE_VM thread munmap'd the buffer mid-copy)
@@ -1054,14 +1053,21 @@ uint64_t sys_sendmsg(uint64_t fd, uint64_t msg_ptr, uint64_t flags)
              * peer is a kernel-stack disclosure. */
             if (copy_from_user(kbuf, (const void *)((uintptr_t)iov.iov_base + off), chunk) != 0)
                 return total_sent > 0 ? (uint64_t)total_sent : SYS_ERR(EFAULT);
-            int n = unix_sock_write(uid, kbuf, chunk);
-            if (n < 0) return total_sent > 0 ? (uint64_t)total_sent : (uint64_t)(int64_t)n;
+            int n = unix_sock_write_nonblock(uid, kbuf, chunk, (flags & MSG_DONTWAIT) != 0);
+            if (n < 0) {
+                if (n == -EAGAIN && total_sent > 0) goto send_ancillary;
+                return total_sent > 0 ? (uint64_t)total_sent : (uint64_t)(int64_t)n;
+            }
             total_sent += n;
             off += (uint64_t)n;
             remain -= (uint64_t)n;
+            /* A short nonblocking write must not retry/spin or skip attached
+             * rights after publishing payload. Finish ancillary processing. */
+            if ((uint32_t)n < chunk) goto send_ancillary;
         }
     }
 
+send_ancillary:
     /* Process ancillary data (SCM_RIGHTS) */
     if (mh.msg_control && mh.msg_controllen >= sizeof(k_cmsghdr_t)) {
         if (!user_ptr_valid((uint64_t)(uintptr_t)mh.msg_control, mh.msg_controllen))

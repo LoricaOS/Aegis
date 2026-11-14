@@ -46,16 +46,20 @@ typedef int aegis_process_t;
 typedef struct {void *iov_base; uint64_t iov_len;} k_iovec_t;
 typedef struct {void *msg_name; uint32_t msg_namelen, pad; k_iovec_t *msg_iov; uint64_t msg_iovlen; void *msg_control; uint64_t msg_controllen; int msg_flags;} k_msghdr_t;
 static sock_t socket;
-static int packets, waits, send_budget, bound, netdev;
+static int packets, waits, send_budget, bound, netdev, is_unix, unix_calls, unix_force_nb;
 static uint16_t packet_len;
 static unsigned char packet[1472];
 static const void *fault;
 static aegis_process_t *current_proc(void) { return 0; }
-static uint32_t get_proc_unix_sock(uint64_t f,int *p) { (void)f;(void)p;return UNIX_NONE; }
+static uint32_t get_proc_unix_sock(uint64_t f,int *p) { (void)f;(void)p;return is_unix ? 0 : UNIX_NONE; }
 static uint64_t get_sock_from_pin(int *p,sock_t **s,uint32_t *id) { (void)p;*s=&socket;*id=0;return 0; }
 static int user_ptr_valid(uint64_t p,uint64_t n) { return n == 0 || (p && p <= UINTPTR_MAX-n); }
 static int copy_from_user(void *d,const void *s,uint64_t n) { if (n && s==fault) return 1; if(n) memcpy(d,s,n); return 0; }
-static int unix_sock_write(uint32_t id,const void *b,uint32_t n) { (void)id;(void)b;(void)n;assert(0);return -1; }
+static int unix_sock_write_nonblock(uint32_t id,const void *b,uint32_t n,int nb) {
+ (void)id;(void)b;unix_calls++;unix_force_nb=nb;
+ if(send_budget>0){int r=n<(uint32_t)send_budget?(int)n:send_budget;send_budget-=r;return r;}
+ return -EAGAIN;
+}
 static void sock_ref(uint32_t id) {(void)id;}
 static void sock_unref(uint32_t id) {(void)id;}
 static uint16_t ntohs(uint16_t n) {return (n>>8)|(n<<8);}
@@ -79,11 +83,11 @@ code += function('kernel/syscall/sys_socket.c', 'sock_send_datagram')
 code += function('kernel/syscall/sys_socket.c', 'sys_sendto')
 # The network branch is tested; unrelated AF_UNIX ancillary handling is omitted.
 sendmsg = function('kernel/syscall/sys_socket.c', 'sys_sendmsg')
-code += sendmsg[:sendmsg.index('\n    (void)flags;')] + '\nreturn SYS_ERR(ENOSYS);\n}\n'
+code += sendmsg[:sendmsg.index('\n    if (!user_ptr_valid(msg_ptr', sendmsg.index('return sent;'))] + '\nreturn SYS_ERR(ENOSYS);\n}\n'
 code += r'''
 static void reset(int domain,int type) {
  socket=(sock_t){.domain=domain,.type=type,.state=SOCK_CONNECTED};
- packets=waits=bound=0;send_budget=0;packet_len=0;fault=0;
+ packets=waits=bound=0;send_budget=0;packet_len=0;fault=0;is_unix=unix_calls=unix_force_nb=0;
 }
 int main(void) {
  char data[1473]; memset(data,'x',sizeof(data));
@@ -121,6 +125,13 @@ int main(void) {
  reset(AF_INET,SOCK_TYPE_STREAM);iov[0]=(k_iovec_t){data,1};iov[1]=(k_iovec_t){data+1,1};send_budget=1;
  assert(sys_sendmsg(1,(uintptr_t)&m,MSG_DONTWAIT)==1 && waits==0);
  assert(sys_sendmsg(1,(uintptr_t)&m,MSG_DONTWAIT)==SYS_ERR(EAGAIN) && waits==0);
+ reset(AF_INET,SOCK_TYPE_STREAM);is_unix=1;
+ assert(sys_sendto(1,(uintptr_t)data,4,MSG_DONTWAIT,0,0)==SYS_ERR(EAGAIN));
+ assert(unix_calls==1 && unix_force_nb==1);
+ send_budget=2;unix_calls=0;
+ assert(sys_sendto(1,(uintptr_t)data,4,MSG_DONTWAIT,0,0)==2 && unix_calls==1);
+ unix_calls=0;
+ assert(sys_sendto(1,(uintptr_t)data,4,0,0,0)==SYS_ERR(EAGAIN) && !unix_force_nb);
  puts("socket send: datagram atomicity, bounds, faults, empty messages, TCP per-call nonblocking: ok");
 }
 '''
