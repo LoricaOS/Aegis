@@ -237,10 +237,13 @@ typedef struct { int type; uint64_t base, len; } vma_entry_t;
 typedef struct { cap_slot_t caps[CAP_TABLE_SIZE]; int admin_session; } aegis_process_t;
 static aegis_process_t proc;
 static unsigned allowed;
+static uint32_t auth_rights;
 static int mapped_type;
 static aegis_process_t *current_proc(void) { return &proc; }
 int cap_check(const cap_slot_t *c, uint32_t n, uint32_t kind, uint32_t rights) {
-    (void)c; (void)n; (void)rights; return allowed & (1U << kind) ? 0 : -1;
+    (void)c; (void)n;
+    if (kind == CAP_KIND_AUTH && (auth_rights & rights) != rights) return -1;
+    return allowed & (1U << kind) ? 0 : -1;
 }
 static int vma_find_copy(aegis_process_t *p, uint64_t a, vma_entry_t *v) {
     (void)p; v->base = a; v->len = 4096; v->type = mapped_type; return 1;
@@ -264,10 +267,26 @@ int main(void) {
     assert(sys_mmap_impl(0,4096,PROT_WRITE,MAP_SHARED,3,0,&fd) == SYS_ERR(EACCES));
     proc.admin_session = 1;
     assert(sys_mmap_impl(0,4096,PROT_WRITE,MAP_SHARED,3,0,&fd) == 123);
-    proc.admin_session = 0; fd.kflags = VFS_KF_AUTH_GATED;
-    assert(sys_mmap_impl(0,4096,PROT_READ,MAP_PRIVATE,3,0,&fd) == SYS_ERR(EACCES));
-    allowed |= 1U << CAP_KIND_AUTH;
-    assert(sys_mmap_impl(0,4096,PROT_READ,MAP_PRIVATE,3,0,&fd) == 123);
+    fd.kflags = VFS_KF_AUTH_GATED;
+    fd.flags = VFS_O_RDONLY;
+    /* An inherited credential fd is not AUTH authority, even in an elevated
+     * session. Cover both read mappings and private writable copies. */
+    for (int admin = 0; admin <= 1; admin++) {
+        proc.admin_session = admin;
+        allowed &= ~(1U << CAP_KIND_AUTH);
+        assert(sys_mmap_impl(0,4096,PROT_READ,MAP_PRIVATE,3,0,&fd) == SYS_ERR(EACCES));
+        assert(sys_mmap_impl(0,4096,PROT_WRITE,MAP_PRIVATE,3,0,&fd) == SYS_ERR(EACCES));
+        assert(sys_mmap_impl(0,4096,PROT_READ,MAP_SHARED,3,0,&fd) == SYS_ERR(EACCES));
+        allowed |= 1U << CAP_KIND_AUTH;
+        auth_rights = CAP_RIGHTS_WRITE;
+        assert(sys_mmap_impl(0,4096,PROT_READ,MAP_PRIVATE,3,0,&fd) == SYS_ERR(EACCES));
+        assert(sys_mmap_impl(0,4096,PROT_WRITE,MAP_PRIVATE,3,0,&fd) == SYS_ERR(EACCES));
+        assert(sys_mmap_impl(0,4096,PROT_READ,MAP_SHARED,3,0,&fd) == SYS_ERR(EACCES));
+        auth_rights = CAP_RIGHTS_READ;
+        assert(sys_mmap_impl(0,4096,PROT_READ,MAP_PRIVATE,3,0,&fd) == 123);
+        assert(sys_mmap_impl(0,4096,PROT_WRITE,MAP_PRIVATE,3,0,&fd) == 123);
+        assert(sys_mmap_impl(0,4096,PROT_READ,MAP_SHARED,3,0,&fd) == 123);
+    }
     mapped_type = VMA_SHARED_RO;
     assert(sys_mprotect_impl(0,4096,PROT_WRITE) == SYS_ERR(EACCES));
     assert(sys_mprotect_impl(0,4096,PROT_READ) == 123);

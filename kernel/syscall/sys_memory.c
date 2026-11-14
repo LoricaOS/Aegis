@@ -318,7 +318,9 @@ sys_mmap_impl(uint64_t arg1, uint64_t arg2, uint64_t arg3,
         if ((backing->flags & VFS_O_ACCMODE) != VFS_O_RDONLY &&
             (backing->flags & VFS_O_ACCMODE) != VFS_O_RDWR)
             return SYS_ERR(EACCES);
-        if ((backing->kflags & VFS_KF_AUTH_GATED) && !proc->admin_session &&
+        /* Match read/pread: an admin session does not replace the live AUTH
+         * capability when consuming an inherited credential descriptor. */
+        if ((backing->kflags & VFS_KF_AUTH_GATED) &&
             cap_check(proc->caps, CAP_TABLE_SIZE,
                       CAP_KIND_AUTH, CAP_RIGHTS_READ) != 0)
             return SYS_ERR(EACCES);
