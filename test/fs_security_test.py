@@ -213,6 +213,13 @@ static unsigned legacy_calls;
 static int legacy_partial(void*p,const void*b,uint64_t n){(void)p;(void)b;(void)n;return legacy_calls++ ? -ENOSPC : 3;}
 static const vfs_ops_t legacy_ops={.write=legacy_partial};
 static uint64_t addr(void*p){return (uint64_t)(uintptr_t)p;}
+static void *position_writer(void *arg){
+ unsigned fd=(unsigned)(uintptr_t)arg;host_proc.fd_table=&table;
+ assert(cap_grant(host_proc.caps,64,CAP_KIND_VFS_WRITE,CAP_RIGHTS_WRITE)>=0);
+ char ch=fd?'B':'A';
+ for(unsigned i=0;i<100;i++)assert(sys_write(fd,addr(&ch),1)==1);
+ return 0;
+}
 int main(void){
  ramfs_init(&fs);host_proc.fd_table=&table;table.magic=FD_TABLE_MAGIC;
  assert(cap_grant(host_proc.caps,64,CAP_KIND_VFS_READ,CAP_RIGHTS_READ)>=0);
@@ -261,6 +268,15 @@ int main(void){
  assert(sys_writev(4,addr(vectors),1)==3);assert(table.fds[4].offset==3);
  assert(!ramfs_unlink(&fs,"pos"));
  for(unsigned i=0;i<4;i++)table.fds[i].ops->close(table.fds[i].priv);
+ assert(!ramfs_busy(&fs)&&host_pages==0);
+ memset(&table.fds,0,sizeof(table.fds));
+ assert(!ramfs_open(&fs,"concurrent",VFS_O_CREAT|VFS_O_RDWR,0600,&table.fds[0]));
+ assert(sys_dup(0)==1);pthread_t pa,pb;
+ assert(!pthread_create(&pa,0,position_writer,(void*)0));
+ assert(!pthread_create(&pb,0,position_writer,(void*)1));pthread_join(pa,0);pthread_join(pb,0);
+ assert(sys_lseek(0,0,1)==200);assert(sys_pread64(0,addr(data),200,0)==200);
+ unsigned ac=0,bc=0;for(unsigned i=0;i<200;i++){ac+=data[i]=='A';bc+=data[i]=='B';}assert(ac==100&&bc==100);
+ assert(!ramfs_unlink(&fs,"concurrent"));table.fds[0].ops->close(table.fds[0].priv);table.fds[1].ops->close(table.fds[1].priv);
  assert(!ramfs_busy(&fs)&&host_pages==0);
  puts("ramfs syscall positions: read/write, pread/pwrite, dup, independent opens, seek-end, append PASS");
 }
