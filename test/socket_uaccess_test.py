@@ -245,7 +245,9 @@ static void second_receiver(void) {
     assert(sock.udp_rx_head==0 && queue[0].in_use && pins==1);
 }
 int main(void) {
-    char buf[5000]={0}, control[128]={0};
+    /* The synthetic 4 GiB range test below needs room below USER_ADDR_MAX.
+     * A stack address can sit within that margin depending on host ASLR. */
+    static char buf[5000]={0}, control[128]={0};
     uint64_t b=(uintptr_t)buf, c=(uintptr_t)control;
     uint32_t alen; k_sockaddr_in_t addr;
     for (int domain=AF_INET; domain<=AF_INET6; domain+=AF_INET6-AF_INET) {
