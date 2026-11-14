@@ -76,7 +76,7 @@ static inline uint64_t arch_get_cycles(void) { return 1000; }
 static inline uint64_t arch_tsc_hz(void) { return 1000; }
 ''',
 'pmm.h': '#pragma once\n#include <stdint.h>\nuint64_t pmm_alloc_page(void);\nvoid pmm_free_page(uint64_t);\nint pmm_ref_page(uint64_t);\n',
-'vmm.h': '#pragma once\n#include <stdint.h>\nvoid vmm_zero_page(uint64_t);\nvoid vmm_copy_from_phys(void *,uint64_t,uint32_t,uint32_t);\n',
+'vmm.h': '#pragma once\n#include <stdint.h>\nvoid vmm_zero_page(uint64_t);\nvoid vmm_write_phys_bytes(uint64_t,uint32_t,const void *,uint32_t);\nvoid vmm_copy_from_phys(void *,uint64_t,uint32_t,uint32_t);\n',
 'tlb.h': '#pragma once\nstatic inline void tlb_poll_incoming(void) {}\n',
 }
 COMMON = r'''
@@ -246,9 +246,35 @@ uint64_t pmm_alloc_page(void){void*p=calloc(1,4096);if(p)__atomic_add_fetch(&hos
 void pmm_free_page(uint64_t p){free((void*)(uintptr_t)p);__atomic_sub_fetch(&host_frames,1,__ATOMIC_SEQ_CST);}
 int pmm_ref_page(uint64_t p){(void)p;return 0;}
 void vmm_zero_page(uint64_t p){memset((void*)(uintptr_t)p,0,4096);}
+void vmm_write_phys_bytes(uint64_t p,uint32_t o,const void*s,uint32_t n){assert(!memfd_lock.value);memcpy((char*)(uintptr_t)p+o,s,n);}
 void vmm_copy_from_phys(void*d,uint64_t p,uint32_t o,uint32_t n){memcpy(d,(char*)(uintptr_t)p+o,n);}
 static void *grower(void *id){for(int i=0;i<1000;i++)assert(!memfd_truncate((uintptr_t)id,(i%8+1)*4096));return 0;}
-int main(void){int id=memfd_alloc("race");assert(id>=0);pthread_t a,b;assert(!pthread_create(&a,0,grower,(void*)(uintptr_t)id));assert(!pthread_create(&b,0,grower,(void*)(uintptr_t)id));pthread_join(a,0);pthread_join(b,0);memfd_vfs_close((void*)(uintptr_t)id);assert(host_frames==0);assert(host_pages==0);puts("memfd: concurrent resize ownership and final reclamation PASS");}
+static void partial_tail(void) {
+ int id=memfd_alloc("tail");assert(id>=0);
+ assert(!memfd_truncate(id,4096));
+ unsigned char *p=(void*)(uintptr_t)memfd_get(id)->phys_pages[0];
+ memset(p,0xA5,4096);
+ assert(!memfd_truncate(id,100));
+ for(int i=0;i<100;i++)assert(p[i]==0xA5);
+ for(int i=100;i<4096;i++)assert(!p[i]);
+ /* A mapping can dirty bytes outside EOF after the shrink. */
+ memset(p+100,0xCC,3996);
+ assert(!memfd_truncate(id,200));
+ for(int i=100;i<200;i++)assert(!p[i]);
+ assert(p[200]==0xCC);
+ assert(!memfd_truncate(id,8192));
+ for(int i=200;i<4096;i++)assert(!p[i]);
+ assert(!memfd_truncate(id,4196));
+ unsigned char *q=(void*)(uintptr_t)memfd_get(id)->phys_pages[1];
+ memset(q,0xDD,100);
+ assert(!memfd_truncate(id,8192));
+ for(int i=0;i<100;i++)assert(q[i]==0xDD);
+ for(int i=100;i<4096;i++)assert(!q[i]);
+ memfd_vfs_close((void*)(uintptr_t)id);
+ assert(!host_frames && !host_pages);
+ puts("memfd: partial-page shrink/regrow, mapped tail writes and prefix preservation PASS");
+}
+int main(void){partial_tail();int id=memfd_alloc("race");assert(id>=0);pthread_t a,b;assert(!pthread_create(&a,0,grower,(void*)(uintptr_t)id));assert(!pthread_create(&b,0,grower,(void*)(uintptr_t)id));pthread_join(a,0);pthread_join(b,0);memfd_vfs_close((void*)(uintptr_t)id);assert(host_frames==0);assert(host_pages==0);puts("memfd: concurrent resize ownership and final reclamation PASS");}
 '''
 EXT2 = r'''
 #define CONFIG_FS_EXT2 1

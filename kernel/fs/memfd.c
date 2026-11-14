@@ -219,6 +219,7 @@ static int memfd_truncate_impl(uint32_t id, uint64_t size)
     /* Grow: allocate new pages.
      * Release memfd_lock before calling pmm/vmm to avoid lock inversion. */
     uint32_t old_count = mf->page_count;
+    uint64_t old_size = mf->size;
     int _need_arr = (new_pages > 0 && mf->phys_pages == (uint64_t *)0);
     spin_unlock_irqrestore(&memfd_lock, fl);
 
@@ -279,6 +280,27 @@ static int memfd_truncate_impl(uint32_t id, uint64_t size)
     fl = spin_lock_irqsave(&memfd_lock);
     mf = memfd_get(id);
     if (!mf) { spin_unlock_irqrestore(&memfd_lock, fl); return -EBADF; }
+
+    /* A retained partial page is not a new allocation: clear the discarded
+     * tail on shrink, and any newly exposed tail on grow (a shared mapping may
+     * have written beyond EOF in the meantime). resize_locks[id] serializes
+     * resizes and the syscall pins the memfd, so this frame stays owned while
+     * memfd_lock is dropped for the VMM window operation. */
+    uint64_t tail_start = size < old_size ? size : old_size;
+    uint32_t tail_off = (uint32_t)(tail_start % 4096);
+    uint32_t tail_page = (uint32_t)(tail_start / 4096);
+    if (size != old_size && tail_off && tail_page < old_count &&
+        mf->phys_pages[tail_page]) {
+        static const uint8_t zeros[4096];
+        uint64_t phys = mf->phys_pages[tail_page];
+        uint32_t bytes = 4096 - tail_off;
+        if (size > old_size && size - old_size < bytes)
+            bytes = (uint32_t)(size - old_size);
+        spin_unlock_irqrestore(&memfd_lock, fl);
+        vmm_write_phys_bytes(phys, tail_off, zeros, bytes);
+        fl = spin_lock_irqsave(&memfd_lock);
+        mf = memfd_get(id);
+    }
 
     /* Shrink: free excess pages */
     for (uint32_t i = new_pages; i < mf->page_count; i++) {
