@@ -27,7 +27,10 @@ def function(path, name):
     return source[match.start():source.index("\n}", match.end()) + 2] + "\n"
 
 
-C = r"""
+# tty_ioctl includes a window-size notification branch even though these tests
+# target process groups. Use the kernel ABI constant rather than a host header.
+C = re.search(r"(?m)^#define SIGWINCH\s+\d+",
+              (ROOT / "kernel/signal/signal.h").read_text()).group(0) + "\n" + r"""
 #define _DEFAULT_SOURCE
 #include <assert.h>
 #include <stdint.h>

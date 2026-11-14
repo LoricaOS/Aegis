@@ -38,7 +38,7 @@ assert "proc->fd_table->fds[pf[i].fd]" not in POLL
 assert "fd_table_pin(proc->fd_table, (int)fd" in EPOLL
 assert "fd_table_pin(proc->fd_table, fd, &out->file)" in WAITQ
 assert ".dup     = ramfs_dup_fn" in RAMFS
-assert ".dup     = ramfs_dir_dup_fn" in RAMFS
+assert re.search(r"\.dup\s*=\s*ramfs_dir_dup_fn\b", RAMFS)
 
 for name in ("sys_fchmod", "sys_fchown"):
     body = re.search(rf"\n{name}\([^)]*\)\n\{{(.*?)(?=\n\}}\n)", META, re.S)
