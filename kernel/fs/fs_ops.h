@@ -75,7 +75,7 @@ typedef struct fs_ops {
     int      (*write)(uint32_t ino, const void *buf, uint32_t off, uint32_t len);
     int      (*readdir)(uint32_t dir_ino, uint64_t index, char *name_out,
                         uint8_t *type_out);
-    int      (*file_size)(uint32_t ino);
+    int64_t  (*file_size)(uint32_t ino);  /* bytes, or negative on error */
     int      (*truncate)(uint32_t ino);
     int      (*is_dir)(uint32_t ino);
     int      (*check_perm)(uint32_t ino, uint16_t uid, uint16_t gid, int want);

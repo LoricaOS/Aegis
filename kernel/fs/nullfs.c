@@ -47,7 +47,7 @@ static int      nf_read(uint32_t i, void *b, uint64_t off, uint32_t n){ (void)i;
 static int      nf_read_val(uint32_t i, void *b, uint64_t off, uint32_t n, uint32_t g){ (void)i; (void)b; (void)off; (void)n; (void)g; return -ENOENT; }
 static int      nf_write(uint32_t i, const void *b, uint32_t off, uint32_t n){ (void)i; (void)b; (void)off; (void)n; return -EPERM; }
 static int      nf_readdir(uint32_t d, uint64_t idx, char *nm, uint8_t *ty){ (void)d; (void)idx; (void)nm; (void)ty; return -ENOENT; }
-static int      nf_file_size(uint32_t i)                   { (void)i; return -ENOENT; }
+static int64_t  nf_file_size(uint32_t i)                   { (void)i; return -ENOENT; }
 static int      nf_truncate(uint32_t i)                    { (void)i; return -EPERM; }
 static int      nf_is_dir(uint32_t i)                      { (void)i; return 0; }
 static int      nf_check_perm(uint32_t i, uint16_t u, uint16_t g, int w){ (void)i; (void)u; (void)g; (void)w; return -EACCES; }

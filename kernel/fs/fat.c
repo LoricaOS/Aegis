@@ -601,7 +601,7 @@ static int fat_readdir(uint32_t dir_ino, uint64_t index, char *name_out, uint8_t
     return r.hit ? 0 : -1;
 }
 
-static int fat_file_size(uint32_t ino) { fat_dirent_t d; if (read_dirent(ino, &d)) return -ENOENT; return (int)d.size; }
+static int64_t fat_file_size(uint32_t ino) { fat_dirent_t d; if (read_dirent(ino, &d)) return -ENOENT; return (int64_t)d.size; }
 static int fat_is_dir(uint32_t ino)    { fat_dirent_t d; if (read_dirent(ino, &d)) return 0; return (d.attr & ATTR_DIR) ? 1 : 0; }
 static int fat_check_perm(uint32_t i, uint16_t u, uint16_t g, int w) { (void)i; (void)u; (void)g; (void)w; return 0; }
 static uint32_t fat_inode_gen(uint32_t i) { (void)i; return 0; }

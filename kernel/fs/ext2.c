@@ -110,7 +110,8 @@ static uint32_t ext2_now(void)
     arch_clock_gettime(&s, &n);
     return (uint32_t)s;
 }
-static uint32_t ext2_block_num_impl(const ext2_inode_t *inode, uint32_t file_block);
+static uint32_t ext2_block_num_impl(const ext2_inode_t *inode, uint32_t file_block,
+                                   int *status);
 static uint32_t ext2_ind_get(uint32_t blk, uint32_t idx);
 static int      ext2_read_symlink_target_impl(uint32_t ino, char *buf, uint32_t bufsiz);
 static int      ext2_walk_impl(uint32_t start_ino, uint32_t root_ino,
@@ -137,7 +138,7 @@ int ext2_write_inode(uint32_t ino, const ext2_inode_t *inode)
 uint32_t ext2_block_num(const ext2_inode_t *inode, uint32_t file_block)
 {
     irqflags_t fl = ext2_lock_acquire();
-    uint32_t r = ext2_block_num_impl(inode, file_block);
+    uint32_t r = ext2_block_num_impl(inode, file_block, (int *)0);
     ext2_lock_release(fl);
     return r;
 }
@@ -781,10 +782,19 @@ static int ext2_write_inode_impl(uint32_t ino, const ext2_inode_t *inode)
 /* ext2_block_num (internal)                                           */
 /* ------------------------------------------------------------------ */
 
+/* Map a file block to a device block number.  0 means "no block here" — a
+ * hole, or an address past what this driver maps (triple indirect).  A
+ * pointer block that cannot be READ also yields 0, which a hole-tolerant
+ * caller would mistake for 4 KiB of zeros, so `status` (optional) carries the
+ * distinction: left 0 for a hole, set to -EIO when a pointer block read
+ * failed.  Pass NULL where only "is there a block" matters. */
 static uint32_t ext2_block_num_impl(const ext2_inode_t *inode,
-                        uint32_t file_block)
+                        uint32_t file_block, int *status)
 {
     uint32_t ptrs_per_block = s_block_size / 4;
+
+    if (status)
+        *status = 0;
 
     if (file_block < 12)
         return inode->i_block[file_block];
@@ -794,8 +804,10 @@ static uint32_t ext2_block_num_impl(const ext2_inode_t *inode,
         if (indirect == 0)
             return 0;
         uint8_t *data = cache_get_slot(indirect);
-        if (!data)
+        if (!data) {
+            if (status) *status = -EIO;
             return 0;
+        }
         uint32_t off = file_block - 12;
         uint32_t entry;
         uint8_t *p = data + off * 4;
@@ -811,7 +823,10 @@ static uint32_t ext2_block_num_impl(const ext2_inode_t *inode,
         uint32_t dind = inode->i_block[13];
         if (dind == 0) return 0;
         uint8_t *outer = cache_get_slot(dind);
-        if (!outer) return 0;
+        if (!outer) {
+            if (status) *status = -EIO;
+            return 0;
+        }
         uint32_t idx       = file_block - 12 - ptrs_per_block;
         uint32_t outer_off = idx / ptrs_per_block;
         uint32_t inner_off = idx % ptrs_per_block;
@@ -823,7 +838,10 @@ static uint32_t ext2_block_num_impl(const ext2_inode_t *inode,
         ind |= (uint32_t)op[3] << 24;
         if (ind == 0) return 0;
         uint8_t *inner = cache_get_slot(ind);
-        if (!inner) return 0;
+        if (!inner) {
+            if (status) *status = -EIO;
+            return 0;
+        }
         uint8_t *ip = inner + inner_off * 4;
         uint32_t entry;
         entry  = (uint32_t)ip[0];
@@ -884,7 +902,14 @@ int ext2_read(uint32_t inode_num, void *buf, uint64_t offset, uint32_t len)
         if (can_copy > len - bytes_read)
             can_copy = len - bytes_read;
 
-        uint32_t blk = ext2_block_num(&inode, file_block);
+        int map_status = 0;
+        uint32_t blk = ext2_block_num_impl(&inode, file_block, &map_status);
+        if (map_status < 0) {
+            /* The block map itself is unreadable — report that as an error (or
+             * a short read), never as a hole's block of zeros. */
+            ext2_lock_release(fl);
+            return bytes_read ? (int)bytes_read : map_status;
+        }
         if (blk == 0) {
             /* sparse block — fill zeros */
             uint32_t i;
@@ -907,9 +932,11 @@ int ext2_read(uint32_t inode_num, void *buf, uint64_t offset, uint32_t len)
             if (max_run > run_cap) max_run = run_cap;
             uint32_t run = 1;
             while (run < max_run) {
-                uint32_t nb = ext2_block_num(&inode, file_block + run);
-                if (nb != blk + run || nb >= s_sb.s_blocks_count ||
-                    cache_find(nb) >= 0)
+                int nb_status = 0;
+                uint32_t nb = ext2_block_num_impl(&inode, file_block + run,
+                                                 &nb_status);
+                if (nb_status < 0 || nb != blk + run ||
+                    nb >= s_sb.s_blocks_count || cache_find(nb) >= 0)
                     break;
                 run++;
             }
@@ -989,7 +1016,7 @@ int ext2_read_validated(uint32_t inode_num, void *buf, uint64_t offset,
 /* ext2_file_size                                                       */
 /* ------------------------------------------------------------------ */
 
-int ext2_file_size(uint32_t inode_num)
+int64_t ext2_file_size(uint32_t inode_num)
 {
     if (!s_mounted)
         return -1;
@@ -998,7 +1025,7 @@ int ext2_file_size(uint32_t inode_num)
     if (ext2_read_inode(inode_num, &inode) < 0)
         return -1;
 
-    return (int)inode.i_size;
+    return (int64_t)inode.i_size;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1507,7 +1534,13 @@ static int ext2_descends_from(uint32_t ino, uint32_t root)
             (dir.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR)
             return 0;
         uint32_t parent = 0;
-        for (uint32_t pos = 0; pos < dir.i_size && !parent;) {
+        /* Bound the walk with ext2_dir_size, never the raw on-disk i_size: a
+         * crafted directory with i_size above 0xFFFFF000 lets this 32-bit pos
+         * counter wrap to 0 and restart the scan forever (under ext2_lock, so
+         * it wedges the whole filesystem).  ext2_dir_size caps at
+         * ext2_max_file_size() <= 0xFFFFFFFF - s_block_size, and rec_len is
+         * checked against the block size below, so pos + rec_len cannot wrap. */
+        for (uint32_t pos = 0; pos < ext2_dir_size(&dir) && !parent;) {
             uint32_t blk = ext2_block_num(&dir, pos / s_block_size);
             uint8_t *data = blk ? cache_get_slot(blk) : 0;
             if (!data) return 0;
@@ -1670,9 +1703,10 @@ int ext2_symlink(const char *linkpath, const char *target, int has_install)
 
     uint32_t parent_ino;
     const char *basename;
-    if (ext2_lookup_parent(linkpath, &parent_ino, &basename) != 0) {
+    int pr = ext2_lookup_parent(linkpath, &parent_ino, &basename);
+    if (pr != 0) {
         ext2_lock_release(fl);
-        return -1;
+        return pr;
     }
     if (ext2_caller_perm(parent_ino, 3) != 0) {
         ext2_lock_release(fl);
@@ -1803,9 +1837,10 @@ int ext2_link(const char *oldpath, const char *newpath, int has_install)
 
     uint32_t parent_ino;
     const char *basename;
-    if (ext2_lookup_parent(newpath, &parent_ino, &basename) != 0) {
+    int pr = ext2_lookup_parent(newpath, &parent_ino, &basename);
+    if (pr != 0) {
         ext2_lock_release(fl);
-        return -ENOENT;
+        return pr == -ENOTDIR ? pr : -ENOENT;
     }
     if (ext2_caller_perm(parent_ino, 3) != 0) {
         ext2_lock_release(fl);
@@ -2405,10 +2440,11 @@ int ext2_create(const char *path, uint16_t mode, int has_install)
 
     uint32_t parent_ino;
     const char *basename;
-    if (ext2_lookup_parent(path, &parent_ino, &basename) != 0) {
+    int pr = ext2_lookup_parent(path, &parent_ino, &basename);
+    if (pr != 0) {
         printk("[EXT2] creat: lookup_parent failed for %s\n", path);
         ext2_lock_release(fl);
-        return -1;
+        return pr;
     }
     if (ext2_caller_perm(parent_ino, 3) != 0) {
         ext2_lock_release(fl);
@@ -2470,9 +2506,10 @@ int ext2_unlink(const char *path, int has_install)
 
     uint32_t parent_ino;
     const char *basename;
-    if (ext2_lookup_parent(path, &parent_ino, &basename) != 0) {
+    int pr = ext2_lookup_parent(path, &parent_ino, &basename);
+    if (pr != 0) {
         ext2_lock_release(fl);
-        return -1;
+        return pr;
     }
     if (ext2_caller_perm(parent_ino, 3) != 0) {
         ext2_lock_release(fl);
@@ -2535,9 +2572,10 @@ int ext2_mkdir(const char *path, uint16_t mode, int has_install)
 
     uint32_t parent_ino;
     const char *basename;
-    if (ext2_lookup_parent(path, &parent_ino, &basename) != 0) {
+    int pr = ext2_lookup_parent(path, &parent_ino, &basename);
+    if (pr != 0) {
         ext2_lock_release(fl);
-        return -1;
+        return pr;
     }
     if (ext2_caller_perm(parent_ino, 3) != 0) {
         ext2_lock_release(fl);
@@ -2650,9 +2688,10 @@ int ext2_rmdir(const char *path, int has_install)
 
     uint32_t parent_ino;
     const char *basename;
-    if (ext2_lookup_parent(path, &parent_ino, &basename) != 0) {
+    int pr = ext2_lookup_parent(path, &parent_ino, &basename);
+    if (pr != 0) {
         ext2_lock_release(fl);
-        return -1;
+        return pr;
     }
     if (ext2_caller_perm(parent_ino, 3) != 0) {
         ext2_lock_release(fl);
@@ -2791,16 +2830,18 @@ int ext2_rename(const char *old_path, const char *new_path, int has_install)
 
     uint32_t old_parent_ino;
     const char *old_basename;
-    if (ext2_lookup_parent(old_path, &old_parent_ino, &old_basename) != 0) {
+    int pr = ext2_lookup_parent(old_path, &old_parent_ino, &old_basename);
+    if (pr != 0) {
         ext2_lock_release(fl);
-        return -1;
+        return pr;
     }
 
     uint32_t new_parent_ino;
     const char *new_basename;
-    if (ext2_lookup_parent(new_path, &new_parent_ino, &new_basename) != 0) {
+    pr = ext2_lookup_parent(new_path, &new_parent_ino, &new_basename);
+    if (pr != 0) {
         ext2_lock_release(fl);
-        return -1;
+        return pr;
     }
     if (ext2_caller_perm(old_parent_ino, 3) != 0 ||
         ext2_caller_perm(new_parent_ino, 3) != 0) {

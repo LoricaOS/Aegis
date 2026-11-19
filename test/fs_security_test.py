@@ -328,6 +328,80 @@ static void credential_opens(void){
  puts("credential opens: exact inode AUTH READ, aliases, DAC isolation, mutation denial, uid0 denial, throttle PASS");
 }
 static void drop_cache(void){assert(!ext2_sync());memset(s_cache,0,sizeof s_cache);icache_clear();}
+/* Point every entry of block `blk` at `target`. */
+static void crafted_pointers(uint32_t blk,uint32_t target){
+ uint8_t *p=cache_get_slot(blk);assert(p);
+ for(unsigned i=0;i<s_block_size/4;i++)memcpy(p+i*4,&target,4);
+ cache_mark_dirty(blk);
+}
+/* One directory block: "." (rec_len 12) then a single entry whose rec_len
+ * finishes exactly at the end of a 4 KiB block.  `parent` (0 = none) makes
+ * that second entry "..", otherwise it is a plain name — so a block written
+ * with parent==0 has no ".." at all. */
+static void crafted_dirblock(uint32_t blk,uint32_t self,uint32_t parent){
+ assert(s_block_size==4096);
+ uint8_t *d=cache_get_slot(blk);assert(d);
+ memset(d,0,s_block_size);
+ ext2_dirent_t *e=(ext2_dirent_t*)d;
+ e->inode=self;e->rec_len=12;e->name_len=1;e->file_type=EXT2_FT_DIR;e->name[0]='.';
+ e=(ext2_dirent_t*)(d+12);e->rec_len=4084;
+ if(parent){e->inode=parent;e->name_len=2;e->file_type=EXT2_FT_DIR;e->name[0]='.';e->name[1]='.';}
+ else{e->inode=self;e->name_len=1;e->file_type=EXT2_FT_REG_FILE;e->name[0]='x';}
+ cache_mark_dirty(blk);
+}
+/* A failed metadata read is not an empty region.  The inode's indirect pointer
+ * block is unreadable, so reads that need it must fail (or stop short) instead
+ * of handing back a block of zeros that a hole would also produce. */
+static void crafted_block_map(uint32_t ino){
+ ext2_inode_t f;assert(!ext2_read_inode(ino,&f));
+ f.i_mode=EXT2_S_IFREG|0600;f.i_size=13*s_block_size;
+ memset(f.i_block,0,sizeof f.i_block);
+ f.i_block[12]=20;                    /* pointer block, at sectors 40-41 */
+ assert(!ext2_write_inode(ino,&f));drop_cache();
+ uint8_t buf[2048];memset(buf,0xA5,sizeof buf);
+ assert(ext2_read(ino,buf,0,1024)==1024);
+ for(unsigned i=0;i<1024;i++)assert(!buf[i]);   /* real hole → zeros */
+ fail_read_lba=20*2;memset(buf,0xA5,sizeof buf);
+ assert(ext2_read(ino,buf,12*s_block_size,1024)==-EIO);
+ for(unsigned i=0;i<1024;i++)assert((uint8_t)buf[i]==0xA5); /* buffer untouched */
+ assert(ext2_read(ino,buf,11*s_block_size,2048)==1024);  /* short read at the fault */
+ fail_read_lba=-1;drop_cache();
+ assert(ext2_read(ino,buf,12*s_block_size,1024)==1024);  /* readable again */
+}
+/* A crafted directory scan must terminate.  On a 4 KiB volume an inode
+ * claiming i_size=0xFFFFFFFF, with every block pointer aimed at one block and
+ * no "..", drives the 32-bit position counter to 0xFFFFF000; the next
+ * += rec_len used to wrap to 0 and restart the walk forever.  ext2_dir_size
+ * bounds that scan at 0xFFFFEFFF, i.e. the last whole block. */
+static void crafted_dir_scan(uint32_t ino){
+ const uint32_t bad=13,ptr=14,outer=15,inner=16,ok=17;
+ drop_cache();                       /* flush the 1 KiB image */
+ s_block_size=4096;drop_cache();     /* the volume this case is crafted for */
+ /* Root only has to be a directory here; the scan starts at `ino`. */
+ ext2_inode_t root={.i_mode=EXT2_S_IFDIR|0777,.i_links_count=2};
+ assert(!ext2_write_inode(EXT2_ROOT_INODE,&root));
+ crafted_dirblock(bad,ino,0);crafted_dirblock(ok,ino,EXT2_ROOT_INODE);
+ crafted_pointers(ptr,bad);crafted_pointers(outer,inner);crafted_pointers(inner,bad);
+ /* Every block pointer names the same block: 12 direct slots, the indirect
+  * block and both levels of the double-indirect one.  i_size is not
+  * block-aligned, so only the scan (never the walk) sees this inode. */
+ ext2_inode_t dir={.i_mode=EXT2_S_IFDIR|0777,.i_links_count=2,.i_size=0xFFFFFFFFu};
+ for(unsigned i=0;i<12;i++)dir.i_block[i]=bad;
+ dir.i_block[12]=ptr;dir.i_block[13]=outer;
+ assert(!ext2_write_inode(ino,&dir));
+ int prot=0;uint32_t out=0;
+ assert(ext2_openat_protected(ino,EXT2_ROOT_INODE,".",&out,&prot)==-EACCES);
+ /* With ".." present the same walk resolves instead of running out.  i_size
+  * stays above the ext2_dir_size cap but block-aligned, which the real walk
+  * requires of any directory it descends into. */
+ dir.i_size=0xFFFFF000u;
+ dir.i_block[0]=ok;dir.i_block[12]=0;dir.i_block[13]=0;
+ assert(!ext2_write_inode(ino,&dir));drop_cache();
+ prot=0;out=0;
+ assert(!ext2_openat_protected(ino,EXT2_ROOT_INODE,".",&out,&prot));
+ assert(out==ino);
+ s_block_size=1024;drop_cache();   /* leave the fixture as it was */
+}
 int main(void){
  blkdev_t dev={.block_count=256,.block_size=512,.read=disk_read,.write=disk_write};s_dev=&dev;s_mounted=1;s_block_size=1024;s_num_groups=1;
  s_sb.s_inodes_count=32;s_sb.s_blocks_count=128;s_sb.s_blocks_per_group=128;s_sb.s_inodes_per_group=32;s_sb.s_inode_size=128;s_sb.s_first_data_block=1;
@@ -354,6 +428,10 @@ int main(void){
  drop_cache();fail_read_lba=(int)plba;marker_unavailable(-EIO);fail_read_lba=-1;marker_present();
  s_mounted=0;marker_unavailable(-ENODEV);s_mounted=1;
  credential_opens();
+ assert(!ext2_create("/crafted",0600,1));uint32_t crafted;assert(!ext2_open("/crafted",&crafted));
+ crafted_block_map(crafted);
+ crafted_dir_scan(crafted);
+ puts("ext2: unreadable indirect block errors instead of reading zeros, crafted directory scan terminates PASS");
  puts("ext2 firstboot: missing marker, inode/directory read faults, corrupt record, present marker PASS");
  puts("ext2: retained unlinked inode, content type, truncate DAC, ancestor DAC, confined moves PASS");
 }

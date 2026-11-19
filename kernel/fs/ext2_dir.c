@@ -3,7 +3,8 @@
 
 /* ext2_lookup_parent — split "/path/to/file" into parent inode and basename.
  * On success, *parent_ino_out and *basename_out are set; returns 0.
- * Returns -1 if the parent directory cannot be opened. */
+ * Returns -1 if the parent cannot be opened or read, -ENOTDIR if it is not
+ * a directory. */
 int ext2_lookup_parent(const char *path, uint32_t *parent_ino_out,
                        const char **basename_out)
 {
@@ -35,6 +36,12 @@ int ext2_lookup_parent(const char *path, uint32_t *parent_ino_out,
         }
         *basename_out = last_slash + 1;
     }
+
+    ext2_inode_t parent;
+    if (ext2_read_inode(*parent_ino_out, &parent) != 0)
+        return -1;
+    if ((parent.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR)
+        return -ENOTDIR;
     return 0;
 }
 

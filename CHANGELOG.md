@@ -3,6 +3,41 @@
 Releases before 1.6.0 predate this file; see the git tags and
 `docs/audits/` for their record.
 
+## 1.6.1
+
+**ext2 driver corrections.** Found by a focused review of the on-disk structure
+decoder. No memory-safety defect was found; these are a hang, a wrong size and
+two failure-reporting gaps. Regression coverage added for each.
+
+- **A directory scan could run without end.** `ext2_descends_from` bounded its
+  32-bit cursor with the raw on-disk `i_size`; a directory whose size is above
+  `0xFFFFF000` and which contains no `..` entry wrapped the cursor back to 0 and
+  restarted the scan, with `ext2_lock` held — the whole filesystem stopped
+  making progress. It now uses `ext2_dir_size()`, as the driver's other four
+  directory scans already did.
+- **Files of 2 GiB or more reported a negative size.** The `file_size` accessor
+  was `int`, so a legal large inode became negative and every consumer clamped
+  it to zero: append wrote from offset 0 (overwriting the head of the file),
+  `SEEK_END` returned 0, stat on an open descriptor failed, and a lazily mapped
+  file was filled with zeros. The accessor and its callers are now 64-bit, and
+  the `ext2`, `fat` and `nullfs` implementations were widened together so the
+  ops table stays consistent.
+- **A failed metadata read looked like an empty region.** An unreadable indirect
+  pointer block produced the same `0` as a genuine hole, so a read error was
+  returned as 4096 zero bytes. The block mapper now distinguishes the two: a
+  hole still reads as zeros, an unreadable pointer block reports `EIO` (or a
+  short read when bytes were already copied).
+- **A directory entry could be written into a regular file.** The shared parent
+  resolver never checked that the parent was a directory, so `mkdir`, `creat`,
+  `symlink`, `link` and `rename` would rewrite a file's own bytes as entries and
+  leak the new inode. It now returns `ENOTDIR`, and all eight callers propagate
+  that error instead of flattening it to `-1`.
+
+Known follow-ups, not fixed here: `ext2_write` still treats an unreadable
+indirect pointer block as a hole when it maps blocks for allocation; and `..` is
+still trusted from the on-disk directory entry, so a modified image can walk out
+of a confined subtree. Both are recorded in docs/design/ext2-decoder-review.md.
+
 ## 1.6.0
 
 This release also carries the 2026-09-07 boot checkpoint that was paused in the

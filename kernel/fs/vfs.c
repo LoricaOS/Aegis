@@ -266,10 +266,10 @@ vfs_open_ext2_inode(uint32_t ino, int is_protected, int flags,
         int rc = g_rootfs->truncate(ino);
         if (rc < 0) return rc;
     }
+    int64_t sz = g_rootfs->file_size(ino);
+    if (sz < 0) return -EIO;
     ext2_fd_priv_t *p = g_rootfs->pool_alloc(ino);
     if (!p) return -ENOMEM;
-    int sz = g_rootfs->file_size(ino);
-    if (sz < 0) sz = 0;
     if (flags & (int)VFS_O_APPEND)
         p->write_offset = (uint32_t)sz;
     out->ops = (const vfs_ops_t *)g_rootfs->file_ops;
@@ -593,8 +593,8 @@ vfs_stat_path(const char *path, k_stat_t *out)
     {
         uint32_t ino = 0;
         if (g_rootfs->open(path, &ino) == 0) {
-            int sz = g_rootfs->file_size(ino);
-            if (sz < 0) sz = 0;
+            int64_t sz = g_rootfs->file_size(ino);
+            if (sz < 0) return -EIO;
             /* Zero the inode BEFORE the read: on failure the six fields
              * copied out below (links_count, uid, gid, atime, mtime, ctime)
              * were read from an uninitialised stack struct and handed to
@@ -615,7 +615,7 @@ vfs_stat_path(const char *path, k_stat_t *out)
             out->st_mode    = mode;
             out->st_uid     = (uint32_t)inode.i_uid;
             out->st_gid     = (uint32_t)inode.i_gid;
-            out->st_size    = (int64_t)sz;
+            out->st_size    = sz;
             out->st_blksize = 4096;
             out->st_blocks  = (int64_t)inode.i_blocks;
             /* Real inode times (ext2 stores 32-bit unix seconds) so `ls -l`,
@@ -676,8 +676,8 @@ vfs_stat_path_ex(const char *path, k_stat_t *out, int follow)
         uint32_t ino = 0;
         if (g_rootfs->open_ex(path, &ino, follow) == 0) {
             ext2_inode_t inode;
-            int sz = g_rootfs->file_size(ino);
-            if (sz < 0) sz = 0;
+            int64_t sz = g_rootfs->file_size(ino);
+            if (sz < 0) return -EIO;
             __builtin_memset(out, 0, sizeof(*out));
             out->st_dev     = 2;
             out->st_ino     = (uint64_t)ino;
@@ -694,7 +694,7 @@ vfs_stat_path_ex(const char *path, k_stat_t *out, int follow)
             } else {
                 out->st_mode = S_IFREG | 0644;
             }
-            out->st_size    = (int64_t)sz;
+            out->st_size    = sz;
             out->st_blksize = 4096;
             return 0;
         }

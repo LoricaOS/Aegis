@@ -176,7 +176,7 @@ int ext2_unlink(const char *path, int has_install);
 int ext2_mkdir(const char *path, uint16_t mode, int has_install);
 int ext2_rmdir(const char *path, int has_install);
 int ext2_rename(const char *old_path, const char *new_path, int has_install);
-int ext2_file_size(uint32_t inode_num);
+int64_t ext2_file_size(uint32_t inode_num);
 
 /* ext2_perfbench — block-cache throughput micro-benchmark.  Writes a large
  * file to the ext2 root then reads it back, printing MiB/ms/MB/s to serial.

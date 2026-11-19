@@ -198,7 +198,7 @@ static int
 ext2_vfs_stat_fn(void *priv, k_stat_t *st)
 {
     ext2_fd_priv_t *p = (ext2_fd_priv_t *)priv;
-    int sz = ext2_file_size(p->ino);
+    int64_t sz = ext2_file_size(p->ino);
     if (sz < 0) return -1;
     ext2_inode_t inode;
     if (ext2_read_inode(p->ino, &inode) != 0) return -1;
@@ -209,7 +209,7 @@ ext2_vfs_stat_fn(void *priv, k_stat_t *st)
     st->st_mode    = (uint32_t)inode.i_mode; /* preserves type + permissions from disk */
     st->st_uid     = (uint32_t)inode.i_uid;
     st->st_gid     = (uint32_t)inode.i_gid;
-    st->st_size    = (int64_t)sz;
+    st->st_size    = sz;
     st->st_blksize = 4096;
     st->st_blocks  = (int64_t)inode.i_blocks;
     st->st_atime   = (int64_t)inode.i_atime;
