@@ -77,6 +77,7 @@ ARCH_SRCS = \
     kernel/arch/x86_64/serial.c \
     kernel/arch/x86_64/vga.c \
     kernel/arch/x86_64/idt.c \
+    kernel/arch/x86_64/early_trap.c \
     kernel/arch/x86_64/pic.c \
     kernel/arch/x86_64/pit.c \
     kernel/arch/x86_64/kbd.c \
@@ -215,6 +216,7 @@ BOOT_SRC  = kernel/arch/x86_64/boot.asm
 
 ARCH_ASMS = \
     kernel/arch/x86_64/isr.asm \
+    kernel/arch/x86_64/early_trap_stubs.asm \
     kernel/arch/x86_64/ctx_switch.asm \
     kernel/arch/x86_64/syscall_entry.asm \
     kernel/arch/x86_64/ap_trampoline.asm

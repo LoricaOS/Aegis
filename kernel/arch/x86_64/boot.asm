@@ -30,6 +30,23 @@
 
 MULTIBOOT2_MAGIC  equ 0xE85250D6   ; identifies this as a multiboot2 header
 MULTIBOOT2_ARCH   equ 0             ; 0 = i386 (32-bit protected mode entry)
+
+; PAINT_STACK — fill the unused part of the boot stack with 0xAA so the deepest
+; extent it ever reaches can be measured later (boot_stack_used(), early_trap.c).
+; Must run with RSP at boot_stack_top, before anything is pushed; the top 256
+; bytes are left alone because the paint and the first calls live there.
+; Preserves RDI/RSI (both call sites still carry the kernel_main/entry args).
+%macro PAINT_STACK 0
+    push rdi
+    push rsi
+    cld
+    mov  rdi, boot_stack
+    mov  rcx, (boot_stack_top - 256 - boot_stack) / 8
+    mov  rax, 0xAAAAAAAAAAAAAAAA
+    rep stosq
+    pop  rsi
+    pop  rdi
+%endmacro
 PVH_BOOT_MAGIC    equ 0x336EC578    ; hvm_start_info.magic; forwarded to
                                     ; kernel_main so it takes the PVH path
 
@@ -352,6 +369,7 @@ limine_start:
     ; Kernel boot stack (16-byte aligned, .bss — mapped by the bootloader
     ; now and by the kernel's own tables later).
     mov rsp, boot_stack_top
+    PAINT_STACK
     xor rbp, rbp
 
     call limine_boot_entry
@@ -371,6 +389,7 @@ long_mode_high:
     ; boot_stack_top is in .bss (higher-half VMA after linker split) — use as-is.
     ; Stack must be 16-byte aligned before the call instruction (ABI requirement).
     mov rsp, boot_stack_top
+    PAINT_STACK
 
     ; Clear the frame pointer to terminate stack unwinding at kernel entry.
     xor rbp, rbp
@@ -407,8 +426,21 @@ pd_lo:       resb 4096
 global pd_hi
 pd_hi:       resb 4096
 
-; 16KB boot stack — 16-byte aligned as required by the SysV AMD64 ABI.
-boot_stack:  resb 16384
+; Boot stack. This sits directly above the bootstrap page tables (pml4_table,
+; the pdpt/pd pairs) in .bss and grows DOWN towards them, so an overflow does
+; not fault where it happens — it corrupts a live page table, and the CPU then
+; triple-faults somewhere unrelated, with no IDT installed and nothing to print.
+; That is a silent, compiler-dependent death (a newer gcc growing any frame on
+; this path is enough) and it cost a long bisect.
+;
+; So: 64 KiB (4x the old 16 KiB — the whole early bring-up fits with room to
+; spare), plus a guard band so a modest overflow lands in padding instead of a
+; page table. PAINT_STACK + boot_stack_used() report the real high-water mark.
+; 16-byte aligned as required by the SysV AMD64 ABI.
+boot_stack_guard:  resb 8192
 
+global boot_stack
 global boot_stack_top
+boot_stack:  resb 65536
+
 boot_stack_top:

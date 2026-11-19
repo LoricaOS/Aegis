@@ -26,11 +26,14 @@ DONE = "[KTEST] DONE all-pass"
 
 with tempfile.TemporaryDirectory(prefix="aegis-captest-harness-") as tmp:
     tmp = Path(tmp)
-    timeout = tmp / "timeout"
-    # Replace only the VM invocation. The actual shell harness parses its
-    # captured log, including all success and failure conditions.
-    timeout.write_text('#!/bin/sh\nexec cat "$CAPTEST_FIXTURE"\n')
-    timeout.chmod(0o755)
+    # Replace only the VM invocation; the harness itself still parses the log it
+    # captured, including every success and failure condition. The harness runs
+    # the emulator through tools/qemu_boot.sh, so the shim is the emulator
+    # binary (not `timeout`: it no longer wraps the invocation).
+    for emulator in ("qemu-system-x86_64", "qemu-system-aarch64"):
+        shim = tmp / emulator
+        shim.write_text('#!/bin/sh\nexec cat "$CAPTEST_FIXTURE"\n')
+        shim.chmod(0o755)
     firmware = tmp / "firmware.fd"
     firmware.touch()
     fixture = tmp / "serial.log"

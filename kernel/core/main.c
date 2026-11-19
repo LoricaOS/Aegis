@@ -14,6 +14,7 @@
 #endif
 
 #include "arch.h"
+#include "early_trap.h"
 #include "fs_ops.h"
 #include "printk.h"
 #include "trace.h"
@@ -156,7 +157,14 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     bph("(entry)");
 
     arch_init();            /* serial_init + vga_init                        */
+    /* From here until idt_init() there is no IDT, so any fault would be a
+     * triple fault with no output — exactly how the ubuntu-26.04 regression
+     * presented. Install the reporting IDT as soon as the serial port is up,
+     * and name each stage below so a report says which step was running. */
+    early_trap_init();
+    early_trap_stage("arch_pat_init");
     arch_pat_init();        /* PAT MSR: PA1=WC for framebuffer mapping       */
+    early_trap_stage("arch_mm_init");
     arch_mm_init(mb_info);  /* parse multiboot2 memory map + cmdline         */
     /* Parse boot mode + quiet flag from kernel cmdline.
      * boot=text  → text console, no splash, printk writes to FB normally.
@@ -302,8 +310,11 @@ kernel_main(uint32_t mb_magic, void *mb_info)
         else
             printk("[CMDLINE] OK: (none)\n");
     }
+    early_trap_stage("pmm_init");
     pmm_init();             /* bitmap allocator — [PMM] OK                   */
+    early_trap_stage("vmm_init");
     vmm_init();             /* page tables, higher-half map — [VMM] OK       */
+    early_trap_stage("kva_init");
     kva_init();             /* kernel virtual allocator — [KVA] OK           */
     kasan_init();           /* [KASAN] OK (KASAN=1 build only; else no-op)    */
 #ifdef KASAN
@@ -344,6 +355,12 @@ kernel_main(uint32_t mb_magic, void *mb_info)
     cap_init();             /* capability stub — [CAP] OK                    */
     smp_percpu_init_bsp();  /* per-CPU data — [SMP] OK                       */
     idt_init();             /* 48 interrupt gates — [IDT] OK                 */
+    /* The real IDT is in place, so the early-trap window is closed. Report how
+     * deep the boot stack actually went: it grows down into the bootstrap page
+     * tables, and an overflow there corrupts a live page table and triple-faults
+     * somewhere unrelated. This turns an invisible limit into a number. */
+    printk("[STACK] boot stack high-water: %lu of 65536 bytes\n",
+           (unsigned long)boot_stack_used());
     pic_init();             /* remap 8259A — [PIC] OK                        */
     pit_init();             /* 100 Hz timer — [PIT] OK                       */
     poll_sources_init();    /* register per-tick device pollers (silent)     */
