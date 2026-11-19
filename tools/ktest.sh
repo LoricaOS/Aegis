@@ -9,11 +9,14 @@
 set -u
 ISO="${1:?usage: ktest.sh <kernel.iso>}"
 LOG="$(mktemp)"
+HERE="$(cd "$(dirname "$0")" && pwd)"
 
-timeout "${QEMU_TIMEOUT:-30}" qemu-system-x86_64 -machine pc -smp 4 -cdrom "$ISO" -boot order=d \
+# Stop as soon as the kernel prints its verdict instead of waiting out the
+# ceiling: the kernel HALTS there, so QEMU never exits by itself.
+bash "$HERE/qemu_boot.sh" "$LOG" "no init at" "${QEMU_TIMEOUT:-30}" -- \
+    qemu-system-x86_64 -machine pc -smp 4 -cdrom "$ISO" -boot order=d \
     -display none -vga std -nodefaults -serial stdio -no-reboot -m 2048M \
-    -device virtio-net-pci -device virtio-rng-pci -device virtio-gpu-pci \
-    </dev/null > "$LOG" 2>&1 || true
+    -device virtio-net-pci -device virtio-rng-pci -device virtio-gpu-pci || true
 
 if grep -q "no init at" "$LOG"; then
     echo "[ktest] PASS: kernel reached init-spawn with no userland"

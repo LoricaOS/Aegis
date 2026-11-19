@@ -5,6 +5,7 @@
 set -u
 ISO="${1:?usage: ktest-arm64.sh <aegis-arm64.iso>}"
 LOG="$(mktemp)"
+HERE="$(cd "$(dirname "$0")" && pwd)"
 FW="${QEMU_EFI:-}"
 if [ -z "$FW" ]; then
     for f in /usr/share/AAVMF/AAVMF_CODE.fd /usr/share/qemu-efi-aarch64/QEMU_EFI.fd; do
@@ -13,11 +14,13 @@ if [ -z "$FW" ]; then
 fi
 [ -f "$FW" ] || { echo "[ktest-arm64] FAIL: set QEMU_EFI to an AAVMF/QEMU_EFI firmware image"; exit 1; }
 
-timeout "${QEMU_TIMEOUT:-120}" qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a72 -m 2048M \
+# Stop as soon as the kernel prints its verdict instead of waiting out the
+# ceiling: the kernel HALTS there, so QEMU never exits by itself.
+bash "$HERE/qemu_boot.sh" "$LOG" "no init at" "${QEMU_TIMEOUT:-120}" -- \
+    qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a72 -m 2048M \
     -bios "$FW" \
     -cdrom "$ISO" \
-    -display none -nodefaults -serial stdio -no-reboot \
-    </dev/null > "$LOG" 2>&1 || true
+    -display none -nodefaults -serial stdio -no-reboot || true
 
 if grep -q "no init at" "$LOG"; then
     echo "[ktest-arm64] PASS: kernel reached init-spawn with no userland"

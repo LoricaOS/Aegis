@@ -5,6 +5,7 @@
 set -u
 ISO="${1:?usage: captest-arm64.sh <aegis-arm64-test.iso>}"
 LOG="$(mktemp)"
+HERE="$(cd "$(dirname "$0")" && pwd)"
 FW="${QEMU_EFI:-}"
 if [ -z "$FW" ]; then
     for f in /usr/share/AAVMF/AAVMF_CODE.fd /usr/share/qemu-efi-aarch64/QEMU_EFI.fd; do
@@ -13,14 +14,16 @@ if [ -z "$FW" ]; then
 fi
 [ -f "$FW" ] || { echo "[captest-arm64] FAIL: set QEMU_EFI to an AAVMF/QEMU_EFI firmware image"; exit 1; }
 
-timeout "${QEMU_TIMEOUT:-150}" qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a72 -smp 4 -m 2048M \
+# `[AEGIS] System halted.` is the last line the guest prints; the suite then
+# idles until the ceiling, so stop QEMU as soon as the halt line lands.
+bash "$HERE/qemu_boot.sh" "$LOG" "System halted" "${QEMU_TIMEOUT:-150}" -- \
+    qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a72 -smp 4 -m 2048M \
     -bios "$FW" \
     -cdrom "$ISO" \
     -object rng-random,id=rng0,filename=/dev/urandom \
     -global virtio-mmio.force-legacy=false \
     -device virtio-rng-device,rng=rng0 \
-    -display none -nodefaults -serial stdio -no-reboot \
-    </dev/null > "$LOG" 2>&1 || true
+    -display none -nodefaults -serial stdio -no-reboot || true
 
 fails=$(grep -c "\[KTEST\] FAIL" "$LOG" || true)
 

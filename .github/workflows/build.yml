@@ -21,18 +21,37 @@ on:
 jobs:
   # ── x86-64: build + full boot/capability test suite ─────────────────────
   x86:
-    runs-on: ubuntu-latest
+    # Pinned, not `ubuntu-latest`: the label rolled 24.04 -> 26.04 between runs and
+    # silently broke the boot test for a commit that had already passed (the same
+    # v1.6.0 tree boots on 24.04 and dies right after [CMDLINE] on 26.04). The
+    # kernel's early bring-up is sensitive to the QEMU/firmware it lands on, so
+    # move this label deliberately, with a boot test to match — not by a label
+    # that re-points itself.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: Cache the pinned Limine clone
+        # tools/fetch-limine.sh clones the pinned Limine release into vendor/
+        # (~4 MB) on first use and copies the files it needs out of it. The
+        # clone is skipped when this cache is warm, which also takes a network
+        # dependency out of every run.
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: limine-${{ hashFiles('tools/limine/VERSION') }}
       - name: Install toolchain
         # gcc-14 specifically: the kernel is -Werror-clean under the canonical
         # x86_64-elf-gcc and gcc-14, but ubuntu's default gcc-13 promotes an
         # -Waddress-of-packed-member in a driver to an error. Match the validated
         # compiler rather than relax the warning set.
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential gcc-14 nasm binutils xorriso \
-            e2fsprogs mtools qemu-system-x86 curl python3-venv
+        #
+        # Cached with the standard apt cache action: the install was ~37s of a
+        # ~156s job, nearly all of it download. Bump `version` to rotate the
+        # cache (e.g. when the package set or runner baseline changes).
+        uses: awalsh128/cache-apt-pkgs-action@v1.6.3
+        with:
+          packages: build-essential gcc-14 nasm binutils xorriso e2fsprogs mtools qemu-system-x86 curl python3-venv
+          version: 1.0
       - name: Generate kernel config (kconfiglib — public kconf replacement)
         run: |
           python3 -m venv /tmp/kcvenv
@@ -49,6 +68,16 @@ jobs:
           touch .config build/auto.conf build/generated/autoconf.h
       - name: Build kernel (x86-64, stock gcc, freestanding)
         run: make CC=gcc-14 LD=ld OBJCOPY=objcopy NM=nm -j"$(nproc)"
+      - name: Record the boot-test environment
+        # A boot test that dies in early bring-up reports almost nothing on its
+        # own. Print the facts that caused the last silent failure — the runner
+        # image and the QEMU build — so the next drift is readable straight from
+        # the log instead of a multi-day bisect.
+        run: |
+          echo "runner image : ${ImageOS:-unknown}"
+          qemu-system-x86_64 --version | head -1
+          gcc-14 --version | head -1
+          echo "kvm available: $([ -e /dev/kvm ] && echo yes || echo no)"
       - name: Boot + capability tests (captest + ktest under QEMU/TCG)
         run: make CC=gcc-14 LD=ld OBJCOPY=objcopy NM=nm test
       - name: Stage release artifact
@@ -64,15 +93,23 @@ jobs:
 
   # ── AArch64: build (cross toolchain from apt) ───────────────────────────
   arm64:
-    runs-on: ubuntu-latest
+    # Pinned for the same reason as the x86 job.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: Cache the pinned Limine clone
+        # Same cache as the x86 job — the Limine release carries both the BIOS
+        # and the AArch64 UEFI blobs.
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: limine-${{ hashFiles('tools/limine/VERSION') }}
       - name: Install aarch64 cross toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-            build-essential nasm curl python3-venv e2fsprogs xorriso \
-            qemu-system-arm qemu-efi-aarch64
+        # Cached for the same reason as x86: this install was ~26s of download.
+        uses: awalsh128/cache-apt-pkgs-action@v1.6.3
+        with:
+          packages: gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu build-essential nasm curl python3-venv e2fsprogs xorriso qemu-system-arm qemu-efi-aarch64
+          version: 1.0
       - name: Generate kernel config (kconfiglib)
         run: |
           python3 -m venv /tmp/kcvenv
@@ -89,6 +126,12 @@ jobs:
           touch .config build/auto.conf build/generated/autoconf.h
       - name: Build kernel (AArch64)
         run: make -f Makefile.arm64 -j"$(nproc)"
+      - name: Record the boot-test environment
+        # Same reason as the x86 job.
+        run: |
+          echo "runner image : ${ImageOS:-unknown}"
+          qemu-system-aarch64 --version | head -1
+          aarch64-linux-gnu-gcc --version | head -1
       - name: Boot + capability tests (captest + ktest under QEMU/TCG)
         run: make -f Makefile.arm64 test
       - name: Stage release artifact
@@ -105,7 +148,7 @@ jobs:
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [x86, arm64]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:

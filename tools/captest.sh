@@ -9,11 +9,14 @@
 set -u
 ISO="${1:?usage: captest.sh <aegis-test.iso>}"
 LOG="$(mktemp)"
+HERE="$(cd "$(dirname "$0")" && pwd)"
 
-timeout "${QEMU_TIMEOUT:-40}" qemu-system-x86_64 -machine pc -smp 4 -cdrom "$ISO" -boot order=d \
+# `[AEGIS] System halted.` is the last line the guest prints; the suite then
+# idles until the ceiling, so stop QEMU as soon as the halt line lands.
+bash "$HERE/qemu_boot.sh" "$LOG" "System halted" "${QEMU_TIMEOUT:-40}" -- \
+    qemu-system-x86_64 -machine pc -smp 4 -cdrom "$ISO" -boot order=d \
     -display none -vga std -nodefaults -serial stdio -no-reboot -m 2048M \
-    -device virtio-net-pci -device virtio-rng-pci -device virtio-gpu-pci \
-    </dev/null > "$LOG" 2>&1 || true
+    -device virtio-net-pci -device virtio-rng-pci -device virtio-gpu-pci || true
 
 fails=$(grep -c "\[KTEST\] FAIL" "$LOG" || true)
 
