@@ -26,7 +26,16 @@ grep -q "refusing service-tier DISK_ADMIN for /bin/exectest" "$LOG" && guards=$(
 grep -q "refusing service-tier ADMIN_AUTH for /bin/exectest" "$LOG" && guards=$((guards+1))
 if [ "$guards" != 2 ]; then
     echo "[captest] FAIL: service-tier laundering guards did not fire ($guards/2)"
+    # Dump the serial log, not just CAP_POLICY lines: when the guest never gets
+    # far enough to load policy, the useful evidence is everything before that
+    # (and an empty log means it never booted at all).
+    echo "----- CAP_POLICY lines -----"
     grep -a "CAP_POLICY" "$LOG" | sed 's/^/  /'
+    echo "----- serial head -----"
+    head -40 "$LOG" | sed 's/^/  /'
+    echo "----- serial tail -----"
+    tail -30 "$LOG" | sed 's/^/  /'
+    rm -f "$LOG"
     exit 1
 fi
 
@@ -44,6 +53,8 @@ do
     if ! grep -Fq "[KTEST] PASS $marker" "$LOG"; then
         echo "[captest] FAIL: missing ring-3 regression: $marker"
         grep "\[KTEST\]" "$LOG" | sed 's/^/  /'
+        echo "----- serial tail -----"
+        tail -30 "$LOG" | sed 's/^/  /'
         rm -f "$LOG"
         exit 1
     fi
