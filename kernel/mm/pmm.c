@@ -181,18 +181,37 @@ static void refcount_set(uint64_t pg, uint16_t count)
  * Internal helpers
  * -------------------------------------------------------------------------- */
 
+/* sat_add — a + b, saturating at UINT64_MAX. Region arithmetic comes from
+ * firmware, so no addition may wrap: a wrapped `base + len` silently turns a
+ * huge region into a tiny one (or the reverse), and the page loop then either
+ * covers nothing or runs for ~2^52 iterations. */
+static uint64_t sat_add(uint64_t a, uint64_t b)
+{
+    return (a > UINT64_MAX - b) ? UINT64_MAX : a + b;
+}
+
 static void pmm_free_region(uint64_t base, uint64_t len)
 {
-    /* Align base up to PAGE_SIZE, len down to a page boundary. */
-    uint64_t start = (base + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    if (start >= base + len)
+    if (len == 0)
         return;
-    uint64_t end = (base + len) & ~(PAGE_SIZE - 1);
+
+    /* Align base up to PAGE_SIZE, end down to a page boundary. Both use
+     * sat_add, so neither can wrap for any input. */
+    uint64_t last  = sat_add(base, len);                       /* exclusive end */
+    uint64_t start = sat_add(base, PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    if (start >= last)
+        return;
+    uint64_t end = last & ~(PAGE_SIZE - 1);
 
     for (uint64_t addr = start; addr < end; addr += PAGE_SIZE) {
         uint64_t idx = addr / PAGE_SIZE;
-        if (idx < s_bitmap_pages)
-            s_bitmap[idx / 8] &= (uint8_t)~(1U << (idx % 8));
+        /* Addresses ascend and the bitmap covers [0, s_bitmap_pages): once
+         * past its end nothing above can be tracked, so stop. Without this a
+         * firmware region far above the tracked range costs one iteration per
+         * 4 KiB of it. */
+        if (idx >= s_bitmap_pages)
+            break;
+        s_bitmap[idx / 8] &= (uint8_t)~(1U << (idx % 8));
     }
 }
 
@@ -217,20 +236,37 @@ static int pmm_page_in_usable_ram(uint64_t addr)
 
 void pmm_reserve_region(uint64_t base, uint64_t len)
 {
-    /* Align base down, end up — reserve conservatively. */
+    if (len == 0)
+        return;
+
+    /* Align base down, end up — reserve conservatively. Saturated, so the
+     * rounding-up cannot wrap to a small end and leave the region unreserved
+     * (which would hand firmware-owned pages out as free). */
     uint64_t start = base & ~(PAGE_SIZE - 1);
-    uint64_t end   = (base + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    uint64_t end   = sat_add(sat_add(base, len), PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
     for (uint64_t addr = start; addr < end; addr += PAGE_SIZE) {
         uint64_t idx = addr / PAGE_SIZE;
-        if (idx < s_bitmap_pages)
-            s_bitmap[idx / 8] |= (uint8_t)(1U << (idx % 8));
+        if (idx >= s_bitmap_pages)
+            break;                      /* ascending; nothing above is tracked */
+        s_bitmap[idx / 8] |= (uint8_t)(1U << (idx % 8));
     }
 }
 
 /* --------------------------------------------------------------------------
  * Public API
  * -------------------------------------------------------------------------- */
+
+/* pmm_region_ok — can this firmware-provided [base, base+len) be expressed at
+ * all? An EMPTY region (len 0) is legitimate — unused reserved-region slots
+ * look exactly like that — so the only malformed shape is one whose end
+ * wraps, which page arithmetic cannot carry. A range above the tracked bitmap
+ * is merely untracked, which is fine because pmm_init_late() re-frees the full
+ * extent. */
+static int pmm_region_ok(uint64_t base, uint64_t len)
+{
+    return base <= UINT64_MAX - len;
+}
 
 void pmm_init(void)
 {
@@ -250,7 +286,18 @@ void pmm_init(void)
 
     uint64_t total_bytes  = 0;
     uint64_t ram_max_page = 0;     /* full extent — sizes the late bitmap */
+    uint32_t bad_regions  = 0;     /* malformed firmware regions, dropped */
+    uint64_t bad_base = 0, bad_len = 0;
     for (uint32_t i = 0; i < nregions; i++) {
+        /* The map is firmware input and is not trusted: a region that wraps is
+         * dropped and counted rather than fed to page arithmetic. */
+        if (!pmm_region_ok(regions[i].base, regions[i].len)) {
+            if (bad_regions++ == 0) {
+                bad_base = regions[i].base;
+                bad_len  = regions[i].len;
+            }
+            continue;
+        }
         /* pmm_free_region only touches pages within the current (bootstrap)
          * bitmap; the rest of RAM is freed by pmm_init_late(). */
         pmm_free_region(regions[i].base, regions[i].len);
@@ -275,8 +322,16 @@ void pmm_init(void)
     uint32_t                  nreserved = arch_mm_reserved_region_count();
     const aegis_mem_region_t *reserved  = arch_mm_get_reserved_regions();
 
-    for (uint32_t i = 0; i < nreserved; i++)
+    for (uint32_t i = 0; i < nreserved; i++) {
+        if (!pmm_region_ok(reserved[i].base, reserved[i].len)) {
+            if (bad_regions++ == 0) {
+                bad_base = reserved[i].base;
+                bad_len  = reserved[i].len;
+            }
+            continue;
+        }
         pmm_reserve_region(reserved[i].base, reserved[i].len);
+    }
 
     /* Step 4: reserve the kernel image + bitmap (bitmap is in .bss,
      * inside this range).  The kernel image spans from PHYS_BASE+slide to
@@ -288,6 +343,21 @@ void pmm_init(void)
     pmm_reserve_region(ARCH_KERNEL_PHYS_BASE + arch_kern_phys_slide(),
                        (uint64_t)(uintptr_t)_kernel_end - ARCH_KERNEL_VIRT_BASE
                        - ARCH_KERNEL_PHYS_BASE);
+
+    /* A dropped region is a map we did not fully understand — say so, with the
+     * first offender, rather than continuing as if the map were clean. */
+    if (bad_regions)
+        printk("[PMM] WARN: dropped %lu malformed region(s), first base=0x%lx len=0x%lx\n",
+               (unsigned long)bad_regions, (unsigned long)bad_base,
+               (unsigned long)bad_len);
+
+    /* Self-check: the wrapped-region guard must actually reject a wrapped
+     * region, and must not reject a good one. Cheap, and it fails loudly if
+     * the validation is ever refactored into uselessness. */
+    if (pmm_region_ok(UINT64_MAX - 0x1000, 0x2000) ||   /* must reject a wrap */
+        !pmm_region_ok(0, 0x1000) ||                     /* must accept a real one */
+        !pmm_region_ok(0x1000, 0))                       /* must accept an empty one */
+        printk("[PMM] FAIL: memory-region validation is broken\n");
 
     /* Step 5: report. Bootstrap phase — the full bitmap (and final managed
      * total) is reported by pmm_init_late(). */
