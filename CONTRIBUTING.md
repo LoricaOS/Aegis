@@ -21,21 +21,19 @@ validates its capabilities before doing anything observable.
 
 ## Build & test
 
-You need an `x86_64-elf` cross toolchain (gcc/ld/objcopy/nm) + `nasm`, plus `xorriso`
-and Limine (`tools/fetch-limine.sh`) for the smoke-test ISO. **No Rust/cargo** — the
-capability core is plain C (`kernel/cap/cap.c`); the kernel builds with a C toolchain
-alone (a prerequisite for LoricaOS self-hosting).
+See the [build requirements](README.md#build) for native Linux and cross-toolchain
+setup, the public Kconfig fallback, and how to run the local pre-release check.
 
 ```
 make          # build/aegis.elf  (the shipped artifact)
 make iso      # build/aegis.iso  — kernel-only smoke-test ISO, bootable via Limine
-make test     # boot the kernel alone; the "no init found" panic is SUCCESS
+make test     # boot the capability suite and both kernel-only smoke ISOs
 make dist     # the stripped, release aegis.elf
 ```
 
-`make iso` / `make test` are a **smoke test only** — there is no userland here, so a
-clean boot ends at the "no init found" panic (exactly like Linux with no init). Real
-boots happen in LoricaOS. For arm64: `make -f Makefile.arm64 test`.
+The kernel-only smoke ISOs are expected to reach the “no init found” panic.
+`make test` also boots a separate ISO with a minimal test init; full OS boots
+happen in LoricaOS. For arm64: `make -f Makefile.arm64 test`.
 
 ## House style
 

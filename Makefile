@@ -3,11 +3,17 @@
 # microkernel-ish kernel). No userland: the kernel loads init from the root
 # filesystem the bootloader/OS provides. See README.md.
 
-CC      = x86_64-elf-gcc
+# Prefer the bare-metal tools when available. Native x86-64 Linux GCC and
+# binutils also emit ELF; native macOS tools do not.
+ifeq ($(origin CROSS_COMPILE),undefined)
+CROSS_COMPILE := $(shell if command -v x86_64-elf-gcc >/dev/null 2>&1 || \
+    [ "$$(uname -s)-$$(uname -m)" != Linux-x86_64 ]; then printf x86_64-elf-; fi)
+endif
+CC      = $(CROSS_COMPILE)gcc
 AS      = nasm
-LD      = x86_64-elf-ld
-OBJCOPY = x86_64-elf-objcopy
-NM      = x86_64-elf-nm
+LD      = $(CROSS_COMPILE)ld
+OBJCOPY = $(CROSS_COMPILE)objcopy
+NM      = $(CROSS_COMPILE)nm
 HOSTCC ?= cc
 MKE2FS ?= mke2fs
 DEBUGFS ?= debugfs
@@ -25,7 +31,8 @@ BUILD = build
 # (#define CONFIG_* for source #ifdef guards) and build/auto.conf (Make vars,
 # -include'd below so CONFIG_* gate the source lists). A bare `make` with no
 # .config seeds configs/full_defconfig, preserving the historical build.
-KCONF        ?= kconf
+PYTHON       ?= python3
+KCONF        ?= $(if $(shell command -v kconf 2>/dev/null),kconf,$(PYTHON) tools/kconfig.py)
 AUTOCONF_H   := $(BUILD)/generated/autoconf.h
 AUTOCONF_MK  := $(BUILD)/auto.conf
 export KCONFIG_CONFIG := .config
@@ -34,10 +41,10 @@ ifeq ($(filter clean distclean %config test-wpa2-crypto test-cryptroot-crypto,$(
 -include $(AUTOCONF_MK)
 endif
 
-GCC_INCLUDE := $(shell $(CC) -print-file-name=include)
+GCC_INCLUDE := $(shell $(CC) -print-file-name=include 2>/dev/null)
 CFLAGS = \
     -ffreestanding -nostdlib -nostdinc \
-    -isystem $(GCC_INCLUDE) \
+    -isystem "$(GCC_INCLUDE)" \
     -mcmodel=kernel \
     -fno-pie -fno-pic \
     -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mgeneral-regs-only \
@@ -383,16 +390,15 @@ all: $(BUILD)/aegis.elf
 # VERSION is expanded into CFLAGS (-DAEGIS_VERSION), so every object must
 # depend on it directly: without this, bumping VERSION left every .o untouched
 # and `make dist` shipped a kernel still stamped with the OLD version.
-$(ALL_OBJS): VERSION | $(AUTOCONF_H)
+$(ALL_OBJS): VERSION Makefile $(AUTOCONF_H)
 
 .config:
 	@echo "  [config] no .config — seeding configs/full_defconfig"
 	@$(KCONF) defconfig configs/full_defconfig Kconfig
 
-$(AUTOCONF_MK): .config Kconfig
+$(AUTOCONF_MK) $(AUTOCONF_H) &: .config Kconfig tools/kconfig.py
 	@mkdir -p $(dir $(AUTOCONF_H))
 	@KCONFIG_AUTOHEADER=$(AUTOCONF_H) KCONFIG_AUTOCONF=$(AUTOCONF_MK) $(KCONF) syncconfig Kconfig
-$(AUTOCONF_H): $(AUTOCONF_MK) ;   # same syncconfig run emits both
 
 # `make <tier>_defconfig` selects a tier; make allnoconfig/allyesconfig/oldconfig.
 %_defconfig:
@@ -562,11 +568,11 @@ USER_CFLAGS = -ffreestanding -nostdlib -static -fno-pie -no-pie \
               -fno-stack-protector -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
               -march=x86-64 -mtune=generic -O2
 
-$(BUILD)/test-init: test/init.c
+$(BUILD)/test-init: test/init.c Makefile
 	@mkdir -p $(BUILD)
 	$(CC) $(USER_CFLAGS) -e _start -o $@ $<
 
-$(BUILD)/test-exectgt: test/exectgt.c
+$(BUILD)/test-exectgt: test/exectgt.c Makefile
 	@mkdir -p $(BUILD)
 	$(CC) $(USER_CFLAGS) -e _start -o $@ $<
 

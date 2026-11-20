@@ -10,10 +10,16 @@
 # Makefile so the x86 build stays untouched; the source lists below are the
 # arm64 subset of the top-level Makefile's (no x86 drivers, no SMP traps).
 
-CC      = aarch64-linux-gnu-gcc
-LD      = aarch64-linux-gnu-ld
-NM      = aarch64-linux-gnu-nm
-OBJCOPY = aarch64-linux-gnu-objcopy
+ifeq ($(origin CROSS_COMPILE),undefined)
+CROSS_COMPILE := $(shell if command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; \
+    then printf aarch64-linux-gnu-; \
+    elif command -v aarch64-elf-gcc >/dev/null 2>&1; then printf aarch64-elf-; \
+    elif [ "$$(uname -s)-$$(uname -m)" != Linux-aarch64 ]; then printf aarch64-linux-gnu-; fi)
+endif
+CC      = $(CROSS_COMPILE)gcc
+LD      = $(CROSS_COMPILE)ld
+NM      = $(CROSS_COMPILE)nm
+OBJCOPY = $(CROSS_COMPILE)objcopy
 HOSTCC ?= cc
 MKE2FS ?= mke2fs
 DEBUGFS ?= debugfs
@@ -22,10 +28,10 @@ AEGIS_VERSION := $(shell cat VERSION 2>/dev/null || echo 0.0.0)
 
 BUILD = build/arm64
 
-GCC_INCLUDE := $(shell $(CC) -print-file-name=include)
+GCC_INCLUDE := $(shell $(CC) -print-file-name=include 2>/dev/null)
 CFLAGS = \
     -ffreestanding -nostdlib -nostdinc \
-    -isystem $(GCC_INCLUDE) \
+    -isystem "$(GCC_INCLUDE)" \
     -march=armv8-a \
     -mgeneral-regs-only \
     -mno-outline-atomics \
@@ -206,7 +212,7 @@ all: $(BUILD)/aegis-arm64.elf
 
 -include $(C_OBJS:.o=.d)
 
-$(AUTOCONF_H) $(AUTOCONF_MK):
+$(AUTOCONF_H) $(AUTOCONF_MK) &: $(wildcard .config) Kconfig Makefile tools/kconfig.py
 	@$(MAKE) --no-print-directory -f Makefile syncconfig
 
 # VERSION feeds -DAEGIS_VERSION in CFLAGS; it must be a direct prerequisite or
