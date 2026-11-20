@@ -192,10 +192,7 @@ jobs:
         # Advisory: this job reports what the floating runner does; it does not
         # gate. The guest's `EARLY FAULT vec=.. rip=..` line names the fault but
         # the rip only means something against THIS build, so keep the binary.
-        run: |
-          set +e
-          make CC=gcc-14 LD=ld OBJCOPY=objcopy NM=nm test
-          exit 0
+        run: make CC=gcc-14 LD=ld OBJCOPY=objcopy NM=nm test
       - name: Keep the canary kernel (for resolving a fault rip)
         uses: actions/upload-artifact@v4
         with:
