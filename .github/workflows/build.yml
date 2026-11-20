@@ -189,51 +189,21 @@ jobs:
           gcc-14 --version | head -1
           echo "kvm available: $([ -e /dev/kvm ] && echo yes || echo no)"
       - name: Build + boot tests (advisory)
-        # Advisory: never fail the job on the test result here — this job exists
-        # to *report* what the floating runner does. When the guest faults, the
-        # kernel now prints `EARLY FAULT vec=.. rip=..`, so resolve that rip
-        # against this build's own symbols and disassemble around it, in the same
-        # run. That turns "the canary is red" into "the canary is red at this
-        # instruction", without shipping the binary anywhere.
+        # Advisory: this job reports what the floating runner does; it does not
+        # gate. The guest's `EARLY FAULT vec=.. rip=..` line names the fault but
+        # the rip only means something against THIS build, so keep the binary.
         run: |
           set +e
-          make CC=gcc-14 LD=ld OBJCOPY=objcopy NM=nm test > /tmp/boot.log 2>&1
-          rc=$?
-          cat /tmp/boot.log
-          rip=$(grep -aoE 'rip=0x[0-9a-f]+' /tmp/boot.log | head -1 | cut -d= -f2)
-          if [ -n "$rip" ]; then
-            echo "=== resolving fault rip $rip ==="
-            python3 - "$rip" <<'PYEOF'
-          import subprocess, sys
-          rip = int(sys.argv[1], 16)
-          out = subprocess.run(["nm", "-n", "build/aegis.elf"],
-                               capture_output=True, text=True).stdout
-          syms = []
-          for line in out.splitlines():
-              p = line.split()
-              if len(p) == 3:
-                  try:
-                      a = int(p[0], 16)
-                  except ValueError:
-                      continue
-                  syms.append((a, p[2]))
-          syms.sort()
-          prev = None
-          for a, n in syms:
-              if a > rip:
-                  break
-              prev = (a, n)
-          if prev:
-              print("nearest symbol: %s +0x%x" % (prev[1], rip - prev[0]))
-          print(subprocess.run(
-              ["objdump", "-d",
-               "--start-address=0x%x" % (rip - 0x30),
-               "--stop-address=0x%x" % (rip + 0x10),
-               "build/aegis.elf"],
-              capture_output=True, text=True).stdout)
-          PYEOF
-          fi
-          exit $rc
+          make CC=gcc-14 LD=ld OBJCOPY=objcopy NM=nm test
+          exit 0
+      - name: Keep the canary kernel (for resolving a fault rip)
+        uses: actions/upload-artifact@v4
+        with:
+          name: canary-kernel
+          path: |
+            build/aegis.elf
+            build/aegis-stripped.elf
+          if-no-files-found: warn
 
   # ── On a version tag: attach both kernels to the release ────────────────
   release:
