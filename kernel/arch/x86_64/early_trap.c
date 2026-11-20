@@ -47,13 +47,6 @@ void early_trap_stage(const char *stage) { s_stage = stage; }
 
 static void put_str(const char *s) { serial_write_string(s); }
 
-static void put_hex(uint64_t v)
-{
-    static const char dig[] = "0123456789abcdef";
-    put_str("0x");
-    for (int shift = 60; shift >= 0; shift -= 4)
-        serial_write_char(dig[(v >> shift) & 0xF]);
-}
 
 static void put_dec(uint64_t v)
 {
@@ -65,56 +58,57 @@ static void put_dec(uint64_t v)
     while (n) serial_write_char(buf[--n]);
 }
 
-static const char *vec_name(uint64_t v)
+
+/* Hex into a caller buffer, digits built by arithmetic rather than a lookup
+ * table: a static const array is one more thing that has to be mapped and
+ * readable from a fault handler, and this path is the last chance to say
+ * anything at all. */
+static void hex_str(uint64_t v, char *out)
 {
-    switch (v) {
-    case 0:  return "divide error";
-    case 1:  return "debug";
-    case 2:  return "NMI";
-    case 3:  return "breakpoint";
-    case 4:  return "overflow";
-    case 5:  return "bound range";
-    case 6:  return "invalid opcode";
-    case 7:  return "device not available";
-    case 8:  return "DOUBLE FAULT";
-    case 10: return "invalid TSS";
-    case 11: return "segment not present";
-    case 12: return "stack-segment fault";
-    case 13: return "general protection";
-    case 14: return "page fault";
-    case 16: return "x87 FP error";
-    case 17: return "alignment check";
-    case 19: return "SIMD FP error";
-    case 21: return "control protection";
-    default: return "reserved";
+    for (int i = 0; i < 18; i++)
+        out[i] = '0';
+    out[0] = '0';
+    out[1] = 'x';
+    for (int i = 17; i >= 2; i--) {
+        unsigned d = (unsigned)(v & 0xF);
+        out[i] = (char)(d < 10 ? '0' + d : 'a' + (d - 10));
+        v >>= 4;
     }
+    out[18] = '\0';
 }
 
-/* early_trap_report — called from early_trap.asm with a normalised frame:
+/* early_trap_report — called from early_trap_stubs.asm with a normalised frame:
  *   f[0]=vector f[1]=error_code f[2]=rip f[3]=cs f[4]=rflags
  *   f[5]=rsp at the fault (before the stub switched to the trap stack)
- * Never returns: printing is all that is safe, so fail closed and halt. */
+ * Never returns: printing is all that is safe, so fail closed and halt.
+ *
+ * The first line carries the whole verdict (vector and rip) on purpose: if
+ * anything later misbehaves, the two fields that name the fault are already
+ * on the wire. An earlier version died mid-report and lost exactly those. */
 void early_trap_report(const uint64_t *f)
 {
+    char    hx[19];
     uint64_t cr2 = 0;
     __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
 
-    put_str("\n*** EARLY FAULT (pre-IDT) ***\n");
-    put_str("  stage   : "); put_str(s_stage);                    put_str("\n");
-    put_str("  vector  : "); put_dec(f[0]); put_str(" (");
-    put_str(vec_name(f[0])); put_str(")\n");
-    /* rip first among the hex fields: it is the one that locates the fault,
-     * and it must survive even if the rest of the report is cut short. */
-    put_str("  rip     : "); put_hex(f[2]);                        put_str("\n");
-    put_str("  error   : "); put_hex(f[1]);                        put_str("\n");
-    put_str("  cs      : "); put_hex(f[3]);                        put_str("\n");
-    put_str("  rflags  : "); put_hex(f[4]);                        put_str("\n");
-    /* CR2 is only meaningful for #PF; print it regardless, it is free. */
-    put_str("  cr2     : "); put_hex(cr2);                         put_str("\n");
-    put_str("  fault rsp: "); put_hex(f[5]);                       put_str("\n");
-    put_str("  boot stack used: "); put_dec(boot_stack_used());
-    put_str(" bytes\n");
-    put_str("*** EARLY FAULT: halted ***\n");
+    /* Verdict first, on one line. */
+    hex_str(f[2], hx);
+    put_str("\nEARLY FAULT vec=");
+    put_dec(f[0]);
+    put_str(" rip=");
+    put_str(hx);
+    put_str(" stage=");
+    put_str(s_stage);
+    put_str("\n");
+
+    /* Then the detail, each field printed straight from a fresh buffer. */
+    hex_str(f[1], hx); put_str("  err     = "); put_str(hx); put_str("\n");
+    hex_str(f[3], hx); put_str("  cs      = "); put_str(hx); put_str("\n");
+    hex_str(f[4], hx); put_str("  rflags  = "); put_str(hx); put_str("\n");
+    hex_str(cr2,  hx); put_str("  cr2     = "); put_str(hx);
+    put_str(f[0] == 14 ? "  (#PF)" : ""); put_str("\n");
+    hex_str(f[5], hx); put_str("  faultrsp= "); put_str(hx); put_str("\n");
+    put_str("EARLY FAULT: halted\n");
 
     for (;;) __asm__ volatile ("cli; hlt");
 }
