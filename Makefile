@@ -551,15 +551,24 @@ $(BUILD)/aegis.iso: $(KERNEL_STRIPPED) $(LIMINE_BIN)
 # packed as /bin/vigil into a tiny ext2 image, and booted as a Limine module.
 # It checks pid/write and — the point — that a POWER-gated syscall is DENIED to
 # baseline-cap init (no ambient authority). See tools/captest.sh.
+#
+# Freestanding user-space test programs: raw syscalls, no libc. They carry the
+# same ISA contract as the kernel — built for the baseline, never for the build
+# host. Without the -march pin a host gcc is free to emit BMI2/AVX here, and a
+# program that then runs on a CPU without it takes #UD: that is exactly how
+# "[KTEST] FAIL exec" presented on the newer CI runner, one layer above the
+# matching kernel bug.
+USER_CFLAGS = -ffreestanding -nostdlib -static -fno-pie -no-pie \
+              -fno-stack-protector -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
+              -march=x86-64 -mtune=generic -O2
+
 $(BUILD)/test-init: test/init.c
 	@mkdir -p $(BUILD)
-	$(CC) -ffreestanding -nostdlib -static -fno-pie -no-pie -fno-stack-protector \
-	    -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -O2 -e _start -o $@ $<
+	$(CC) $(USER_CFLAGS) -e _start -o $@ $<
 
 $(BUILD)/test-exectgt: test/exectgt.c
 	@mkdir -p $(BUILD)
-	$(CC) -ffreestanding -nostdlib -static -fno-pie -no-pie -fno-stack-protector \
-	    -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -O2 -e _start -o $@ $<
+	$(CC) $(USER_CFLAGS) -e _start -o $@ $<
 
 $(BUILD)/test-rootfs.img: $(BUILD)/test-init $(BUILD)/test-exectgt test/exectest.caps
 	dd if=/dev/zero of=$@ bs=512 count=8192 2>/dev/null      # 4 MiB
