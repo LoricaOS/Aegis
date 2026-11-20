@@ -40,7 +40,7 @@ CFLAGS = \
     -isystem $(GCC_INCLUDE) \
     -mcmodel=kernel \
     -fno-pie -fno-pic \
-    -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
+    -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mgeneral-regs-only \
     -fno-stack-protector \
     -fno-omit-frame-pointer \
     -O$(if $(CONFIG_CC_OPTIMIZE_FOR_SIZE),s,2) -fno-strict-aliasing \

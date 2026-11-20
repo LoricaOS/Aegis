@@ -103,8 +103,10 @@ void early_trap_report(const uint64_t *f)
     put_str("  stage   : "); put_str(s_stage);                    put_str("\n");
     put_str("  vector  : "); put_dec(f[0]); put_str(" (");
     put_str(vec_name(f[0])); put_str(")\n");
-    put_str("  error   : "); put_hex(f[1]);                        put_str("\n");
+    /* rip first among the hex fields: it is the one that locates the fault,
+     * and it must survive even if the rest of the report is cut short. */
     put_str("  rip     : "); put_hex(f[2]);                        put_str("\n");
+    put_str("  error   : "); put_hex(f[1]);                        put_str("\n");
     put_str("  cs      : "); put_hex(f[3]);                        put_str("\n");
     put_str("  rflags  : "); put_hex(f[4]);                        put_str("\n");
     /* CR2 is only meaningful for #PF; print it regardless, it is free. */
