@@ -144,6 +144,51 @@ jobs:
           path: aegis-arm64.elf
           if-no-files-found: error
 
+  # ── Canary: the same boot test on the FLOATING runner ────────────────────
+  # Both gating jobs above are pinned to ubuntu-24.04 because the label moved
+  # 24.04 -> 26.04 underneath a commit that had already passed and broke the
+  # x86 boot test. This job runs the identical test on `ubuntu-latest` and does
+  # NOT gate anything, so the next move of that label shows up as a red canary
+  # carrying the kernel's own [PMM]/early-fault diagnostics — instead of as a
+  # mystery failure in a release build.
+  x86-canary:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache the pinned Limine clone
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: limine-${{ hashFiles('tools/limine/VERSION') }}
+      - name: Install toolchain
+        uses: awalsh128/cache-apt-pkgs-action@v1.6.3
+        with:
+          packages: build-essential gcc-14 nasm binutils xorriso e2fsprogs mtools qemu-system-x86 curl python3-venv
+          version: 1.0
+      - name: Generate kernel config (kconfiglib)
+        run: |
+          python3 -m venv /tmp/kcvenv
+          /tmp/kcvenv/bin/pip install --quiet kconfiglib
+          mkdir -p build/generated
+          /tmp/kcvenv/bin/python - <<'PY'
+          import kconfiglib
+          kc = kconfiglib.Kconfig("Kconfig", warn_to_stderr=False)
+          kc.load_config("configs/full_defconfig")
+          kc.write_config(".config")
+          kc.write_config("build/auto.conf")
+          kc.write_autoconf("build/generated/autoconf.h")
+          PY
+          touch .config build/auto.conf build/generated/autoconf.h
+      - name: Record the boot-test environment
+        run: |
+          echo "runner image : ${ImageOS:-unknown}"
+          qemu-system-x86_64 --version | head -1
+          gcc-14 --version | head -1
+          echo "kvm available: $([ -e /dev/kvm ] && echo yes || echo no)"
+      - name: Build + boot tests (advisory)
+        run: make CC=gcc-14 LD=ld OBJCOPY=objcopy NM=nm test
+
   # ── On a version tag: attach both kernels to the release ────────────────
   release:
     if: startsWith(github.ref, 'refs/tags/v')
